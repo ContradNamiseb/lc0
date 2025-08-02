@@ -45,28 +45,6 @@ jobs:
           git submodule sync --recursive
           git submodule update --init --recursive
 
-      # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-      # ~~~ RESTORE CACHED BUILD DEPENDENCIES ~~~
-      # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-      
-      - name: Restore cached Dep packages
-        id: cache-dep-restore
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ github.workspace }}/dep-cache/
-          key: cache-${{ matrix.os }}-${{ matrix.backend }}-${{ matrix.artifact_name }}
-          enableCrossOsArchive: true
-          restore-keys: |
-             cache-${{ matrix.os }}-${{ matrix.backend }}-${{ matrix.artifact_name }}
-             cache-${{ matrix.os }}-
-             cache-
-
-      - name: Copy back cached Dep packages
-        #if: steps.cache-dep-restore.outputs.cache-hit
-        run: |
-          sudo cp -r ${{ github.workspace }}/dep-cache/*.deb /var/cache/apt/archives/ || true
-
-
       # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
       # ~~  DEPENDENCY INSTALLATION ~~
       # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -126,25 +104,6 @@ jobs:
             intel-oneapi-mkl-devel \
             opencl-headers \
             ocl-icd-opencl-dev
-
-      # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-      # ~~~     CACHE BUILD DEPENDENCIES      ~~~
-      # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-      # Create a cache directory. And copy .dep files over to it.
-      - name: Create dep cache directory
-        run: |
-          mkdir -p ${{ github.workspace }}/dep-cache/
-          sudo cp /var/cache/apt/archives/*.deb ${{ github.workspace }}/dep-cache/ || true
-
-      - name: Cache Dep Packages
-        id: cache-dep-packages
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ github.workspace }}/dep-cache/
-          key: ${{ steps.cache-dep-restore.outputs.cache-primary-key }}
-          enableCrossOsArchive: true
-
 
       # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
       # ~~~    BUILD & CONFIGURE   ~~~
