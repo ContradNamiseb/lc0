@@ -112,8 +112,8 @@ jobs:
       - name: Configure Meson
         run: |
           #Delete build dir and abseil dir
-          echo "Cleaning old build and subproject/abseil directories..."
-          rm -rf build subprojects/abseil-cpp subprojects/packagecache
+          echo "Cleaning old build..."
+          rm -rf build
           # Define base Meson command
           MESON_CMD="meson setup --buildtype release build -Dgtest=false"
 
@@ -139,11 +139,10 @@ jobs:
              fi
              $CXX --version
              
-             # Configure Meson with the corrected syntax for cpp_args
+             # Configure Meson
              $MESON_CMD -Dsycl=l0 \
                  -Dcpp_args=-pthreads \
                  -Dcpp_link_args=-fsycl \
-                 -Ddag_classic=true \
                  -Dnative_arch=false
           elif [ "${{ matrix.backend }}" == "cuda" ]; then
              $MESON_CMD -Dplain_cuda=true -Dcudnn=false
