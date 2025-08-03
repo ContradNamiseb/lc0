@@ -17,22 +17,22 @@ jobs:
           # Linux only, for now
           - os: ubuntu-22.04
             backend: sycl
-            artifact_name: sycl-ubuntu-22.04
+            artifact_name: lc0-sycl-ubuntu-22.04
           - os: ubuntu-24.04
             backend: sycl
-            artifact_name: sycl-ubuntu-24.04 
+            artifact_name: lc0-sycl-ubuntu-24.04 
           - os: ubuntu-22.04
             backend: blas
-            artifact_name: blas-ubuntu-22.04
+            artifact_name: lc0-blas-ubuntu-22.04
           - os: ubuntu-24.04
             backend: blas
-            artifact_name: blas-unbuntu-24.04 
+            artifact_name: lc0-blas-unbuntu-24.04 
           - os: ubuntu-22.04
             backend: cuda
-            artifact_name: cuda-12.9-ubuntu-22.04
+            artifact_name: lc0-cuda-12.9-ubuntu-22.04
           - os: ubuntu-24.04
             backend: cuda
-            artifact_name: cuda-12.9-ubuntu-24.04
+            artifact_name: lc0-cuda-12.9-ubuntu-24.04
             
     runs-on: ${{ matrix.os }}
     steps:
@@ -162,7 +162,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4.4.3
         with:
-          name: build-logs-${{ matrix.os }}-${{ matrix.backend }}
+          name: build-logs-${{ matrix.artifact_name }}
           path: build
 
       # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -187,7 +187,7 @@ jobs:
       - name: Upload a Build Artifact
         uses: actions/upload-artifact@v4.4.3
         with:
-          name: lc0-${{ matrix.artifact_name }}
+          name: ${{ matrix.artifact_name }}
           path: |
             build/lc0
             build/T79.pb.gz
