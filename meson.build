@@ -592,9 +592,11 @@ if get_option('build_backends')
   ## ~~~~~~~~~~
   ## ONNX
   ## ~~~~~~~~~~
-  if get_option('onnx_libdir') != '' and get_option('onnx_include') != ''
-    deps += cc.find_library('onnxruntime', dirs: get_option('onnx_libdir'),
-                            required: true)
+  onnxruntime = cc.find_library('onnxruntime', dirs: get_option('onnx_libdir'),
+                                required: false)
+  if get_option('onnx') and onnxruntime.found() and\
+     run_command('scripts/checkdir.py', get_option('onnx_include'), check: false).returncode() == 0
+    deps += onnxruntime
     includes += include_directories(get_option('onnx_include'), is_system: true)
     cc.has_header('onnxruntime_cxx_api.h', required: true,
                   args: '-I' + get_option('onnx_include'))
@@ -734,6 +736,7 @@ if get_option('build_backends')
         # For sycl under windows we need to link using icx to generate the device code.
         # This script edits build.ninja for this and for an icx dependency issue.
         meson.add_postconf_script('scripts/sycl_build_hack.py')
+        add_project_link_arguments('-rtlib=compiler-rt', language : 'cpp')
       endif
   endif
 
