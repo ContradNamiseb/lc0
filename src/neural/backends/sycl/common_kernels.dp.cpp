@@ -855,39 +855,39 @@ void globalAvgPool_kernel(T* output, const T* input, const T* prevLayerBias,
                           const sycl::nd_item<3>& item_ct1) {
   const int elementsPerWarp = 64;  // 8x8 board
   const int elementsPerThread = 2; // Each thread processes 2 elements
-  const int logicalSubGroupSize = 32; // Warp-like size for reduction
+  const int logicalSGSize = 32; // Warp-like size for reduction
 
   // Get thread and sub-group info
   int tid = item_ct1.get_group(2) * item_ct1.get_local_range(2) +
             item_ct1.get_local_id(2);
-  int laneId = item_ct1.get_local_id(2) % logicalSubGroupSize;
+  int laneId = item_ct1.get_local_id(2) % logicalSGSize;
   int laneStartIndex = (tid - laneId) * elementsPerThread;
 
   // Compute per-thread sum for elementsPerThread elements
   float S = 0.0f;
 #pragma unroll
-  for (int i = 0; i < elementsPerWarp; i += logicalSubGroupSize) {
+  for (int i = 0; i < elementsPerWarp; i += logicalSGSize) {
     int index = laneStartIndex + laneId + i;
     if (index < inputSize) S += (float)(input[index]);
   }
 
   // Perform warp-wide reduction using syclcompat::shift_sub_group_left
   auto sg = item_ct1.get_sub_group();
-  if (sg.get_local_range()[0] < logicalSubGroupSize) {
+  if (sg.get_local_range()[0] < logicalSGSize) {
     // Handle case where sub-group size is smaller than expected
     return; // Or throw an exception, depending on your backend
   }
 
 #pragma unroll
-  for (int offset = 1; offset < logicalSubGroupSize; offset *= 2) {
-    S = syclcompat::shift_sub_group_left(sg, S, offset, logicalSubGroupSize);
+  for (int offset = 1; offset < logicalSGSize; offset *= 2) {
+    S += syclcompat::shift_sub_group_left(sg, S, offset, logicalSGSize);
   }
 
   // Compute average
   float avg = S / elementsPerWarp;
 
   // Add bias if provided
-  int opIndex = tid / logicalSubGroupSize;
+  int opIndex = tid / logicalSGSize;
   if (laneId == 0 && opIndex < outputSize) {
     if (prevLayerBias) avg += (float)prevLayerBias[opIndex % C];
     output[opIndex] = (T)avg;
