@@ -20,7 +20,7 @@
 */
 
 #include <sycl/sycl.hpp>
-#include "dpct/dpct.hpp"
+#include <syclcompat/util.hpp>
 #include <algorithm>
 #include <cassert>
 
@@ -850,49 +850,47 @@ void globalAvgPool_kernel_NHWC_fp16(sycl::half* output, const sycl::half* input,
 
 // Each thread reads 2 inputs (8x8/32), and each warp writes a single output.
 template <typename T>
-void globalAvgPool_kernel(T* output, const T* input,
-                                     const T* prevLayerBias, int inputSize,
-                                     int outputSize, int C,
-                                     const sycl::nd_item<3> &item_ct1) {
-  const int elementsPerWarp = 64;
-  const int elementsPerThread = 2;
+void globalAvgPool_kernel(T* output, const T* input, const T* prevLayerBias,
+                          int inputSize, int outputSize, int C,
+                          const sycl::nd_item<3>& item_ct1) {
+  const int elementsPerWarp = 64;  // 8x8 board
+  const int elementsPerThread = 2; // Each thread processes 2 elements
+  const int logicalSubGroupSize = 32; // Warp-like size for reduction
 
+  // Get thread and sub-group info
   int tid = item_ct1.get_group(2) * item_ct1.get_local_range(2) +
             item_ct1.get_local_id(2);
-
-  int laneId = item_ct1.get_local_id(2) & 0x1F;
+  int laneId = item_ct1.get_local_id(2) % logicalSubGroupSize;
   int laneStartIndex = (tid - laneId) * elementsPerThread;
 
-  // Compute per-thread sum for elementsPerThread elements.
-  float S = 0;
-
+  // Compute per-thread sum for elementsPerThread elements
+  float S = 0.0f;
 #pragma unroll
-  for (int i = 0; i < elementsPerWarp; i += 32) {
+  for (int i = 0; i < elementsPerWarp; i += logicalSubGroupSize) {
     int index = laneStartIndex + laneId + i;
     if (index < inputSize) S += (float)(input[index]);
   }
 
-// Compute warp wide sum (for entire plane - elementsPerWarp elements).
-#pragma unroll
-  for (int offset = 1; offset < 32; offset *= 2) {
-    /*
-    DPCT1023:10: The SYCL sub-group does not support mask options for
-    dpct::shift_sub_group_left. You can specify
-    "--use-experimental-features=masked-sub-group-operation" to use the
-    experimental helper function to migrate __shfl_down_sync.
-    */
-    S += dpct::shift_sub_group_left(item_ct1.get_sub_group(), S, offset);
+  // Perform warp-wide reduction using syclcompat::shift_sub_group_left
+  auto sg = item_ct1.get_sub_group();
+  if (sg.get_local_range()[0] < logicalSubGroupSize) {
+    // Handle case where sub-group size is smaller than expected
+    return; // Or throw an exception, depending on your backend
   }
 
-  float avg = S / elementsPerWarp;
-  int opIndex = tid >> 5;
+#pragma unroll
+  for (int offset = 1; offset < logicalSubGroupSize; offset *= 2) {
+    S = syclcompat::shift_sub_group_left(sg, S, offset, logicalSubGroupSize);
+  }
 
-  // First thread in warp has the sum, write it in output.
-  if (laneId == 0) {
-    if (opIndex < outputSize) {
-      if (prevLayerBias) avg += (float)prevLayerBias[opIndex % C];
-      output[opIndex] = (T)avg;
-    }
+  // Compute average
+  float avg = S / elementsPerWarp;
+
+  // Add bias if provided
+  int opIndex = tid / logicalSubGroupSize;
+  if (laneId == 0 && opIndex < outputSize) {
+    if (prevLayerBias) avg += (float)prevLayerBias[opIndex % C];
+    output[opIndex] = (T)avg;
   }
 }
 
