@@ -20,7 +20,6 @@
 */
 
 #include <sycl/sycl.hpp>
-#include <syclcompat/util.hpp>
 #include <algorithm>
 #include <cassert>
 
@@ -853,14 +852,14 @@ template <typename T>
 void globalAvgPool_kernel(T* output, const T* input, const T* prevLayerBias,
                           int inputSize, int outputSize, int C,
                           const sycl::nd_item<3>& item_ct1) {
-  const int elementsPerWarp = 64;  // 8x8 board
-  const int elementsPerThread = 2; // Each thread processes 2 elements
-  const int logicalSGSize = 32; // Warp-like size for reduction
+  const int elementsPerWarp = 64;
+  const int elementsPerThread = 2; 
+  const int logicalSGSize = 32; // Sub_group size
 
   // Get thread and sub-group info
   int tid = item_ct1.get_group(2) * item_ct1.get_local_range(2) +
             item_ct1.get_local_id(2);
-  int laneId = item_ct1.get_local_id(2) % logicalSGSize;
+  int laneId = item_ct1.get_local_id(2) & 0x1F;
   int laneStartIndex = (tid - laneId) * elementsPerThread;
 
   // Compute per-thread sum for elementsPerThread elements
@@ -871,26 +870,31 @@ void globalAvgPool_kernel(T* output, const T* input, const T* prevLayerBias,
     if (index < inputSize) S += (float)(input[index]);
   }
 
-  // Perform warp-wide reduction using syclcompat::shift_sub_group_left
+ 
   auto sg = item_ct1.get_sub_group();
-  if (sg.get_local_range()[0] < logicalSGSize) {
-    // Handle case where sub-group size is smaller than expected
-    return; // Or throw an exception, depending on your backend
-  }
-
+  /*if (sg.get_local_range().get(0) < logicalSGSize) {
+    for (int offset = 1; offset < 16; offset *= 2) {
+      S += sycl::shift_group_left(sg, S, offset);
+    }
+  }*/
+  
+// Compute per-thread sum for elementsPerThread elements.
 #pragma unroll
   for (int offset = 1; offset < logicalSGSize; offset *= 2) {
-    S += syclcompat::shift_sub_group_left(sg, S, offset, logicalSGSize);
+    S += sycl::shift_group_left(sg, S, offset);
   }
 
   // Compute average
   float avg = S / elementsPerWarp;
 
-  // Add bias if provided
-  int opIndex = tid / logicalSGSize;
-  if (laneId == 0 && opIndex < outputSize) {
-    if (prevLayerBias) avg += (float)prevLayerBias[opIndex % C];
-    output[opIndex] = (T)avg;
+  int opIndex = tid >> 5;
+
+  // First thread in warp has the sum, write it in output.
+  if (laneId == 0) {
+    if (opIndex < outputSize) {
+      if (prevLayerBias) avg += (float)prevLayerBias[opIndex % C];
+      output[opIndex] = (T)avg;
+    }
   }
 }
 
@@ -1126,7 +1130,7 @@ void softmax_opt_64_kernel(T* output, const T* input,
   "--use-experimental-features=masked-sub-group-operation" to use the
   experimental helper function to migrate __shfl_sync.
   */
-  maxval = dpct::select_from_sub_group(item_ct1.get_sub_group(), maxval, 0);
+  maxval = sycl::select_from_group(item_ct1.get_sub_group(), maxval, 0);
 
   ex[0] = sycl::exp(x[0] - maxval);
   ex[1] = sycl::exp(x[1] - maxval);
@@ -1139,7 +1143,7 @@ void softmax_opt_64_kernel(T* output, const T* input,
   "--use-experimental-features=masked-sub-group-operation" to use the
   experimental helper function to migrate __shfl_sync.
   */
-  Sum = dpct::select_from_sub_group(item_ct1.get_sub_group(), Sum, 0);
+  Sum = sycl::select_from_group(item_ct1.get_sub_group(), Sum, 0);
 
   ex[0] = ex[0] / Sum;
   ex[1] = ex[1] / Sum;
@@ -1194,10 +1198,14 @@ void softmax_kernel(T* output, const T* input, const T* input2,
   float val = warpReduce(ex, item_ct1);
 
   // update shared memory sum across C dimension
-  if ((c & 0x1F) == 0)
-      dpct::atomic_fetch_add<sycl::access::address_space::generic_space>(&sum,
-                                                                         val);
-
+  if ((c & 0x1F) == 0) {
+    auto val_atomic = sycl::atomic_ref<float,
+                      sycl::memory_order::relaxed,
+                      sycl::memory_scope::device,
+                      sycl::access::address_space::generic_space>(sum);
+                           
+    val_atomic.fetch_add(val);
+    }
   
   item_ct1.barrier(sycl::access::fence_space::local_space);
 
