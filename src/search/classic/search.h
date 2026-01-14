@@ -43,6 +43,8 @@
 #include "syzygy/syzygy.h"
 #include "utils/logging.h"
 #include "utils/mutex.h"
+#include "utils/spinhelper.h"
+#include <atomic>
 
 namespace lczero {
 namespace classic {
@@ -351,26 +353,48 @@ class SearchWorker {
           is_collision(is_collision) {}
   };
 
-  // Holds per task worker scratch data
-  struct TaskWorkspace {
-    std::array<Node::Iterator, 256> cur_iters;
-    std::vector<std::unique_ptr<std::array<int, 256>>> vtp_buffer;
-    std::vector<std::unique_ptr<std::array<int, 256>>> visits_to_perform;
-    std::vector<int> vtp_last_filled;
-    std::vector<int> current_path;
-    std::vector<Move> moves_to_path;
-    PositionHistory history;
-    TaskWorkspace() {
-      vtp_buffer.reserve(30);
-      visits_to_perform.reserve(30);
-      vtp_last_filled.reserve(30);
-      current_path.reserve(30);
-      moves_to_path.reserve(30);
-      history.Reserve(30);
+  // Helper struct to hold cached data during the traversal.
+  struct CachedNodeData {
+    std::array<Node::Iterator, 256> cur_iters; // Current iterations cache.
+    std::array<float, 256> policy_cache{};
+    std::array<float, 256> utility_cache{};    // Q + M-utility
+    std::array<float, 256> uct_score_cache{};
+    std::array<int,   256> n_started_cache{};
+    std::vector<int> vtp_last_filled_cache{};  // indices we have filled
+    float puct_mult = 0.0f;                    // cpuct * sqrt(parent_visits)
+    int   cache_filled_idx = -1;              // highest index we have filled
+    int   max_policy_entries_needed = 0;       // how many children we consider
+    int   collision_limit_for_level = 0;       // visits allocated to this node
+    
+    CachedNodeData() { // forces value-init on all 256 iterators 
+       vtp_last_filled_cache.reserve(30);
     }
+
+    // Remove this line completely:
+    // Node::Iterator current_edge_iterator;   // Dangling danger!
   };
 
-  struct PickTask {
+  struct TaskWorkspace {
+    // Core search stacks.
+    // std::vector<CachedNodeData> cached_data;
+    std::vector<std::unique_ptr<std::array<int, 256>>> vtp_buffer;
+    std::vector<std::unique_ptr<std::array<int, 256>>> visits_to_perform;
+    
+    std::vector<int> current_path;     // which child index we took at each level
+    std::vector<Move> moves_to_path;
+    PositionHistory history;
+
+    TaskWorkspace() {
+        //cached_data.reserve(30);
+        vtp_buffer.reserve(30);
+        visits_to_perform.reserve(30);
+        current_path.reserve(30);
+        moves_to_path.reserve(30);
+        history.Reserve(30);
+    }
+  };
+  
+  struct alignas(64) PickTask {
     enum PickTaskType { kGathering, kProcessing };
     PickTaskType task_type;
 
@@ -405,10 +429,10 @@ class SearchWorker {
   bool MaybeSetBounds(Node* p, float m, int* n_to_fix, float* v_delta,
                       float* d_delta, float* m_delta) const;
   void PickNodesToExtend(int collision_limit);
-  void PickNodesToExtendTask(Node* starting_point, int base_depth,
-                             int collision_limit,
-                             const std::vector<Move>& moves_to_base,
-                             std::vector<NodeToProcess>* receiver,
+  void PickNodesToExtendTask(Node* starting_node, int base_search_depth,
+                             int collision_visit_limit,
+                             const std::vector<Move>& moves_to_node,
+                             std::vector<NodeToProcess>* output_receiver,
                              TaskWorkspace* workspace);
   void EnsureNodeTwoFoldCorrectForDepth(Node* node, int depth);
   void ProcessPickedTask(int batch_start, int batch_end,
@@ -438,17 +462,20 @@ class SearchWorker {
 
   // Multigather task related fields.
 
+  // Task management.
   Mutex picking_tasks_mutex_;
   std::vector<PickTask> picking_tasks_;
-  std::atomic<int> task_count_ = -1;
-  std::atomic<int> task_taking_started_ = 0;
-  std::atomic<int> tasks_taken_ = 0;
-  std::atomic<int> completed_tasks_ = 0;
   std::condition_variable task_added_;
   std::vector<std::thread> task_threads_;
   std::vector<TaskWorkspace> task_workspaces_;
   TaskWorkspace main_workspace_;
-  bool exiting_ = false;
+  std::atomic<bool> exiting_{false};
+
+  // Padded atomic counters to avoid false sharing.
+  alignas(64) std::atomic<int> task_count_{-1};
+  alignas(64) std::atomic<int> task_taking_started_{0};
+  alignas(64) std::atomic<int> tasks_taken_{0};
+  alignas(64) std::atomic<int> completed_tasks_{0};
 };
 
 }  // namespace classic
