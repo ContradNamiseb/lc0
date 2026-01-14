@@ -202,6 +202,82 @@ Node* Node::CreateSingleChildNode(Move move) {
   return child_.get();
 }
 
+// Move constructor: transfers ownership of pointers and copies atomic counters.
+Node::Node(Node&& other) noexcept
+    : edges_(std::move(other.edges_)),
+      parent_(other.parent_),
+      child_(std::move(other.child_)),
+      sibling_(std::move(other.sibling_)),
+      wl_(other.wl_),
+      d_(other.d_),
+      m_(other.m_),
+      num_edges_(other.num_edges_),
+      terminal_type_(other.terminal_type_),
+      lower_bound_(other.lower_bound_),
+      upper_bound_(other.upper_bound_),
+      solid_children_(other.solid_children_),
+      index_(other.index_) {
+  // Copy atomics' values explicitly.
+  n_.store(other.n_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+  n_in_flight_.store(other.n_in_flight_.load(std::memory_order_relaxed),
+                     std::memory_order_relaxed);
+
+  // Leave other in a safe-to-destroy state.
+  other.parent_ = nullptr;
+  other.num_edges_ = 0;
+  other.wl_ = 0.0;
+  other.d_ = 1.0f;
+  other.m_ = 0.0f;
+  other.terminal_type_ = Terminal::NonTerminal;
+  other.lower_bound_ = GameResult::BLACK_WON;
+  other.upper_bound_ = GameResult::WHITE_WON;
+  other.solid_children_ = false;
+  other.n_.store(0, std::memory_order_relaxed);
+  other.n_in_flight_.store(0, std::memory_order_relaxed);
+}
+
+// Move assignment: move contents but preserve this->parent_ and this->index_
+Node& Node::operator=(Node&& other) noexcept {
+  if (this == &other) return *this;
+
+  // Move pointer-owning members.
+  edges_ = std::move(other.edges_);
+  child_ = std::move(other.child_);
+  sibling_ = std::move(other.sibling_);
+
+  // Copy scalar fields (but keep parent_ and index_ of the target intact).
+  wl_ = other.wl_;
+  d_ = other.d_;
+  m_ = other.m_;
+  num_edges_ = other.num_edges_;
+  terminal_type_ = other.terminal_type_;
+  lower_bound_ = other.lower_bound_;
+  upper_bound_ = other.upper_bound_;
+  solid_children_ = other.solid_children_;
+
+  // Copy atomics explicitly.
+  n_.store(other.n_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+  n_in_flight_.store(other.n_in_flight_.load(std::memory_order_relaxed),
+                     std::memory_order_relaxed);
+
+  // Reset other to safe state.
+  other.edges_.reset();
+  other.child_.reset();
+  other.sibling_.reset();
+  other.num_edges_ = 0;
+  other.wl_ = 0.0;
+  other.d_ = 1.0f;
+  other.m_ = 0.0f;
+  other.terminal_type_ = Terminal::NonTerminal;
+  other.lower_bound_ = GameResult::BLACK_WON;
+  other.upper_bound_ = GameResult::WHITE_WON;
+  other.solid_children_ = false;
+  other.n_.store(0, std::memory_order_relaxed);
+  other.n_in_flight_.store(0, std::memory_order_relaxed);
+
+  return *this;
+}
+
 void Node::CreateEdges(const MoveList& moves) {
   assert(!edges_);
   assert(!child_);
@@ -346,12 +422,26 @@ void Node::SetBounds(GameResult lower, GameResult upper) {
 }
 
 bool Node::TryStartScoreUpdate() {
-  if (n_ == 0 && n_in_flight_ > 0) return false;
-  ++n_in_flight_;
+  uint32_t expected_n = n_.load(std::memory_order_acquire);
+  uint32_t expected_inflight = n_in_flight_.load(std::memory_order_acquire);
+
+  // If node is being extended for the first time by another thread, wait.
+  if (expected_n == 0 && expected_inflight > 0) return false;
+
+  // Atomically increment n_in_flight. 
+  // If expected_n changed to 0 and expected_inflight > 0 in between, 
+  // we might still increment, but that's generally okay for multi-visits 
+  // as long as the first extender wins the extension right.
+  // To be perfectly safe, we'd use a more complex CAS loop or rely on the 
+  // fact that extension itself is protected by an exclusive lock or similar 
+  // Higher-level logic.
+  n_in_flight_.fetch_add(1, std::memory_order_relaxed);
   return true;
 }
 
-void Node::CancelScoreUpdate(int multivisit) { n_in_flight_ -= multivisit; }
+void Node::CancelScoreUpdate(int multivisit) {
+  n_in_flight_.fetch_sub(multivisit, std::memory_order_relaxed);
+}
 
 void Node::FinalizeScoreUpdate(float v, float d, float m, int multivisit) {
   // Recompute Q.
@@ -360,9 +450,9 @@ void Node::FinalizeScoreUpdate(float v, float d, float m, int multivisit) {
   m_ += multivisit * (m - m_) / (n_ + multivisit);
 
   // Increment N.
-  n_ += multivisit;
+  n_.fetch_add(multivisit, std::memory_order_relaxed);
   // Decrement virtual loss.
-  n_in_flight_ -= multivisit;
+  n_in_flight_.fetch_sub(multivisit, std::memory_order_relaxed);
 }
 
 void Node::AdjustForTerminal(float v, float d, float m, int multivisit) {
