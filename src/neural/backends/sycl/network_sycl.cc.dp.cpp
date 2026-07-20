@@ -854,9 +854,11 @@ class SyclNetwork : public Network {
     }
 
     // Copy policy output from device memory to host memory.
+#ifndef USE_INTEL
     auto event =
         io_sycl_queue_.memcpy(io->op_policy_mem_, io->op_policy_mem_gpu_,
                               sizeof(float) * kNumOutputPolicy * batchSize);
+#endif
 
     if (!multi_stream_) {
       // ReportCUDAErrors(
@@ -865,7 +867,11 @@ class SyclNetwork : public Network {
       lock_.unlock();
     }
 
+#ifndef USE_INTEL
     event.wait();
+#else
+    io_sycl_queue_.wait();
+#endif
 
     if (wdl_) {
       // Value softmax done cpu side.
