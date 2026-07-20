@@ -35,11 +35,17 @@ struct InputsOutputs {
   #endif                
     input_masks_mem_shared_ = malloc_host<uint64_t>(maxBatchSize * kInputPlanes, q_ct1);
     input_val_mem_shared_ = malloc_host<float>(maxBatchSize * kInputPlanes, q_ct1);
-    // Seperate device memory copy for policy output.
+    // Separate device memory copy for policy output.
     // It's faster to write to device memory and then copy to host memory
-    // than having the kernel write directly to it.
+    // than having the kernel write directly to it (for discrete GPUs).
+    // For Intel iGPUs, shared memory is faster since it avoids the extra copy.
+#ifdef USE_INTEL
+    op_policy_mem_gpu_ = malloc_shared<float>(maxBatchSize * kNumOutputPolicy, q_ct1);
+    op_policy_mem_ = op_policy_mem_gpu_;
+#else
     op_policy_mem_ = malloc_host<float>(maxBatchSize * kNumOutputPolicy, q_ct1);
     op_policy_mem_gpu_ = malloc_device<float>(maxBatchSize * kNumOutputPolicy, q_ct1);
+#endif
     op_value_mem_shared_ = malloc_host<float>(maxBatchSize * (wdl ? 3 : 1), q_ct1);
 
     if (moves_left) {
