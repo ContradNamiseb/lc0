@@ -765,7 +765,7 @@ void PolicyMapLayer<DataType>::Eval(
 }
 
 template <typename DataType> PolicyMapLayer<DataType>::~PolicyMapLayer() {
-  free(weights_, sycl_queue_);
+  sycl::free(weights_, sycl_queue_);
 }
 
 template <typename DataType>
@@ -1285,9 +1285,9 @@ void Conv1Layer<DataType>::Eval(int N, DataType* output, const DataType* input,
 template <typename DataType>
 Conv1Layer<DataType>::~Conv1Layer() {
  
-  free(weights_, sycl_queue_);
+  sycl::free(weights_, sycl_queue_);
   if (use_bias_) 
-    free(biases_, sycl_queue_);
+    sycl::free(biases_, sycl_queue_);
 }
 
 template <typename DataType>
@@ -1548,15 +1548,15 @@ void ResidualBlock<DataType>::Eval(int N, DataType* output,
 template <typename DataType>
 ResidualBlock<DataType>::~ResidualBlock() {
 
-  free(transformed_weights0_, sycl_queue_);
-  free(biases0_, sycl_queue_);
-  free(transformed_weights1_, sycl_queue_);
-  free(biases1_, sycl_queue_);
+  sycl::free(transformed_weights0_, sycl_queue_);
+  sycl::free(biases0_, sycl_queue_);
+  sycl::free(transformed_weights1_, sycl_queue_);
+  sycl::free(biases1_, sycl_queue_);
   if (has_se_) {
-    free(w1_, sycl_queue_);
-    free(w2_, sycl_queue_);
-    free(b1_, sycl_queue_);
-    free(b2_, sycl_queue_);
+    sycl::free(w1_, sycl_queue_);
+    sycl::free(w2_, sycl_queue_);
+    sycl::free(b1_, sycl_queue_);
+    sycl::free(b2_, sycl_queue_);
   }
 }
 
@@ -1569,12 +1569,17 @@ void allocAndUpload(DataType** gpu_dest, std::vector<float> cpu_src,
     return;
   }
 
+  auto deleter = [&sycl_queue](DataType* ptr) {
+    sycl::free(ptr, sycl_queue);
+  };
+  std::unique_ptr<DataType, decltype(deleter)> ptr_guard(
+      (DataType*)sycl::malloc_device(size, sycl_queue), deleter);
 
-  *gpu_dest = (DataType*)sycl::malloc_device(size, sycl_queue);
+  sycl_queue.memcpy(scratch, &cpu_src[0], cpu_src.size() * sizeof(float)).wait();
 
-   sycl_queue.memcpy(scratch, &cpu_src[0], cpu_src.size() * sizeof(float)).wait();
+  copyTypeConverted((DataType*)ptr_guard.get(), (float*)scratch, (int)cpu_src.size(), sycl_queue);
 
-   copyTypeConverted((DataType*)(*gpu_dest), (float*)scratch, (int)cpu_src.size(), sycl_queue);
+  *gpu_dest = ptr_guard.release();
 }
 
 template <typename DataType>
@@ -1632,7 +1637,7 @@ AttentionPolicyHead<DataType>::AttentionPolicyHead(
         max_batch_size, ACTIVATION_SWISH, act_,
         1e-6, sycl_queue_);  // attentionbody nets don't have policy encoders, so using old
                 // epsilon for backward compatibility with T78.
-    encoder_weights_.emplace_back(pW);
+    encoder_weights_.emplace_back(std::unique_ptr<EncoderBlock<DataType>>(pW));
   }
 }
 
@@ -2263,7 +2268,7 @@ void AttentionPolicyHead<DataType>::Eval(int N, DataType* output, const DataType
   }
 
   // 2. Encoder layers
-  for (const auto pEnc : encoder_weights_) {
+  for (const auto& pEnc : encoder_weights_) {
     pEnc->Eval(N, input2_tensor, (DataType*)scratch, buffer1, buffer2, sycl_queue, offset_pointers);
   }  // End of encoder blocks
 
@@ -2325,7 +2330,7 @@ AttentionPolicyHead<DataType>::~AttentionPolicyHead() {
       sycl::free(ip4_pol_w_, sycl_queue_);
       sycl::free(wqk_w_, sycl_queue_);
       sycl::free(wqk_b_, sycl_queue_);
-  for (const auto pEnc : encoder_weights_) delete pEnc;
+  // encoder_weights_ is managed by std::unique_ptr
 }
 
 template <typename DataType>
@@ -2471,7 +2476,7 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
         activations_.smolgen_activation, activations_.ffn_activation,
         is_pe_dense_embedding_ ? 1e-3 : 1e-6, sycl_queue_);
 
-    encoder_weights_.emplace_back(pW);
+    encoder_weights_.emplace_back(std::unique_ptr<EncoderBlock<DataType>>(pW));
   }
 }
 
@@ -2501,7 +2506,7 @@ AttentionBody<DataType>::~AttentionBody() {
   if (has_smolgen_) {
     sycl::free(smolgen_global_, sycl_queue_);
   }
-  for (const auto pEnc : encoder_weights_) delete pEnc;
+  // encoder_weights_ is managed by std::unique_ptr
 }
 
 template <typename DataType>
@@ -2653,7 +2658,7 @@ void AttentionBody<DataType>::Eval(int N, DataType* output,
   }
 
   // 2. Encoder blocks
-  for (const auto pEnc : encoder_weights_) {
+  for (const auto& pEnc : encoder_weights_) {
     pEnc->Eval(N, output_tensor, (DataType*)scratch, buffer1, buffer2, sycl_queue, offset_pointers);
   }  // End of encoder blocks
 }

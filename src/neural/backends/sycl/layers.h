@@ -24,6 +24,7 @@
 #include <sycl/sycl.hpp>
 
 #include <cstddef>
+#include <memory>
 
 #include "sycl_common.h"
 #include "neural/backends/shared/activation.h"
@@ -390,7 +391,7 @@ class AttentionPolicyHead : public BaseLayer<DataType> {
   bool attention_body_;
   ActivationFunction act_;
 
-  std::vector<EncoderBlock<DataType>*> encoder_weights_;
+  std::vector<std::unique_ptr<EncoderBlock<DataType>>> encoder_weights_;
 };
 
 template <typename DataType>
@@ -465,7 +466,7 @@ class AttentionBody : public BaseLayer<DataType> {
   int embedding_ffn_size_;
   int embedding_ffn_dff_;
   int encoder_head_count_;
-  std::vector<EncoderBlock<DataType>*> encoder_weights_;
+  std::vector<std::unique_ptr<EncoderBlock<DataType>>> encoder_weights_;
   Activations activations_;
   int num_resi_blocks_;
   int input_c_;
