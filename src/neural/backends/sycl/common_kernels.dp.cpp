@@ -1496,32 +1496,31 @@ void promotion_logits_kernel(int C, T* output, const T* keys,
   int threadInGroup = item_ct1.get_local_id(1) * 24 + item_ct1.get_local_id(2);
 
   // phase 1 : compute promotion_offsets by multiplying keys and ppo matrices
+  // Each of the 32 matrix elements is computed cooperatively by all 32 threads:
+  // thread `t` accumulates partial sums from positions i = t, t+32, t+64, ...
+  // then a group reduce collapses them. This ensures fully coalesced reads
+  // across adjacent threads (stride-1 access over i).
   const T* keys_start =
       keys + n * 64 * C + C * 56;  // we are interested only in last 8 out of 64
                                    // 'rows' of keys matrix
 
-  // only 32 threads out of 192 in the group are active in this phase, and each
-  // thread computes one element of the promotion_offsets matrix
-  // TODO: opt idea1, can use more threads to reduce the length of the loop for
-  // the matrix multiply (do parallel reduction of partial sums later)
-  //       opt idea2, the below loop for matrix mul has very poor memory access
-  //       pattern, can do the loop over 32, and do parallel reductions
   if (threadInGroup < 32) {
-    int x = threadInGroup % 4;
-    int y = threadInGroup / 4;
+    int elem_x = threadInGroup % 4;   // which ppo row (0..3)
+    int elem_y = threadInGroup / 4;   // which keys row (0..7)
 
+    // Each thread accumulates partial sums for its own unique (elem_x, elem_y)
+    // element. We stride the inner loop by 32 so that adjacent threads (with
+    // consecutive threadInGroup values) access consecutive memory addresses on
+    // each iteration, yielding fully coalesced global loads.
     float S = 0;
-    for (int i = 0; i < C;
-         i++) {  // TODO: modify to loop over 32 instead of C (doing parallel
-                 // reductions for the 32 sums)
-      float a = (float)keys_start[y * C + i];
-      float b =
-          (float)ppo[x * C + i];  // weight matrix is transposed (col major)
+    for (int i = threadInGroup; i < C; i += 32) {
+      float a = (float)keys_start[elem_y * C + i];
+      float b = (float)ppo[elem_x * C + i];  // weight matrix is col-major
       S += a * b;
     }
 
-    // write the product (promotion_offsets) in shared memory
-    promotion_offsets[x][y] = S;
+    // write the accumulated dot product into shared memory
+    promotion_offsets[elem_x][elem_y] = S;
   }
 
   /*

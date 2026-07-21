@@ -445,21 +445,10 @@ void OutputTransform_kernel(int N, int C, int se_K, T* output,
 // fast reduction for the warp
 [[gnu::always_inline]]
 inline float warpReduce(float x, const sycl::nd_item<3>& item_ct1) {
+  // Dynamically query sub-group width so this works on Intel (8/16), AMD (32/64), and NVIDIA (32).
+  const int sg_size = item_ct1.get_sub_group().get_max_local_range()[0];
 #pragma unroll
-  for (int mask = 16; mask > 0; mask >>= 1)
-    /*
-    DPCT1023:4: The SYCL sub-group does not support mask options for
-    dpct::permute_sub_group_by_xor. You can specify
-    "--use-experimental-features=masked-sub-group-operation" to use the
-    experimental helper function to migrate __shfl_xor_sync.
-    */
-    /*
-    DPCT1096:122: The right-most dimension of the work-group used in the SYCL
-    kernel that calls this function may be less than "32". The function
-    "dpct::permute_sub_group_by_xor" may return an unexpected result on the CPU
-    device. Modify the size of the work-group to ensure that the value of the
-    right-most dimension is a multiple of "32".
-    */
+  for (int mask = sg_size / 2; mask > 0; mask >>= 1)
     x += sycl::permute_group_by_xor(item_ct1.get_sub_group(), x, mask);
 
   return x;
@@ -468,21 +457,10 @@ inline float warpReduce(float x, const sycl::nd_item<3>& item_ct1) {
 // fast max reduction for the warp
 [[gnu::always_inline]]
 inline float warpMax(float x, const sycl::nd_item<3>& item_ct1) {
+  // Dynamically query sub-group width so this works on Intel (8/16), AMD (32/64), and NVIDIA (32).
+  const int sg_size = item_ct1.get_sub_group().get_max_local_range()[0];
 #pragma unroll
-  for (int mask = 16; mask > 0; mask >>= 1)
-    /*
-    DPCT1023:5: The SYCL sub-group does not support mask options for
-    dpct::permute_sub_group_by_xor. You can specify
-    "--use-experimental-features=masked-sub-group-operation" to use the
-    experimental helper function to migrate __shfl_xor_sync.
-    */
-    /*
-    DPCT1096:123: The right-most dimension of the work-group used in the SYCL
-    kernel that calls this function may be less than "32". The function
-    "dpct::permute_sub_group_by_xor" may return an unexpected result on the CPU
-    device. Modify the size of the work-group to ensure that the value of the
-    right-most dimension is a multiple of "32".
-    */
+  for (int mask = sg_size / 2; mask > 0; mask >>= 1)
     x = sycl::max(x, (float)(sycl::permute_group_by_xor(
                          item_ct1.get_sub_group(), x, mask)));
 
