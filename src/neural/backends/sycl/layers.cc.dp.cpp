@@ -119,7 +119,9 @@ SELayer<DataType>::SELayer(BaseLayer<DataType>* ip, int fc1Outputs,
 template <typename DataType>
 SELayer<DataType>::~SELayer() {
   sycl::free(w1_, sycl_queue_);
+  if (w1_t_) sycl::free(w1_t_, sycl_queue_);
   sycl::free(w2_, sycl_queue_);
+  if (w2_t_) sycl::free(w2_t_, sycl_queue_);
   sycl::free(b1_, sycl_queue_);
   sycl::free(b2_, sycl_queue_);
   sycl::free(bPrev_, sycl_queue_);
@@ -658,7 +660,9 @@ void FCLayer<float>::Eval(int N, float* output_tensor,
 template <typename DataType>
 FCLayer<DataType>::~FCLayer() {
   sycl::free(weights_, sycl_queue_);
-  sycl::free(biases_, sycl_queue_);
+  if (use_bias_ && biases_) {
+    sycl::free(biases_, sycl_queue_);
+  }
 }
 
 template <typename DataType>

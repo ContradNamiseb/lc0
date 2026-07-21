@@ -1,22 +1,4 @@
-/*
-  This file is part of Leela Chess Zero.
-  Copyright (C) 2023 Intel Corporation
-
-  This program is free software: you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 3 of the License, or
-  (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <https://www.gnu.org/licenses/>.
-   
-  SPDX-License-Identifier:GNU General Public License v3.0 or later
-*/
+#pragma once
 
 #include <iostream>
 #include <sycl/sycl.hpp>
@@ -27,72 +9,61 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-class cuBlasContextManager;
-static cuBlasContextManager *_cuBlasContextManager;
+class cuBlasContextManager {
+ private:
+  cublasHandle_t handle;
 
-class cuBlasContextManager{
-     
-    //~cuBlasContextManager() { cublasDestroy(handle); }
-    cublasHandle_t handle;
+  cuBlasContextManager() {
+    cublasCreate(&handle);
+  }
 
-    cuBlasContextManager() {
-        cublasCreate(&handle);
-    }
+  ~cuBlasContextManager() {
+    cublasDestroy(handle);
+  }
 
-    public:
-     static cublasHandle_t getcuBlasHandle_t(){
-        if(_cuBlasContextManager == NULL){
-            _cuBlasContextManager = new cuBlasContextManager(); 
-        }
-        return _cuBlasContextManager->handle;
-    }
+ public:
+  cuBlasContextManager(const cuBlasContextManager&) = delete;
+  cuBlasContextManager& operator=(const cuBlasContextManager&) = delete;
 
-    static cublasHandle_t destroycuBlasHandle_t(){
-        if(_cuBlasContextManager != NULL){
-           cublasDestroy(_cuBlasContextManager->getcuBlasHandle_t()); 
-           free(_cuBlasContextManager); 
-        }
+  static cublasHandle_t getcuBlasHandle_t() {
+    static cuBlasContextManager instance;
+    return instance.handle;
+  }
 
-        return _cuBlasContextManager->handle;
-    }
+  static void destroycuBlasHandle_t() {
+    // Managed automatically by function-local static destructor.
+  }
 };
 
 #elif defined(USE_HIPBLAS)
 
-
 #include "hip/hip_runtime.h" 
 #include "hipblas/hipblas.h"
 
-class hipBlasContextManager;
-static hipBlasContextManager *_hipBlasContextManager;
+class hipBlasContextManager {
+ private:
+  hipblasHandle_t handle;
 
-class hipBlasContextManager{
-     
-    //~cuBlasContextManager() { cublasDestroy(handle); }
-    hipblasHandle_t handle;
+  hipBlasContextManager() {
+    hipblasCreate(&handle);
+  }
 
-    hipBlasContextManager() {
-        hipblasCreate(&handle);
-    }
+  ~hipBlasContextManager() {
+    hipblasDestroy(handle);
+  }
 
-    public:
-     static hipblasHandle_t gethipBlasHandle_t(){
-        if(_hipBlasContextManager == NULL){
-            _hipBlasContextManager = new hipBlasContextManager(); 
-        }
-        return _hipBlasContextManager->handle;
-    }
+ public:
+  hipBlasContextManager(const hipBlasContextManager&) = delete;
+  hipBlasContextManager& operator=(const hipBlasContextManager&) = delete;
 
-    static hipblasHandle_t destroycuBlasHandle_t(){
-        if(_hipBlasContextManager != NULL){
-           hipblasDestroy(_hipBlasContextManager->gethipBlasHandle_t()); 
-           free(_hipBlasContextManager); 
-        }
+  static hipblasHandle_t gethipBlasHandle_t() {
+    static hipBlasContextManager instance;
+    return instance.handle;
+  }
 
-        return _hipBlasContextManager->handle;
-    }
+  static void destroycuBlasHandle_t() {
+    // Managed automatically by function-local static destructor.
+  }
 };
-
-
 
 #endif

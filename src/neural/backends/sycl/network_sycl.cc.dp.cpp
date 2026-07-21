@@ -293,29 +293,9 @@ class SyclNetwork : public Network {
               "using a smaller network.";
     }
 
-    // Disable res block fusing for fp32 for now (not worth it)
-    // TODO: make it work for filters not a multiple of 32.
-    // Note that when used with SE, the optimization
-    // works only when filter count is <= 384 (pre-Ampere), or less than 512
-    // (Ampere)
-    // It turns dynamically off based on filter count (see
-    // ResidualBlock<DataType>::Eval)
-    // TODO: fix res_block_fusing.
-    if (kNumFilters % 32 == 0 && std::is_same<sycl::half, DataType>::value) {
-      use_res_block_winograd_fuse_opt_ = false;
-    } else {
-      use_res_block_winograd_fuse_opt_ = false;
-    }
-    // Override if set in backend-opts.
-#if 0
-    if (options.Exists<bool>("res_block_fusing")) {
-      use_res_block_winograd_fuse_opt_ = options.Get<bool>("res_block_fusing");
-    }
-#endif
-    /*
-    DPCT1005:86: The SYCL device version is different from CUDA Compute
-    Compatibility. You may need to rewrite this code.
-    */
+    // Res block fusing option (fused winograd kernels).
+    use_res_block_winograd_fuse_opt_ =
+        options.GetOrDefault<bool>("res_block_fusing", false);
 
     // 0. Check for SE.
     has_se_ = false;
@@ -623,7 +603,7 @@ class SyclNetwork : public Network {
     // Expand packed planes to full planes.
     uint64_t* ipDataMasks = io->input_masks_mem_shared_;
     float* ipDataValues = io->input_val_mem_shared_;
-    sycl::queue io_sycl_queue_ = io->q_ct1;
+    sycl::queue& io_sycl_queue_ = io->q_ct1;
 
     DataType* tensor_mem[3];
     void* scratch_mem;
@@ -913,7 +893,9 @@ class SyclNetwork : public Network {
   int GetThreads() const override { return 1 + multi_stream_; }
 
   int GetMiniBatchSize() const override {
-    if (is_cpu_) return 47;
+    // Default mini-batch size tuned for SYCL CPU host execution
+    constexpr int kCpuDefaultMiniBatchSize = 47;
+    if (is_cpu_) return kCpuDefaultMiniBatchSize;
     // Simple heuristic that seems to work for a wide range of GPUs.
     return 2 * compute_units_;
   }

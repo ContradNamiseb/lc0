@@ -18,10 +18,14 @@
    
   SPDX-License-Identifier:GNU General Public License v3.0 or later
 */
+#pragma once
 
 #include <sycl/sycl.hpp>
 #include "neural/network.h"
+
+#if defined(USE_CUBLAS) || defined(USE_HIPBLAS)
 #include "cuBlasContext.h"
+#endif
 
 namespace lczero {
 namespace sycldnn_backend {
@@ -67,40 +71,34 @@ struct InputsOutputs {
 
 
   ~InputsOutputs() {
-    /*
     sycl::free(input_masks_mem_shared_, q_ct1);
     sycl::free(input_val_mem_shared_, q_ct1);
     sycl::free(op_value_mem_shared_, q_ct1);
     if (op_moves_left_mem_shared_ != nullptr)
-        sycl::free(op_moves_left_mem_shared_, q_ct1);
+      sycl::free(op_moves_left_mem_shared_, q_ct1);
     sycl::free(op_policy_mem_gpu_, q_ct1);
+#ifndef USE_INTEL
+    sycl::free(op_policy_mem_, q_ct1);
+#endif
 
     if (multi_stream_) {
       for (auto mem : tensor_mem_) {
         if (mem) 
-            sycl::free(mem, q_ct1);
+          sycl::free(mem, q_ct1);
       }
       if (scratch_mem_) 
-          sycl::free(scratch_mem_, q_ct1);
+        sycl::free(scratch_mem_, q_ct1);
       if (offset_pointers_) 
-          sycl::free(offset_pointers_, q_ct1);
+        sycl::free(offset_pointers_, q_ct1);
       if (head_offset_pointers_) {
-          sycl::free(head_offset_pointers_, q_ct1);
+        sycl::free(head_offset_pointers_, q_ct1);
       } 
-      //dpct::get_current_device().destroy_queue(stream_);
-      //cublas_ = nullptr;
-    } */
+    }
   }
   uint64_t* input_masks_mem_shared_;
   float* input_val_mem_shared_;
   float* op_value_mem_shared_;
   float* op_moves_left_mem_shared_ = nullptr;
-
-  // GPU pointers for the above allocations.
-  //uint64_t* input_masks_mem_gpu_;
-  //float* input_val_mem_gpu_;
-  //float* op_value_mem_gpu_;
-  //float* op_moves_left_mem_gpu_;
 
   // This is a seperate copy.
   float* op_policy_mem_gpu_;
@@ -109,12 +107,12 @@ struct InputsOutputs {
   // memory needed to run the network owned by InputsOutputs when multi_stream
   // is enabled
   bool multi_stream_;
-  void* tensor_mem_[3];
-  void* scratch_mem_;
+  void* tensor_mem_[3] = {nullptr, nullptr, nullptr};
+  void* scratch_mem_ = nullptr;
   void** offset_pointers_ = nullptr;
   void** head_offset_pointers_ = nullptr;
 
-  // cuda stream used to run the network
+  // sycl queue used to run the network
   sycl::queue& q_ct1;
 };
 

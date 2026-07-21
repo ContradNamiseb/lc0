@@ -32,10 +32,11 @@
 
 namespace lczero {
 namespace sycldnn_backend {
-
-// The Layer objects only hold memory for weights, biases, etc
-// memory for input and output tensors is provided by caller of Eval.
-
+/**
+ * @brief Base class for all neural network layers in the SYCL backend.
+ * Layer objects hold memory for weights and biases on the GPU device;
+ * input/output tensor memory is passed per Eval call.
+ */
 template <typename DataType>
 class BaseLayer {
  public:
@@ -49,14 +50,23 @@ class BaseLayer {
   BaseLayer(int c, int h, int w, BaseLayer* ip, sycl::queue& sycl_queue);
   BaseLayer(int c, int h, int w, BaseLayer* ip, bool nhwc, sycl::queue& sycl_queue);
   virtual ~BaseLayer() = default;
+
+  /**
+   * @brief Returns output buffer size in bytes for batch size N.
+   * @param N Batch size.
+   */
   size_t GetOutputSize(int N) const { return sizeof(DataType) * N * C * H * W; }
 
-  // Input2 is optional (skip connection).
-  //virtual void Eval(int N, DataType* output, const DataType* input,
-  //                  const DataType* input2, void* scratch, size_t scratch_size,
-  //                  cudnnHandle_t cudnn, dpct::queue_ptr cublas,
-  //                  dpct::queue_ptr stream, DataType*** = nullptr) = 0;
-
+  /**
+   * @brief Evaluates the layer for batch size N.
+   * @param N Batch size.
+   * @param output Pointer to output device memory.
+   * @param input Pointer to input device memory.
+   * @param input2 Optional skip-connection input memory.
+   * @param scratch Scratch device memory pointer.
+   * @param scratch_size Size of scratch memory in bytes.
+   * @param sycl_queue SYCL queue to execute operations on.
+   */
   virtual void Eval(int N, DataType* output, const DataType* input,
                     const DataType* input2, void* scratch, size_t scratch_size,
                     sycl::queue &sycl_queue, DataType*** = nullptr) = 0;
@@ -76,6 +86,9 @@ class BaseLayer {
                                int batchSize, sycl::queue &sycl_queue);
 };
 
+/**
+ * @brief Fully Connected (FC) Layer implementation.
+ */
 template <typename DataType>
 class FCLayer : public BaseLayer<DataType> {
   using BaseLayer<DataType>::nhwc_;
@@ -87,10 +100,6 @@ class FCLayer : public BaseLayer<DataType> {
   ~FCLayer();
 
   void LoadWeights(float* cpuWeight, float* cpuBias, void* scratch);
-  //void Eval(int N, DataType* output, const DataType* input,
-  //          const DataType* input2, void* scratch, size_t scratch_size,
-  //          cudnnHandle_t cudnn, dpct::queue_ptr cublas, dpct::queue_ptr stream,
-  //          DataType*** = nullptr) override;
 
   void Eval(int N, DataType* output, const DataType* input,
             const DataType* input2, void* scratch, size_t scratch_size,
@@ -103,6 +112,9 @@ class FCLayer : public BaseLayer<DataType> {
   DataType* biases_ = nullptr;
 };
 
+/**
+ * @brief Policy Mapping Layer converting tensor representations to policy logits.
+ */
 template <typename DataType>
 class PolicyMapLayer : public BaseLayer<DataType> {
   using BaseLayer<DataType>::nhwc_;
@@ -120,16 +132,14 @@ class PolicyMapLayer : public BaseLayer<DataType> {
             DataType*** = nullptr) override;
 
  private:
-  int used_size_;  // Size of the input without padding (typically 73x64).
-                   // This is over-written to contain size with padding
-                   // (typically 80x64) after CHW->HWC conversion for fp16.
+  int used_size_;  // Size of the input without padding
   const bool attention_map_;
   short* weights_ = nullptr;
 };
 
-// Fused SE layer:
-// (optional bias add +) global avg -> FC1 -> FC2 -> global scale -> add skip
-// connection -> RELU.
+/**
+ * @brief Squeeze-and-Excitation (SE) Layer implementation.
+ */
 template <typename DataType>
 class SELayer : public BaseLayer<DataType> {
   using BaseLayer<DataType>::C;
@@ -161,7 +171,9 @@ class SELayer : public BaseLayer<DataType> {
   const ActivationFunction act_;
 };
 
-// Multi-pass Winograd Conv fused with (optional) SE
+/**
+ * @brief Multi-pass Winograd Convolution fused with optional Squeeze-and-Excitation.
+ */
 template <typename DataType>
 class FusedWinogradConvSELayer : public BaseLayer<DataType> {
   using BaseLayer<DataType>::C;
@@ -199,10 +211,10 @@ class FusedWinogradConvSELayer : public BaseLayer<DataType> {
   DataType* transformed_weights_ = nullptr;  // After winograd transform.
 
   // Weights and Biases for (optional) SE.
-  DataType* w1_;
-  DataType* w2_;
-  DataType* b1_;
-  DataType* b2_;
+  DataType* w1_ = nullptr;
+  DataType* w2_ = nullptr;
+  DataType* b1_ = nullptr;
+  DataType* b2_ = nullptr;
 };
 
 template <typename DataType>
@@ -234,12 +246,10 @@ class Conv1Layer : public BaseLayer<DataType> {
   DataType* biases_ = nullptr;
   DataType* weights_ = nullptr;
 
-  // uses stride of 0 to read a vector as a matrix
-   void cublasSpecialMatrixMul(const DataType* A, const DataType* B,
+  void cublasSpecialMatrixMul(const DataType* A, const DataType* B,
                               DataType* Out, int M, int N, int K, int batchSize, sycl::queue &sycl_queue);
 };
 
-// Multi-pass Winograd Conv fused with (optional) SE
 template <typename DataType>
 class ResidualBlock : public BaseLayer<DataType> {
   using BaseLayer<DataType>::C;
@@ -275,16 +285,18 @@ class ResidualBlock : public BaseLayer<DataType> {
 
   DataType* biases0_ = nullptr;
   DataType* biases1_ = nullptr;
-  DataType* transformed_weights0_ = nullptr;  // After winograd transform.
-  DataType* transformed_weights1_ = nullptr;  // After winograd transform.
+  DataType* transformed_weights0_ = nullptr;
+  DataType* transformed_weights1_ = nullptr;
 
-  // Weights and Biases for (optional) SE.
-  DataType* w1_;
-  DataType* w2_;
-  DataType* b1_;
-  DataType* b2_;
+  DataType* w1_ = nullptr;
+  DataType* w2_ = nullptr;
+  DataType* b1_ = nullptr;
+  DataType* b2_ = nullptr;
 };
 
+/**
+ * @brief Single Transformer Encoder block (Multi-Head Attention + Feed Forward Network).
+ */
 template <typename DataType>
 class EncoderBlock {
  public:
@@ -299,26 +311,27 @@ class EncoderBlock {
             DataType* scratch2, sycl::queue &sycl_queue,
             DataType*** offset_pointers);
 
-  // all GPU side pointers
-  DataType *mha_q_w, *mha_q_b;
-  DataType *mha_k_w, *mha_k_b;
-  DataType *mha_v_w, *mha_v_b;
-  DataType *mha_qkv_w, *mha_qkv_b;
-  DataType *mha_dense_w, *mha_dense_b;
+ private:
+  // GPU side device memory pointers
+  DataType *mha_q_w = nullptr, *mha_q_b = nullptr;
+  DataType *mha_k_w = nullptr, *mha_k_b = nullptr;
+  DataType *mha_v_w = nullptr, *mha_v_b = nullptr;
+  DataType *mha_qkv_w = nullptr, *mha_qkv_b = nullptr;
+  DataType *mha_dense_w = nullptr, *mha_dense_b = nullptr;
 
-  DataType *ln1_gammas, *ln1_betas;
+  DataType *ln1_gammas = nullptr, *ln1_betas = nullptr;
 
-  DataType *ffn_dense1_w, *ffn_dense1_b;
-  DataType *ffn_dense2_w, *ffn_dense2_b;
+  DataType *ffn_dense1_w = nullptr, *ffn_dense1_b = nullptr;
+  DataType *ffn_dense2_w = nullptr, *ffn_dense2_b = nullptr;
 
-  DataType *ln2_gammas, *ln2_betas;
+  DataType *ln2_gammas = nullptr, *ln2_betas = nullptr;
 
-  DataType *smol_compress;
-  DataType *smol_dense1_w, *smol_dense1_b;
-  DataType *smol_dense2_w, *smol_dense2_b;
-  DataType *smol_ln1_gammas, *smol_ln1_betas;
-  DataType *smol_ln2_gammas, *smol_ln2_betas;
-  DataType *smol_global;
+  DataType *smol_compress = nullptr;
+  DataType *smol_dense1_w = nullptr, *smol_dense1_b = nullptr;
+  DataType *smol_dense2_w = nullptr, *smol_dense2_b = nullptr;
+  DataType *smol_ln1_gammas = nullptr, *smol_ln1_betas = nullptr;
+  DataType *smol_ln2_gammas = nullptr, *smol_ln2_betas = nullptr;
+  DataType *smol_global = nullptr;
 
   int mha_q_size_;
   int mha_k_size_;
@@ -338,7 +351,6 @@ class EncoderBlock {
   const ActivationFunction smolgen_activation_;
   const ActivationFunction ffn_activation_;
 
-  // Output sizes for smolgen layers.
   int smol_compress_size_;
   int smol_dense_1_size_;
   int smol_dense_2_size_;
@@ -349,9 +361,9 @@ class EncoderBlock {
   sycl::queue sycl_queue_;
 };
 
-// The Attention policy head implementation
-// Responsible for loading weights into GPU memory, and evaluating the entire
-// policy head
+/**
+ * @brief Attention Policy Head implementation.
+ */
 template <typename DataType>
 class AttentionPolicyHead : public BaseLayer<DataType> {
   using BaseLayer<DataType>::C;
@@ -374,13 +386,12 @@ class AttentionPolicyHead : public BaseLayer<DataType> {
             sycl::queue &sycl_queue, DataType*** = nullptr) override;
 
  private:
-  // GPU allocations to hold various weights used by the attention policy head
-  DataType *ip_pol_w_, *ip_pol_b_;    // "embedding" in policy attention
-  DataType *ip2_pol_w_, *ip2_pol_b_;  // "wq" in policy attention
-  DataType *ip3_pol_w_, *ip3_pol_b_;  // "wk" in policy attention
-  DataType *ip4_pol_w_;               // "ppo" in policy attention
+  DataType *ip_pol_w_ = nullptr, *ip_pol_b_ = nullptr;
+  DataType *ip2_pol_w_ = nullptr, *ip2_pol_b_ = nullptr;
+  DataType *ip3_pol_w_ = nullptr, *ip3_pol_b_ = nullptr;
+  DataType *ip4_pol_w_ = nullptr;
 
-  DataType *wqk_w_, *wqk_b_;  // allocation containing both "wq" and "wq"
+  DataType *wqk_w_ = nullptr, *wqk_b_ = nullptr;
 
   int embedding_op_size_;
   int wq_op_size_;
@@ -407,23 +418,18 @@ class EmbeddingLayer : public BaseLayer<DataType> {
                  ActivationFunction activation, sycl::queue &sycl_queue);
   ~EmbeddingLayer();
 
-  //void Eval(int N, DataType* output, const DataType* input,
-  //          const DataType* input2, void* scratch, size_t scratch_size,
-  //          cudnnHandle_t cudnn, dpct::queue_ptr cublas, dpct::queue_ptr stream,
-  //          DataType*** = nullptr) override;
-
   void Eval(int N, DataType* output, const DataType* input,
             const DataType* input2, void* scratch, size_t scratch_size,
             sycl::queue &sycl_queue, DataType*** = nullptr) override;
 
  private:
-  DataType *weights_, *biases_;
+  DataType *weights_ = nullptr, *biases_ = nullptr;
   ActivationFunction act_;
 };
 
-// The Attention body implementation
-// Responsible for loading weights into GPU memory, and evaluating the entire
-// attention network part of the body including the stack of encoder layers
+/**
+ * @brief Attention Body implementation containing transformer encoder stack.
+ */
 template <typename DataType>
 class AttentionBody : public BaseLayer<DataType> {
   using BaseLayer<DataType>::C;
@@ -440,27 +446,22 @@ class AttentionBody : public BaseLayer<DataType> {
                 int max_batch_size, bool is_pe_dense_embedding,
                 sycl::queue &sycl_queue);
   ~AttentionBody();
-  //void Eval(int N, DataType* output, const DataType* input,
-  //          const DataType* input2, void* scratch, size_t scratch_size,
-  //          cudnnHandle_t cudnn, dpct::queue_ptr cublas, dpct::queue_ptr stream,
-  //          DataType*** = nullptr) override;
 
   void Eval(int N, DataType* output, const DataType* input,
             const DataType* input2, void* scratch, size_t scratch_size,
             sycl::queue &sycl_queue, DataType*** = nullptr) override;
 
  private:
-  // GPU allocations to hold various weights used by the attention net body.
-  DataType *ip_emb_pre_w_, *ip_emb_pre_b_;  // input position preprocessing weights.
-  DataType *ip_emb_w_, *ip_emb_b_;          // "embedding" layer in net body
-  DataType *ip_emb_ln_g_, *ip_emb_ln_b_;  // input embedding layernorm gamma and beta
-  DataType *ip_mult_gate_, *ip_add_gate_;   // input gating
-  DataType *ip_emb_ffn_d1_w_, *ip_emb_ffn_d1_b_;  // input embedding FFN dense1 weights
-  DataType *ip_emb_ffn_d2_w_, *ip_emb_ffn_d2_b_;  // input embedding FFN dense2 weights
-  DataType *ip_emb_ffn_ln_g_, *ip_emb_ffn_ln_b_;  // input embedding FFN layernorm gamma and beta
-  DataType *smolgen_global_;  // global smolgen weights for all encoder layers
-  bool is_pe_dense_embedding_;  // flag for dense position encoding
-  DataType *pos_encoding_;
+  DataType *ip_emb_pre_w_ = nullptr, *ip_emb_pre_b_ = nullptr;
+  DataType *ip_emb_w_ = nullptr, *ip_emb_b_ = nullptr;
+  DataType *ip_emb_ln_g_ = nullptr, *ip_emb_ln_b_ = nullptr;
+  DataType *ip_mult_gate_ = nullptr, *ip_add_gate_ = nullptr;
+  DataType *ip_emb_ffn_d1_w_ = nullptr, *ip_emb_ffn_d1_b_ = nullptr;
+  DataType *ip_emb_ffn_d2_w_ = nullptr, *ip_emb_ffn_d2_b_ = nullptr;
+  DataType *ip_emb_ffn_ln_g_ = nullptr, *ip_emb_ffn_ln_b_ = nullptr;
+  DataType *smolgen_global_ = nullptr;
+  bool is_pe_dense_embedding_;
+  DataType *pos_encoding_ = nullptr;
   int embedding_dense_size_;
   int embedding_op_size_;
   int embedding_ffn_size_;
@@ -475,9 +476,9 @@ class AttentionBody : public BaseLayer<DataType> {
   const bool has_smolgen_;
 };
 
-// The value head implementation
-// Responsible for loading weights into GPU memory, and evaluating the value
-// head and value error head
+/**
+ * @brief Value Head implementation (WDL/Classic).
+ */
 template <typename DataType>
 class ValueHead : public BaseLayer<DataType> {
   using BaseLayer<DataType>::C;
@@ -498,14 +499,12 @@ class ValueHead : public BaseLayer<DataType> {
             sycl::queue &sycl_queue, DataType*** = nullptr) override;
 
  private:
-  // "convolution" in value head (legacy)
   std::unique_ptr<Conv1Layer<DataType>> conv_;
 
-  // GPU allocations to hold various weights used by the attention policy head
-  DataType *ip_val_w_, *ip_val_b_;          // "embedding" in value head
-  DataType *ip1_val_w_, *ip1_val_b_;        // "FC1" in value head
-  DataType *ip2_val_w_, *ip2_val_b_;        // "FC2" in value head
-  DataType *ip_val_err_w_, *ip_val_err_b_;  // value error "FC" weights
+  DataType *ip_val_w_ = nullptr, *ip_val_b_ = nullptr;
+  DataType *ip1_val_w_ = nullptr, *ip1_val_b_ = nullptr;
+  DataType *ip2_val_w_ = nullptr, *ip2_val_b_ = nullptr;
+  DataType *ip_val_err_w_ = nullptr, *ip_val_err_b_ = nullptr;
 
   int embedding_size_;
   int value_hidden_size_;
@@ -513,6 +512,9 @@ class ValueHead : public BaseLayer<DataType> {
   bool attention_body_;
   ActivationFunction act_;
 };
+
+}  // namespace sycldnn_backend
+}  // namespace lczero
 
 
 }  // namespace sycldnn_backend

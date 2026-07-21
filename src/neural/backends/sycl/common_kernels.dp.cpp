@@ -847,50 +847,41 @@ void globalAvgPool_kernel_NHWC_fp16(sycl::half* output, const sycl::half* input,
   if (opIndex < outputSize) output[opIndex] = (sycl::half)avg;
 }
 
-// Each thread reads 2 inputs (8x8/32), and each warp writes a single output.
+// Sub-group size agnostic globalAvgPool kernel for NCHW layout.
 template <typename T>
 void globalAvgPool_kernel(T* output, const T* input,
-                                     const T* prevLayerBias, int inputSize,
-                                     int outputSize, int C,
-                                     const sycl::nd_item<3> &item_ct1) {
-  const int elementsPerWarp = 64;
-  const int elementsPerThread = 2;
+                           const T* prevLayerBias, int inputSize,
+                           int outputSize, int C,
+                           const sycl::nd_item<3> &item_ct1) {
+  const int elementsPerPlane = 64;
+  const int sg_size = item_ct1.get_sub_group().get_max_local_range()[0];
 
-  int tid = item_ct1.get_group(2) * item_ct1.get_local_range(2) +
-            item_ct1.get_local_id(2);
+  int localId = item_ct1.get_local_id(2);
+  int laneId = localId % sg_size;
+  int subGroupId = localId / sg_size;
+  int subGroupsPerBlock = item_ct1.get_local_range(2) / sg_size;
+  int globalSubGroupId = (item_ct1.get_group(2) * subGroupsPerBlock) + subGroupId;
 
-  int laneId = item_ct1.get_local_id(2) & 0x1F;
-  int laneStartIndex = (tid - laneId) * elementsPerThread;
+  int planeStartIndex = globalSubGroupId * elementsPerPlane;
 
-  // Compute per-thread sum for elementsPerThread elements.
+  // Compute per-thread partial sum for the plane.
   float S = 0;
-
-#pragma unroll
-  for (int i = 0; i < elementsPerWarp; i += 32) {
-    int index = laneStartIndex + laneId + i;
+  for (int index = planeStartIndex + laneId; index < planeStartIndex + elementsPerPlane; index += sg_size) {
     if (index < inputSize) S += (float)(input[index]);
   }
 
-// Compute warp wide sum (for entire plane - elementsPerWarp elements).
-#pragma unroll
-  for (int offset = 1; offset < 32; offset *= 2) {
-    /*
-    DPCT1023:10: The SYCL sub-group does not support mask options for
-    dpct::shift_sub_group_left. You can specify
-    "--use-experimental-features=masked-sub-group-operation" to use the
-    experimental helper function to migrate __shfl_down_sync.
-    */
+  // Compute sub-group wide sum across all threads in sub-group.
+  for (int offset = 1; offset < sg_size; offset *= 2) {
     S += sycl::shift_group_left(item_ct1.get_sub_group(), S, offset);
   }
 
-  float avg = S / elementsPerWarp;
-  int opIndex = tid >> 5;
+  float avg = S / elementsPerPlane;
 
-  // First thread in warp has the sum, write it in output.
+  // First thread in sub-group has the sum, write it to output.
   if (laneId == 0) {
-    if (opIndex < outputSize) {
-      if (prevLayerBias) avg += (float)prevLayerBias[opIndex % C];
-      output[opIndex] = (T)avg;
+    if (globalSubGroupId < outputSize) {
+      if (prevLayerBias) avg += (float)prevLayerBias[globalSubGroupId % C];
+      output[globalSubGroupId] = (T)avg;
     }
   }
 }
@@ -904,38 +895,28 @@ void globalAvgPool(int N, int C, T* output, const T* input,
   if (nhwc) {
     assert(fp16);
     // For NHWC fp16, simply launch N blocks, each with C threads.
-    /*
-    DPCT1049:11: The work-group size passed to the SYCL kernel may exceed the
-    limit. To get the device limit, query info::device::max_work_group_size.
-    Adjust the work-group size if needed.
-    */
-    {
-      
-      sycl_queue.parallel_for(
-          sycl::nd_range<3>(sycl::range<3>(1, 1, N) * sycl::range<3>(1, 1, C),
-                            sycl::range<3>(1, 1, C)),
-          [=](sycl::nd_item<3> item_ct1) {
-            globalAvgPool_kernel_NHWC_fp16((sycl::half*)output,
-                                           (sycl::half*)input,
-                                           (sycl::half*)prevLayerBias,
-                                           N * C * kPlaneSize, N * C, item_ct1);
-          });
-    }
+    sycl_queue.parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, N) * sycl::range<3>(1, 1, C),
+                          sycl::range<3>(1, 1, C)),
+        [=](sycl::nd_item<3> item_ct1) {
+          globalAvgPool_kernel_NHWC_fp16((sycl::half*)output,
+                                         (sycl::half*)input,
+                                         (sycl::half*)prevLayerBias,
+                                         N * C * kPlaneSize, N * C, item_ct1);
+        });
   } else {
     // For NCHW layout (used with fp32),
-    // each warp processes a full plane (64 elements), and writes a single
-    // average N*C warps are launched.
+    // each sub-group processes a full plane (64 elements), and writes a single average.
+    const int kTotalSubGroups = N * C;
+    const int kSubGroupsPerBlock = 8;
+    const int kBlockSize = kSubGroupsPerBlock * 32;
 
-    const int kTotalWarps = N * C;
-    const int kWarpsPerBlock = 8;
-    const int kBlockSize = kWarpsPerBlock * 32;
-
-    int blocks = DivUp(kTotalWarps, kWarpsPerBlock);
+    int blocks = DivUp(kTotalSubGroups, kSubGroupsPerBlock);
     sycl_queue.parallel_for(
         sycl::nd_range<3>(
             sycl::range<3>(1, 1, blocks) * sycl::range<3>(1, 1, kBlockSize),
             sycl::range<3>(1, 1, kBlockSize)),
-        [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(SYCL_SUB_GROUP_SIZE)]] {
+        [=](sycl::nd_item<3> item_ct1) {
           globalAvgPool_kernel(output, input, prevLayerBias, N * C * kPlaneSize,
                                N * C, C, item_ct1);
         });
