@@ -22,6 +22,7 @@
 
 #include <sycl/sycl.hpp>
 #include "neural/network.h"
+#include "sycl_common.h"
 
 #if defined(USE_CUBLAS) || defined(USE_HIPBLAS)
 #include "cuBlasContext.h"
@@ -31,6 +32,11 @@ namespace lczero {
 namespace sycldnn_backend {
 
 struct InputsOutputs {
+  InputsOutputs(const InputsOutputs&) = delete;
+  InputsOutputs& operator=(const InputsOutputs&) = delete;
+  InputsOutputs(InputsOutputs&&) = delete;
+  InputsOutputs& operator=(InputsOutputs&&) = delete;
+
   InputsOutputs(int maxBatchSize, bool wdl, bool moves_left, sycl::queue& m_ct1,
                 size_t tensor_mem_size = 0, size_t scratch_size = 0,
                 bool cublasDisableTensorCores = false): q_ct1(m_ct1) {

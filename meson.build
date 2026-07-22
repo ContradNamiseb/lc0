@@ -721,7 +721,11 @@ if get_option('build_backends')
       if get_option('sycl') == 'l0'
         message('Building SYCL for the L0 backend')
         add_project_arguments('-DMKL_ILP64', language : 'cpp')
-        deps += cc.find_library('mkl_sycl', required: true)
+        if host_machine.system() == 'windows'
+          deps += cc.find_library('mkl_sycl_blas_dll', required: true)
+        else
+          deps += cc.find_library('mkl_sycl', required: true)
+        endif
         deps += cc.find_library('mkl_intel_ilp64', required: true)
         deps += cc.find_library('mkl_sequential', required: true)
         deps += cc.find_library('mkl_core', required: true)

@@ -57,5 +57,11 @@ void CublasError(int status, const char* file, const int& line);
 
 inline int DivUp(int a, int b) { return (a + b - 1) / b; }
 
+struct SyclDeviceCache {
+    int sub_group_size;
+};
+
+extern SyclDeviceCache g_sycl_device_cache;
+
 }  // namespace sycldnn_backend
 }  // namespace lczero

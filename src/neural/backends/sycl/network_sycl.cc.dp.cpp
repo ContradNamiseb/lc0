@@ -46,6 +46,10 @@
 namespace lczero {
 using namespace sycldnn_backend;
 
+namespace sycldnn_backend {
+SyclDeviceCache g_sycl_device_cache;
+}
+
 template <typename DataType>
 class SyclNetwork;
 
@@ -223,14 +227,17 @@ class SyclNetwork : public Network {
         devices[gpu_id_].get_info<sycl::info::device::max_compute_units>();
     // Get context.
     sycl::context context{devices[gpu_id_]};
-    auto exceptions_handler = [this](sycl::exception_list exceptions) {
+    auto exceptions_handler = [](sycl::exception_list exceptions) {
       for (std::exception_ptr const& e : exceptions) {
         try {
           std::rethrow_exception(e);
         } catch (sycl::exception const& e) {
-          CERR << "Caught asynchronous SYCL exception during GEMM:\n"
-               << e.what() << "\n ";
-          std::terminate();
+          std::cerr << "Caught asynchronous SYCL exception:\n"
+                    << e.what() << std::endl;
+          // Do not rethrow, just print to allow wait_and_throw to catch it!
+        } catch (std::exception const& e) {
+          std::cerr << "Caught asynchronous std::exception:\n"
+                    << e.what() << std::endl;
         }
       }
     };
@@ -241,8 +248,16 @@ class SyclNetwork : public Network {
 
     showDeviceInfo(*sycl_queue_);
 
+    auto sg_sizes = sycl_queue_->get_device().get_info<sycl::info::device::sub_group_sizes>();
+    g_sycl_device_cache.sub_group_size = 32; // Default
+    if (std::find(sg_sizes.begin(), sg_sizes.end(), 32) != sg_sizes.end()) {
+        g_sycl_device_cache.sub_group_size = 32;
+    } else if (!sg_sizes.empty()) {
+        g_sycl_device_cache.sub_group_size = sg_sizes.back();
+    }
+
     l2_cache_size_ = sycl_queue_->get_device()
-                         .get_info<sycl::info::device::local_mem_size>();
+                         .get_info<sycl::info::device::global_mem_cache_size>();
 
     allow_cache_opt_ = options.GetOrDefault<bool>("cache_opt", false);
 
@@ -377,26 +392,7 @@ class SyclNetwork : public Network {
         bool has_se = weights.residual[block].has_se;
         int se_k = (int)weights.residual[block].se.b1.size();
 
-        /*
-        if (use_res_block_winograd_fuse_opt_) {
-          auto layer = std::make_unique<ResidualBlock<DataType>>(
-              getLastLayer(), kNumFilters, has_se, se_k,
-              block == 0, block == (numBlocks_ - 1), act,
-              deviceProp.sharedMemPerBlockOptin);
-          layer->LoadWeights0(&weights.residual[block].conv1.weights[0],
-                              &weights.residual[block].conv1.biases[0],
-                              scratch_mem_);
-          layer->LoadWeights1(&weights.residual[block].conv2.weights[0],
-                              &weights.residual[block].conv2.biases[0],
-                              scratch_mem_);
-          if (has_se)
-            layer->LoadSEWeights(&weights.residual[block].se.w1[0],
-                                 &weights.residual[block].se.b1[0],
-                                 &weights.residual[block].se.w2[0],
-                                 &weights.residual[block].se.b2[0],
-                                 scratch_mem_);
-          network_.emplace_back(std::move(layer));
-        } else { */
+
         auto conv1 = std::make_unique<FusedWinogradConvSELayer<DataType>>(
             getLastLayer(), kNumFilters, 8, 8, kNumFilters, act, true, false,
             false, 0, *sycl_queue_);
@@ -594,7 +590,8 @@ class SyclNetwork : public Network {
   }
 
   void forwardEval(InputsOutputs* io, int batchSize) {
-    if (!multi_stream_) lock_.lock();
+    std::unique_lock<std::mutex> guard(lock_, std::defer_lock);
+    if (!multi_stream_) guard.lock();
 
 #ifdef DEBUG_RAW_NPS
     auto t_start = std::chrono::high_resolution_clock::now();
@@ -629,6 +626,7 @@ class SyclNetwork : public Network {
     }
 
     bool fp16 = std::is_same<sycl::half, DataType>::value;
+    CERR << "TRACE: Before expandPlanes\n";
     if (fp16) {
       expandPlanes_Fp16_NCHW((sycl::half*)(tensor_mem[0]), ipDataMasks,
                              ipDataValues, batchSize * kInputPlanes,
@@ -655,31 +653,7 @@ class SyclNetwork : public Network {
     const int res_block_mem =
         transformed_tensor_size * 2 + pre_transform_tensor_size;
 
-    // cudaStreamAttrValue stream_attribute = {};
-    // stream_attribute.accessPolicyWindow.base_ptr = tensor_mem[2];
-    // stream_attribute.accessPolicyWindow.num_bytes = res_block_mem;
-    // stream_attribute.accessPolicyWindow.hitRatio = 1.0f;
-    // stream_attribute.accessPolicyWindow.hitProp =
-    // cudaAccessPropertyPersisting;
-    // stream_attribute.accessPolicyWindow.missProp =
-    // cudaAccessPropertyStreaming;
 
-    // if (allow_cache_opt_ && use_res_block_winograd_fuse_opt_ &&
-    //     (res_block_mem <= scratch_size_) && (res_block_mem <=
-    //     l2_cache_size_)) {
-    //  we can use a single alloc to hold all the required tensors, and enable
-    //  persistent L2 caching on it
-    /*
-    DPCT1007:87: Migration of cudaStreamSetAttribute is not supported.
-    */
-    // cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow,
-    // &stream_attribute);
-
-    // enableCacheOpt = true;
-    //  skip_connection =
-    //      tensor_mem[2] + 2 * transformed_tensor_size / sizeof(DataType);
-    // }
-    // #endif
 
     int l = 0;
 
@@ -689,6 +663,8 @@ class SyclNetwork : public Network {
 
     if (numBlocks_ > 0) {
       // Input.
+      CERR << "TRACE: Before input conv Eval\n";
+      io_sycl_queue_.wait();
       network_[l++]->Eval(batchSize, skip_connection, tensor_mem[0], nullptr,
                           scratch_mem, scratch_size_, io_sycl_queue_,
                           nullptr);  // input conv
@@ -708,6 +684,8 @@ class SyclNetwork : public Network {
                               tensor_mem[2], scratch_mem, scratch_size_,
                               io_sycl_queue_, nullptr);  // conv2
         }
+        io_sycl_queue_.wait();
+        CERR << "TRACE: After Residual block " << block << "\n";
       }
 
       flow = tensor_mem[2];
@@ -716,6 +694,8 @@ class SyclNetwork : public Network {
     }
 
     if (attn_body_) {
+      CERR << "TRACE: Before Attention Body\n";
+      io_sycl_queue_.wait();
       network_[l++]->Eval(
           batchSize, tensor_mem[1],
           (numBlocks_ > 0) ? tensor_mem[2] : tensor_mem[0],
@@ -729,6 +709,8 @@ class SyclNetwork : public Network {
     }
 
     // Policy head.
+    CERR << "TRACE: Before Policy Head\n";
+    io_sycl_queue_.wait();
 
     if (attn_policy_) {
       network_[l++]->Eval(
@@ -794,6 +776,8 @@ class SyclNetwork : public Network {
     }
 
     // value head
+    CERR << "TRACE: Before Value Head\n";
+    io_sycl_queue_.wait();
     if (fp16) {
       network_[l++]->Eval(batchSize, spare1, flow, spare2, scratch_mem,
                           scratch_size_, io_sycl_queue_,
@@ -808,6 +792,8 @@ class SyclNetwork : public Network {
     }
 
     if (moves_left_) {
+      CERR << "TRACE: Before Moves Left Head\n";
+      io_sycl_queue_.wait();
       // Moves left head
       network_[l++]->Eval(batchSize, spare1, flow, nullptr, scratch_mem,
                           scratch_size_, io_sycl_queue_,
@@ -834,6 +820,8 @@ class SyclNetwork : public Network {
     }
 
     // Copy policy output from device memory to host memory.
+    CERR << "TRACE: Before copying policy output to host\n";
+    io_sycl_queue_.wait();
 #ifndef USE_INTEL
     auto event =
         io_sycl_queue_.memcpy(io->op_policy_mem_, io->op_policy_mem_gpu_,
@@ -844,7 +832,6 @@ class SyclNetwork : public Network {
       // ReportCUDAErrors(
       //   DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()));
       // The next thread can start using the GPU now.
-      lock_.unlock();
     }
 
 #ifndef USE_INTEL
@@ -954,8 +941,8 @@ class SyclNetwork : public Network {
   std::vector<std::unique_ptr<BaseLayer<DataType>>> network_;
   BaseLayer<DataType>* getLastLayer() { return network_.back().get(); }
 
-  BaseLayer<DataType>* resi_last_;
-  BaseLayer<DataType>* encoder_last_;
+  BaseLayer<DataType>* resi_last_ = nullptr;
+  BaseLayer<DataType>* encoder_last_ = nullptr;
 
   size_t tensor_mem_size_;
   size_t scratch_size_;
@@ -1014,10 +1001,14 @@ class SyclNetwork : public Network {
          << mqueue.get_device()
                 .get_info<sycl::info::device::max_clock_frequency>()
          << " MHz";
-    CERR << "L2 cache capacity: "
+    CERR << "  Local memory capacity: "
          << mqueue.get_device().get_info<sycl::info::device::local_mem_size>() /
-                (1024)
-         << " KB";
+                1024
+         << " KB\n";
+    CERR << "  Global mem cache capacity: "
+         << mqueue.get_device().get_info<sycl::info::device::global_mem_cache_size>() /
+                1024
+         << " KB\n";
     CERR
         << "Global memory size: "
         << mqueue.get_device().get_info<sycl::info::device::global_mem_size>() /

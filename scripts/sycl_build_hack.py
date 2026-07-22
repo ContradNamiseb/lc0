@@ -12,16 +12,19 @@ dep_flag = False
 link_flag = False
 
 for line in lines:
-  # Replace xilink with icx as the linker.
+  # Replace xilink or link with icx as the linker.
   if not link_flag:
-    link_flag = 'xilink.exe' in line
+    link_flag = 'xilink.exe' in line or '"link"' in line
   if link_flag:
     line = line.replace('xilink.exe', 'icx')
+    line = line.replace('"link"', 'icx')
     line = line.replace('/MACHINE:x64', '')
     line = line.replace('/OUT:', '-o ')
     line = line.replace('/SUBSYSTEM:CONSOLE', '')
     line = line.replace('/OPT:REF', '')
     line = line.replace('/PDB:', '/Fd')
+    line = line.replace('/release', '')
+    line = line.replace('/RELEASE', '')
   # Replace msvc compatible dependencies with gcc ones as icx output with /showincludes includes
   # temporary header files causing full project rebuilds.
   if line.startswith('rule') or line.startswith('build'):

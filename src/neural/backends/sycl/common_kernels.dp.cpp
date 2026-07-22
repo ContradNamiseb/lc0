@@ -759,7 +759,7 @@ void globalScale_kernel(T* output, const T* input,
   int tid = item_ct1.get_group(2) * item_ct1.get_local_range(2) +
             item_ct1.get_local_id(2);
 
-  if (tid > inputSize) return;
+  if (tid >= inputSize) return;
 
   int nc = tid / kPlaneSize;
   int n = nc / C;
@@ -793,7 +793,7 @@ void globalScale_kernel_fp16_nhwc(sycl::half* output, const sycl::half* input,
   int tid = item_ct1.get_group(2) * item_ct1.get_local_range(2) +
             item_ct1.get_local_id(2);
 
-  if (tid > inputSize) return;
+  if (tid >= inputSize) return;
 
   int c = tid % C;
   int n = tid / (HWC);
@@ -1069,7 +1069,7 @@ void OutputInputTransform(int N, int C, int se_K, T* output, const T* input,
 template <typename T>
 void softmax_opt_64_kernel(T* output, const T* input,
                                       const T* input2, int N,
-                                      const sycl::nd_item<3> &item_ct1) {
+                                      const sycl::nd_item<3> &item_ct1, int sg_size) {
   int index = item_ct1.get_local_range(2) * item_ct1.get_group(2) +
               item_ct1.get_local_id(2);
   if (index >= N) return;
@@ -1145,7 +1145,7 @@ void softmax_opt_64_kernel(T* output, const T* input,
 template <typename T>
 void softmax_kernel(T* output, const T* input, const T* input2,
                     const sycl::nd_item<3> &item_ct1, float &localsum,
-                    float &localmax) {
+                    float &localmax, int sg_size) {
   int n = item_ct1.get_group(2);
   int c = item_ct1.get_local_id(2);
   int C = item_ct1.get_local_range(2);
@@ -1170,7 +1170,8 @@ void softmax_kernel(T* output, const T* input, const T* input2,
 
   // Get max across warp first, and then update across C dimension
   float warpmax = warpMax(x, item_ct1);
-  if ((c & 0x1F) == 0) maxval.fetch_max(warpmax);
+  int sg_mask = sg_size - 1;
+  if ((c & sg_mask) == 0) maxval.fetch_max(warpmax);
 
   
   item_ct1.barrier(sycl::access::fence_space::local_space);
@@ -1181,7 +1182,7 @@ void softmax_kernel(T* output, const T* input, const T* input2,
   float val = warpReduce(ex, item_ct1);
 
   // update shared memory sum across C dimension
-  if ((c & 0x1F) == 0)
+  if ((c & sg_mask) == 0)
       sum.fetch_add(val);
 
   
@@ -1195,7 +1196,8 @@ void softmax_kernel(T* output, const T* input, const T* input2,
 template <typename T>
 void Softmax(int N, int C, T* output, const T* input, const T* input2, sycl::queue &sycl_queue) {
   if (C == 64) {
-    int size = N * 32;  // Total no of threads needed
+    int sg_size = g_sycl_device_cache.sub_group_size;
+    int size = N * (64 / sg_size) * sg_size;  // Total no of threads needed
     const int kBlockSize = 256;
     int blocks = DivUp(size, kBlockSize);
     {
@@ -1204,8 +1206,8 @@ void Softmax(int N, int C, T* output, const T* input, const T* input2, sycl::que
           sycl::nd_range<3>(
               sycl::range<3>(1, 1, blocks) * sycl::range<3>(1, 1, kBlockSize),
               sycl::range<3>(1, 1, kBlockSize)),
-          [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(SYCL_SUB_GROUP_SIZE)]] {
-            softmax_opt_64_kernel<T>(output, input, input2, size, item_ct1);
+          [=](sycl::nd_item<3> item_ct1) {
+            softmax_opt_64_kernel<T>(output, input, input2, size, item_ct1, sg_size);
           });
     }
   } else {
@@ -1214,6 +1216,7 @@ void Softmax(int N, int C, T* output, const T* input, const T* input2, sycl::que
     limit. To get the device limit, query info::device::max_work_group_size.
     Adjust the work-group size if needed.
     */
+    int sg_size = g_sycl_device_cache.sub_group_size;
     sycl_queue.submit([&](sycl::handler& cgh) {
       sycl::local_accessor<float, 0> sum_acc_ct1(cgh);
       sycl::local_accessor<float, 0> maxval_acc_ct1(cgh);
@@ -1221,9 +1224,9 @@ void Softmax(int N, int C, T* output, const T* input, const T* input2, sycl::que
       cgh.parallel_for(
           sycl::nd_range<3>(sycl::range<3>(1, 1, N) * sycl::range<3>(1, 1, C),
                             sycl::range<3>(1, 1, C)),
-          [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(SYCL_SUB_GROUP_SIZE)]] {
+          [=](sycl::nd_item<3> item_ct1) {
             softmax_kernel<T>(output, input, input2, item_ct1, sum_acc_ct1,
-                              maxval_acc_ct1);
+                              maxval_acc_ct1, sg_size);
           });
     });
   }

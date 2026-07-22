@@ -76,6 +76,109 @@ namespace sycldnn_backend {
 // than using multiple passes. The flag can be set to false for debugging.
 static constexpr bool kUseFusedSELayer = true;
 
+// ============================================================================
+// Pure SYCL GEMM helpers — bypass MKL which crashes on some Intel iGPUs.
+// C = alpha * op(A) * op(B) + beta * C, column-major layout.
+// ============================================================================
+template <typename DataType>
+static void syclGemm(sycl::queue& q, transpose_type transa, transpose_type transb,
+                     int m, int n, int k, float alpha,
+                     const DataType* A, int lda,
+                     const DataType* B, int ldb,
+                     float beta, DataType* C, int ldc) {
+  bool transA = (transa == transpose_type_transpose);
+  bool transB = (transb == transpose_type_transpose);
+
+  q.parallel_for(sycl::range<2>(n, m), [=](sycl::id<2> idx) {
+    int col = idx[0];
+    int row = idx[1];
+    float sum = 0.0f;
+    for (int p = 0; p < k; ++p) {
+      float a_val = transA ? static_cast<float>(A[row * lda + p])
+                           : static_cast<float>(A[p * lda + row]);
+      float b_val = transB ? static_cast<float>(B[p * ldb + col])
+                           : static_cast<float>(B[col * ldb + p]);
+      sum += a_val * b_val;
+    }
+    float c_old = (beta != 0.0f) ? static_cast<float>(C[col * ldc + row]) : 0.0f;
+    C[col * ldc + row] = static_cast<DataType>(alpha * sum + beta * c_old);
+  });
+}
+
+template <typename DataType>
+static void syclGemmStridedBatched(sycl::queue& q,
+    transpose_type transa, transpose_type transb,
+    int m, int n, int k, float alpha,
+    const DataType* A, int lda, long long int strideA,
+    const DataType* B, int ldb, long long int strideB,
+    float beta, DataType* C, int ldc, long long int strideC,
+    int batchCount) {
+  bool transA = (transa == transpose_type_transpose);
+  bool transB = (transb == transpose_type_transpose);
+
+  q.parallel_for(sycl::range<3>(batchCount, n, m), [=](sycl::id<3> idx) {
+    int batch = idx[0];
+    int col = idx[1];
+    int row = idx[2];
+    const DataType* Ab = A + batch * strideA;
+    const DataType* Bb = B + batch * strideB;
+    DataType* Cb = C + batch * strideC;
+
+    float sum = 0.0f;
+    for (int p = 0; p < k; ++p) {
+      float a_val = transA ? static_cast<float>(Ab[row * lda + p])
+                           : static_cast<float>(Ab[p * lda + row]);
+      float b_val = transB ? static_cast<float>(Bb[p * ldb + col])
+                           : static_cast<float>(Bb[col * ldb + p]);
+      sum += a_val * b_val;
+    }
+    float c_old = (beta != 0.0f) ? static_cast<float>(Cb[col * ldc + row]) : 0.0f;
+    Cb[col * ldc + row] = static_cast<DataType>(alpha * sum + beta * c_old);
+  });
+}
+
+template <typename DataType>
+static void syclGemmBatched(sycl::queue& q,
+    transpose_type transa, transpose_type transb,
+    int m, int n, int k, float alpha,
+    DataType** A, int lda, DataType** B, int ldb,
+    float beta, DataType** C, int ldc, int batchCount) {
+  // Copy pointer arrays to device
+  auto A_dev = sycl::malloc_device<DataType*>(batchCount, q);
+  auto B_dev = sycl::malloc_device<DataType*>(batchCount, q);
+  auto C_dev = sycl::malloc_device<DataType*>(batchCount, q);
+  q.memcpy(A_dev, A, batchCount * sizeof(DataType*));
+  q.memcpy(B_dev, B, batchCount * sizeof(DataType*));
+  q.memcpy(C_dev, C, batchCount * sizeof(DataType*)).wait();
+
+  bool transA = (transa == transpose_type_transpose);
+  bool transB = (transb == transpose_type_transpose);
+
+  q.parallel_for(sycl::range<3>(batchCount, n, m), [=](sycl::id<3> idx) {
+    int batch = idx[0];
+    int col = idx[1];
+    int row = idx[2];
+    const DataType* Ab = A_dev[batch];
+    const DataType* Bb = B_dev[batch];
+    DataType* Cb = C_dev[batch];
+
+    float sum = 0.0f;
+    for (int p = 0; p < k; ++p) {
+      float a_val = transA ? static_cast<float>(Ab[row * lda + p])
+                           : static_cast<float>(Ab[p * lda + row]);
+      float b_val = transB ? static_cast<float>(Bb[p * ldb + col])
+                           : static_cast<float>(Bb[col * ldb + p]);
+      sum += a_val * b_val;
+    }
+    float c_old = (beta != 0.0f) ? static_cast<float>(Cb[col * ldc + row]) : 0.0f;
+    Cb[col * ldc + row] = static_cast<DataType>(alpha * sum + beta * c_old);
+  }).wait();
+
+  sycl::free(A_dev, q);
+  sycl::free(B_dev, q);
+  sycl::free(C_dev, q);
+}
+
 template <typename DataType>
 BaseLayer<DataType>::BaseLayer(int c, int h, int w, BaseLayer* ip, bool nhwc,
                                sycl::queue& sycl_queue)
@@ -170,7 +273,7 @@ void SELayer<sycl::half>::LoadWeights(float* w1, float* b1, float* w2, float* b2
   size_t weight_size2 = 2 * weight_size1;
 
   // Transpose the weight matrices for the fused path.
-  std::vector<float> temp(weight_size2);
+  std::vector<float> temp(num_weights2);
 
   // Weight for the first FC layer.
  
@@ -269,11 +372,9 @@ void SELayer<float>::Eval(int N, float* output, const float* input,
         });
   });  
   #else
-  
-  oneapi::mkl::blas::column_major::gemm(sycl_queue, transpose_type_transpose,
+  syclGemm<float>(sycl_queue, transpose_type_transpose,
         transpose_type_notranspose, numFc1Out_, N, C, alpha, w1_, C, op2,
         C, beta, op1, numFc1Out_);
-
   #endif
 
   addVectors(op1, b1_, op1, numFc1Out_ * N, numFc1Out_, numFc1Out_ * N, act_, sycl_queue);
@@ -312,7 +413,7 @@ void SELayer<float>::Eval(int N, float* output, const float* input,
         });
   });
   #else
-    oneapi::mkl::blas::column_major::gemm(sycl_queue, transpose_type_transpose,
+    syclGemm<float>(sycl_queue, transpose_type_transpose,
         transpose_type_notranspose, 2 * C, N, numFc1Out_, alpha, w2_,
         numFc1Out_, op1, numFc1Out_, beta, op2, 2 * C);
   #endif
@@ -399,10 +500,9 @@ void SELayer<sycl::half>::Eval(int N, sycl::half* output, const sycl::half* inpu
       });
     });
 #else
-    oneapi::mkl::blas::column_major::gemm(
-        sycl_queue, transpose_type_transpose, transpose_type_notranspose,
-        numFc1Out_, N, C, alpha, ((const sycl::half *)w1_), C,
-        ((const sycl::half *)op2),C, beta, ((sycl::half *)op1), numFc1Out_);
+    syclGemm<sycl::half>(sycl_queue, transpose_type_transpose, transpose_type_notranspose,
+        numFc1Out_, N, C, alpha, (const sycl::half*)w1_, C, (const sycl::half*)op2, C,
+        beta, (sycl::half*)op1, numFc1Out_);
 #endif
 
     addVectors(op1, b1_, op1, numFc1Out_ * N, numFc1Out_, numFc1Out_ * N, act_, sycl_queue);
@@ -439,10 +539,9 @@ void SELayer<sycl::half>::Eval(int N, sycl::half* output, const sycl::half* inpu
       });
     });
 #else
-    oneapi::mkl::blas::column_major::gemm(
-        sycl_queue, transpose_type_transpose, transpose_type_notranspose, 2 * C,
-        N, numFc1Out_, alpha, ((const sycl::half *)w2_), numFc1Out_,
-        ((const sycl::half *)op1), numFc1Out_, beta, ((sycl::half *)op2),
+    syclGemm<sycl::half>(sycl_queue, transpose_type_transpose, transpose_type_notranspose, 2 * C,
+        N, numFc1Out_, alpha, (const sycl::half*)w2_, numFc1Out_,
+        (const sycl::half*)op1, numFc1Out_, beta, (sycl::half*)op2,
         2 * C);
 #endif
     
@@ -579,11 +678,10 @@ template <>
       });
   });
 #else
-  oneapi::mkl::blas::column_major::gemm(
-      sycl_queue, transpose_type_transpose, transpose_type_notranspose,
-      num_outputs, N, num_inputs, alpha, ((const sycl::half *)weights_),
-      num_inputs, ((const sycl::half *)input_tensor), num_inputs, beta,
-      ((sycl::half *)output_tensor), num_outputs);
+  syclGemm<sycl::half>(sycl_queue, transpose_type_transpose, transpose_type_notranspose,
+      num_outputs, N, num_inputs, alpha, (const sycl::half*)weights_, num_inputs,
+      (const sycl::half*)input_tensor, num_inputs, beta, (sycl::half*)output_tensor,
+      num_outputs);
 #endif
 
    if (use_bias_ || (act_ != ACTIVATION_NONE)) {
@@ -641,13 +739,10 @@ void FCLayer<float>::Eval(int N, float* output_tensor,
       });
   });
   #else
-   //printf("3\n");
-   oneapi::mkl::blas::column_major::gemm(sycl_queue, transpose_type_transpose,
+   syclGemm<float>(sycl_queue, transpose_type_transpose,
         transpose_type_notranspose, num_outputs, N, num_inputs, alpha,
-        weights_, num_inputs, input_tensor, num_inputs, beta, output_tensor,
-        num_outputs);
-    
-    //event.wait();
+        (const float*)weights_, num_inputs, (const float*)input_tensor, num_inputs,
+        beta, (float*)output_tensor, num_outputs);
   #endif
 
 
@@ -812,10 +907,10 @@ FusedWinogradConvSELayer<DataType>::FusedWinogradConvSELayer(
     const size_t biases_size1 = sizeof(DataType) * num_biases1;
     const size_t biases_size2 = sizeof(DataType) * num_biases2;
 
-    w1_ = (DataType *)sycl::malloc_device(weight_size1 * 4, sycl_queue_);
-    w2_ = (DataType *)sycl::malloc_device(weight_size2 * 4, sycl_queue_);
-    b1_ = (DataType *)sycl::malloc_device(biases_size1 * 4, sycl_queue_);
-    b2_ = (DataType *)sycl::malloc_device(biases_size2 * 4, sycl_queue_);
+    w1_ = (DataType *)sycl::malloc_device(weight_size1, sycl_queue_);
+    w2_ = (DataType *)sycl::malloc_device(weight_size2, sycl_queue_);
+    b1_ = (DataType *)sycl::malloc_device(biases_size1, sycl_queue_);
+    b2_ = (DataType *)sycl::malloc_device(biases_size2, sycl_queue_);
   }
 }
 
@@ -838,12 +933,7 @@ template <typename DataType> void FusedWinogradConvSELayer<DataType>::LoadWeight
   if (pBias) {
     
     
-    //sycl_queue_.memcpy(scratch, pBias, bias_size).wait();
-    sycl_queue_.memcpy(scratch, pBias, bias_size);  
-
-    float total = 0;
-    for(int i = 0; i < C; i++)
-      total = pBias[i] + total;
+    sycl_queue_.memcpy(scratch, pBias, bias_size).wait();
 
     copyTypeConverted((DataType*)biases_, (float*)scratch, C, sycl_queue_);
   }
@@ -953,13 +1043,37 @@ template <>
     });
   });
 #else
+  // Workaround: MKL BLAS (gemm/gemm_batch) crashes on some Intel iGPUs
+  // (e.g. Iris Xe) with both half and float. Use a pure SYCL kernel instead.
+  // Computes: Out = A * B (row-major), i.e. Out[b][m][n] = sum_k A[b][m][k] * B[b][k][n]
+  // But in column-major trick: C_col = B_col * A_col, so m_col=N, n_col=M, k_col=K
+  // Each batch element: C(N,M) = B(N,K) * A(K,M)
   int64_t M_ = M;
   int64_t N_ = N;
   int64_t K_ = K;
-  oneapi::mkl::blas::column_major::gemm_batch(
-      sycl_queue, transpose_type_notranspose, transpose_type_notranspose, N_,
-      M_, K_, alpha, B, N_, N_ * K_, A, K_, K_ * M_, beta, Out, N_, N_ * M_,
-      batchSize);
+
+  sycl_queue.parallel_for(
+      sycl::range<3>(batchSize, M_, N_),
+      [=](sycl::id<3> idx) {
+        int b = idx[0];
+        int m = idx[1];
+        int n = idx[2];
+
+        const sycl::half* Ab = A + b * K_ * M_;  // A batch slice (K x M in col-major)
+        const sycl::half* Bb = B + b * N_ * K_;  // B batch slice (N x K in col-major)
+        sycl::half* Cb = Out + b * N_ * M_;       // C batch slice (N x M in col-major)
+
+        float sum = 0.0f;
+        for (int64_t k = 0; k < K_; ++k) {
+          // Col-major: B(n,k) = Bb[k*N + n], A(k,m) = Ab[m*K + k]
+          sum += static_cast<float>(Bb[k * N_ + n]) * static_cast<float>(Ab[m * K_ + k]);
+        }
+        // Col-major: C(n,m) = Cb[m*N + n]
+        Cb[m * N_ + n] = static_cast<sycl::half>(sum);
+      });
+  std::cerr << "TRACE: SYCL GEMM kernel submitted. Waiting..." << std::endl;
+  sycl_queue.wait_and_throw();
+  std::cerr << "TRACE: SYCL GEMM kernel done!" << std::endl;
 #endif
  }
 
@@ -1015,7 +1129,7 @@ template <> void BaseLayer<float>::cublasRowMajorMatrixMul(const float* A, const
         });
     });  
     #else
-      oneapi::mkl::blas::column_major::gemm_batch(sycl_queue, transpose_type_notranspose,
+      syclGemmStridedBatched<float>(sycl_queue, transpose_type_notranspose,
             transpose_type_notranspose, N_, M_, K_, floatOne, B, N_, N_ * K_, A, K_, K_ * M_, floatZero, Out, N_, N_ * M_, batchSize);
     #endif
   }
@@ -1025,6 +1139,7 @@ template <typename DataType>
 void FusedWinogradConvSELayer<DataType>::Eval(
     int N, DataType* output, const DataType* input, const DataType* input2,
     void* scratch, size_t scratch_size, sycl::queue &sycl_queue, DataType***) {
+  try {
   // Split the scratch space into two parts - use first part for holding
   // transformed input and second part for transformed output.
 
@@ -1034,9 +1149,17 @@ void FusedWinogradConvSELayer<DataType>::Eval(
   DataType* transformed_output =
       transformed_input + scratch_size / (2 * sizeof(DataType));
 
+  std::cerr << "TRACE: Before InputTransform" << std::endl;
   InputTransform<DataType, false>(N, c_input_, transformed_input, input, sycl_queue);
+  std::cerr << "TRACE: InputTransform submitted, calling wait_and_throw..." << std::endl;
+  sycl_queue.wait_and_throw();
+  std::cerr << "TRACE: InputTransform completed OK" << std::endl;
+  std::cerr << "TRACE: Calling cublasRowMajorMatrixMul M=" << N*4 << " N=" << C << " K=" << c_input_ << " batch=36" << std::endl;
   BaseLayer<DataType>::cublasRowMajorMatrixMul(
       transformed_input, transformed_weights_, transformed_output, N * 4, C, c_input_, 36, sycl_queue);
+  std::cerr << "TRACE: cublasRowMajorMatrixMul submitted, calling wait_and_throw..." << std::endl;
+  sycl_queue.wait_and_throw();
+  std::cerr << "TRACE: cublasRowMajorMatrixMul completed OK" << std::endl;
 
   if (act_ == ACTIVATION_NONE) {
     if (!has_se_ && use_bias_ && !skip_add_)
@@ -1064,6 +1187,8 @@ void FusedWinogradConvSELayer<DataType>::Eval(
           nullptr, nullptr, nullptr, sycl_queue);
     else
       throw Exception("unsupported network type!");
+    std::cerr << "TRACE: After OutputTransform (RELU)" << std::endl;
+    sycl_queue.wait_and_throw();
   } else if (act_ == ACTIVATION_MISH) {
     if (has_se_ && use_bias_ && skip_add_)
       OutputTransform<DataType, true, ACTIVATION_MISH, true, true, false, false>(
@@ -1086,6 +1211,14 @@ void FusedWinogradConvSELayer<DataType>::Eval(
       throw Exception("unsupported network type!");
   } else
     throw Exception("unsupported network type!");
+
+  } catch (const sycl::exception& e) {
+    std::cerr << "SYCL EXCEPTION in FusedWinogradConvSELayer::Eval: " << e.what() << std::endl;
+  } catch (const std::exception& e) {
+    std::cerr << "EXCEPTION in FusedWinogradConvSELayer::Eval: " << e.what() << std::endl;
+  } catch (...) {
+    std::cerr << "UNKNOWN EXCEPTION in FusedWinogradConvSELayer::Eval" << std::endl;
+  }
 }
 
 template <typename DataType>
@@ -1193,13 +1326,9 @@ template <>
       });
     });
 #else
-    int64_t M_ = M;
-    int64_t N_ = N;
-    int64_t K_ = K;
-    oneapi::mkl::blas::column_major::gemm_batch(
-        sycl_queue, transpose_type_notranspose, transpose_type_notranspose, N_,
-        M_, K_, alpha, B, N_, N_ * K_, A, K_, 0, beta, Out, N_, N_ * M_,
-        batchSize);
+    syclGemmStridedBatched<sycl::half>(
+        sycl_queue, transpose_type_notranspose, transpose_type_notranspose, N,
+        M, K, alpha, B, N, N * K, A, K, 0, beta, Out, N, N * M, batchSize);
 #endif
 }
 
@@ -1258,7 +1387,7 @@ void Conv1Layer<float>::cublasSpecialMatrixMul(const float* A, const float* B,
         });   
     });
     #else
-      oneapi::mkl::blas::column_major::gemm_batch(
+      syclGemmStridedBatched<float>(
         sycl_queue, transpose_type_notranspose,
         transpose_type_notranspose, N_, M_, K_, floatOne, B, N_, N_ * K_, A, K_,
         0, floatZero, Out, N_, N_ * M_, batchSize); 
@@ -1802,7 +1931,7 @@ static void cublasXgemm(transpose_type transa,
       });
   }
   #else
-    oneapi::mkl::blas::column_major::gemm(sycl_queue, transa, transb, m, n, k, alpha, (const DataType *)A, lda,
+    syclGemm<DataType>(sycl_queue, transa, transb, m, n, k, alpha, (const DataType *)A, lda,
         (const DataType *)B, ldb, beta, (DataType *)C, ldc);
   #endif
 
@@ -1894,7 +2023,7 @@ static void cublasXGemmStridedBatched(transpose_type transa, transpose_type tran
     });
   }
   #else
-  oneapi::mkl::blas::column_major::gemm_batch(sycl_queue, transa, transb, m, n, k,  alpha, (const DataType *)A, lda, strideA, (const DataType *)B, ldb, strideB, beta, (DataType *)C, ldc, strideC, batchCount);
+  syclGemmStridedBatched<DataType>(sycl_queue, transa, transb, m, n, k, alpha, (const DataType *)A, lda, strideA, (const DataType *)B, ldb, strideB, beta, (DataType *)C, ldc, strideC, batchCount);
   #endif
 }
 
@@ -1990,15 +2119,11 @@ static void cublasXGemmBatched(transpose_type transa,
     unsigned short alpha_h = FP32toFP16(alpha);
     unsigned short beta_h = FP32toFP16(beta);
 
-    oneapi::mkl::blas::column_major::gemm_batch(
-        sycl_queue, &transa, &transb, &m, &n, &k,  (const sycl::half*)&alpha_h,
-        (const sycl::half **)A, &lda, (const sycl::half **)B, &ldb,
-        (const sycl::half*)&beta_h, (sycl::half **)C, &ldc, 1, &batchCount);
+    syclGemmBatched<sycl::half>(sycl_queue, transa, transb, m, n, k, alpha,
+        (sycl::half**)A, lda, (sycl::half**)B, ldb, beta, (sycl::half**)C, ldc, batchCount);
   } else {
-    oneapi::mkl::blas::column_major::gemm_batch(
-        sycl_queue, &transa, &transb, &m, &n, &k,  &alpha, (const float **)A,
-        &lda, (const float **)B, &ldb, &beta, (float **)C, &ldc, 1,
-        &batchCount);
+    syclGemmBatched<float>(sycl_queue, transa, transb, m, n, k, alpha,
+        (float**)A, lda, (float**)B, ldb, beta, (float**)C, ldc, batchCount);
   }
 
   #endif

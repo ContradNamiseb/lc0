@@ -18,8 +18,9 @@ rem 2. Edit the paths for the build dependencies.
 set CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v10.0
 set CUDNN_PATH=%CUDA_PATH%
 set OPENBLAS_PATH=C:\OpenBLAS
-set MKL_PATH=C:\Program Files (x86)\Intel\oneAPI\mkl\latest\
-set DNNL_PATH=C:\Program Files (x86)\Intel\oneAPI\dnnl\latest\cpu_iomp
+set MKL_PATH=C:\Program Files (x86)\Intel\oneAPI\mkl\2026.1
+set DNNL_PATH=C:\Program Files (x86)\Intel\oneAPI\dnnl\2026.0
+set SYCL_PATH=C:\Program Files (x86)\Intel\oneAPI\compiler\latest\windows
 set OPENCL_LIB_PATH=%CUDA_PATH%\lib\x64
 set OPENCL_INCLUDE_PATH=%CUDA_PATH%\include
 
@@ -27,9 +28,11 @@ rem 3. In most cases you won't need to change anything further down.
 echo Deleting build directory:
 rd /s build
 
-rem Use cl for C files to get a resource compiler as needed for zlib.
-set CC=cl
+rem Use Intel compilers for SYCL and proper archiver
+set CC=icx
 set CXX=icx
+rem set AR=xilib.exe
+rem set RANLIB=xilib.exe
 
 set BLAS=true
 if %MKL%==false if %DNNL%==false if %OPENBLAS%==false if %EIGEN%==false set BLAS=false

@@ -61,7 +61,7 @@ class hipBlasContextManager {
     return instance.handle;
   }
 
-  static void destroycuBlasHandle_t() {
+  static void destroyhipBlasHandle_t() {
     // Managed automatically by function-local static destructor.
   }
 };

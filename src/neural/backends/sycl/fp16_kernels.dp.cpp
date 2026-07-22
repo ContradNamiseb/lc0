@@ -514,7 +514,8 @@ void OutputInputTransformKernel_fp16_shmem_board(
   float avg = S / 64;
   shared_data[k] = avg;
 
-  int lane = k & 0x1F;
+    int sg_size = item_ct1.get_sub_group().get_max_local_range()[0];
+    int lane = k % sg_size;
   int warp = k >> 5;
   item_ct1.barrier(sycl::access::fence_space::local_space);
 

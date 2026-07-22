@@ -43,7 +43,7 @@ class BaseLayer {
   int GetC() const { return C; }
   int GetH() const { return H; }
   int GetW() const { return W; }
-  sycl::queue GetSycl_Queue() { return sycl_queue_;}
+  sycl::queue& GetSycl_Queue() { return sycl_queue_;}
 
   bool isNHWC() const { return nhwc_; }
 
@@ -358,7 +358,7 @@ class EncoderBlock {
 
   const int max_batch_size_;
 
-  sycl::queue sycl_queue_;
+  sycl::queue& sycl_queue_;
 };
 
 /**
@@ -512,10 +512,6 @@ class ValueHead : public BaseLayer<DataType> {
   bool attention_body_;
   ActivationFunction act_;
 };
-
-}  // namespace sycldnn_backend
-}  // namespace lczero
-
 
 }  // namespace sycldnn_backend
 }  // namespace lczero

@@ -19,6 +19,8 @@
   SPDX-License-Identifier:GNU General Public License v3.0 or later
 */
 
+#pragma once
+
 #include <sycl/sycl.hpp>
 
 namespace lczero {
@@ -541,7 +543,8 @@ void OutputTransform_SE_relu_InputTransform_kernel(
     float avg = S / 64;
     shared_data[k] = avg;
 
-    int lane = k & 0x1F;
+    int sg_size = item_ct1.get_sub_group().get_max_local_range()[0];
+    int lane = k % sg_size;
     int warp = k >> 5;
     /*
     DPCT1065:41: Consider replacing sycl::nd_item::barrier() with
