@@ -447,26 +447,13 @@ void OutputTransform_kernel(int N, int C, int se_K, T* output,
 // fast reduction for the warp
 [[gnu::always_inline]]
 inline float warpReduce(float x, const sycl::nd_item<3>& item_ct1) {
-  // Dynamically query sub-group width so this works on Intel (8/16), AMD (32/64), and NVIDIA (32).
-  const int sg_size = item_ct1.get_sub_group().get_max_local_range()[0];
-#pragma unroll
-  for (int mask = sg_size / 2; mask > 0; mask >>= 1)
-    x += sycl::permute_group_by_xor(item_ct1.get_sub_group(), x, mask);
-
-  return x;
+  return sycl::reduce_over_group(item_ct1.get_sub_group(), x, sycl::plus<float>());
 }
 
 // fast max reduction for the warp
 [[gnu::always_inline]]
 inline float warpMax(float x, const sycl::nd_item<3>& item_ct1) {
-  // Dynamically query sub-group width so this works on Intel (8/16), AMD (32/64), and NVIDIA (32).
-  const int sg_size = item_ct1.get_sub_group().get_max_local_range()[0];
-#pragma unroll
-  for (int mask = sg_size / 2; mask > 0; mask >>= 1)
-    x = sycl::max(x, (float)(sycl::permute_group_by_xor(
-                         item_ct1.get_sub_group(), x, mask)));
-
-  return x;
+  return sycl::reduce_over_group(item_ct1.get_sub_group(), x, sycl::maximum<float>());
 }
 
 // Helper fuction to do vector loads/stores
@@ -543,9 +530,9 @@ void OutputTransform_SE_relu_InputTransform_kernel(
     float avg = S / 64;
     shared_data[k] = avg;
 
-    int sg_size = item_ct1.get_sub_group().get_max_local_range()[0];
-    int lane = k % sg_size;
-    int warp = k >> 5;
+    int sg_size = item_ct1.get_sub_group().get_local_linear_range();
+    int lane = item_ct1.get_sub_group().get_local_linear_id();
+    int warp = item_ct1.get_sub_group().get_group_linear_id();
     /*
     DPCT1065:41: Consider replacing sycl::nd_item::barrier() with
     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
@@ -573,7 +560,7 @@ void OutputTransform_SE_relu_InputTransform_kernel(
     item_ct1.barrier();
     if (k < se_K) {
       S = 0;
-      for (int i = 0; i < C / 32; i++) S += shared_sums[i][k];
+      for (int i = 0; i < item_ct1.get_sub_group().get_group_linear_range(); i++) S += shared_sums[i][k];
 
       S += (float)b1[k];
       S = activate(S, activation);

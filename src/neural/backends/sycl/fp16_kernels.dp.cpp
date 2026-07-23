@@ -514,9 +514,9 @@ void OutputInputTransformKernel_fp16_shmem_board(
   float avg = S / 64;
   shared_data[k] = avg;
 
-    int sg_size = item_ct1.get_sub_group().get_max_local_range()[0];
-    int lane = k % sg_size;
-  int warp = k >> 5;
+    int sg_size = item_ct1.get_sub_group().get_local_linear_range();
+    int lane = item_ct1.get_sub_group().get_local_linear_id();
+  int warp = item_ct1.get_sub_group().get_group_linear_id();
   item_ct1.barrier(sycl::access::fence_space::local_space);
 
   // First fully-connected layer for SE
@@ -534,7 +534,7 @@ void OutputInputTransformKernel_fp16_shmem_board(
   item_ct1.barrier(sycl::access::fence_space::local_space);
   if (k < se_K) {
     S = 0;
-    for (int i = 0; i < C / 32; i++) S += shared_sums[i][k];
+    for (int i = 0; i < item_ct1.get_sub_group().get_group_linear_range(); i++) S += shared_sums[i][k];
 
     S += (float)b1[k];
     S = activate(S, activation);
@@ -728,7 +728,7 @@ void OutputInputTransform(int N, int C, int se_K, T* output, const T* input,
           comments, if it is correct.
           */
           sycl::local_accessor<float, 2> shared_sums_acc_ct1(
-              sycl::range<2>(16 /*kMaxResBlockFusingSeKFp16Ampere / 32*/,
+              sycl::range<2>(64 /*kMaxResBlockFusingSeKFp16Ampere / 8*/,
                              128 /*kMaxResBlockFusingSeK*/),
               cgh);
 
@@ -779,7 +779,7 @@ void OutputInputTransform(int N, int C, int se_K, T* output, const T* input,
       comments, if it is correct.
       */
       sycl::local_accessor<float, 2> shared_sums_acc_ct1(
-          sycl::range<2>(12 /*kMaxResBlockFusingChannels / 32*/,
+          sycl::range<2>(48 /*kMaxResBlockFusingChannels / 8*/,
                          128 /*kMaxResBlockFusingSeK*/),
           cgh);
 

@@ -1045,8 +1045,8 @@ void OutputInputTransform(int N, int C, int se_K, T* output, const T* input,
       comments, if it is correct.
       */
       sycl::local_accessor<float, 2> shared_sums_acc_ct1(
-          sycl::range<2>(12 /*kMaxResBlockFusingChannels / 32*/,
-                         128 /*kMaxResBlockFusingSeK*/),
+          sycl::range<2>(48 /*kMaxResBlockFusingChannels / 8*/,
+                         se_K /*kMaxResBlockFusingSeK*/),
           cgh);
 
       cgh.parallel_for(
