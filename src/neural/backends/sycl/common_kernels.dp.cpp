@@ -823,28 +823,33 @@ void globalScale_kernel_fp16_nhwc(sycl::half* output, const sycl::half* input,
 // Each thread writes a single output.
 void globalAvgPool_kernel_NHWC_fp16(sycl::half* output, const sycl::half* input,
                                     const sycl::half* prevLayerBias,
-                                    int inputSize, int outputSize,
-                                    const sycl::nd_item<3>& item_ct1) {
+                                    int outputSize, int C,
+                                    const sycl::nd_item<1>& item_ct1) {
+  int global_id = item_ct1.get_global_id(0);
+  if (global_id >= outputSize) return;
+
+  int batch_idx = global_id / C;
+  int c_idx = global_id % C;
+
   const int elementsPerThread = 64;  // 8x8 board.
 
-  int blockStart = item_ct1.get_group(2) * item_ct1.get_local_range(2);
+  int blockStart = batch_idx * C;
 
   float S = 0;
 
 #pragma unroll
   for (int i = 0; i < elementsPerThread; i++) {
-    int localIndex = i * item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
+    int localIndex = i * C + c_idx;
     int inputIndex = blockStart * elementsPerThread + localIndex;
-    if (inputIndex < inputSize) S += (float)(input[inputIndex]);
+    S += (float)(input[inputIndex]);
   }
 
   float avg = S / elementsPerThread;
 
   // Add bias from previous layer.
-  if (prevLayerBias) avg += (float)(prevLayerBias[item_ct1.get_local_id(2)]);
+  if (prevLayerBias) avg += (float)(prevLayerBias[c_idx]);
 
-  int opIndex = blockStart + item_ct1.get_local_id(2);
-  if (opIndex < outputSize) output[opIndex] = (sycl::half)avg;
+  output[global_id] = (sycl::half)avg;
 }
 
 // Sub-group size agnostic globalAvgPool kernel for NCHW layout.
@@ -894,15 +899,17 @@ void globalAvgPool(int N, int C, T* output, const T* input,
   const bool fp16 = std::is_same<sycl::half, T>::value;
   if (nhwc) {
     assert(fp16);
-    // For NHWC fp16, simply launch N blocks, each with C threads.
+    // For NHWC fp16, launch a 1D grid with N * C threads to process each channel independently.
+    int total_threads = N * C;
+    int local_size = 256;
+    int blocks = DivUp(total_threads, local_size);
     sycl_queue.parallel_for(
-        sycl::nd_range<3>(sycl::range<3>(1, 1, N) * sycl::range<3>(1, 1, C),
-                          sycl::range<3>(1, 1, C)),
-        [=](sycl::nd_item<3> item_ct1) {
+        sycl::nd_range<1>(sycl::range<1>(blocks * local_size), sycl::range<1>(local_size)),
+        [=](sycl::nd_item<1> item_ct1) {
           globalAvgPool_kernel_NHWC_fp16((sycl::half*)output,
                                          (sycl::half*)input,
                                          (sycl::half*)prevLayerBias,
-                                         N * C * kPlaneSize, N * C, item_ct1);
+                                         total_threads, C, item_ct1);
         });
   } else {
     // For NCHW layout (used with fp32),
@@ -1045,7 +1052,7 @@ void OutputInputTransform(int N, int C, int se_K, T* output, const T* input,
       comments, if it is correct.
       */
       sycl::local_accessor<float, 2> shared_sums_acc_ct1(
-          sycl::range<2>(48 /*kMaxResBlockFusingChannels / 8*/,
+          sycl::range<2>(kMaxResBlockFusingChannels / SYCL_SUB_GROUP_SIZE,
                          se_K /*kMaxResBlockFusingSeK*/),
           cgh);
 
@@ -1196,7 +1203,7 @@ void softmax_kernel(T* output, const T* input, const T* input2,
 template <typename T>
 void Softmax(int N, int C, T* output, const T* input, const T* input2, sycl::queue &sycl_queue) {
   if (C == 64) {
-    int sg_size = g_sycl_device_cache.sub_group_size;
+    int sg_size = GetSubGroupSize(sycl_queue);
     int size = N * (64 / sg_size) * sg_size;  // Total no of threads needed
     const int kBlockSize = 256;
     int blocks = DivUp(size, kBlockSize);
@@ -1216,7 +1223,7 @@ void Softmax(int N, int C, T* output, const T* input, const T* input2, sycl::que
     limit. To get the device limit, query info::device::max_work_group_size.
     Adjust the work-group size if needed.
     */
-    int sg_size = g_sycl_device_cache.sub_group_size;
+    int sg_size = GetSubGroupSize(sycl_queue);
     sycl_queue.submit([&](sycl::handler& cgh) {
       sycl::local_accessor<float, 0> sum_acc_ct1(cgh);
       sycl::local_accessor<float, 0> maxval_acc_ct1(cgh);
@@ -1234,60 +1241,54 @@ void Softmax(int N, int C, T* output, const T* input, const T* input2, sycl::que
 
 [[gnu::always_inline]]
 inline float shared_sum_for_layer_norm(
-    float x, const sycl::nd_item<3>& item_ct1,
-    sycl::local_accessor<float, 2> sum) {
-  // compute warp-wide sum
+    float x, const sycl::nd_item<1>& item_ct1,
+    sycl::local_accessor<float, 1> sum) {
+  auto sg = item_ct1.get_sub_group();
   float s = warpReduce(x, item_ct1);
 
-  // warp-wide sums
-  // Max product of the two dimension for the below array is 16 (512/32), but
-  // we make each dimension 16 for simplicity. if shared memory capacity is the
-  // bottleneck (it's not), we can convert these to single dim array and
-  // dynamically index
-
-  // compute sum across C dimension using the warp wide partial sums
-  if (item_ct1.get_local_id(2) == 0)
-      sum[item_ct1.get_local_id(0)][item_ct1.get_local_id(1)] = s;
-  
-  item_ct1.barrier(sycl::access::fence_space::local_space);
-
-  if (item_ct1.get_local_id(2) == 0 && item_ct1.get_local_id(1) == 0) {
-    float cSum = 0;
-    for (int j = 0; j < item_ct1.get_local_range(1); j++) cSum +=
-        sum[item_ct1.get_local_id(0)][j];
-    sum[item_ct1.get_local_id(0)][0] = cSum;
+  if (sg.get_local_linear_id() == 0) {
+      sum[sg.get_group_linear_id()] = s;
   }
   
   item_ct1.barrier(sycl::access::fence_space::local_space);
 
-  // s now contains the sum across C dimension
-  return sum[item_ct1.get_local_id(0)][0];
+  if (item_ct1.get_local_linear_id() == 0) {
+    float cSum = 0;
+    for (uint32_t j = 0; j < sg.get_group_linear_range(); j++) cSum += sum[j];
+    sum[0] = cSum;
+  }
+  
+  item_ct1.barrier(sycl::access::fence_space::local_space);
+
+  float result = sum[0];
+  item_ct1.barrier(sycl::access::fence_space::local_space);
+
+  return result;
 }
 
-// Each thread processes 4 elements
 // 1. Perform Bias add, and skip add
 // 2. Perform layer norm (normalize across C dimension)
 template <typename T>
 void layer_norm_kernel(int N, int C, T* output, const T* input, const T* bias,
                        const T* skip, const T* gammas, const T* betas, float ep,
                        float alpha, ActivationFunction act,
-                       const sycl::nd_item<3>& item_ct1,
-                       sycl::local_accessor<float, 2> sum) {
-  int n = item_ct1.get_group(2) * item_ct1.get_local_range(0) +
-          item_ct1.get_local_id(0);
+                       const sycl::nd_item<1>& item_ct1,
+                       sycl::local_accessor<float, 1> sum) {
+  int n = item_ct1.get_group(0); // Batch index
   if (n >= N) return;
-  int c = (item_ct1.get_local_id(1) * 32 + item_ct1.get_local_id(2)) * 16;
-  bool oobThread = c >= C;
-
-  int biasIndex = c;
-  int tensorIndex = n * C + c;
-
-  float val[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-  float oth[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  int local_id = item_ct1.get_local_id(0);
+  int local_range = item_ct1.get_local_range(0);
 
   const bool fp16 = std::is_same<sycl::half, T>::value;
-  if (!oobThread) {
-    // Load from memory (16 elements a time)
+
+  // 1. Compute mean
+  float s = 0;
+  for (int c = local_id * 16; c < C; c += local_range * 16) {
+    int tensorIndex = n * C + c;
+    int biasIndex = c;
+    float val[16] = {0};
+    float oth[16] = {0};
+
     if (fp16) {
       sycl::half inp[8];
       copyAs<sycl::uint4>(&inp[0], &input[tensorIndex]);
@@ -1310,11 +1311,8 @@ void layer_norm_kernel(int N, int C, T* output, const T* input, const T* bias,
       copyAs<sycl::uint4>(&oth[12], &bias[biasIndex + 12]);
       for (int i = 0; i < 16; i++) val[i] += oth[i];
     }
-  }
 
-  if (!oobThread) {
     if (skip != nullptr) {
-      // Load from memory (16 elements a time)
       if (fp16) {
         sycl::half inp[8];
         copyAs<sycl::uint4>(&inp[0], &skip[tensorIndex]);
@@ -1328,11 +1326,7 @@ void layer_norm_kernel(int N, int C, T* output, const T* input, const T* bias,
         copyAs<sycl::uint4>(&oth[12], &skip[tensorIndex + 12]);
       }
     }
-  }
 
-  // 1. Compute mean
-  float s = 0;
-  if (!oobThread)
     if (skip != nullptr) {
       for (int i = 0; i < 16; i++) {
         val[i] = activate(val[i], act) * alpha + oth[i];
@@ -1344,23 +1338,132 @@ void layer_norm_kernel(int N, int C, T* output, const T* input, const T* bias,
         s += val[i];
       }
     }
+  }
 
   s = shared_sum_for_layer_norm(s, item_ct1, sum);
   float mean = s / C;
 
-  // 2. Compute varience
+  // 2. Compute variance
   s = 0;
-  if (!oobThread)
+  for (int c = local_id * 16; c < C; c += local_range * 16) {
+    int tensorIndex = n * C + c;
+    int biasIndex = c;
+    float val[16] = {0};
+    float oth[16] = {0};
+
+    if (fp16) {
+      sycl::half inp[8];
+      copyAs<sycl::uint4>(&inp[0], &input[tensorIndex]);
+      for (int i = 0; i < 8; i++) val[i] = (float)inp[i];
+      copyAs<sycl::uint4>(&inp[0], &input[tensorIndex + 8]);
+      for (int i = 0; i < 8; i++) val[i + 8] = (float)inp[i];
+      copyAs<sycl::uint4>(&inp[0], &bias[biasIndex]);
+      for (int i = 0; i < 8; i++) oth[i] = (float)inp[i];
+      copyAs<sycl::uint4>(&inp[0], &bias[biasIndex + 8]);
+      for (int i = 0; i < 8; i++) oth[i + 8] = (float)inp[i];
+      for (int i = 0; i < 16; i++) val[i] += oth[i];
+    } else {
+      copyAs<sycl::uint4>(&val[0], &input[tensorIndex]);
+      copyAs<sycl::uint4>(&val[4], &input[tensorIndex + 4]);
+      copyAs<sycl::uint4>(&val[8], &input[tensorIndex + 8]);
+      copyAs<sycl::uint4>(&val[12], &input[tensorIndex + 12]);
+      copyAs<sycl::uint4>(&oth[0], &bias[biasIndex]);
+      copyAs<sycl::uint4>(&oth[4], &bias[biasIndex + 4]);
+      copyAs<sycl::uint4>(&oth[8], &bias[biasIndex + 8]);
+      copyAs<sycl::uint4>(&oth[12], &bias[biasIndex + 12]);
+      for (int i = 0; i < 16; i++) val[i] += oth[i];
+    }
+
+    if (skip != nullptr) {
+      if (fp16) {
+        sycl::half inp[8];
+        copyAs<sycl::uint4>(&inp[0], &skip[tensorIndex]);
+        for (int i = 0; i < 8; i++) oth[i] = (float)inp[i];
+        copyAs<sycl::uint4>(&inp[0], &skip[tensorIndex + 8]);
+        for (int i = 0; i < 8; i++) oth[i + 8] = (float)inp[i];
+      } else {
+        copyAs<sycl::uint4>(&oth[0], &skip[tensorIndex]);
+        copyAs<sycl::uint4>(&oth[4], &skip[tensorIndex + 4]);
+        copyAs<sycl::uint4>(&oth[8], &skip[tensorIndex + 8]);
+        copyAs<sycl::uint4>(&oth[12], &skip[tensorIndex + 12]);
+      }
+    }
+
+    if (skip != nullptr) {
+      for (int i = 0; i < 16; i++) {
+        val[i] = activate(val[i], act) * alpha + oth[i];
+      }
+    } else {
+      for (int i = 0; i < 16; i++) {
+        val[i] = activate(val[i], act) * alpha;
+      }
+    }
+
     for (int i = 0; i < 16; i++) {
       float d = val[i] - mean;
       float d_sq = d * d;
       s += d_sq;
     }
+  }
+
   s = shared_sum_for_layer_norm(s, item_ct1, sum);
   float var = s / C;
 
-  if (!oobThread) {
-    // Load from memory (16 elements a time)
+  // 3. Normalize
+  for (int c = local_id * 16; c < C; c += local_range * 16) {
+    int tensorIndex = n * C + c;
+    int biasIndex = c;
+    float val[16] = {0};
+    float oth[16] = {0};
+
+    if (fp16) {
+      sycl::half inp[8];
+      copyAs<sycl::uint4>(&inp[0], &input[tensorIndex]);
+      for (int i = 0; i < 8; i++) val[i] = (float)inp[i];
+      copyAs<sycl::uint4>(&inp[0], &input[tensorIndex + 8]);
+      for (int i = 0; i < 8; i++) val[i + 8] = (float)inp[i];
+      copyAs<sycl::uint4>(&inp[0], &bias[biasIndex]);
+      for (int i = 0; i < 8; i++) oth[i] = (float)inp[i];
+      copyAs<sycl::uint4>(&inp[0], &bias[biasIndex + 8]);
+      for (int i = 0; i < 8; i++) oth[i + 8] = (float)inp[i];
+      for (int i = 0; i < 16; i++) val[i] += oth[i];
+    } else {
+      copyAs<sycl::uint4>(&val[0], &input[tensorIndex]);
+      copyAs<sycl::uint4>(&val[4], &input[tensorIndex + 4]);
+      copyAs<sycl::uint4>(&val[8], &input[tensorIndex + 8]);
+      copyAs<sycl::uint4>(&val[12], &input[tensorIndex + 12]);
+      copyAs<sycl::uint4>(&oth[0], &bias[biasIndex]);
+      copyAs<sycl::uint4>(&oth[4], &bias[biasIndex + 4]);
+      copyAs<sycl::uint4>(&oth[8], &bias[biasIndex + 8]);
+      copyAs<sycl::uint4>(&oth[12], &bias[biasIndex + 12]);
+      for (int i = 0; i < 16; i++) val[i] += oth[i];
+    }
+
+    if (skip != nullptr) {
+      if (fp16) {
+        sycl::half inp[8];
+        copyAs<sycl::uint4>(&inp[0], &skip[tensorIndex]);
+        for (int i = 0; i < 8; i++) oth[i] = (float)inp[i];
+        copyAs<sycl::uint4>(&inp[0], &skip[tensorIndex + 8]);
+        for (int i = 0; i < 8; i++) oth[i + 8] = (float)inp[i];
+      } else {
+        copyAs<sycl::uint4>(&oth[0], &skip[tensorIndex]);
+        copyAs<sycl::uint4>(&oth[4], &skip[tensorIndex + 4]);
+        copyAs<sycl::uint4>(&oth[8], &skip[tensorIndex + 8]);
+        copyAs<sycl::uint4>(&oth[12], &skip[tensorIndex + 12]);
+      }
+    }
+
+    if (skip != nullptr) {
+      for (int i = 0; i < 16; i++) {
+        val[i] = activate(val[i], act) * alpha + oth[i];
+      }
+    } else {
+      for (int i = 0; i < 16; i++) {
+        val[i] = activate(val[i], act) * alpha;
+      }
+    }
+
     if (fp16) {
       sycl::half inp[8];
       copyAs<sycl::uint4>(&inp[0], &gammas[biasIndex]);
@@ -1373,18 +1476,14 @@ void layer_norm_kernel(int N, int C, T* output, const T* input, const T* bias,
       copyAs<sycl::uint4>(&oth[8], &gammas[biasIndex + 8]);
       copyAs<sycl::uint4>(&oth[12], &gammas[biasIndex + 12]);
     }
-  }
 
-  // 3. Normalize
-  for (int i = 0; i < 16; i++) {
-    float d = val[i] - mean;
-    float norm = d / sycl::sqrt(var + ep);
-    float op = norm * oth[i];
-    val[i] = op;
-  }
+    for (int i = 0; i < 16; i++) {
+      float d = val[i] - mean;
+      float norm = d / sycl::sqrt(var + ep);
+      float op = norm * oth[i];
+      val[i] = op;
+    }
 
-  if (!oobThread) {
-    // Load from memory (16 elements a time)
     if (fp16) {
       sycl::half inp[8];
       copyAs<sycl::uint4>(&inp[0], &betas[biasIndex]);
@@ -1397,14 +1496,11 @@ void layer_norm_kernel(int N, int C, T* output, const T* input, const T* bias,
       copyAs<sycl::uint4>(&oth[8], &betas[biasIndex + 8]);
       copyAs<sycl::uint4>(&oth[12], &betas[biasIndex + 12]);
     }
-  }
 
-  for (int i = 0; i < 16; i++) {
-    val[i] += oth[i];
-  }
+    for (int i = 0; i < 16; i++) {
+      val[i] += oth[i];
+    }
 
-  if (!oobThread) {
-    // Write to memory
     if (fp16) {
       sycl::half op[8];
       for (int i = 0; i < 8; i++) op[i] = (sycl::half)val[i];
@@ -1431,32 +1527,22 @@ void LayerNorm(int N, int C, T* output, const T* input, const T* bias,
   if (C % 16 != 0) throw Exception("unsupported filter size");
   if (C > 8192) throw Exception("unsupported filter size");
 
-  sycl::range<3> blockDim(1, 1, 1), gridDim(1, 1, 1);
-  blockDim[2] = 32;
-  blockDim[1] = DivUp(C / 16, 32);
-  blockDim[0] = 1;
-  gridDim[2] = N;
-  gridDim[1] = 1;
-  gridDim[0] = 1;
+  // Max 256 threads per batch to respect max_work_group_size on most Intel devices.
+  int threads_per_batch = std::min(C / 16, 256);
+  sycl::range<1> blockDim(threads_per_batch);
+  sycl::range<1> gridDim(N * threads_per_batch);
 
-  /*
-  DPCT1049:17: The work-group size passed to the SYCL kernel may exceed the
-  limit. To get the device limit, query info::device::max_work_group_size.
-  Adjust the work-group size if needed.
-  */
-  {
-    
-    sycl_queue.submit([&](sycl::handler& cgh) {
-      sycl::local_accessor<float, 2> sum_acc_ct1(sycl::range<2>(16, 16), cgh);
+  sycl_queue.submit([&](sycl::handler& cgh) {
+    // Need enough space for max subgroups (256 / 8 = 32 max subgroups)
+    sycl::local_accessor<float, 1> sum_acc_ct1(sycl::range<1>(64), cgh);
 
-      cgh.parallel_for(
-          sycl::nd_range<3>(gridDim * blockDim, blockDim),
-          [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(SYCL_SUB_GROUP_SIZE)]] {
-            layer_norm_kernel<T>(N, C, output, input, bias, skip, gammas, betas,
-                                 ep, alpha, act, item_ct1, sum_acc_ct1);
-          });
-    });
-  }
+    cgh.parallel_for(
+        sycl::nd_range<1>(gridDim, blockDim),
+        [=](sycl::nd_item<1> item_ct1) [[intel::reqd_sub_group_size(SYCL_SUB_GROUP_SIZE)]] {
+          layer_norm_kernel<T>(N, C, output, input, bias, skip, gammas, betas,
+                               ep, alpha, act, item_ct1, sum_acc_ct1);
+        });
+  });
 }
 
 // Compute promotion logits in a single kernel

@@ -728,7 +728,7 @@ void OutputInputTransform(int N, int C, int se_K, T* output, const T* input,
           comments, if it is correct.
           */
           sycl::local_accessor<float, 2> shared_sums_acc_ct1(
-              sycl::range<2>(64 /*kMaxResBlockFusingSeKFp16Ampere / 8*/,
+              sycl::range<2>(kMaxResBlockFusingSeKFp16Ampere / SYCL_SUB_GROUP_SIZE,
                              128 /*kMaxResBlockFusingSeK*/),
               cgh);
 
@@ -779,7 +779,7 @@ void OutputInputTransform(int N, int C, int se_K, T* output, const T* input,
       comments, if it is correct.
       */
       sycl::local_accessor<float, 2> shared_sums_acc_ct1(
-          sycl::range<2>(48 /*kMaxResBlockFusingChannels / 8*/,
+          sycl::range<2>(kMaxResBlockFusingChannels / SYCL_SUB_GROUP_SIZE,
                          128 /*kMaxResBlockFusingSeK*/),
           cgh);
 

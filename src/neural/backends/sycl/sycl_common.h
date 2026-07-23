@@ -21,6 +21,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <string>
 #include <sycl/sycl.hpp>
 
 #include "utils/exception.h"
@@ -58,10 +60,28 @@ void CublasError(int status, const char* file, const int& line);
 inline int DivUp(int a, int b) { return (a + b - 1) / b; }
 
 struct SyclDeviceCache {
-    int sub_group_size;
+  int sub_group_size = 32;
+  size_t max_work_group_size = 256;
+  size_t l2_cache_size = 0;
+  size_t local_mem_size = 0;
+  size_t max_mem_alloc_size = 0;
+  size_t global_mem_size = 0;
+  int max_compute_units = 1;
+  int max_clock_frequency = 0;
+  bool supports_fp16 = false;
+  bool is_gpu = false;
+  std::string device_name;
 };
 
-extern SyclDeviceCache g_sycl_device_cache;
+inline int GetSubGroupSize(const sycl::queue& q) {
+  auto sg_sizes = q.get_device().get_info<sycl::info::device::sub_group_sizes>();
+  if (std::find(sg_sizes.begin(), sg_sizes.end(), 32) != sg_sizes.end()) {
+    return 32;
+  } else if (!sg_sizes.empty()) {
+    return static_cast<int>(sg_sizes.back());
+  }
+  return 32;
+}
 
 }  // namespace sycldnn_backend
 }  // namespace lczero

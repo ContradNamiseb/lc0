@@ -445,14 +445,16 @@ void OutputTransform_kernel(int N, int C, int se_K, T* output,
 }
 
 // fast reduction for the warp
+template <int D>
 [[gnu::always_inline]]
-inline float warpReduce(float x, const sycl::nd_item<3>& item_ct1) {
+inline float warpReduce(float x, const sycl::nd_item<D>& item_ct1) {
   return sycl::reduce_over_group(item_ct1.get_sub_group(), x, sycl::plus<float>());
 }
 
 // fast max reduction for the warp
+template <int D>
 [[gnu::always_inline]]
-inline float warpMax(float x, const sycl::nd_item<3>& item_ct1) {
+inline float warpMax(float x, const sycl::nd_item<D>& item_ct1) {
   return sycl::reduce_over_group(item_ct1.get_sub_group(), x, sycl::maximum<float>());
 }
 

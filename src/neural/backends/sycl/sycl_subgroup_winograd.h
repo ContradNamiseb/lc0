@@ -1,12 +1,45 @@
 #pragma once
 
 #include <sycl/sycl.hpp>
+#include <cassert>
+#include <algorithm>
 #include "winograd_helper.h"
 #include "neural/backends/shared/activation.h"
 
 namespace lczero {
 namespace sycldnn_backend {
 
+/**
+ * @brief SYCL device kernel: fused Winograd output transform + SE block + input transform.
+ *
+ * Performs in a single kernel:
+ *   1. Inverse Winograd transform (6x6 tiles → 8x8 spatial board) per channel.
+ *   2. Squeeze-and-Excitation (SE) MLP: global avg pool → FC1(activation) → FC2 →
+ *      per-channel scale (sigmoid) and bias.
+ *   3. Optional skip connection addition (layout: NHCW).
+ *   4. Activation on the final output.
+ *   5. Forward Winograd input transform (8x8 → four 6x6 tiles) ready for the next conv.
+ *
+ * Thread mapping: one work-item per channel (k = local_id(2)), one work-group per sample (n = group(2)).
+ * Work-group size must equal C. shared_data[C] must be pre-allocated as local accessor by the caller.
+ *
+ * @tparam activation  Post-SE activation applied to each board element (ACTIVATION_RELU, ACTIVATION_MISH, etc.).
+ * @tparam use_bias    If true, the per-channel bias from @p bias is added before the SE global avg pool.
+ * @tparam use_skip    If true, the skip connection from @p skip (NHCW layout) is added and also updated in-place.
+ * @param  N           Batch size.
+ * @param  C           Number of channels. Must be <= device max_work_group_size.
+ * @param  se_K        SE bottleneck width (number of neurons in the SE FC layers).
+ * @param  output      [out] Winograd-transformed output tensor (TEMP_INDEX_HWNC layout).
+ * @param  input       [in]  Winograd-transformed input tensor (TEMP_INDEX_HWNC layout).
+ * @param  skip        [in/out] Spatial skip connection tensor (NHCW layout). Modified in-place if use_skip.
+ * @param  bias        [in]  Per-channel output bias (length C), or nullptr if !use_bias.
+ * @param  w1          [in]  SE FC1 weight matrix (se_K x C, transposed).
+ * @param  b1          [in]  SE FC1 bias vector (length se_K).
+ * @param  w2          [in]  SE FC2 weight matrix (2*C x se_K, transposed).
+ * @param  b2          [in]  SE FC2 bias vector (length 2*C; first C = scale bias, next C = additive bias).
+ * @param  item_ct1    SYCL nd_item for the 3D kernel.
+ * @param  shared_data Pointer to local memory of size C (channel averages for SE reduction).
+ */
 template <ActivationFunction activation, bool use_bias, bool use_skip>
 void OutputInputTransformKernel_SubGroup(
     int N, int C, int se_K, sycl::half* output, const sycl::half* input,
@@ -194,6 +227,29 @@ void OutputInputTransformKernel_SubGroup(
   }
 }
 
+/**
+ * @brief SYCL device kernel: fused Winograd output transform + SE block (output only, no input re-transform).
+ *
+ * Same as OutputInputTransformKernel_SubGroup but writes the final spatial result to @p output
+ * instead of re-applying the Winograd input transform. Used for the last residual block in the tower.
+ *
+ * @tparam activation      Post-SE activation (e.g., ACTIVATION_RELU, ACTIVATION_MISH).
+ * @tparam use_bias        If true, adds per-channel @p bias before SE global avg pool.
+ * @tparam use_skip        If true, adds skip connection from @p skip.
+ * @tparam skipInput_nhcw  Layout of the @p skip tensor: true = NHCW, false = NCHW.
+ * @tparam output_nhcw     Layout of the @p output tensor: true = NHCW, false = NCHW.
+ * @param  N      Batch size.
+ * @param  C      Number of channels. Must be <= device max_work_group_size.
+ * @param  se_K   SE bottleneck width.
+ * @param  output [out] Final spatial output tensor (NHCW or NCHW as per output_nhcw).
+ * @param  input  [in]  Winograd-transformed input tensor (TEMP_INDEX_HWNC layout).
+ * @param  skip   [in]  Skip connection tensor (layout per skipInput_nhcw).
+ * @param  bias   [in]  Per-channel bias (length C), or nullptr if !use_bias.
+ * @param  w1,b1  [in]  SE FC1 weights (se_K x C transposed) and biases (se_K).
+ * @param  w2,b2  [in]  SE FC2 weights (2*C x se_K transposed) and biases (2*C).
+ * @param  item_ct1   SYCL nd_item for the 3D kernel.
+ * @param  shared_data  Local memory pointer of size C for SE channel averages.
+ */
 template <ActivationFunction activation, bool use_bias, bool use_skip,
           bool skipInput_nhcw, bool output_nhcw>
 void OutputTransformKernel_SubGroup(
@@ -310,15 +366,33 @@ void OutputTransformKernel_SubGroup(
   }
 }
 
+/**
+ * @brief Submits the SubGroup fused output+SE+input transform kernel to a SYCL queue.
+ *
+ * Launches OutputInputTransformKernel_SubGroup with nd_range(N*C, C), one work-group per
+ * sample, C work-items per work-group. A local accessor of size C is allocated for SE reduction.
+ *
+ * @pre  C <= sycl_queue.get_device().get_info<sycl::info::device::max_work_group_size>()
+ * @param  N, C, se_K   Batch size, channel count, SE bottleneck width.
+ * @param  output       Winograd transform-domain output (TEMP_INDEX_HWNC).
+ * @param  input        Winograd transform-domain input (TEMP_INDEX_HWNC).
+ * @param  skip         Skip connection in NHCW layout (may be nullptr if !use_skip).
+ * @param  bias         Per-channel bias (length C; may be nullptr if !use_bias).
+ * @param  w1,b1        SE FC1 weights/biases.
+ * @param  w2,b2        SE FC2 weights/biases.
+ * @param  sycl_queue   Target in-order SYCL queue.
+ */
 template <ActivationFunction activation, bool use_bias, bool use_skip>
 void SubGroupOutputInputTransform(
     int N, int C, int se_K, sycl::half* output, const sycl::half* input,
     const sycl::half* skip, const sycl::half* bias, const sycl::half* w1,
     const sycl::half* b1, const sycl::half* w2, const sycl::half* b2,
     sycl::queue &sycl_queue) {
-  
+  assert(se_K <= C);
+  const int local_storage_size = std::max(C, se_K);
+
   sycl_queue.submit([&](sycl::handler& cgh) {
-    sycl::local_accessor<float, 1> shared_data_acc(sycl::range<1>(C), cgh);
+    sycl::local_accessor<float, 1> shared_data_acc(sycl::range<1>(local_storage_size), cgh);
 
     cgh.parallel_for(
         sycl::nd_range<3>(
@@ -333,6 +407,17 @@ void SubGroupOutputInputTransform(
   });
 }
 
+/**
+ * @brief Submits the SubGroup fused output transform + SE block kernel to a SYCL queue.
+ *
+ * Launches OutputTransformKernel_SubGroup — like SubGroupOutputInputTransform but writes
+ * the final spatial result directly to @p output without re-applying the input transform.
+ * Used for the last residual block in the tower.
+ *
+ * @tparam skipInput_nhcw  Layout of @p skip: true = NHCW (residual path), false = NCHW.
+ * @tparam output_nhcw     Layout of @p output: true = NHCW, false = NCHW.
+ * @pre  C <= sycl_queue.get_device().get_info<sycl::info::device::max_work_group_size>()
+ */
 template <ActivationFunction activation, bool use_bias, bool use_skip,
           bool skipInput_nhcw, bool output_nhcw>
 void SubGroupOutputTransform(
@@ -340,9 +425,11 @@ void SubGroupOutputTransform(
     const sycl::half* skip, const sycl::half* bias, const sycl::half* w1,
     const sycl::half* b1, const sycl::half* w2, const sycl::half* b2,
     sycl::queue &sycl_queue) {
-  
+  assert(se_K <= C);
+  const int local_storage_size = std::max(C, se_K);
+
   sycl_queue.submit([&](sycl::handler& cgh) {
-    sycl::local_accessor<float, 1> shared_data_acc(sycl::range<1>(C), cgh);
+    sycl::local_accessor<float, 1> shared_data_acc(sycl::range<1>(local_storage_size), cgh);
 
     cgh.parallel_for(
         sycl::nd_range<3>(

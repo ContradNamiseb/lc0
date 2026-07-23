@@ -95,6 +95,10 @@ static void syclGemm(sycl::queue& q, transpose_type transa, transpose_type trans
   bool transB = (transb == transpose_type_transpose);
 
   if (m <= 16) {
+    // Small-M path for Winograd input GEMMs (M = N_batch * 4 tiles, often <= 16).
+    // TN=32: covers one SIMD-32 lane group across the N dimension.
+    // TK=16: SLM tile depth balances reuse vs. SLM pressure; +1 padding on TileB
+    //        (allocated as [TK][TN+1]) avoids 4-byte bank conflicts on Intel EUs.
     constexpr int TN = 32;
     constexpr int TK = 16;
 
@@ -1565,10 +1569,6 @@ void FusedWinogradConvSELayer<DataType>::Eval(
     int N, DataType* output, const DataType* input, const DataType* input2,
     void* scratch, size_t scratch_size, sycl::queue &sycl_queue, DataType***) {
   
-  static std::atomic<int> print_count{0};
-  if (op_nhcw_ && print_count++ < 10) {
-      printf("=> [TRACE] FusedWinogradConvSELayer::Eval() is executing (fusing is active)!\n");
-  }
 
   // Split the scratch space into two parts - use first part for holding
   // transformed input and second part for transformed output.
@@ -1835,9 +1835,9 @@ Conv1Layer<DataType>::~Conv1Layer() {
 
 template <typename DataType>
 ResidualBlock<DataType>::ResidualBlock(BaseLayer<DataType>* ip, int C, bool se,
-                                       int se_k, bool first,
-                                       bool last, ActivationFunction activation,
-                                       int shared_mem_size, sycl::queue& sycl_queue)
+                                       int se_k, bool first, bool last,
+                                       ActivationFunction activation,
+                                       int shared_mem_size, size_t max_work_group_size, sycl::queue &sycl_queue)
     : BaseLayer<DataType>(C, 8, 8, ip, ip->isNHWC(), sycl_queue),
       has_se_(se),
       se_k_(se_k),
@@ -1845,6 +1845,7 @@ ResidualBlock<DataType>::ResidualBlock(BaseLayer<DataType>* ip, int C, bool se,
       first_block_(first),
       last_block_(last),
       shared_mem_size_(shared_mem_size),
+      max_wg_size_(max_work_group_size),
       act_(activation) {
 
   if (act_ != ACTIVATION_RELU && act_ != ACTIVATION_MISH) {
@@ -1993,7 +1994,7 @@ void ResidualBlock<DataType>::Eval(int N, DataType* output,
   }
 
   if (first_block_) {
-    InputTransform<DataType, true>(N, c_input_, transformed_input, input, sycl_queue_);
+    InputTransform<DataType, true>(N, c_input_, transformed_input, input, sycl_queue);
     BaseLayer<DataType>::cublasRowMajorMatrixMul(
         transformed_input, transformed_weights0_, transformed_output, N * 4, C,
         c_input_, 36, sycl_queue);
@@ -2021,21 +2022,30 @@ void ResidualBlock<DataType>::Eval(int N, DataType* output,
 
   const bool fp16 = std::is_same<sycl::half, DataType>::value;
   bool allowFusing =
-      (C <= kMaxResBlockFusingChannels) ||
-      (fp16 && (shared_mem_size_ >= kMaxResBlockFusingSeFp16AmpereSmem) &&
-       (C <= kMaxResBlockFusingSeKFp16Ampere));
+      ((C <= kMaxResBlockFusingChannels) ||
+       (fp16 && (shared_mem_size_ >= kMaxResBlockFusingSeFp16AmpereSmem) &&
+        (C <= kMaxResBlockFusingSeKFp16Ampere))) &&
+      (se_k_ <= C);
        
   if constexpr (std::is_same_v<DataType, sycl::half>) {
-      allowFusing = true;
+    // SubGroup kernels launch with work-group size = C. Verify that the device
+    // can support this before enabling fusing to avoid crashes or silent errors.
+    allowFusing = allowFusing && (static_cast<size_t>(C) <= max_wg_size_);
   }
 
   if (act_ == ACTIVATION_RELU) {
     if (last_block_) {
       if (has_se_) {
-        if constexpr (std::is_same_v<DataType, sycl::half>) {
-          SubGroupOutputTransform<ACTIVATION_RELU, true, true, true, false>(
-              N, C, se_k_, (sycl::half*)output, (const sycl::half*)transformed_output, (const sycl::half*)input,
-              (const sycl::half*)biases1_, (const sycl::half*)w1_, (const sycl::half*)b1_, (const sycl::half*)w2_, (const sycl::half*)b2_, sycl_queue);
+        if (allowFusing) {
+          if constexpr (std::is_same_v<DataType, sycl::half>) {
+            SubGroupOutputTransform<ACTIVATION_RELU, true, true, true, false>(
+                N, C, se_k_, (sycl::half*)output, (const sycl::half*)transformed_output, (const sycl::half*)input,
+                (const sycl::half*)biases1_, (const sycl::half*)w1_, (const sycl::half*)b1_, (const sycl::half*)w2_, (const sycl::half*)b2_, sycl_queue);
+          } else {
+            OutputTransform<DataType, true, ACTIVATION_RELU, true, true, true,
+                            false>(N, C, se_k_, output, transformed_output, input,
+                                   biases1_, w1_, b1_, w2_, b2_, sycl_queue);
+          }
         } else {
           OutputTransform<DataType, true, ACTIVATION_RELU, true, true, true,
                           false>(N, C, se_k_, output, transformed_output, input,
@@ -2073,10 +2083,16 @@ void ResidualBlock<DataType>::Eval(int N, DataType* output,
   } else if (act_ == ACTIVATION_MISH) {
     if (last_block_) {
       if (has_se_) {
-        if constexpr (std::is_same_v<DataType, sycl::half>) {
-          SubGroupOutputTransform<ACTIVATION_MISH, true, true, true, false>(
-              N, C, se_k_, (sycl::half*)output, (const sycl::half*)transformed_output, (const sycl::half*)input,
-              (const sycl::half*)biases1_, (const sycl::half*)w1_, (const sycl::half*)b1_, (const sycl::half*)w2_, (const sycl::half*)b2_, sycl_queue);
+        if (allowFusing) {
+          if constexpr (std::is_same_v<DataType, sycl::half>) {
+            SubGroupOutputTransform<ACTIVATION_MISH, true, true, true, false>(
+                N, C, se_k_, (sycl::half*)output, (const sycl::half*)transformed_output, (const sycl::half*)input,
+                (const sycl::half*)biases1_, (const sycl::half*)w1_, (const sycl::half*)b1_, (const sycl::half*)w2_, (const sycl::half*)b2_, sycl_queue);
+          } else {
+            OutputTransform<DataType, true, ACTIVATION_MISH, true, true, true,
+                            false>(N, C, se_k_, output, transformed_output, input,
+                                   biases1_, w1_, b1_, w2_, b2_, sycl_queue);
+          }
         } else {
           OutputTransform<DataType, true, ACTIVATION_MISH, true, true, true,
                           false>(N, C, se_k_, output, transformed_output, input,
@@ -3018,10 +3034,12 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
     embedding_ffn_size_ = weights.ip_emb_ffn.dense2_b.size();
     embedding_ffn_dff_ = weights.ip_emb_ffn.dense1_b.size();
   } else {
-    size_t size = 64 * kNumPosEncodingChannels * sizeof(float);
-    pos_encoding_ = (DataType *)sycl::malloc_device(size, sycl_queue_);
-    sycl_queue_.memcpy(scratch, kPosEncoding, size);
-    copyTypeConverted(pos_encoding_, (float*)scratch, size, sycl_queue_);
+    size_t element_count = 64 * kNumPosEncodingChannels;
+    size_t dest_byte_count = element_count * sizeof(DataType);
+    size_t float_byte_count = element_count * sizeof(float);
+    pos_encoding_ = (DataType *)sycl::malloc_device(dest_byte_count, sycl_queue_);
+    sycl_queue_.memcpy(scratch, kPosEncoding, float_byte_count);
+    copyTypeConverted(pos_encoding_, (float*)scratch, static_cast<int>(element_count), sycl_queue_);
   }
 
   if (has_gating_) {

@@ -47,7 +47,40 @@ namespace lczero {
 using namespace sycldnn_backend;
 
 namespace sycldnn_backend {
-SyclDeviceCache g_sycl_device_cache;
+
+SyclDeviceCache InitDeviceCache(const sycl::queue& q) {
+  SyclDeviceCache cache;
+  auto device = q.get_device();
+  auto sg_sizes = device.get_info<sycl::info::device::sub_group_sizes>();
+  if (std::find(sg_sizes.begin(), sg_sizes.end(), 32) != sg_sizes.end()) {
+    cache.sub_group_size = 32;
+  } else if (!sg_sizes.empty()) {
+    cache.sub_group_size = sg_sizes.back();
+  } else {
+    cache.sub_group_size = 32; // Default
+  }
+
+  cache.max_work_group_size =
+      device.get_info<sycl::info::device::max_work_group_size>();
+  cache.l2_cache_size =
+      device.get_info<sycl::info::device::global_mem_cache_size>();
+  cache.local_mem_size =
+      device.get_info<sycl::info::device::local_mem_size>();
+  cache.max_mem_alloc_size =
+      device.get_info<sycl::info::device::max_mem_alloc_size>();
+  cache.global_mem_size =
+      device.get_info<sycl::info::device::global_mem_size>();
+  cache.max_compute_units =
+      device.get_info<sycl::info::device::max_compute_units>();
+  cache.max_clock_frequency =
+      device.get_info<sycl::info::device::max_clock_frequency>();
+  cache.supports_fp16 = device.has(sycl::aspect::fp16);
+  cache.is_gpu = device.is_gpu();
+  cache.device_name =
+      device.get_info<sycl::info::device::name>();
+  
+  return cache;
+}
 }
 
 template <typename DataType>
@@ -220,11 +253,6 @@ class SyclNetwork : public Network {
     if (gpu_id_ >= (int)devices.size() || gpu_id_ < 0)
       throw Exception("Invalid GPU Id: " + std::to_string(gpu_id_));
 
-    // Is it a cpu device?
-    is_cpu_ = devices[gpu_id_].is_cpu();
-    // Get the number of compute units(execution units).
-    compute_units_ =
-        devices[gpu_id_].get_info<sycl::info::device::max_compute_units>();
     // Get context.
     sycl::context context{devices[gpu_id_]};
     auto exceptions_handler = [](sycl::exception_list exceptions) {
@@ -247,18 +275,8 @@ class SyclNetwork : public Network {
                         devices[gpu_id_], exceptions_handler,
                         sycl::property_list{sycl::property::queue::in_order{}});
 
+    device_cache_ = InitDeviceCache(*sycl_queue_);
     showDeviceInfo(*sycl_queue_);
-
-    auto sg_sizes = sycl_queue_->get_device().get_info<sycl::info::device::sub_group_sizes>();
-    g_sycl_device_cache.sub_group_size = 32; // Default
-    if (std::find(sg_sizes.begin(), sg_sizes.end(), 32) != sg_sizes.end()) {
-        g_sycl_device_cache.sub_group_size = 32;
-    } else if (!sg_sizes.empty()) {
-        g_sycl_device_cache.sub_group_size = sg_sizes.back();
-    }
-
-    l2_cache_size_ = sycl_queue_->get_device()
-                         .get_info<sycl::info::device::global_mem_cache_size>();
 
     allow_cache_opt_ = options.GetOrDefault<bool>("cache_opt", false);
 
@@ -273,7 +291,7 @@ class SyclNetwork : public Network {
     // sycl_queue_->get_device().get_device_info(deviceProp);
 
     if (fp16) {
-      if (!sycl_queue_->get_device().has(sycl::aspect::fp16)) {
+      if (!device_cache_.supports_fp16) {
         throw Exception("Requested fp16 is not supported by the device");
       }
       CERR << "Using Fp16 ";
@@ -300,9 +318,7 @@ class SyclNetwork : public Network {
         residual_single_layer_weight_size * numBlocks_ * 2;
     size_t transformed_residual_weight_size = residual_weight_size * 4;
 
-    size_t global_mem_size =
-        sycl_queue_->get_device()
-            .get_info<sycl::info::device::max_mem_alloc_size>();
+    size_t global_mem_size = device_cache_.max_mem_alloc_size;
 
     if (transformed_residual_weight_size > 0.4 * global_mem_size) {
       CERR << "WARNING: Low GPU video memory. You may run into OOM errors. Try "
@@ -397,7 +413,7 @@ class SyclNetwork : public Network {
           auto layer = std::make_unique<ResidualBlock<DataType>>(
               getLastLayer(), kNumFilters, has_se, se_k,
               block == 0, block == (numBlocks_ - 1), act,
-              l2_cache_size_, *sycl_queue_);
+              device_cache_.local_mem_size, device_cache_.max_work_group_size, *sycl_queue_);
           layer->LoadWeights0(&weights.residual[block].conv1.weights[0],
                               &weights.residual[block].conv1.biases[0],
                               scratch_mem_);
@@ -612,6 +628,8 @@ class SyclNetwork : public Network {
     std::unique_lock<std::mutex> guard(lock_, std::defer_lock);
     if (!multi_stream_) guard.lock();
 
+    try {
+
 #ifdef DEBUG_RAW_NPS
     auto t_start = std::chrono::high_resolution_clock::now();
 #endif
@@ -665,16 +683,15 @@ class SyclNetwork : public Network {
         use_res_block_winograd_fuse_opt_ ? tensor_mem[1] : tensor_mem[2];
 
     // #if DPCT_COMPAT_RT_VERSION >= 11000
-    const int pre_transform_tensor_size =
-        batchSize * numFilters_ * 8 * 8 * sizeof(DataType);
-    const int transformed_tensor_size = pre_transform_tensor_size * 36 / 16;
-    const int res_block_mem =
+    const size_t pre_transform_tensor_size =
+        static_cast<size_t>(batchSize) * numFilters_ * 8 * 8 * sizeof(DataType);
+    const size_t transformed_tensor_size = pre_transform_tensor_size * 36 / 16;
+    const size_t res_block_mem =
         transformed_tensor_size * 2 + pre_transform_tensor_size;
 
     if (allow_cache_opt_ && use_res_block_winograd_fuse_opt_ &&
-        (static_cast<size_t>(res_block_mem) <= scratch_size_) &&
-        (res_block_mem <= l2_cache_size_)) {
-      std::cout << "=> [TRACE] cache_opt logic triggered! (res_block_mem <= l2_cache_size_)" << std::endl;
+        (res_block_mem <= scratch_size_) &&
+        (res_block_mem <= device_cache_.l2_cache_size)) {
       enableCacheOpt = true;
       skip_connection =
           tensor_mem[2] + 2 * transformed_tensor_size / sizeof(DataType);
@@ -845,9 +862,9 @@ class SyclNetwork : public Network {
     }
 
 #ifndef USE_INTEL
-    event.wait();
+    event.wait_and_throw();
 #else
-    io_sycl_queue_.wait();
+    io_sycl_queue_.wait_and_throw();
 #endif
 
     if (wdl_) {
@@ -869,7 +886,12 @@ class SyclNetwork : public Network {
         io->op_value_mem_shared_[3 * i + 2] = l;
       }
     }
+    } catch (const sycl::exception& e) {
+      CERR << "SYCL exception in forwardEval: " << e.what();
+      throw;  // Re-throw so the caller can handle or terminate cleanly.
+    }
   }
+
 
   ~SyclNetwork() {
     if (!multi_stream_) {
@@ -885,16 +907,16 @@ class SyclNetwork : public Network {
   }
 
   // Check if device is the cpu for thread handling.
-  bool IsCpu() const override { return is_cpu_; }
+  bool IsCpu() const override { return !device_cache_.is_gpu; }
 
   int GetThreads() const override { return 1 + multi_stream_; }
 
   int GetMiniBatchSize() const override {
     // Default mini-batch size tuned for SYCL CPU host execution
     constexpr int kCpuDefaultMiniBatchSize = 47;
-    if (is_cpu_) return kCpuDefaultMiniBatchSize;
+    if (!device_cache_.is_gpu) return kCpuDefaultMiniBatchSize;
     // Simple heuristic that seems to work for a wide range of GPUs.
-    return 2 * compute_units_;
+    return 2 * device_cache_.max_compute_units;
   }
 
   std::unique_ptr<NetworkComputation> NewComputation() override {
@@ -925,9 +947,7 @@ class SyclNetwork : public Network {
  private:
   const NetworkCapabilities capabilities_;
   int gpu_id_;
-  int l2_cache_size_;
   int max_batch_size_;
-  int compute_units_;
   bool wdl_;
   bool moves_left_;
   bool use_res_block_winograd_fuse_opt_;  // fuse operations inside the residual
@@ -939,7 +959,7 @@ class SyclNetwork : public Network {
   // by allocating more memory).
   mutable std::mutex lock_;
   std::unique_ptr<sycl::queue> sycl_queue_;
-  bool is_cpu_;
+  SyclDeviceCache device_cache_;
 
   int numBlocks_;
   int numFilters_;
@@ -992,38 +1012,26 @@ class SyclNetwork : public Network {
   mutable std::mutex inputs_outputs_lock_;
   std::list<std::unique_ptr<InputsOutputs>> free_inputs_outputs_;
 
-  void showDeviceInfo(const sycl::queue& mqueue) const {
-    CERR << "Device-Info...";
+  void showDeviceInfo(const sycl::queue& mqueue) {
+    CERR << "Device-Info-Start...";
     CERR << "Platform: "
          << mqueue.get_device()
                 .get_platform()
                 .get_info<sycl::info::platform::name>()
          << " selected";
-    std::string device_type = mqueue.get_device().is_gpu() ? "GPU" : "CPU";
+    std::string device_type = device_cache_.is_gpu ? "GPU" : "CPU";
+    CERR << device_type << ": " << device_cache_.device_name;
     CERR << device_type << ": "
-         << mqueue.get_device().get_info<sycl::info::device::name>();
-    CERR << device_type << ": "
-         << mqueue.get_device()
-                    .get_info<sycl::info::device::max_mem_alloc_size>() /
-                (1024 * 1024)
+         << device_cache_.max_mem_alloc_size / (1024 * 1024)
          << " MB (max allocation)";
     CERR << device_type << " clock frequency: "
-         << mqueue.get_device()
-                .get_info<sycl::info::device::max_clock_frequency>()
-         << " MHz";
+         << device_cache_.max_clock_frequency << " MHz";
     CERR << "  Local memory capacity: "
-         << mqueue.get_device().get_info<sycl::info::device::local_mem_size>() /
-                1024
-         << " KB\n";
+         << device_cache_.local_mem_size / 1024 << " KB\n";
     CERR << "  Global mem cache capacity: "
-         << mqueue.get_device().get_info<sycl::info::device::global_mem_cache_size>() /
-                1024
-         << " KB\n";
-    CERR
-        << "Global memory size: "
-        << mqueue.get_device().get_info<sycl::info::device::global_mem_size>() /
-               (1024 * 1024)
-        << " MB";
+         << device_cache_.l2_cache_size / 1024 << " KB\n";
+    CERR << "Global memory size: "
+         << device_cache_.global_mem_size / (1024 * 1024) << " MB";
     CERR << "...Device-Info-End";
   }
 

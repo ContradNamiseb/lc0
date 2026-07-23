@@ -1,2 +1,4 @@
+@rem compile.bat.example — Copy to compile.bat and adjust the oneAPI path for your machine.
+@rem This file is intentionally NOT tracked by git as a working compile.bat.
 call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat"
 meson compile -C build
