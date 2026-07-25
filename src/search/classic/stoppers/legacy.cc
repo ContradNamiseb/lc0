@@ -27,6 +27,7 @@
 
 #include "search/classic/stoppers/legacy.h"
 
+#include <algorithm>
 #include <cmath>
 
 #include "search/classic/stoppers/stoppers.h"
@@ -56,14 +57,28 @@ namespace {
 
 class LegacyStopper : public TimeLimitStopper {
  public:
-  LegacyStopper(int64_t deadline_ms, int64_t* time_piggy_bank)
-      : TimeLimitStopper(deadline_ms), time_piggy_bank_(time_piggy_bank) {}
+  LegacyStopper(int64_t deadline_ms, int64_t* time_piggy_bank,
+                int64_t* total_nodes, int64_t* total_time_ms, float* last_nps)
+      : TimeLimitStopper(deadline_ms),
+        time_piggy_bank_(time_piggy_bank),
+        total_nodes_(total_nodes),
+        total_time_ms_(total_time_ms),
+        last_nps_(last_nps) {}
   virtual void OnSearchDone(const IterationStats& stats) override {
     *time_piggy_bank_ += GetTimeLimitMs() - stats.time_since_movestart;
+    if (stats.time_since_movestart > 0) {
+      *total_nodes_ += stats.nodes_since_movestart;
+      *total_time_ms_ += stats.time_since_movestart;
+      *last_nps_ = static_cast<float>(stats.nodes_since_movestart) * 1000.0f /
+                   stats.time_since_movestart;
+    }
   }
 
  private:
   int64_t* const time_piggy_bank_;
+  int64_t* const total_nodes_;
+  int64_t* const total_time_ms_;
+  float* const last_nps_;
 };
 
 class LegacyTimeManager : public TimeManager {
@@ -76,7 +91,9 @@ class LegacyTimeManager : public TimeManager {
         time_curve_steepness_(params.GetOrDefault<float>("steepness", 7.0f)),
         spend_saved_time_(params.GetOrDefault<float>("immediate-use", 1.0f)),
         first_move_bonus_(params.GetOrDefault<float>("first-move-bonus", 1.8f)),
-        book_ply_bonus_(params.GetOrDefault<float>("book-ply-bonus", 0.25f)) {}
+        book_ply_bonus_(params.GetOrDefault<float>("book-ply-bonus", 0.25f)),
+        nps_time_scaling_(
+            params.GetOrDefault<float>("nps-time-scaling", 15.0f)) {}
   std::unique_ptr<SearchStopper> GetStopper(const GoParams& params,
                                             const Position& position,
                                             size_t /*total_memory*/,
@@ -92,9 +109,13 @@ class LegacyTimeManager : public TimeManager {
   // When starting a game from a book, add bonus time per ply of the book.
   const float first_move_bonus_;
   const float book_ply_bonus_;
+  const float nps_time_scaling_;
   bool first_move_of_game_ = true;
   // No need to be atomic as only one thread will update it.
   int64_t time_spared_ms_ = 0;
+  int64_t total_nodes_ = 0;
+  int64_t total_time_ms_ = 0;
+  float last_nps_ = 0.0f;
 };
 
 std::unique_ptr<SearchStopper> LegacyTimeManager::GetStopper(
@@ -146,6 +167,55 @@ std::unique_ptr<SearchStopper> LegacyTimeManager::GetStopper(
     first_move_of_game_ = false;
   }
 
+  // Calculate average NPS and adjust move time based on the instantaneous NPS ratio.
+  // When search speed (NPS) rises above the running average, the search tree is traversing
+  // and resolving the current position efficiently, allowing us to safely conserve move time.
+  // Conversely, when NPS drops below average, the search is encountering complex lines or
+  // node resolution bottlenecks and requires additional thinking time for accurate evaluation.
+  if (total_time_ms_ > 0 && last_nps_ > 0.0f) {
+    const float nPs = last_nps_;
+    const float totalNodes = static_cast<float>(total_nodes_);
+    const float totalTime = static_cast<float>(total_time_ms_);
+
+    double alpha = 2.0 / (nPs + 1.0);
+    float average_nps =
+        alpha * nPs + (1.0f - alpha) * (totalNodes * 1e3f / totalTime);
+    if (average_nps > 0.0f) {
+      float nps_ratio = nPs / average_nps;
+      // Scale move time inversely proportional to search NPS ratio, clamped by configured percentage.
+      float max_scale = nps_time_scaling_ / 100.0f;
+      float min_factor = std::max(0.0f, 1.0f - max_scale);
+      float max_factor = 1.0f + max_scale;
+      float nps_factor = std::clamp(1.0f / nps_ratio, min_factor, max_factor);
+
+      float old_time = this_move_time;
+      this_move_time *= nps_factor;
+
+      if (std::abs(nps_factor - 1.0f) < 0.001f) {
+        LOGFILE << "NPS time adjustment: Current NPS (" << nPs
+                << ") vs average NPS (" << average_nps
+                << ") [ratio: " << nps_ratio
+                << "]. Move time unchanged (scaled by factor " << nps_factor
+                << ", move time: " << this_move_time << "ms).";
+      } else if (nps_factor < 1.0f) {
+        LOGFILE << "NPS time adjustment: Current NPS (" << nPs
+                << ") is higher than average NPS (" << average_nps
+                << ") [ratio: " << nps_ratio << ", factor: " << nps_factor
+                << "]. Decreased move time by " << (old_time - this_move_time)
+                << "ms (from " << old_time << "ms to " << this_move_time << "ms).";
+      } else {
+        LOGFILE << "NPS time adjustment: Current NPS (" << nPs
+                << ") is lower than average NPS (" << average_nps
+                << ") [ratio: " << nps_ratio << ", factor: " << nps_factor
+                << "]. Increased move time by " << (this_move_time - old_time)
+                << "ms (from " << old_time << "ms to " << this_move_time << "ms).";
+      }
+    }
+  } else {
+    LOGFILE << "NPS time adjustment: No previous search NPS history available yet. Move time unchanged ("
+            << this_move_time << "ms).";
+  }
+
   // Only extend thinking time with slowmover if smart pruning can potentially
   // reduce it.
   constexpr int kSmartPruningToleranceMs = 200;
@@ -166,7 +236,8 @@ std::unique_ptr<SearchStopper> LegacyTimeManager::GetStopper(
   // Make sure we don't exceed current time limit with what we calculated.
   auto deadline =
       std::min(static_cast<int64_t>(this_move_time), *time - move_overhead_);
-  return std::make_unique<LegacyStopper>(deadline, &time_spared_ms_);
+  return std::make_unique<LegacyStopper>(
+      deadline, &time_spared_ms_, &total_nodes_, &total_time_ms_, &last_nps_);
 }
 
 }  // namespace
