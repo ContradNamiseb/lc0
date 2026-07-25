@@ -471,7 +471,7 @@ void OutputInputTransformKernel_fp16_shmem_board(
   auto _sboard = (sycl::half*)dpct_local;
   sycl::half* shboard = &_sboard[k * 72];  // 72 instead of 64 to reduce shared
                                            // memory bank conflicts.
-  sycl::half b = bias[k];
+  sycl::half b = use_bias ? bias[k] : (sycl::half)0.0f;
 
 #pragma unroll
   for (int hStart = 0; hStart < 8; hStart += 4)

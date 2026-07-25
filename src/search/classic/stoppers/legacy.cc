@@ -167,22 +167,24 @@ std::unique_ptr<SearchStopper> LegacyTimeManager::GetStopper(
     first_move_of_game_ = false;
   }
 
-  // Calculate average NPS and adjust move time based on the instantaneous NPS ratio.
-  // When search speed (NPS) rises above the running average, the search tree is traversing
-  // and resolving the current position efficiently, allowing us to safely conserve move time.
-  // Conversely, when NPS drops below average, the search is encountering complex lines or
-  // node resolution bottlenecks and requires additional thinking time for accurate evaluation.
+  // Calculate average NPS and adjust move time based on the instantaneous NPS
+  // ratio. When search speed (NPS) rises above the running average, the search
+  // tree is traversing and resolving the current position efficiently, allowing
+  // us to safely conserve move time. Conversely, when NPS drops below average,
+  // the search is encountering complex lines or node resolution bottlenecks and
+  // requires additional thinking time for accurate evaluation.
   if (total_time_ms_ > 0 && last_nps_ > 0.0f) {
-    const float nPs = last_nps_;
+    const float nps = last_nps_;
     const float totalNodes = static_cast<float>(total_nodes_);
     const float totalTime = static_cast<float>(total_time_ms_);
 
-    double alpha = 2.0 / (nPs + 1.0);
+    double alpha = 2.0 / (nps + 1.0);
     float average_nps =
-        alpha * nPs + (1.0f - alpha) * (totalNodes * 1e3f / totalTime);
+        alpha * nps + (1.0f - alpha) * (totalNodes * 1e3f / totalTime);
     if (average_nps > 0.0f) {
-      float nps_ratio = nPs / average_nps;
-      // Scale move time inversely proportional to search NPS ratio, clamped by configured percentage.
+      float nps_ratio = nps / average_nps;
+      // Scale move time inversely proportional to search NPS ratio, clamped by
+      // configured percentage.
       float max_scale = nps_time_scaling_ / 100.0f;
       float min_factor = std::max(0.0f, 1.0f - max_scale);
       float max_factor = 1.0f + max_scale;
@@ -192,27 +194,30 @@ std::unique_ptr<SearchStopper> LegacyTimeManager::GetStopper(
       this_move_time *= nps_factor;
 
       if (std::abs(nps_factor - 1.0f) < 0.001f) {
-        LOGFILE << "NPS time adjustment: Current NPS (" << nPs
+        LOGFILE << "NPS time adjustment: Current NPS (" << nps
                 << ") vs average NPS (" << average_nps
                 << ") [ratio: " << nps_ratio
                 << "]. Move time unchanged (scaled by factor " << nps_factor
                 << ", move time: " << this_move_time << "ms).";
       } else if (nps_factor < 1.0f) {
-        LOGFILE << "NPS time adjustment: Current NPS (" << nPs
+        LOGFILE << "NPS time adjustment: Current NPS (" << nps
                 << ") is higher than average NPS (" << average_nps
                 << ") [ratio: " << nps_ratio << ", factor: " << nps_factor
                 << "]. Decreased move time by " << (old_time - this_move_time)
-                << "ms (from " << old_time << "ms to " << this_move_time << "ms).";
+                << "ms (from " << old_time << "ms to " << this_move_time
+                << "ms).";
       } else {
-        LOGFILE << "NPS time adjustment: Current NPS (" << nPs
+        LOGFILE << "NPS time adjustment: Current NPS (" << nps
                 << ") is lower than average NPS (" << average_nps
                 << ") [ratio: " << nps_ratio << ", factor: " << nps_factor
                 << "]. Increased move time by " << (this_move_time - old_time)
-                << "ms (from " << old_time << "ms to " << this_move_time << "ms).";
+                << "ms (from " << old_time << "ms to " << this_move_time
+                << "ms).";
       }
     }
   } else {
-    LOGFILE << "NPS time adjustment: No previous search NPS history available yet. Move time unchanged ("
+    LOGFILE << "NPS time adjustment: No previous search NPS history available "
+               "yet. Move time unchanged ("
             << this_move_time << "ms).";
   }
 

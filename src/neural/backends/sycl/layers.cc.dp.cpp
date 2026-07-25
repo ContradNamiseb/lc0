@@ -29,7 +29,6 @@
 
 #include "sycl_subgroup_winograd.h"
 
-
 #ifdef USE_HIPBLAS
 #include "cuBlasContext.h"
 #include "hipblas/hipblas.h"
@@ -1174,11 +1173,14 @@ void FCLayer<sycl::half>::Eval(int N, sycl::half* output_tensor,
     });
   });
 #else
-  syclGemm<sycl::half>(sycl_queue, transpose_type_transpose,
-                       transpose_type_notranspose, num_outputs, N, num_inputs,
-                       alpha, (const sycl::half*)weights_, num_inputs,
-                       (const sycl::half*)input_tensor, num_inputs, beta,
-                       (sycl::half*)output_tensor, num_outputs);
+  oneapi::mkl::blas::column_major::gemm(
+      sycl_queue, transpose_type_transpose, transpose_type_notranspose,
+      static_cast<std::int64_t>(num_outputs), static_cast<std::int64_t>(N),
+      static_cast<std::int64_t>(num_inputs), alpha,
+      ((const sycl::half*)weights_), static_cast<std::int64_t>(num_inputs),
+      ((const sycl::half*)input_tensor), static_cast<std::int64_t>(num_inputs),
+      beta, ((sycl::half*)output_tensor),
+      static_cast<std::int64_t>(num_outputs));
 #endif
 
   if (use_bias_ || (act_ != ACTIVATION_NONE)) {
@@ -1230,11 +1232,13 @@ void FCLayer<float>::Eval(int N, float* output_tensor,
     });
   });
 #else
-  syclGemm<float>(sycl_queue, transpose_type_transpose,
-                  transpose_type_notranspose, num_outputs, N, num_inputs, alpha,
-                  (const float*)weights_, num_inputs,
-                  (const float*)input_tensor, num_inputs, beta,
-                  (float*)output_tensor, num_outputs);
+  oneapi::mkl::blas::column_major::gemm(
+      sycl_queue, transpose_type_transpose, transpose_type_notranspose,
+      static_cast<std::int64_t>(num_outputs), static_cast<std::int64_t>(N),
+      static_cast<std::int64_t>(num_inputs), alpha, weights_,
+      static_cast<std::int64_t>(num_inputs), input_tensor,
+      static_cast<std::int64_t>(num_inputs), beta, output_tensor,
+      static_cast<std::int64_t>(num_outputs));
 #endif
 
   if (use_bias_ || (act_ != ACTIVATION_NONE)) {
@@ -2081,13 +2085,39 @@ void ResidualBlock<DataType>::Eval(int N, DataType* output,
   }
 
   if (act_ == ACTIVATION_RELU) {
-    OutputInputTransform<DataType, false, ACTIVATION_RELU, true, false>(
-        N, C, 0, transformed_input, transformed_output, nullptr, biases0_,
-        nullptr, nullptr, nullptr, nullptr, sycl_queue);
+    if constexpr (std::is_same_v<DataType, sycl::half>) {
+      if (static_cast<size_t>(C) <= max_wg_size_) {
+        SubGroupOutputInputTransform_NoSE<ACTIVATION_RELU, true, false>(
+            N, C, (sycl::half*)transformed_input,
+            (const sycl::half*)transformed_output, nullptr,
+            (const sycl::half*)biases0_, sycl_queue);
+      } else {
+        OutputInputTransform<DataType, false, ACTIVATION_RELU, true, false>(
+            N, C, 0, transformed_input, transformed_output, nullptr, biases0_,
+            nullptr, nullptr, nullptr, nullptr, sycl_queue);
+      }
+    } else {
+      OutputInputTransform<DataType, false, ACTIVATION_RELU, true, false>(
+          N, C, 0, transformed_input, transformed_output, nullptr, biases0_,
+          nullptr, nullptr, nullptr, nullptr, sycl_queue);
+    }
   } else if (act_ == ACTIVATION_MISH) {
-    OutputInputTransform<DataType, false, ACTIVATION_MISH, true, false>(
-        N, C, 0, transformed_input, transformed_output, nullptr, biases0_,
-        nullptr, nullptr, nullptr, nullptr, sycl_queue);
+    if constexpr (std::is_same_v<DataType, sycl::half>) {
+      if (static_cast<size_t>(C) <= max_wg_size_) {
+        SubGroupOutputInputTransform_NoSE<ACTIVATION_MISH, true, false>(
+            N, C, (sycl::half*)transformed_input,
+            (const sycl::half*)transformed_output, nullptr,
+            (const sycl::half*)biases0_, sycl_queue);
+      } else {
+        OutputInputTransform<DataType, false, ACTIVATION_MISH, true, false>(
+            N, C, 0, transformed_input, transformed_output, nullptr, biases0_,
+            nullptr, nullptr, nullptr, nullptr, sycl_queue);
+      }
+    } else {
+      OutputInputTransform<DataType, false, ACTIVATION_MISH, true, false>(
+          N, C, 0, transformed_input, transformed_output, nullptr, biases0_,
+          nullptr, nullptr, nullptr, nullptr, sycl_queue);
+    }
   }
   // "transformed_input" tensor now contains transformed input for the next
   // convolution
@@ -2137,10 +2167,27 @@ void ResidualBlock<DataType>::Eval(int N, DataType* output,
                           false>(N, C, se_k_, output, transformed_output, input,
                                  biases1_, w1_, b1_, w2_, b2_, sycl_queue);
         }
-      } else
-        OutputTransform<DataType, false, ACTIVATION_RELU, true, true, true,
-                        false>(N, C, se_k_, output, transformed_output, input,
-                               biases1_, w1_, b1_, w2_, b2_, sycl_queue);
+      } else {
+        if constexpr (std::is_same_v<DataType, sycl::half>) {
+          if (static_cast<size_t>(C) <= max_wg_size_) {
+            SubGroupOutputTransform_NoSE<ACTIVATION_RELU, true, true, true,
+                                        false>(
+                N, C, (sycl::half*)output,
+                (const sycl::half*)transformed_output,
+                (const sycl::half*)input, (const sycl::half*)biases1_,
+                sycl_queue);
+          } else {
+            OutputTransform<DataType, false, ACTIVATION_RELU, true, true, true,
+                            false>(N, C, se_k_, output, transformed_output,
+                                   input, biases1_, w1_, b1_, w2_, b2_,
+                                   sycl_queue);
+          }
+        } else {
+          OutputTransform<DataType, false, ACTIVATION_RELU, true, true, true,
+                          false>(N, C, se_k_, output, transformed_output, input,
+                                 biases1_, w1_, b1_, w2_, b2_, sycl_queue);
+        }
+      }
     } else {
       if (has_se_) {
         if (allowFusing) {
@@ -2164,10 +2211,25 @@ void ResidualBlock<DataType>::Eval(int N, DataType* output,
           InputTransform<DataType, true>(N, C, output, (DataType*)input,
                                          sycl_queue);
         }
-      } else
-        OutputInputTransform<DataType, false, ACTIVATION_RELU, true, true>(
-            N, C, se_k_, output, transformed_output, input, biases1_, w1_, b1_,
-            w2_, b2_, sycl_queue);
+      } else {
+        if constexpr (std::is_same_v<DataType, sycl::half>) {
+          if (static_cast<size_t>(C) <= max_wg_size_) {
+            SubGroupOutputInputTransform_NoSE<ACTIVATION_RELU, true, true>(
+                N, C, (sycl::half*)output,
+                (const sycl::half*)transformed_output,
+                (const sycl::half*)input, (const sycl::half*)biases1_,
+                sycl_queue);
+          } else {
+            OutputInputTransform<DataType, false, ACTIVATION_RELU, true, true>(
+                N, C, se_k_, output, transformed_output, input, biases1_, w1_,
+                b1_, w2_, b2_, sycl_queue);
+          }
+        } else {
+          OutputInputTransform<DataType, false, ACTIVATION_RELU, true, true>(
+              N, C, se_k_, output, transformed_output, input, biases1_, w1_,
+              b1_, w2_, b2_, sycl_queue);
+        }
+      }
     }
   } else if (act_ == ACTIVATION_MISH) {
     if (last_block_) {
@@ -2191,10 +2253,27 @@ void ResidualBlock<DataType>::Eval(int N, DataType* output,
                           false>(N, C, se_k_, output, transformed_output, input,
                                  biases1_, w1_, b1_, w2_, b2_, sycl_queue);
         }
-      } else
-        OutputTransform<DataType, false, ACTIVATION_MISH, true, true, true,
-                        false>(N, C, se_k_, output, transformed_output, input,
-                               biases1_, w1_, b1_, w2_, b2_, sycl_queue);
+      } else {
+        if constexpr (std::is_same_v<DataType, sycl::half>) {
+          if (static_cast<size_t>(C) <= max_wg_size_) {
+            SubGroupOutputTransform_NoSE<ACTIVATION_MISH, true, true, true,
+                                        false>(
+                N, C, (sycl::half*)output,
+                (const sycl::half*)transformed_output,
+                (const sycl::half*)input, (const sycl::half*)biases1_,
+                sycl_queue);
+          } else {
+            OutputTransform<DataType, false, ACTIVATION_MISH, true, true, true,
+                            false>(N, C, se_k_, output, transformed_output,
+                                   input, biases1_, w1_, b1_, w2_, b2_,
+                                   sycl_queue);
+          }
+        } else {
+          OutputTransform<DataType, false, ACTIVATION_MISH, true, true, true,
+                          false>(N, C, se_k_, output, transformed_output, input,
+                                 biases1_, w1_, b1_, w2_, b2_, sycl_queue);
+        }
+      }
     } else {
       if (has_se_) {
         if (allowFusing) {
@@ -2218,10 +2297,25 @@ void ResidualBlock<DataType>::Eval(int N, DataType* output,
           InputTransform<DataType, true>(N, C, output, (DataType*)input,
                                          sycl_queue);
         }
-      } else
-        OutputInputTransform<DataType, false, ACTIVATION_MISH, true, true>(
-            N, C, se_k_, output, transformed_output, input, biases1_, w1_, b1_,
-            w2_, b2_, sycl_queue);
+      } else {
+        if constexpr (std::is_same_v<DataType, sycl::half>) {
+          if (static_cast<size_t>(C) <= max_wg_size_) {
+            SubGroupOutputInputTransform_NoSE<ACTIVATION_MISH, true, true>(
+                N, C, (sycl::half*)output,
+                (const sycl::half*)transformed_output,
+                (const sycl::half*)input, (const sycl::half*)biases1_,
+                sycl_queue);
+          } else {
+            OutputInputTransform<DataType, false, ACTIVATION_MISH, true, true>(
+                N, C, se_k_, output, transformed_output, input, biases1_, w1_,
+                b1_, w2_, b2_, sycl_queue);
+          }
+        } else {
+          OutputInputTransform<DataType, false, ACTIVATION_MISH, true, true>(
+              N, C, se_k_, output, transformed_output, input, biases1_, w1_,
+              b1_, w2_, b2_, sycl_queue);
+        }
+      }
     }
   }
   // "output" tensor now contains transformed input for the next
@@ -2499,9 +2593,14 @@ static void cublasXgemm(transpose_type transa, transpose_type transb, int m,
     });
   }
 #else
-  syclGemm<DataType>(sycl_queue, transa, transb, m, n, k, alpha,
-                     (const DataType*)A, lda, (const DataType*)B, ldb, beta,
-                     (DataType*)C, ldc);
+  const DataType alpha_t = static_cast<DataType>(alpha);
+  const DataType beta_t = static_cast<DataType>(beta);
+  oneapi::mkl::blas::column_major::gemm(
+      sycl_queue, transa, transb, static_cast<std::int64_t>(m),
+      static_cast<std::int64_t>(n), static_cast<std::int64_t>(k), alpha_t,
+      (const DataType*)A, static_cast<std::int64_t>(lda), (const DataType*)B,
+      static_cast<std::int64_t>(ldb), beta_t, (DataType*)C,
+      static_cast<std::int64_t>(ldc));
 #endif
 }
 
@@ -2583,10 +2682,17 @@ static void cublasXGemmStridedBatched(
     });
   }
 #else
-  syclGemmStridedBatched<DataType>(sycl_queue, transa, transb, m, n, k, alpha,
-                                   (const DataType*)A, lda, strideA,
-                                   (const DataType*)B, ldb, strideB, beta,
-                                   (DataType*)C, ldc, strideC, batchCount);
+  const DataType alpha_t = static_cast<DataType>(alpha);
+  const DataType beta_t = static_cast<DataType>(beta);
+  oneapi::mkl::blas::column_major::gemm_batch(
+      sycl_queue, transa, transb, static_cast<std::int64_t>(m),
+      static_cast<std::int64_t>(n), static_cast<std::int64_t>(k), alpha_t,
+      static_cast<const DataType*>(A), static_cast<std::int64_t>(lda),
+      static_cast<std::int64_t>(strideA), static_cast<const DataType*>(B),
+      static_cast<std::int64_t>(ldb), static_cast<std::int64_t>(strideB),
+      beta_t, static_cast<DataType*>(C), static_cast<std::int64_t>(ldc),
+      static_cast<std::int64_t>(strideC),
+      static_cast<std::int64_t>(batchCount));
 #endif
 }
 
@@ -2670,19 +2776,14 @@ static void cublasXGemmBatched(transpose_type transa, transpose_type transb,
   }
 
 #else
-  if (fp16) {
-    unsigned short alpha_h = FP32toFP16(alpha);
-    unsigned short beta_h = FP32toFP16(beta);
-
-    syclGemmBatched<sycl::half>(sycl_queue, transa, transb, m, n, k, alpha,
-                                (sycl::half**)A, lda, (sycl::half**)B, ldb,
-                                beta, (sycl::half**)C, ldc, batchCount);
-  } else {
-    syclGemmBatched<float>(sycl_queue, transa, transb, m, n, k, alpha,
-                           (float**)A, lda, (float**)B, ldb, beta, (float**)C,
-                           ldc, batchCount);
-  }
-
+  const DataType alpha_t = static_cast<DataType>(alpha);
+  const DataType beta_t = static_cast<DataType>(beta);
+  oneapi::mkl::blas::column_major::gemm_batch(
+      sycl_queue, transa, transb, static_cast<std::int64_t>(m),
+      static_cast<std::int64_t>(n), static_cast<std::int64_t>(k), alpha_t,
+      const_cast<const DataType**>(A), static_cast<std::int64_t>(lda),
+      const_cast<const DataType**>(B), static_cast<std::int64_t>(ldb), beta_t,
+      C, static_cast<std::int64_t>(ldc), static_cast<std::int64_t>(batchCount));
 #endif
 }
 

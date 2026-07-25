@@ -308,7 +308,7 @@ void OutputTransform_kernel(int N, int C, int se_K, T* output,
   int n = item_ct1.get_group(2);
 
   T board[8][8];
-  T b = bias[k];
+  T b = use_bias ? bias[k] : (T)0.0f;
 
 #pragma unroll
   for (int hStart = 0; hStart < 8; hStart += 4)
@@ -491,7 +491,7 @@ void OutputTransform_SE_relu_InputTransform_kernel(
   int n = item_ct1.get_group(2);
 
   T board[8][8];
-  T b = bias[k];
+  T b = use_bias ? bias[k] : (T)0.0f;
 
 #pragma unroll
   for (int hStart = 0; hStart < 8; hStart += 4)
@@ -718,14 +718,16 @@ void OutputTransform_relu_InputTransform_kernel(
   int n = item_ct1.get_group(1);
 
   T board[8][8];
-  T b = bias[k];
+  T b = use_bias ? bias[k] : (T)0.0f;
 
   T skipInp[8][8];
+  if (use_skip) {
 #pragma unroll
-  for (int h = 0; h < 8; h++) {
-    copyAs<sycl::uint4>(&skipInp[h][0], &skip[INDEX_NHCW(n, k, h, 0)]);
-    if (!fp16)
-        copyAs<sycl::uint4>(&skipInp[h][4], &skip[INDEX_NHCW(n, k, h, 4)]);
+    for (int h = 0; h < 8; h++) {
+      copyAs<sycl::uint4>(&skipInp[h][0], &skip[INDEX_NHCW(n, k, h, 0)]);
+      if (!fp16)
+          copyAs<sycl::uint4>(&skipInp[h][4], &skip[INDEX_NHCW(n, k, h, 4)]);
+    }
   }
 
 #pragma unroll
