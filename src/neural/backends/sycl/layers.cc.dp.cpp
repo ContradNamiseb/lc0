@@ -2778,12 +2778,23 @@ static void cublasXGemmBatched(transpose_type transa, transpose_type transb,
 #else
   const DataType alpha_t = static_cast<DataType>(alpha);
   const DataType beta_t = static_cast<DataType>(beta);
+  oneapi::mkl::transpose transa_arr[1] = {transa};
+  oneapi::mkl::transpose transb_arr[1] = {transb};
+  std::int64_t m_arr[1] = {static_cast<std::int64_t>(m)};
+  std::int64_t n_arr[1] = {static_cast<std::int64_t>(n)};
+  std::int64_t k_arr[1] = {static_cast<std::int64_t>(k)};
+  DataType alpha_arr[1] = {alpha_t};
+  DataType beta_arr[1] = {beta_t};
+  std::int64_t lda_arr[1] = {static_cast<std::int64_t>(lda)};
+  std::int64_t ldb_arr[1] = {static_cast<std::int64_t>(ldb)};
+  std::int64_t ldc_arr[1] = {static_cast<std::int64_t>(ldc)};
+  std::int64_t group_size[1] = {static_cast<std::int64_t>(batchCount)};
+  std::int64_t group_count = 1;
+
   oneapi::mkl::blas::column_major::gemm_batch(
-      sycl_queue, transa, transb, static_cast<std::int64_t>(m),
-      static_cast<std::int64_t>(n), static_cast<std::int64_t>(k), alpha_t,
-      const_cast<const DataType**>(A), static_cast<std::int64_t>(lda),
-      const_cast<const DataType**>(B), static_cast<std::int64_t>(ldb), beta_t,
-      C, static_cast<std::int64_t>(ldc), static_cast<std::int64_t>(batchCount));
+      sycl_queue, transa_arr, transb_arr, m_arr, n_arr, k_arr, alpha_arr,
+      const_cast<const DataType**>(A), lda_arr, const_cast<const DataType**>(B),
+      ldb_arr, beta_arr, C, ldc_arr, group_count, group_size);
 #endif
 }
 
