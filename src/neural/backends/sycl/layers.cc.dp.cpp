@@ -15,60 +15,64 @@
 
   You should have received a copy of the GNU General Public License
   along with this program.  If not, see <https://www.gnu.org/licenses/>.
-   
+
   SPDX-License-Identifier:GNU General Public License v3.0 or later
 */
 
-#include <sycl/sycl.hpp>
 #include "layers.h"
-#include "sycl_subgroup_winograd.h"
 
+#include <atomic>
 #include <cassert>
 #include <cstring>
+#include <sycl/sycl.hpp>
 #include <vector>
-#include <atomic>
 
-#ifdef USE_HIPBLAS 
-#include "hipblas/hipblas.h"
+#include "sycl_subgroup_winograd.h"
+
+
+#ifdef USE_HIPBLAS
 #include "cuBlasContext.h"
+#include "hipblas/hipblas.h"
+
 #elif defined(USE_CUBLAS)
-#include <sycl/backend/cuda.hpp>
 #include <cublas_v2.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+
+#include <sycl/backend/cuda.hpp>
+
 #include "cuBlasContext.h"
+
 #else
 #include "oneapi/mkl.hpp"
 #include "oneapi/mkl/blas.hpp"
 #endif
 
-#include "sycl_common.h"
+#include <cmath>
+
 #include "kernels.h"
 #include "neural/network.h"
 #include "neural/tables/attention_policy_map.h"
+#include "sycl_common.h"
 #include "utils/fp16_utils.h"
-
-#include <cmath>
-
 
 #ifdef USE_HIPBLAS
 #if hipblasVersionMajor < 3
 #define HIPBLAS_COMPUTE_16F HIPBLAS_R_16F
 #define HIPBLAS_COMPUTE_32F HIPBLAS_R_32F
 #endif
-#define transpose_type hipblasOperation_t 
-#define transpose_type_transpose HIPBLAS_OP_T  
-#define transpose_type_notranspose HIPBLAS_OP_N 
+#define transpose_type hipblasOperation_t
+#define transpose_type_transpose HIPBLAS_OP_T
+#define transpose_type_notranspose HIPBLAS_OP_N
 #elif defined(USE_CUBLAS)
-#define transpose_type cublasOperation_t 
-#define transpose_type_transpose CUBLAS_OP_T  
-#define transpose_type_notranspose CUBLAS_OP_N 
+#define transpose_type cublasOperation_t
+#define transpose_type_transpose CUBLAS_OP_T
+#define transpose_type_notranspose CUBLAS_OP_N
 #else
-#define transpose_type oneapi::mkl::transpose 
+#define transpose_type oneapi::mkl::transpose
 #define transpose_type_transpose oneapi::mkl::transpose::trans
 #define transpose_type_notranspose oneapi::mkl::transpose::nontrans
 #endif
-
 
 namespace lczero {
 namespace sycldnn_backend {
@@ -79,26 +83,27 @@ namespace sycldnn_backend {
 static constexpr bool kUseFusedSELayer = true;
 
 // ============================================================================
-// High-Performance Adaptive Tiled SYCL GEMM helpers (Optimized for Intel iGPU EUs).
-// Dynamically adjusts tile_m (e.g. tile_m=4 for M<=4 Winograd GEMMs) to eliminate
-// idle EU threads, and uses padded Local Shared Memory [16][17] to prevent bank conflicts.
-// C = alpha * op(A) * op(B) + beta * C, column-major layout.
+// High-Performance Adaptive Tiled SYCL GEMM helpers (Optimized for Intel iGPU
+// EUs). Dynamically adjusts tile_m (e.g. tile_m=4 for M<=4 Winograd GEMMs) to
+// eliminate idle EU threads, and uses padded Local Shared Memory [16][17] to
+// prevent bank conflicts. C = alpha * op(A) * op(B) + beta * C, column-major
+// layout.
 // ============================================================================
 
 template <typename DataType>
-static void syclGemm(sycl::queue& q, transpose_type transa, transpose_type transb,
-                     int m, int n, int k, float alpha,
-                     const DataType* A, int lda,
-                     const DataType* B, int ldb,
+static void syclGemm(sycl::queue& q, transpose_type transa,
+                     transpose_type transb, int m, int n, int k, float alpha,
+                     const DataType* A, int lda, const DataType* B, int ldb,
                      float beta, DataType* C, int ldc) {
   bool transA = (transa == transpose_type_transpose);
   bool transB = (transb == transpose_type_transpose);
 
   if (m <= 16) {
-    // Small-M path for Winograd input GEMMs (M = N_batch * 4 tiles, often <= 16).
-    // TN=32: covers one SIMD-32 lane group across the N dimension.
-    // TK=16: SLM tile depth balances reuse vs. SLM pressure; +1 padding on TileB
-    //        (allocated as [TK][TN+1]) avoids 4-byte bank conflicts on Intel EUs.
+    // Small-M path for Winograd input GEMMs (M = N_batch * 4 tiles, often <=
+    // 16). TN=32: covers one SIMD-32 lane group across the N dimension. TK=16:
+    // SLM tile depth balances reuse vs. SLM pressure; +1 padding on TileB
+    //        (allocated as [TK][TN+1]) avoids 4-byte bank conflicts on Intel
+    //        EUs.
     constexpr int TN = 32;
     constexpr int TK = 16;
 
@@ -134,10 +139,11 @@ static void syclGemm(sycl::queue& q, transpose_type transa, transpose_type trans
                 }
                 int b_k = t * TK + b_r;
                 int b_n = col_base + b_c;
-                tileB[b_r][b_c] = (b_k < k && b_n < n)
-                    ? (transB ? static_cast<float>(B[b_k * ldb + b_n])
-                              : static_cast<float>(B[b_n * ldb + b_k]))
-                    : 0.0f;
+                tileB[b_r][b_c] =
+                    (b_k < k && b_n < n)
+                        ? (transB ? static_cast<float>(B[b_k * ldb + b_n])
+                                  : static_cast<float>(B[b_n * ldb + b_k]))
+                        : 0.0f;
               }
 
               item.barrier(sycl::access::fence_space::local_space);
@@ -146,10 +152,11 @@ static void syclGemm(sycl::queue& q, transpose_type transa, transpose_type trans
 #pragma unroll
               for (int p = 0; p < TK; ++p) {
                 int a_k = t * TK + p;
-                a_reg[p] = (row < m && a_k < k)
-                    ? (transA ? static_cast<float>(A[row * lda + a_k])
-                              : static_cast<float>(A[a_k * lda + row]))
-                    : 0.0f;
+                a_reg[p] =
+                    (row < m && a_k < k)
+                        ? (transA ? static_cast<float>(A[row * lda + a_k])
+                                  : static_cast<float>(A[a_k * lda + row]))
+                        : 0.0f;
               }
 
 #pragma unroll
@@ -169,8 +176,11 @@ static void syclGemm(sycl::queue& q, transpose_type transa, transpose_type trans
               for (int c = 0; c < 32; ++c) {
                 int c_idx = col_base + c;
                 if (c_idx < n) {
-                  float c_old = (beta != 0.0f) ? static_cast<float>(C[c_idx * ldc + row]) : 0.0f;
-                  C[c_idx * ldc + row] = static_cast<DataType>(alpha * sum[c] + beta * c_old);
+                  float c_old = (beta != 0.0f)
+                                    ? static_cast<float>(C[c_idx * ldc + row])
+                                    : 0.0f;
+                  C[c_idx * ldc + row] =
+                      static_cast<DataType>(alpha * sum[c] + beta * c_old);
                 }
               }
             }
@@ -181,8 +191,7 @@ static void syclGemm(sycl::queue& q, transpose_type transa, transpose_type trans
     constexpr int WN = 32;
     constexpr int WK = 16;
 
-    sycl::range<2> global_range((n + WN - 1) / WN * 16,
-                                (m + WM - 1) / WM * 4);
+    sycl::range<2> global_range((n + WN - 1) / WN * 16, (m + WM - 1) / WM * 4);
     sycl::range<2> local_range(16, 4);
 
     q.submit([&](sycl::handler& cgh) {
@@ -217,10 +226,11 @@ static void syclGemm(sycl::queue& q, transpose_type transa, transpose_type trans
                 }
                 int b_k = t * WK + b_r;
                 int b_n = col_base + b_c;
-                tileB[b_r][b_c] = (b_k < k && b_n < n)
-                    ? (transB ? static_cast<float>(B[b_k * ldb + b_n])
-                              : static_cast<float>(B[b_n * ldb + b_k]))
-                    : 0.0f;
+                tileB[b_r][b_c] =
+                    (b_k < k && b_n < n)
+                        ? (transB ? static_cast<float>(B[b_k * ldb + b_n])
+                                  : static_cast<float>(B[b_n * ldb + b_k]))
+                        : 0.0f;
               }
 
               item.barrier(sycl::access::fence_space::local_space);
@@ -229,10 +239,11 @@ static void syclGemm(sycl::queue& q, transpose_type transa, transpose_type trans
 #pragma unroll
               for (int p = 0; p < WK; ++p) {
                 int a_k = t * WK + p;
-                a_reg[p] = (row < m && a_k < k)
-                    ? (transA ? static_cast<float>(A[row * lda + a_k])
-                              : static_cast<float>(A[a_k * lda + row]))
-                    : 0.0f;
+                a_reg[p] =
+                    (row < m && a_k < k)
+                        ? (transA ? static_cast<float>(A[row * lda + a_k])
+                                  : static_cast<float>(A[a_k * lda + row]))
+                        : 0.0f;
               }
 
 #pragma unroll
@@ -252,8 +263,11 @@ static void syclGemm(sycl::queue& q, transpose_type transa, transpose_type trans
               for (int c = 0; c < 32; ++c) {
                 int c_idx = col_base + c;
                 if (c_idx < n) {
-                  float c_old = (beta != 0.0f) ? static_cast<float>(C[c_idx * ldc + row]) : 0.0f;
-                  C[c_idx * ldc + row] = static_cast<DataType>(alpha * sum[c] + beta * c_old);
+                  float c_old = (beta != 0.0f)
+                                    ? static_cast<float>(C[c_idx * ldc + row])
+                                    : 0.0f;
+                  C[c_idx * ldc + row] =
+                      static_cast<DataType>(alpha * sum[c] + beta * c_old);
                 }
               }
             }
@@ -263,13 +277,13 @@ static void syclGemm(sycl::queue& q, transpose_type transa, transpose_type trans
 }
 
 template <typename DataType>
-static void syclGemmStridedBatched(sycl::queue& q,
-    transpose_type transa, transpose_type transb,
-    int m, int n, int k, float alpha,
-    const DataType* A, int lda, long long int strideA,
-    const DataType* B, int ldb, long long int strideB,
-    float beta, DataType* C, int ldc, long long int strideC,
-    int batchCount) {
+static void syclGemmStridedBatched(sycl::queue& q, transpose_type transa,
+                                   transpose_type transb, int m, int n, int k,
+                                   float alpha, const DataType* A, int lda,
+                                   long long int strideA, const DataType* B,
+                                   int ldb, long long int strideB, float beta,
+                                   DataType* C, int ldc, long long int strideC,
+                                   int batchCount) {
   bool transA = (transa == transpose_type_transpose);
   bool transB = (transb == transpose_type_transpose);
 
@@ -277,9 +291,7 @@ static void syclGemmStridedBatched(sycl::queue& q,
     constexpr int TN = 32;
     constexpr int TK = 16;
 
-    sycl::range<3> global_range(batchCount,
-                                (n + TN - 1) / TN * 16,
-                                1);
+    sycl::range<3> global_range(batchCount, (n + TN - 1) / TN * 16, 1);
     sycl::range<3> local_range(1, 16, 1);
 
     q.submit([&](sycl::handler& cgh) {
@@ -316,10 +328,11 @@ static void syclGemmStridedBatched(sycl::queue& q,
                 }
                 int b_k = t * TK + b_r;
                 int b_n = col_base + b_c;
-                tileB[b_r][b_c] = (b_k < k && b_n < n)
-                    ? (transB ? static_cast<float>(Bb[b_k * ldb + b_n])
-                              : static_cast<float>(Bb[b_n * ldb + b_k]))
-                    : 0.0f;
+                tileB[b_r][b_c] =
+                    (b_k < k && b_n < n)
+                        ? (transB ? static_cast<float>(Bb[b_k * ldb + b_n])
+                                  : static_cast<float>(Bb[b_n * ldb + b_k]))
+                        : 0.0f;
               }
 
               item.barrier(sycl::access::fence_space::local_space);
@@ -328,10 +341,11 @@ static void syclGemmStridedBatched(sycl::queue& q,
 #pragma unroll
               for (int p = 0; p < TK; ++p) {
                 int a_k = t * TK + p;
-                a_reg[p] = (row < m && a_k < k)
-                    ? (transA ? static_cast<float>(Ab[row * lda + a_k])
-                              : static_cast<float>(Ab[a_k * lda + row]))
-                    : 0.0f;
+                a_reg[p] =
+                    (row < m && a_k < k)
+                        ? (transA ? static_cast<float>(Ab[row * lda + a_k])
+                                  : static_cast<float>(Ab[a_k * lda + row]))
+                        : 0.0f;
               }
 
 #pragma unroll
@@ -351,8 +365,11 @@ static void syclGemmStridedBatched(sycl::queue& q,
               for (int c = 0; c < 32; ++c) {
                 int c_idx = col_base + c;
                 if (c_idx < n) {
-                  float c_old = (beta != 0.0f) ? static_cast<float>(Cb[c_idx * ldc + row]) : 0.0f;
-                  Cb[c_idx * ldc + row] = static_cast<DataType>(alpha * sum[c] + beta * c_old);
+                  float c_old = (beta != 0.0f)
+                                    ? static_cast<float>(Cb[c_idx * ldc + row])
+                                    : 0.0f;
+                  Cb[c_idx * ldc + row] =
+                      static_cast<DataType>(alpha * sum[c] + beta * c_old);
                 }
               }
             }
@@ -363,8 +380,7 @@ static void syclGemmStridedBatched(sycl::queue& q,
     constexpr int WN = 32;
     constexpr int WK = 16;
 
-    sycl::range<3> global_range(batchCount,
-                                (n + WN - 1) / WN * 16,
+    sycl::range<3> global_range(batchCount, (n + WN - 1) / WN * 16,
                                 (m + WM - 1) / WM * 4);
     sycl::range<3> local_range(1, 16, 4);
 
@@ -405,10 +421,11 @@ static void syclGemmStridedBatched(sycl::queue& q,
                 }
                 int b_k = t * WK + b_r;
                 int b_n = col_base + b_c;
-                tileB[b_r][b_c] = (b_k < k && b_n < n)
-                    ? (transB ? static_cast<float>(Bb[b_k * ldb + b_n])
-                              : static_cast<float>(Bb[b_n * ldb + b_k]))
-                    : 0.0f;
+                tileB[b_r][b_c] =
+                    (b_k < k && b_n < n)
+                        ? (transB ? static_cast<float>(Bb[b_k * ldb + b_n])
+                                  : static_cast<float>(Bb[b_n * ldb + b_k]))
+                        : 0.0f;
               }
 
               item.barrier(sycl::access::fence_space::local_space);
@@ -417,10 +434,11 @@ static void syclGemmStridedBatched(sycl::queue& q,
 #pragma unroll
               for (int p = 0; p < WK; ++p) {
                 int a_k = t * WK + p;
-                a_reg[p] = (row < m && a_k < k)
-                    ? (transA ? static_cast<float>(Ab[row * lda + a_k])
-                              : static_cast<float>(Ab[a_k * lda + row]))
-                    : 0.0f;
+                a_reg[p] =
+                    (row < m && a_k < k)
+                        ? (transA ? static_cast<float>(Ab[row * lda + a_k])
+                                  : static_cast<float>(Ab[a_k * lda + row]))
+                        : 0.0f;
               }
 
 #pragma unroll
@@ -440,8 +458,11 @@ static void syclGemmStridedBatched(sycl::queue& q,
               for (int c = 0; c < 32; ++c) {
                 int c_idx = col_base + c;
                 if (c_idx < n) {
-                  float c_old = (beta != 0.0f) ? static_cast<float>(Cb[c_idx * ldc + row]) : 0.0f;
-                  Cb[c_idx * ldc + row] = static_cast<DataType>(alpha * sum[c] + beta * c_old);
+                  float c_old = (beta != 0.0f)
+                                    ? static_cast<float>(Cb[c_idx * ldc + row])
+                                    : 0.0f;
+                  Cb[c_idx * ldc + row] =
+                      static_cast<DataType>(alpha * sum[c] + beta * c_old);
                 }
               }
             }
@@ -451,11 +472,11 @@ static void syclGemmStridedBatched(sycl::queue& q,
 }
 
 template <typename DataType>
-static void syclGemmBatched(sycl::queue& q,
-    transpose_type transa, transpose_type transb,
-    int m, int n, int k, float alpha,
-    DataType** A, int lda, DataType** B, int ldb,
-    float beta, DataType** C, int ldc, int batchCount) {
+static void syclGemmBatched(sycl::queue& q, transpose_type transa,
+                            transpose_type transb, int m, int n, int k,
+                            float alpha, DataType** A, int lda, DataType** B,
+                            int ldb, float beta, DataType** C, int ldc,
+                            int batchCount) {
   bool transA = (transa == transpose_type_transpose);
   bool transB = (transb == transpose_type_transpose);
 
@@ -463,9 +484,7 @@ static void syclGemmBatched(sycl::queue& q,
     constexpr int TN = 32;
     constexpr int TK = 16;
 
-    sycl::range<3> global_range(batchCount,
-                                (n + TN - 1) / TN * 16,
-                                1);
+    sycl::range<3> global_range(batchCount, (n + TN - 1) / TN * 16, 1);
     sycl::range<3> local_range(1, 16, 1);
 
     q.submit([&](sycl::handler& cgh) {
@@ -502,10 +521,11 @@ static void syclGemmBatched(sycl::queue& q,
                 }
                 int b_k = t * TK + b_r;
                 int b_n = col_base + b_c;
-                tileB[b_r][b_c] = (b_k < k && b_n < n)
-                    ? (transB ? static_cast<float>(Bb[b_k * ldb + b_n])
-                              : static_cast<float>(Bb[b_n * ldb + b_k]))
-                    : 0.0f;
+                tileB[b_r][b_c] =
+                    (b_k < k && b_n < n)
+                        ? (transB ? static_cast<float>(Bb[b_k * ldb + b_n])
+                                  : static_cast<float>(Bb[b_n * ldb + b_k]))
+                        : 0.0f;
               }
 
               item.barrier(sycl::access::fence_space::local_space);
@@ -514,10 +534,11 @@ static void syclGemmBatched(sycl::queue& q,
 #pragma unroll
               for (int p = 0; p < TK; ++p) {
                 int a_k = t * TK + p;
-                a_reg[p] = (row < m && a_k < k)
-                    ? (transA ? static_cast<float>(Ab[row * lda + a_k])
-                              : static_cast<float>(Ab[a_k * lda + row]))
-                    : 0.0f;
+                a_reg[p] =
+                    (row < m && a_k < k)
+                        ? (transA ? static_cast<float>(Ab[row * lda + a_k])
+                                  : static_cast<float>(Ab[a_k * lda + row]))
+                        : 0.0f;
               }
 
 #pragma unroll
@@ -537,8 +558,11 @@ static void syclGemmBatched(sycl::queue& q,
               for (int c = 0; c < 32; ++c) {
                 int c_idx = col_base + c;
                 if (c_idx < n) {
-                  float c_old = (beta != 0.0f) ? static_cast<float>(Cb[c_idx * ldc + row]) : 0.0f;
-                  Cb[c_idx * ldc + row] = static_cast<DataType>(alpha * sum[c] + beta * c_old);
+                  float c_old = (beta != 0.0f)
+                                    ? static_cast<float>(Cb[c_idx * ldc + row])
+                                    : 0.0f;
+                  Cb[c_idx * ldc + row] =
+                      static_cast<DataType>(alpha * sum[c] + beta * c_old);
                 }
               }
             }
@@ -549,8 +573,7 @@ static void syclGemmBatched(sycl::queue& q,
     constexpr int WN = 32;
     constexpr int WK = 16;
 
-    sycl::range<3> global_range(batchCount,
-                                (n + WN - 1) / WN * 16,
+    sycl::range<3> global_range(batchCount, (n + WN - 1) / WN * 16,
                                 (m + WM - 1) / WM * 4);
     sycl::range<3> local_range(1, 16, 4);
 
@@ -591,10 +614,11 @@ static void syclGemmBatched(sycl::queue& q,
                 }
                 int b_k = t * WK + b_r;
                 int b_n = col_base + b_c;
-                tileB[b_r][b_c] = (b_k < k && b_n < n)
-                    ? (transB ? static_cast<float>(Bb[b_k * ldb + b_n])
-                              : static_cast<float>(Bb[b_n * ldb + b_k]))
-                    : 0.0f;
+                tileB[b_r][b_c] =
+                    (b_k < k && b_n < n)
+                        ? (transB ? static_cast<float>(Bb[b_k * ldb + b_n])
+                                  : static_cast<float>(Bb[b_n * ldb + b_k]))
+                        : 0.0f;
               }
 
               item.barrier(sycl::access::fence_space::local_space);
@@ -603,10 +627,11 @@ static void syclGemmBatched(sycl::queue& q,
 #pragma unroll
               for (int p = 0; p < WK; ++p) {
                 int a_k = t * WK + p;
-                a_reg[p] = (row < m && a_k < k)
-                    ? (transA ? static_cast<float>(Ab[row * lda + a_k])
-                              : static_cast<float>(Ab[a_k * lda + row]))
-                    : 0.0f;
+                a_reg[p] =
+                    (row < m && a_k < k)
+                        ? (transA ? static_cast<float>(Ab[row * lda + a_k])
+                                  : static_cast<float>(Ab[a_k * lda + row]))
+                        : 0.0f;
               }
 
 #pragma unroll
@@ -626,8 +651,11 @@ static void syclGemmBatched(sycl::queue& q,
               for (int c = 0; c < 32; ++c) {
                 int c_idx = col_base + c;
                 if (c_idx < n) {
-                  float c_old = (beta != 0.0f) ? static_cast<float>(Cb[c_idx * ldc + row]) : 0.0f;
-                  Cb[c_idx * ldc + row] = static_cast<DataType>(alpha * sum[c] + beta * c_old);
+                  float c_old = (beta != 0.0f)
+                                    ? static_cast<float>(Cb[c_idx * ldc + row])
+                                    : 0.0f;
+                  Cb[c_idx * ldc + row] =
+                      static_cast<DataType>(alpha * sum[c] + beta * c_old);
                 }
               }
             }
@@ -642,7 +670,8 @@ BaseLayer<DataType>::BaseLayer(int c, int h, int w, BaseLayer* ip, bool nhwc,
     : input_(ip), C(c), H(h), W(w), nhwc_(nhwc), sycl_queue_(sycl_queue) {}
 
 template <typename DataType>
-BaseLayer<DataType>::BaseLayer(int c, int h, int w, BaseLayer* ip, sycl::queue& sycl_queue)
+BaseLayer<DataType>::BaseLayer(int c, int h, int w, BaseLayer* ip,
+                               sycl::queue& sycl_queue)
     : input_(ip),
       C(c),
       H(h),
@@ -652,7 +681,8 @@ BaseLayer<DataType>::BaseLayer(int c, int h, int w, BaseLayer* ip, sycl::queue& 
 
 template <typename DataType>
 SELayer<DataType>::SELayer(BaseLayer<DataType>* ip, int fc1Outputs,
-                           bool addPrevLayerBias, ActivationFunction activation, sycl::queue &sycl_queue)
+                           bool addPrevLayerBias, ActivationFunction activation,
+                           sycl::queue& sycl_queue)
     : BaseLayer<DataType>(ip->GetC(), ip->GetH(), ip->GetW(), ip, sycl_queue),
       numFc1Out_(fc1Outputs),
       addPrevLayerBias_(addPrevLayerBias),
@@ -665,8 +695,8 @@ SELayer<DataType>::SELayer(BaseLayer<DataType>* ip, int fc1Outputs,
   if (kUseFusedSELayer && nhwc_) {
     w1_t_ = (DataType*)sycl::malloc_device(C * numFc1Out_ * sizeof(DataType),
                                            sycl_queue_);
-    w2_t_ = (DataType*)sycl::malloc_device(2 * C * numFc1Out_ * sizeof(DataType),
-                                           sycl_queue_);
+    w2_t_ = (DataType*)sycl::malloc_device(
+        2 * C * numFc1Out_ * sizeof(DataType), sycl_queue_);
   }
 
   b1_ = (DataType*)sycl::malloc_device(numFc1Out_ * sizeof(DataType),
@@ -721,8 +751,9 @@ void cpuTranspose(float* op, float* ip, int rows, int cols) {
 }
 
 template <>
-void SELayer<sycl::half>::LoadWeights(float* w1, float* b1, float* w2, float* b2,
-                                float* prevLayerBias, void* scratch) {
+void SELayer<sycl::half>::LoadWeights(float* w1, float* b1, float* w2,
+                                      float* b2, float* prevLayerBias,
+                                      void* scratch) {
   const size_t num_weights1 = C * numFc1Out_;
   size_t weight_size1 = sizeof(float) * num_weights1;
 
@@ -733,35 +764,39 @@ void SELayer<sycl::half>::LoadWeights(float* w1, float* b1, float* w2, float* b2
   std::vector<float> temp(num_weights2);
 
   // Weight for the first FC layer.
- 
+
   sycl_queue_.memcpy(scratch, w1, weight_size1).wait();
-  
-  copyTypeConverted((sycl::half*)w1_, (float*)scratch, (int)num_weights1, sycl_queue_);
+
+  copyTypeConverted((sycl::half*)w1_, (float*)scratch, (int)num_weights1,
+                    sycl_queue_);
 
   if (kUseFusedSELayer && nhwc_) {
     // transposed copy for fused SE kernel
     cpuTranspose(temp.data(), w1, numFc1Out_, C);
-    
-    sycl_queue_.memcpy(scratch, temp.data(), weight_size1).wait();    
-    
-    copyTypeConverted((sycl::half*)w1_t_, (float*)scratch, (int)num_weights1, sycl_queue_);
+
+    sycl_queue_.memcpy(scratch, temp.data(), weight_size1).wait();
+
+    copyTypeConverted((sycl::half*)w1_t_, (float*)scratch, (int)num_weights1,
+                      sycl_queue_);
   }
 
   // Weight for the second FC layer.
   sycl_queue_.memcpy(scratch, w2, weight_size2).wait();
-  
-  copyTypeConverted((sycl::half*)w2_, (float*)scratch, (int)num_weights2, sycl_queue_);
+
+  copyTypeConverted((sycl::half*)w2_, (float*)scratch, (int)num_weights2,
+                    sycl_queue_);
   if (kUseFusedSELayer && nhwc_) {
     cpuTranspose(temp.data(), w2, 2 * C, numFc1Out_);
-    
+
     sycl_queue_.memcpy(scratch, temp.data(), weight_size2).wait();
-    copyTypeConverted((sycl::half*)w2_t_, (float*)scratch, (int)num_weights2, sycl_queue_);
+    copyTypeConverted((sycl::half*)w2_t_, (float*)scratch, (int)num_weights2,
+                      sycl_queue_);
   }
 
   // Bias for the first FC layer.
-    
+
   sycl_queue_.memcpy(scratch, b1, numFc1Out_ * sizeof(float)).wait();
-  
+
   copyTypeConverted((sycl::half*)b1_, (float*)scratch, numFc1Out_, sycl_queue_);
 
   // Bias for the second FC layer.
@@ -771,20 +806,18 @@ void SELayer<sycl::half>::LoadWeights(float* w1, float* b1, float* w2, float* b2
 
   // Bias for previous layer (Convolution).
   if (prevLayerBias) {
-    
     sycl_queue_.memcpy(scratch, prevLayerBias, C * sizeof(float)).wait();
     copyTypeConverted((sycl::half*)bPrev_, (float*)scratch, C, sycl_queue_);
   }
-
-} 
+}
 
 template <>
 void SELayer<float>::Eval(int N, float* output, const float* input,
                           const float* /*input2*/, void* scratch,
-                          size_t scratch_size, sycl::queue &sycl_queue, float***) {
-
-  //CERR << "SELayer<float>::Eval. ";                          
-  // Ping-pong between 'op1' and 'op2' (parts of scratch memory).
+                          size_t scratch_size, sycl::queue& sycl_queue,
+                          float***) {
+  // CERR << "SELayer<float>::Eval. ";
+  //  Ping-pong between 'op1' and 'op2' (parts of scratch memory).
   float* op1 = (float*)scratch;
   float* op2 = (float*)scratch + scratch_size / sizeof(float) / 2;
 
@@ -795,98 +828,98 @@ void SELayer<float>::Eval(int N, float* output, const float* input,
   // 2. First fully connected layer.
   float alpha = 1.0f, beta = 0.0f;
 
-  #ifdef USE_CUBLAS
+#ifdef USE_CUBLAS
   cublasHandle_t handle = cuBlasContextManager::getcuBlasHandle_t();
 
-  sycl_queue.submit([&](sycl::handler &cgh) {
-        //auto d_A = b_A.get_access<sycl::access::mode::read_write>(cgh);
-        
-        cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+  sycl_queue.submit([&](sycl::handler& cgh) {
+    // auto d_A = b_A.get_access<sycl::access::mode::read_write>(cgh);
 
-        auto cudaStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
-        cublasSetStream(handle, cudaStreamHandle);  
+    cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+      auto cudaStreamHandle =
+          ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
+      cublasSetStream(handle, cudaStreamHandle);
 
-        ReportCUBLASErrors(cublasSgemm(handle, transpose_type_transpose, transpose_type_notranspose, numFc1Out_,
-                                 N, C, &alpha, w1_, C, op2, C, &beta, op1,
-                                 numFc1Out_));
-
-        });
+      ReportCUBLASErrors(cublasSgemm(
+          handle, transpose_type_transpose, transpose_type_notranspose,
+          numFc1Out_, N, C, &alpha, w1_, C, op2, C, &beta, op1, numFc1Out_));
+    });
   });
-  #elif defined(USE_HIPBLAS)
+#elif defined(USE_HIPBLAS)
   hipblasHandle_t handle = hipBlasContextManager::gethipBlasHandle_t();
 
-  sycl_queue.submit([&](sycl::handler &cgh) {
-        //auto d_A = b_A.get_access<sycl::access::mode::read_write>(cgh);
-        
-        cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
-        auto hipStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
+  sycl_queue.submit([&](sycl::handler& cgh) {
+    // auto d_A = b_A.get_access<sycl::access::mode::read_write>(cgh);
 
-        hipblasSetStream(handle, hipStreamHandle);  
+    cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+      auto hipStreamHandle =
+          ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
 
-        hipblasSgemm(handle, transpose_type_transpose, transpose_type_notranspose, numFc1Out_,
-                                 N, C, &alpha, w1_, C, op2, C, &beta, op1,
-                                 numFc1Out_);
-        });
-  });  
-  #else
+      hipblasSetStream(handle, hipStreamHandle);
+
+      hipblasSgemm(handle, transpose_type_transpose, transpose_type_notranspose,
+                   numFc1Out_, N, C, &alpha, w1_, C, op2, C, &beta, op1,
+                   numFc1Out_);
+    });
+  });
+#else
   syclGemm<float>(sycl_queue, transpose_type_transpose,
-        transpose_type_notranspose, numFc1Out_, N, C, alpha, w1_, C, op2,
-        C, beta, op1, numFc1Out_);
-  #endif
+                  transpose_type_notranspose, numFc1Out_, N, C, alpha, w1_, C,
+                  op2, C, beta, op1, numFc1Out_);
+#endif
 
-  addVectors(op1, b1_, op1, numFc1Out_ * N, numFc1Out_, numFc1Out_ * N, act_, sycl_queue);
+  addVectors(op1, b1_, op1, numFc1Out_ * N, numFc1Out_, numFc1Out_ * N, act_,
+             sycl_queue);
 
   // 3. Second fully connected layer.
 
-  #ifdef USE_CUBLAS
-  sycl_queue.submit([&](sycl::handler &cgh) {
-        
-        
-        cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+#ifdef USE_CUBLAS
+  sycl_queue.submit([&](sycl::handler& cgh) {
+    cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+      auto cudaStreamHandle =
+          ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
+      cublasSetStream(handle, cudaStreamHandle);
 
-        auto cudaStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
-        cublasSetStream(handle, cudaStreamHandle);  
-
-        ReportCUBLASErrors(cublasSgemm(handle, transpose_type_transpose, transpose_type_notranspose, 2 * C, N,
-                                 numFc1Out_, &alpha, w2_, numFc1Out_, op1,
-                                 numFc1Out_, &beta, op2, 2 * C));
-
-        });
+      ReportCUBLASErrors(cublasSgemm(handle, transpose_type_transpose,
+                                     transpose_type_notranspose, 2 * C, N,
+                                     numFc1Out_, &alpha, w2_, numFc1Out_, op1,
+                                     numFc1Out_, &beta, op2, 2 * C));
+    });
   });
 
-  #elif defined(USE_HIPBLAS)
-  sycl_queue.submit([&](sycl::handler &cgh) {
-        
-        cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
-        auto hipStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
+#elif defined(USE_HIPBLAS)
+  sycl_queue.submit([&](sycl::handler& cgh) {
+    cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+      auto hipStreamHandle =
+          ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
 
-        hipblasSetStream(handle, hipStreamHandle);  
+      hipblasSetStream(handle, hipStreamHandle);
 
-        hipblasSgemm(handle, transpose_type_transpose, transpose_type_notranspose, 2 * C, N,
-                                 numFc1Out_, &alpha, w2_, numFc1Out_, op1,
-                                 numFc1Out_, &beta, op2, 2 * C);
-
-        
-        });
+      hipblasSgemm(handle, transpose_type_transpose, transpose_type_notranspose,
+                   2 * C, N, numFc1Out_, &alpha, w2_, numFc1Out_, op1,
+                   numFc1Out_, &beta, op2, 2 * C);
+    });
   });
-  #else
-    syclGemm<float>(sycl_queue, transpose_type_transpose,
-        transpose_type_notranspose, 2 * C, N, numFc1Out_, alpha, w2_,
-        numFc1Out_, op1, numFc1Out_, beta, op2, 2 * C);
-  #endif
+#else
+  syclGemm<float>(sycl_queue, transpose_type_transpose,
+                  transpose_type_notranspose, 2 * C, N, numFc1Out_, alpha, w2_,
+                  numFc1Out_, op1, numFc1Out_, beta, op2, 2 * C);
+#endif
 
-  addVectors(op2, b2_, op2, 2 * C * N, 2 * C, 2 * C * N, ACTIVATION_NONE, sycl_queue);
+  addVectors(op2, b2_, op2, 2 * C * N, 2 * C, 2 * C * N, ACTIVATION_NONE,
+             sycl_queue);
 
   // 4. (Optional prev layer bias add), Global scale, residual add, relu and
   // bias.
   globalScale(N, C, output, input, op2, bPrev_, false, act_, sycl_queue);
-
 }
 
 template <>
-void SELayer<sycl::half>::Eval(int N, sycl::half* output, const sycl::half* input,
-                         const sycl::half* input2, void* scratch, size_t scratch_size, sycl::queue &sycl_queue, sycl::half***) {
-  //CERR << "SELayer<sycl::half>::Eval. ";
+void SELayer<sycl::half>::Eval(int N, sycl::half* output,
+                               const sycl::half* input,
+                               const sycl::half* input2, void* scratch,
+                               size_t scratch_size, sycl::queue& sycl_queue,
+                               sycl::half***) {
+  // CERR << "SELayer<sycl::half>::Eval. ";
 
   bool se_done = false;
   if (kUseFusedSELayer && nhwc_) {
@@ -897,131 +930,136 @@ void SELayer<sycl::half>::Eval(int N, sycl::half* output, const sycl::half* inpu
     assert(output == input2);
     // Ping-pong between 'op1' and 'op2' (parts of scratch memory).
     sycl::half* op1 = (sycl::half*)scratch;
-    sycl::half* op2 = (sycl::half*)scratch + scratch_size / sizeof(sycl::half) / 2;
+    sycl::half* op2 =
+        (sycl::half*)scratch + scratch_size / sizeof(sycl::half) / 2;
 
     // 1. Global avg pooling (also adds previous layer bias before computing
     // averages).
     globalAvgPool(N, C, op2, input, bPrev_, nhwc_, sycl_queue);
 
     // 2. First fully connected layer.
-    //half_raw one_h{0x3C00};
-    //half_raw zero_h{0};
+    // half_raw one_h{0x3C00};
+    // half_raw zero_h{0};
 
-    #ifdef USE_CUBLAS
+#ifdef USE_CUBLAS
     __half_raw one_h{0x3C00};
     __half_raw zero_h{0};
     half alpha = one_h;
     half beta = zero_h;
 
-    #elif defined(USE_HIPBLAS)
+#elif defined(USE_HIPBLAS)
     hipblasHalf alpha{1};
     hipblasHalf beta{0};
 
-    #else
+#else
     sycl::half alpha = 1;
     sycl::half beta = 0;
-    #endif
+#endif
 
-    #ifdef USE_CUBLAS
-  
+#ifdef USE_CUBLAS
+
     cublasHandle_t handle = cuBlasContextManager::getcuBlasHandle_t();
 
-    sycl_queue.submit([&](sycl::handler &cgh) {
-       
-        cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+    sycl_queue.submit([&](sycl::handler& cgh) {
+      cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+        auto cudaStreamHandle =
+            ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
+        cublasSetStream(handle, cudaStreamHandle);
 
-        auto cudaStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
-        cublasSetStream(handle, cudaStreamHandle);  
-    
-        ReportCUBLASErrors(cublasHgemm(handle, transpose_type_transpose, transpose_type_notranspose, numFc1Out_,
-                                   N, C, &alpha, ((const half *)w1_), C, ((const half *)op2), C, &beta, ((half *)op1),
-                                   numFc1Out_));
-    
-        });
+        ReportCUBLASErrors(cublasHgemm(
+            handle, transpose_type_transpose, transpose_type_notranspose,
+            numFc1Out_, N, C, &alpha, ((const half*)w1_), C, ((const half*)op2),
+            C, &beta, ((half*)op1), numFc1Out_));
+      });
     });
 
 #elif defined(USE_HIPBLAS)
     hipblasHandle_t handle = hipBlasContextManager::gethipBlasHandle_t();
 
-    sycl_queue.submit([&](sycl::handler &cgh) {
+    sycl_queue.submit([&](sycl::handler& cgh) {
       cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
-        auto hipStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
+        auto hipStreamHandle =
+            ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
 
         hipblasSetStream(handle, hipStreamHandle);
 
         hipblasHgemm(handle, transpose_type_transpose,
-                     transpose_type_notranspose,numFc1Out_, N, C, &alpha,
-                     ((const hipblasHalf *)w1_), C, ((const hipblasHalf *)op2), C,
-                     &beta, ((hipblasHalf *)op1), numFc1Out_);
-
+                     transpose_type_notranspose, numFc1Out_, N, C, &alpha,
+                     ((const hipblasHalf*)w1_), C, ((const hipblasHalf*)op2), C,
+                     &beta, ((hipblasHalf*)op1), numFc1Out_);
       });
     });
 #else
-    syclGemm<sycl::half>(sycl_queue, transpose_type_transpose, transpose_type_notranspose,
-        numFc1Out_, N, C, alpha, (const sycl::half*)w1_, C, (const sycl::half*)op2, C,
-        beta, (sycl::half*)op1, numFc1Out_);
+    syclGemm<sycl::half>(sycl_queue, transpose_type_transpose,
+                         transpose_type_notranspose, numFc1Out_, N, C, alpha,
+                         (const sycl::half*)w1_, C, (const sycl::half*)op2, C,
+                         beta, (sycl::half*)op1, numFc1Out_);
 #endif
 
-    addVectors(op1, b1_, op1, numFc1Out_ * N, numFc1Out_, numFc1Out_ * N, act_, sycl_queue);
+    addVectors(op1, b1_, op1, numFc1Out_ * N, numFc1Out_, numFc1Out_ * N, act_,
+               sycl_queue);
 
-    #ifdef USE_CUBLAS
+#ifdef USE_CUBLAS
 
-    sycl_queue_.submit([&](sycl::handler &cgh) {
-        
-        cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
-
-        auto cudaStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
-        cublasSetStream(handle, cudaStreamHandle);   
-    
-        // 3. Second fully connected layer.
-        ReportCUBLASErrors(cublasHgemm(handle, transpose_type_transpose, transpose_type_notranspose, 2 * C, N,
-                                   numFc1Out_, &alpha, ((const half *)w2_), numFc1Out_, ((const half *)op1),
-                                   numFc1Out_, &beta, ((half *)op2), 2 * C));
-  
-        });
-    });  
-    
-#elif defined(USE_HIPBLAS)
-    sycl_queue.submit([&](sycl::handler &cgh) {
+    sycl_queue_.submit([&](sycl::handler& cgh) {
       cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
-        auto hipStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
+        auto cudaStreamHandle =
+            ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
+        cublasSetStream(handle, cudaStreamHandle);
+
+        // 3. Second fully connected layer.
+        ReportCUBLASErrors(cublasHgemm(
+            handle, transpose_type_transpose, transpose_type_notranspose, 2 * C,
+            N, numFc1Out_, &alpha, ((const half*)w2_), numFc1Out_,
+            ((const half*)op1), numFc1Out_, &beta, ((half*)op2), 2 * C));
+      });
+    });
+
+#elif defined(USE_HIPBLAS)
+    sycl_queue.submit([&](sycl::handler& cgh) {
+      cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+        auto hipStreamHandle =
+            ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
         hipblasSetStream(handle, hipStreamHandle);
 
-        hipblasHgemm(
-            handle, transpose_type_transpose, transpose_type_notranspose, 2 * C,
-            N, numFc1Out_, &alpha,((const hipblasHalf *)w2_), numFc1Out_,
-            ((const hipblasHalf *)op1), numFc1Out_, &beta, ((hipblasHalf *)op2),
-            2 * C);
-
+        hipblasHgemm(handle, transpose_type_transpose,
+                     transpose_type_notranspose, 2 * C, N, numFc1Out_, &alpha,
+                     ((const hipblasHalf*)w2_), numFc1Out_,
+                     ((const hipblasHalf*)op1), numFc1Out_, &beta,
+                     ((hipblasHalf*)op2), 2 * C);
       });
     });
 #else
-    syclGemm<sycl::half>(sycl_queue, transpose_type_transpose, transpose_type_notranspose, 2 * C,
+    syclGemm<sycl::half>(
+        sycl_queue, transpose_type_transpose, transpose_type_notranspose, 2 * C,
         N, numFc1Out_, alpha, (const sycl::half*)w2_, numFc1Out_,
-        (const sycl::half*)op1, numFc1Out_, beta, (sycl::half*)op2,
-        2 * C);
+        (const sycl::half*)op1, numFc1Out_, beta, (sycl::half*)op2, 2 * C);
 #endif
-    
-    addVectors(op2, b2_, op2, 2 * C * N, 2 * C, 2 * C * N, ACTIVATION_NONE, sycl_queue);
+
+    addVectors(op2, b2_, op2, 2 * C * N, 2 * C, 2 * C * N, ACTIVATION_NONE,
+               sycl_queue);
 
     // 4. (Optional prev layer bias add), Global scale, residual add, relu and
     // bias.
     globalScale(N, C, output, input, op2, bPrev_, nhwc_, act_, sycl_queue);
   }
-} 
+}
 
 template <typename DataType>
 FCLayer<DataType>::FCLayer(BaseLayer<DataType>* ip, int C, int H, int W,
-                           bool bias, ActivationFunction activation, sycl::queue &sycl_queue)
-    : BaseLayer<DataType>(C, H, W, ip, sycl_queue), use_bias_(bias), act_(activation)  {
+                           bool bias, ActivationFunction activation,
+                           sycl::queue& sycl_queue)
+    : BaseLayer<DataType>(C, H, W, ip, sycl_queue),
+      use_bias_(bias),
+      act_(activation) {
   const size_t weight_size =
       sizeof(DataType) * C * H * W * ip->GetC() * ip->GetH() * ip->GetW();
   const size_t bias_size = sizeof(DataType) * C * H * W;
-  
+
   weights_ = (DataType*)sycl::malloc_device(weight_size, sycl_queue_);
 
   if (use_bias_) {
-    biases_ = (DataType *)sycl::malloc_device(bias_size, sycl_queue_);
+    biases_ = (DataType*)sycl::malloc_device(bias_size, sycl_queue_);
   } else {
     biases_ = nullptr;
   }
@@ -1029,7 +1067,7 @@ FCLayer<DataType>::FCLayer(BaseLayer<DataType>* ip, int C, int H, int W,
 
 template <>
 void FCLayer<sycl::half>::LoadWeights(float* cpuWeight, float* cpuBias,
-                                void* scratch) {
+                                      void* scratch) {
   const size_t num_weights =
       C * H * W * input_->GetC() * input_->GetH() * input_->GetW();
   const size_t weight_size = sizeof(float) * num_weights;
@@ -1038,7 +1076,7 @@ void FCLayer<sycl::half>::LoadWeights(float* cpuWeight, float* cpuBias,
 
   // also need to convert from fp32 to fp16
   assert(scratch);
-  
+
   sycl_queue_.memcpy(scratch, cpuWeight, weight_size).wait();
 
   if (nhwc_) {
@@ -1046,14 +1084,16 @@ void FCLayer<sycl::half>::LoadWeights(float* cpuWeight, float* cpuBias,
                       input_->GetC(), (int)num_biases, input_->GetC(),
                       input_->GetH(), input_->GetW(), sycl_queue_);
   } else {
-    copyTypeConverted((sycl::half*)weights_, (float*)scratch, (int)num_weights, sycl_queue_);
+    copyTypeConverted((sycl::half*)weights_, (float*)scratch, (int)num_weights,
+                      sycl_queue_);
   }
 
   if (cpuBias) {
     sycl_queue_.memcpy(scratch, cpuBias, bias_size).wait();
-    copyTypeConverted((sycl::half*)biases_, (float*)scratch, (int)num_biases, sycl_queue_);
-  } 
-} 
+    copyTypeConverted((sycl::half*)biases_, (float*)scratch, (int)num_biases,
+                      sycl_queue_);
+  }
+}
 
 template <>
 void FCLayer<float>::LoadWeights(float* cpuWeight, float* cpuBias,
@@ -1064,144 +1104,138 @@ void FCLayer<float>::LoadWeights(float* cpuWeight, float* cpuBias,
   const size_t num_biases = C * H * W;
   const size_t bias_size = sizeof(float) * num_biases;
 
-  
   sycl_queue_.memcpy(weights_, cpuWeight, weight_size);
-  
+
   if (use_bias_) {
     sycl_queue_.memcpy(biases_, cpuBias, bias_size);
   }
 
-  //sycl_queue_.wait();
+  // sycl_queue_.wait();
 }
 
 template <>
- void FCLayer<sycl::half>::Eval(int N, sycl::half* output_tensor, const sycl::half* input_tensor,
-                          const sycl::half* /*input2*/, void* /*scratch*/,
-                          size_t /*scratch_size*/, sycl::queue &sycl_queue, sycl::half***) {
+void FCLayer<sycl::half>::Eval(int N, sycl::half* output_tensor,
+                               const sycl::half* input_tensor,
+                               const sycl::half* /*input2*/, void* /*scratch*/,
+                               size_t /*scratch_size*/, sycl::queue& sycl_queue,
+                               sycl::half***) {
+  // CERR << "FCLayer<sycl::half>::Eval. ";
 
-   //CERR << "FCLayer<sycl::half>::Eval. ";
+  const int num_outputs = C * H * W;
+  const int num_inputs = input_->GetC() * input_->GetH() * input_->GetW();
 
-   const int num_outputs = C * H * W;
-   const int num_inputs = input_->GetC() * input_->GetH() * input_->GetW();
+  // sycl::half alpha = float2half_rn(1.0f),
+  // beta = float2half_rn(0.0f);
 
-   //sycl::half alpha = float2half_rn(1.0f), 
-   //beta = float2half_rn(0.0f);
-   
-   #ifdef USE_CUBLAS
-    __half_raw one_h{0x3C00};
-    __half_raw zero_h{0};
-    half alpha = one_h;
-    half beta = zero_h;
+#ifdef USE_CUBLAS
+  __half_raw one_h{0x3C00};
+  __half_raw zero_h{0};
+  half alpha = one_h;
+  half beta = zero_h;
 
-    #elif defined(USE_HIPBLAS)
-    hipblasHalf alpha{1};
-    hipblasHalf beta{0};
-
-    #else
-    sycl::half alpha = 1;
-    sycl::half beta = 0;
-    #endif
-
-   #ifdef USE_CUBLAS
-    cublasHandle_t handle = cuBlasContextManager::getcuBlasHandle_t();
-
-    sycl_queue.submit([&](sycl::handler &cgh) {
-        
-         cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
-
-         auto cudaStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
-         cublasSetStream(handle, cudaStreamHandle);    
-  
-         ReportCUBLASErrors(cublasHgemm(handle, transpose_type_transpose, transpose_type_notranspose, num_outputs,
-                                  N, num_inputs, &alpha, ((const half *)weights_), num_inputs,
-                                  ((const half *)input_tensor), num_inputs, &beta, ((half *)output_tensor),
-                                  num_outputs));
-
-       });
-   });  
 #elif defined(USE_HIPBLAS)
-  hipblasHandle_t handle = hipBlasContextManager::gethipBlasHandle_t();
-  sycl_queue.submit([&](sycl::handler &cgh) {
-    cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
-      auto hipStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
-      hipblasSetStream(handle, hipStreamHandle);
+  hipblasHalf alpha{1};
+  hipblasHalf beta{0};
 
-      hipblasHgemm(
-          handle, transpose_type_transpose, transpose_type_notranspose,
-          num_outputs, N, num_inputs, &alpha, ((const hipblasHalf *)weights_),
-          num_inputs, ((const hipblasHalf *)input_tensor), num_inputs, &beta,
-          ((hipblasHalf *)output_tensor), num_outputs);
-
-      });
-  });
 #else
-  syclGemm<sycl::half>(sycl_queue, transpose_type_transpose, transpose_type_notranspose,
-      num_outputs, N, num_inputs, alpha, (const sycl::half*)weights_, num_inputs,
-      (const sycl::half*)input_tensor, num_inputs, beta, (sycl::half*)output_tensor,
-      num_outputs);
+  sycl::half alpha = 1;
+  sycl::half beta = 0;
 #endif
 
-   if (use_bias_ || (act_ != ACTIVATION_NONE)) {
-     addVectors(output_tensor, biases_, output_tensor, num_outputs * N,
-                num_outputs, num_outputs * N, act_, sycl_queue);
-   }
- } 
+#ifdef USE_CUBLAS
+  cublasHandle_t handle = cuBlasContextManager::getcuBlasHandle_t();
+
+  sycl_queue.submit([&](sycl::handler& cgh) {
+    cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+      auto cudaStreamHandle =
+          ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
+      cublasSetStream(handle, cudaStreamHandle);
+
+      ReportCUBLASErrors(cublasHgemm(
+          handle, transpose_type_transpose, transpose_type_notranspose,
+          num_outputs, N, num_inputs, &alpha, ((const half*)weights_),
+          num_inputs, ((const half*)input_tensor), num_inputs, &beta,
+          ((half*)output_tensor), num_outputs));
+    });
+  });
+#elif defined(USE_HIPBLAS)
+  hipblasHandle_t handle = hipBlasContextManager::gethipBlasHandle_t();
+  sycl_queue.submit([&](sycl::handler& cgh) {
+    cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+      auto hipStreamHandle =
+          ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
+      hipblasSetStream(handle, hipStreamHandle);
+
+      hipblasHgemm(handle, transpose_type_transpose, transpose_type_notranspose,
+                   num_outputs, N, num_inputs, &alpha,
+                   ((const hipblasHalf*)weights_), num_inputs,
+                   ((const hipblasHalf*)input_tensor), num_inputs, &beta,
+                   ((hipblasHalf*)output_tensor), num_outputs);
+    });
+  });
+#else
+  syclGemm<sycl::half>(sycl_queue, transpose_type_transpose,
+                       transpose_type_notranspose, num_outputs, N, num_inputs,
+                       alpha, (const sycl::half*)weights_, num_inputs,
+                       (const sycl::half*)input_tensor, num_inputs, beta,
+                       (sycl::half*)output_tensor, num_outputs);
+#endif
+
+  if (use_bias_ || (act_ != ACTIVATION_NONE)) {
+    addVectors(output_tensor, biases_, output_tensor, num_outputs * N,
+               num_outputs, num_outputs * N, act_, sycl_queue);
+  }
+}
 
 template <>
 void FCLayer<float>::Eval(int N, float* output_tensor,
                           const float* input_tensor, const float* /*input2*/,
-                          void* /*scratch*/, size_t /*scratch_size*/, sycl::queue &sycl_queue, float***) {
-
-  //CERR << "FCLayer<float>::Eval. ";
+                          void* /*scratch*/, size_t /*scratch_size*/,
+                          sycl::queue& sycl_queue, float***) {
+  // CERR << "FCLayer<float>::Eval. ";
 
   const int num_outputs = C * H * W;
   const int num_inputs = input_->GetC() * input_->GetH() * input_->GetW();
 
   float alpha = 1.0f, beta = 0.0f;
-  //CERR << "FCLayer<float>::Eval - 1. " << num_inputs << " " << num_outputs;
+  // CERR << "FCLayer<float>::Eval - 1. " << num_inputs << " " << num_outputs;
 
-  #ifdef USE_CUBLAS
+#ifdef USE_CUBLAS
   cublasHandle_t handle = cuBlasContextManager::getcuBlasHandle_t();
 
-  sycl_queue.submit([&](sycl::handler &cgh) {
-        
-        cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+  sycl_queue.submit([&](sycl::handler& cgh) {
+    cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+      auto cudaStreamHandle =
+          ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
+      cublasSetStream(handle, cudaStreamHandle);
 
-        auto cudaStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
-        cublasSetStream(handle, cudaStreamHandle);    
-
-
-        ReportCUBLASErrors(cublasSgemm(handle, transpose_type_transpose, transpose_type_notranspose, num_outputs,
-                                 N, num_inputs, &alpha, weights_, num_inputs,
-                                 input_tensor, num_inputs, &beta, output_tensor,
-                                 num_outputs));
-
-      });
-  });  
-  #elif defined(USE_HIPBLAS)
-  hipblasHandle_t handle = hipBlasContextManager::gethipBlasHandle_t();
-  sycl_queue.submit([&](sycl::handler &cgh) {
-      cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
-        auto hipStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
-
-        hipblasSetStream(handle, hipStreamHandle);    
-
-
-        hipblasSgemm(handle, transpose_type_transpose, transpose_type_notranspose, num_outputs,
-                                 N, num_inputs, &alpha, weights_, num_inputs,
-                                 input_tensor, num_inputs, &beta, output_tensor,
-                                 num_outputs);
-
-        
-      });
+      ReportCUBLASErrors(cublasSgemm(
+          handle, transpose_type_transpose, transpose_type_notranspose,
+          num_outputs, N, num_inputs, &alpha, weights_, num_inputs,
+          input_tensor, num_inputs, &beta, output_tensor, num_outputs));
+    });
   });
-  #else
-   syclGemm<float>(sycl_queue, transpose_type_transpose,
-        transpose_type_notranspose, num_outputs, N, num_inputs, alpha,
-        (const float*)weights_, num_inputs, (const float*)input_tensor, num_inputs,
-        beta, (float*)output_tensor, num_outputs);
-  #endif
+#elif defined(USE_HIPBLAS)
+  hipblasHandle_t handle = hipBlasContextManager::gethipBlasHandle_t();
+  sycl_queue.submit([&](sycl::handler& cgh) {
+    cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+      auto hipStreamHandle =
+          ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
 
+      hipblasSetStream(handle, hipStreamHandle);
+
+      hipblasSgemm(handle, transpose_type_transpose, transpose_type_notranspose,
+                   num_outputs, N, num_inputs, &alpha, weights_, num_inputs,
+                   input_tensor, num_inputs, &beta, output_tensor, num_outputs);
+    });
+  });
+#else
+  syclGemm<float>(sycl_queue, transpose_type_transpose,
+                  transpose_type_notranspose, num_outputs, N, num_inputs, alpha,
+                  (const float*)weights_, num_inputs,
+                  (const float*)input_tensor, num_inputs, beta,
+                  (float*)output_tensor, num_outputs);
+#endif
 
   if (use_bias_ || (act_ != ACTIVATION_NONE)) {
     addVectors(output_tensor, biases_, output_tensor, num_outputs * N,
@@ -1219,22 +1253,21 @@ FCLayer<DataType>::~FCLayer() {
 
 template <typename DataType>
 PolicyMapLayer<DataType>::PolicyMapLayer(BaseLayer<DataType>* ip, int C, int H,
-                                         int W, int usedSize, bool attention, sycl::queue& sycl_queue)
+                                         int W, int usedSize, bool attention,
+                                         sycl::queue& sycl_queue)
     : BaseLayer<DataType>(C, H, W, ip, sycl_queue),
       used_size_(usedSize),
       attention_map_(attention) {
-
   size_t weight_size = sizeof(short) * this->input_->GetC() * 64;
 
   if (attention) weight_size = sizeof(short) * usedSize;
-  
-  weights_ = (short *)sycl::malloc_device(weight_size, sycl_queue_);
+
+  weights_ = (short*)sycl::malloc_device(weight_size, sycl_queue_);
 }
 
 template <typename DataType>
 void PolicyMapLayer<DataType>::LoadWeights(const short* cpuWeight,
                                            void* /*scratch*/) {
-
   size_t weight_size = sizeof(short) * used_size_;
 
   if (nhwc_ && !attention_map_) {
@@ -1298,29 +1331,33 @@ void PolicyMapLayer<DataType>::LoadWeights(const short* cpuWeight,
         else
           convertedWeights[hw * Cin + c] = -1;
       }
-    sycl_queue_.memcpy(weights_, convertedWeights.data(),
-                       used_size_ * sizeof(short)).wait();
+    sycl_queue_
+        .memcpy(weights_, convertedWeights.data(), used_size_ * sizeof(short))
+        .wait();
   } else {
     sycl_queue_.memcpy(weights_, cpuWeight, weight_size).wait();
   }
 }
 
 template <typename DataType>
-void PolicyMapLayer<DataType>::Eval(
-    int N, DataType* output_tensor, const DataType* input_tensor,
-    const DataType* /*input2*/, void* /*scratch*/, size_t /*scratch_size*/, sycl::queue &sycl_queue, DataType***) {
-  
-  //CERR << "PolicyMapLayer<DataType>::Eval. ";    
+void PolicyMapLayer<DataType>::Eval(int N, DataType* output_tensor,
+                                    const DataType* input_tensor,
+                                    const DataType* /*input2*/,
+                                    void* /*scratch*/, size_t /*scratch_size*/,
+                                    sycl::queue& sycl_queue, DataType***) {
+  // CERR << "PolicyMapLayer<DataType>::Eval. ";
 
   int inputSize =
       this->input_->GetC() * this->input_->GetH() * this->input_->GetW();
   if (attention_map_) inputSize = used_size_;
   int outputSize = this->C * this->H * this->W;
 
-  PolicyMap(N, output_tensor, input_tensor, weights_, inputSize, used_size_, outputSize, sycl_queue);
+  PolicyMap(N, output_tensor, input_tensor, weights_, inputSize, used_size_,
+            outputSize, sycl_queue);
 }
 
-template <typename DataType> PolicyMapLayer<DataType>::~PolicyMapLayer() {
+template <typename DataType>
+PolicyMapLayer<DataType>::~PolicyMapLayer() {
   sycl::free(weights_, sycl_queue_);
 }
 
@@ -1328,7 +1365,7 @@ template <typename DataType>
 FusedWinogradConvSELayer<DataType>::FusedWinogradConvSELayer(
     BaseLayer<DataType>* ip, int C, int H, int W, int Cin,
     ActivationFunction activation, bool bias, bool skip_add, bool se, int se_k,
-    sycl::queue &sycl_queue, bool op_nhcw)
+    sycl::queue& sycl_queue, bool op_nhcw)
     : BaseLayer<DataType>(C, H, W, ip, false, sycl_queue),
       c_input_(Cin),
       act_(activation),
@@ -1336,9 +1373,9 @@ FusedWinogradConvSELayer<DataType>::FusedWinogradConvSELayer(
       skip_add_(skip_add),
       has_se_(se),
       se_k_(se_k),
-      op_nhcw_(op_nhcw){
-
-  if (act_ != ACTIVATION_RELU && act_ != ACTIVATION_MISH && act_ != ACTIVATION_NONE) {
+      op_nhcw_(op_nhcw) {
+  if (act_ != ACTIVATION_RELU && act_ != ACTIVATION_MISH &&
+      act_ != ACTIVATION_NONE) {
     throw Exception("Unsupported activation for fused winograd conv SE layer.");
   }
 
@@ -1347,11 +1384,12 @@ FusedWinogradConvSELayer<DataType>::FusedWinogradConvSELayer(
 
   if (use_bias_) {
     const size_t bias_size = sizeof(DataType) * C;
-    biases_ = (DataType *)sycl::malloc_device(bias_size, sycl_queue_);
+    biases_ = (DataType*)sycl::malloc_device(bias_size, sycl_queue_);
   }
 
   // 6x6 transformed filter size, for 3x3 convolution
-  transformed_weights_ = (DataType *)sycl::malloc_device(weight_size * 4, sycl_queue_);
+  transformed_weights_ =
+      (DataType*)sycl::malloc_device(weight_size * 4, sycl_queue_);
 
   if (has_se_) {
     const size_t num_weights1 = C * se_k_;
@@ -1364,14 +1402,15 @@ FusedWinogradConvSELayer<DataType>::FusedWinogradConvSELayer(
     const size_t biases_size1 = sizeof(DataType) * num_biases1;
     const size_t biases_size2 = sizeof(DataType) * num_biases2;
 
-    w1_ = (DataType *)sycl::malloc_device(weight_size1, sycl_queue_);
-    w2_ = (DataType *)sycl::malloc_device(weight_size2, sycl_queue_);
-    b1_ = (DataType *)sycl::malloc_device(biases_size1, sycl_queue_);
-    b2_ = (DataType *)sycl::malloc_device(biases_size2, sycl_queue_);
+    w1_ = (DataType*)sycl::malloc_device(weight_size1, sycl_queue_);
+    w2_ = (DataType*)sycl::malloc_device(weight_size2, sycl_queue_);
+    b1_ = (DataType*)sycl::malloc_device(biases_size1, sycl_queue_);
+    b2_ = (DataType*)sycl::malloc_device(biases_size2, sycl_queue_);
   }
 }
 
-template <typename DataType> void FusedWinogradConvSELayer<DataType>::LoadWeights(float* pfilter,
+template <typename DataType>
+void FusedWinogradConvSELayer<DataType>::LoadWeights(float* pfilter,
                                                      float* pBias,
                                                      void* scratch) {
   const size_t weight_size = sizeof(float) * c_input_ * C * 3 * 3;
@@ -1383,13 +1422,12 @@ template <typename DataType> void FusedWinogradConvSELayer<DataType>::LoadWeight
   // first copy from CPU memory to scratch space in GPU memory
   // and then do the type conversion using a kernel
   assert(scratch);
-  //sycl_queue_.memcpy(scratch, pfilter, weight_size).wait_and_throw();
+  // sycl_queue_.memcpy(scratch, pfilter, weight_size).wait_and_throw();
   sycl_queue_.memcpy(scratch, pfilter, weight_size).wait();
-  copyTypeConverted((DataType*)weights, (float*)scratch, C * c_input_ * 3 * 3, sycl_queue_);
+  copyTypeConverted((DataType*)weights, (float*)scratch, C * c_input_ * 3 * 3,
+                    sycl_queue_);
 
   if (pBias) {
-    
-    
     sycl_queue_.memcpy(scratch, pBias, bias_size).wait();
 
     copyTypeConverted((DataType*)biases_, (float*)scratch, C, sycl_queue_);
@@ -1419,76 +1457,81 @@ void FusedWinogradConvSELayer<DataType>::LoadSEWeights(float* w1, float* b1,
   std::vector<float> temp_transposed(num_weights2);
 
   CpuTranspose(temp_transposed.data(), w1, se_k_, C);
-  //sycl_queue_.memcpy(scratch, temp_transposed.data(), num_weights1 * sizeof(float)).wait();
-  sycl_queue_.memcpy(scratch, temp_transposed.data(), num_weights1 * sizeof(float)).wait();
-  
-  copyTypeConverted((DataType*)w1_, (float*)scratch, (int)num_weights1, sycl_queue_);
+  sycl_queue_
+      .memcpy(scratch, temp_transposed.data(), num_weights1 * sizeof(float))
+      .wait();
+
+  copyTypeConverted((DataType*)w1_, (float*)scratch, (int)num_weights1,
+                    sycl_queue_);
 
   CpuTranspose(temp_transposed.data(), w2, 2 * C, se_k_);
 
-  //sycl_queue_.memcpy(scratch, temp_transposed.data(), num_weights2 * sizeof(float)).wait();
-  sycl_queue_.memcpy(scratch, temp_transposed.data(), num_weights2 * sizeof(float)).wait();
-  copyTypeConverted((DataType*)w2_, (float*)scratch, (int)num_weights2, sycl_queue_);
+  sycl_queue_
+      .memcpy(scratch, temp_transposed.data(), num_weights2 * sizeof(float))
+      .wait();
+  copyTypeConverted((DataType*)w2_, (float*)scratch, (int)num_weights2,
+                    sycl_queue_);
 
-  //sycl_queue_.memcpy(scratch, b1, num_biases1 * sizeof(float)).wait();
   sycl_queue_.memcpy(scratch, b1, num_biases1 * sizeof(float)).wait();
-  copyTypeConverted((DataType*)b1_, (float*)scratch, (int)num_biases1, sycl_queue_);
+  copyTypeConverted((DataType*)b1_, (float*)scratch, (int)num_biases1,
+                    sycl_queue_);
 
-  //sycl_queue_.memcpy(scratch, b2, num_biases2 * sizeof(float)).wait();
   sycl_queue_.memcpy(scratch, b2, num_biases2 * sizeof(float)).wait();
-  copyTypeConverted((DataType*)b2_, (float*)scratch, (int)num_biases2, sycl_queue_);
-
+  copyTypeConverted((DataType*)b2_, (float*)scratch, (int)num_biases2,
+                    sycl_queue_);
 }
 
 template <>
- void BaseLayer<sycl::half>::cublasRowMajorMatrixMul(const sycl::half* A, const sycl::half* B,
-                                               sycl::half* Out, int M, int N, int K,
-                                               int batchSize, sycl::queue &sycl_queue) {
-   // Need to initialize 1.0 and 0.0 as hexadecimal for fp16 because typecasting
-   // float to sycl::half type doesn't work before CUDA 10.0
-   #ifdef USE_CUBLAS
-    __half_raw one_h{0x3C00};
-    __half_raw zero_h{0};
-    half alpha = one_h;
-    half beta = zero_h;
+void BaseLayer<sycl::half>::cublasRowMajorMatrixMul(const sycl::half* A,
+                                                    const sycl::half* B,
+                                                    sycl::half* Out, int M,
+                                                    int N, int K, int batchSize,
+                                                    sycl::queue& sycl_queue) {
+// Need to initialize 1.0 and 0.0 as hexadecimal for fp16 because typecasting
+// float to sycl::half type doesn't work before CUDA 10.0
+#ifdef USE_CUBLAS
+  __half_raw one_h{0x3C00};
+  __half_raw zero_h{0};
+  half alpha = one_h;
+  half beta = zero_h;
 
-    #else
-    sycl::half alpha = 1;
-    sycl::half beta = 0;
-    #endif
+#else
+  sycl::half alpha = 1;
+  sycl::half beta = 0;
+#endif
 
-   // dimensions of matrix A = M x K
-   // dimensions of matrix B = K x N
-   // dimensions of output   = M x N
+  // dimensions of matrix A = M x K
+  // dimensions of matrix B = K x N
+  // dimensions of output   = M x N
 
-   // cublas supports only col major output
-   // to multiply row major matrices, use the trick below
-  
-  #ifdef USE_CUBLAS
-   cublasHandle_t handle = cuBlasContextManager::getcuBlasHandle_t();
-  
-   sycl_queue.submit([&](sycl::handler &cgh) {
-        //auto d_A = b_A.get_access<sycl::access::mode::read_write>(cgh);
-         cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
-  
-          auto cudaStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
-          cublasSetStream(handle, cudaStreamHandle);
+  // cublas supports only col major output
+  // to multiply row major matrices, use the trick below
 
-          ReportCUBLASErrors(cublasGemmStridedBatchedEx(
-             handle, transpose_type_notranspose, transpose_type_notranspose, N, M, K, &one_h, B, CUDA_R_16F, N,
-             N * K, A, CUDA_R_16F, K, K * M, &zero_h, Out, CUDA_R_16F, N, N * M,
-             batchSize, CUDA_R_16F, CUBLAS_GEMM_DEFAULT));
+#ifdef USE_CUBLAS
+  cublasHandle_t handle = cuBlasContextManager::getcuBlasHandle_t();
 
-          
-         });   
-   });
-  
+  sycl_queue.submit([&](sycl::handler& cgh) {
+    // auto d_A = b_A.get_access<sycl::access::mode::read_write>(cgh);
+    cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+      auto cudaStreamHandle =
+          ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
+      cublasSetStream(handle, cudaStreamHandle);
+
+      ReportCUBLASErrors(cublasGemmStridedBatchedEx(
+          handle, transpose_type_notranspose, transpose_type_notranspose, N, M,
+          K, &one_h, B, CUDA_R_16F, N, N * K, A, CUDA_R_16F, K, K * M, &zero_h,
+          Out, CUDA_R_16F, N, N * M, batchSize, CUDA_R_16F,
+          CUBLAS_GEMM_DEFAULT));
+    });
+  });
+
 #elif defined(USE_HIPBLAS)
   hipblasHandle_t handle = hipBlasContextManager::gethipBlasHandle_t();
 
-  sycl_queue.submit([&](sycl::handler &cgh) {
+  sycl_queue.submit([&](sycl::handler& cgh) {
     cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
-      auto hipStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
+      auto hipStreamHandle =
+          ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
       hipblasSetStream(handle, hipStreamHandle);
 
       hipblasGemmStridedBatchedEx(
@@ -1496,19 +1539,20 @@ template <>
           K, &alpha, B, HIPBLAS_R_16F, N, N * K, A, HIPBLAS_R_16F, K, K * M,
           &beta, Out, HIPBLAS_R_16F, N, N * M, batchSize, HIPBLAS_COMPUTE_16F,
           HIPBLAS_GEMM_DEFAULT);
-
     });
   });
 #else
   syclGemmStridedBatched<sycl::half>(
-      sycl_queue, transpose_type_notranspose, transpose_type_notranspose, N,
-      M, K, 1.0f, B, N, N * K, A, K, K * M, 0.0f, Out, N, N * M, batchSize);
+      sycl_queue, transpose_type_notranspose, transpose_type_notranspose, N, M,
+      K, 1.0f, B, N, N * K, A, K, K * M, 0.0f, Out, N, N * M, batchSize);
 #endif
- }
+}
 
-template <> void BaseLayer<float>::cublasRowMajorMatrixMul(const float* A, const float* B,
+template <>
+void BaseLayer<float>::cublasRowMajorMatrixMul(const float* A, const float* B,
                                                float* Out, int M, int N, int K,
-                                               int batchSize, sycl::queue &sycl_queue) {
+                                               int batchSize,
+                                               sycl::queue& sycl_queue) {
   float floatOne = 1.0f;
   float floatZero = 0.0f;
 
@@ -1516,59 +1560,64 @@ template <> void BaseLayer<float>::cublasRowMajorMatrixMul(const float* A, const
   int64_t N_ = N;
   int64_t K_ = K;
 
-  #ifdef USE_CUBLAS
-  //static cublasHandle_t handle;
-  //ReportCUBLASErrors(cublasCreate(&handle)); 
+#ifdef USE_CUBLAS
+  // static cublasHandle_t handle;
+  // ReportCUBLASErrors(cublasCreate(&handle));
   cublasHandle_t handle = cuBlasContextManager::getcuBlasHandle_t();
-  #endif
+#endif
 
-  #ifdef USE_HIPBLAS
+#ifdef USE_HIPBLAS
   hipblasHandle_t handle = hipBlasContextManager::gethipBlasHandle_t();
-  #endif
+#endif
 
   {
-    #ifdef USE_CUBLAS
-    sycl_queue.submit([&](sycl::handler &cgh) {
-        //auto d_A = b_A.get_access<sycl::access::mode::read_write>(cgh);
-        cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
-            auto cudaStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
-            cublasSetStream(handle, cudaStreamHandle);   
+#ifdef USE_CUBLAS
+    sycl_queue.submit([&](sycl::handler& cgh) {
+      // auto d_A = b_A.get_access<sycl::access::mode::read_write>(cgh);
+      cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+        auto cudaStreamHandle =
+            ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
+        cublasSetStream(handle, cudaStreamHandle);
 
-          ReportCUBLASErrors(cublasGemmStridedBatchedEx(
-            handle, transpose_type_notranspose, transpose_type_notranspose, N, M, K, &floatOne, B, CUDA_R_32F, N,
-            N * K, A, CUDA_R_32F, K, K * M, &floatZero, Out, CUDA_R_32F, N, N * M,
-          batchSize, CUDA_R_32F, CUBLAS_GEMM_DEFAULT));
-
-          
-        });
+        ReportCUBLASErrors(cublasGemmStridedBatchedEx(
+            handle, transpose_type_notranspose, transpose_type_notranspose, N,
+            M, K, &floatOne, B, CUDA_R_32F, N, N * K, A, CUDA_R_32F, K, K * M,
+            &floatZero, Out, CUDA_R_32F, N, N * M, batchSize, CUDA_R_32F,
+            CUBLAS_GEMM_DEFAULT));
+      });
     });
-    #elif defined(USE_HIPBLAS)
-    sycl_queue.submit([&](sycl::handler &cgh) {
-        //auto d_A = b_A.get_access<sycl::access::mode::read_write>(cgh);
-        cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
-            auto hipStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
-            hipblasSetStream(handle, hipStreamHandle);   
+#elif defined(USE_HIPBLAS)
+    sycl_queue.submit([&](sycl::handler& cgh) {
+      // auto d_A = b_A.get_access<sycl::access::mode::read_write>(cgh);
+      cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+        auto hipStreamHandle =
+            ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
+        hipblasSetStream(handle, hipStreamHandle);
 
-          hipblasGemmStridedBatchedEx(
-            handle, transpose_type_notranspose, transpose_type_notranspose, N, M, K, &floatOne, B, HIPBLAS_R_32F, N,
-            N * K, A, HIPBLAS_R_32F, K, K * M, &floatZero, Out, HIPBLAS_R_32F, N, N * M,
-          batchSize, HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
-
-          
-        });
-    });  
-    #else
-      syclGemmStridedBatched<float>(sycl_queue, transpose_type_notranspose,
-            transpose_type_notranspose, N_, M_, K_, floatOne, B, N_, N_ * K_, A, K_, K_ * M_, floatZero, Out, N_, N_ * M_, batchSize);
-    #endif
+        hipblasGemmStridedBatchedEx(
+            handle, transpose_type_notranspose, transpose_type_notranspose, N,
+            M, K, &floatOne, B, HIPBLAS_R_32F, N, N * K, A, HIPBLAS_R_32F, K,
+            K * M, &floatZero, Out, HIPBLAS_R_32F, N, N * M, batchSize,
+            HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
+      });
+    });
+#else
+    syclGemmStridedBatched<float>(sycl_queue, transpose_type_notranspose,
+                                  transpose_type_notranspose, N_, M_, K_,
+                                  floatOne, B, N_, N_ * K_, A, K_, K_ * M_,
+                                  floatZero, Out, N_, N_ * M_, batchSize);
+#endif
   }
 }
 
 template <typename DataType>
 void FusedWinogradConvSELayer<DataType>::Eval(
     int N, DataType* output, const DataType* input, const DataType* input2,
-    void* scratch, size_t scratch_size, sycl::queue &sycl_queue, DataType***) {
-  
+    void* scratch, size_t scratch_size, sycl::queue& sycl_queue, DataType***) {
+  /*CERR << "[SYCL TRACE] FusedWinogradConvSELayer::Eval (N=" << N
+       << ", C=" << C << ", c_input=" << c_input_
+       << ", has_se=" << (has_se_ ? "true" : "false")
+       << ", skip_add=" << (skip_add_ ? "true" : "false") << ")";*/
 
   // Split the scratch space into two parts - use first part for holding
   // transformed input and second part for transformed output.
@@ -1577,54 +1626,64 @@ void FusedWinogradConvSELayer<DataType>::Eval(
   DataType* transformed_output =
       transformed_input + scratch_size / (2 * sizeof(DataType));
 
-  InputTransform<DataType, false>(N, c_input_, transformed_input, input, sycl_queue);
+  InputTransform<DataType, false>(N, c_input_, transformed_input, input,
+                                  sycl_queue);
   BaseLayer<DataType>::cublasRowMajorMatrixMul(
-      transformed_input, transformed_weights_, transformed_output, N * 4, C, c_input_, 36, sycl_queue);
+      transformed_input, transformed_weights_, transformed_output, N * 4, C,
+      c_input_, 36, sycl_queue);
 
   if (act_ == ACTIVATION_NONE) {
     if (!has_se_ && use_bias_ && !skip_add_)
-      OutputTransform<DataType, false, ACTIVATION_NONE, true, false, false, false>(
-          N, C, 0, output, transformed_output, nullptr, biases_, nullptr, nullptr, nullptr, nullptr, sycl_queue);
+      OutputTransform<DataType, false, ACTIVATION_NONE, true, false, false,
+                      false>(N, C, 0, output, transformed_output, nullptr,
+                             biases_, nullptr, nullptr, nullptr, nullptr,
+                             sycl_queue);
     else
       throw Exception("unsupported network type!");
   } else if (act_ == ACTIVATION_RELU) {
     if (has_se_ && use_bias_ && skip_add_)
-      OutputTransform<DataType, true, ACTIVATION_RELU, true, true, false, false>(
-          N, C, se_k_, output, transformed_output, input2, biases_, w1_, b1_,
-          w2_, b2_, sycl_queue);
+      OutputTransform<DataType, true, ACTIVATION_RELU, true, true, false,
+                      false>(N, C, se_k_, output, transformed_output, input2,
+                             biases_, w1_, b1_, w2_, b2_, sycl_queue);
     else if (!has_se_ && use_bias_ && !skip_add_) {
       if (op_nhcw_)
-        OutputTransform<DataType, false, ACTIVATION_RELU, true, false, false, true>(
-            N, C, 0, output, transformed_output, nullptr, biases_, nullptr,
-            nullptr, nullptr, nullptr, sycl_queue);
+        OutputTransform<DataType, false, ACTIVATION_RELU, true, false, false,
+                        true>(N, C, 0, output, transformed_output, nullptr,
+                              biases_, nullptr, nullptr, nullptr, nullptr,
+                              sycl_queue);
       else
-        OutputTransform<DataType, false, ACTIVATION_RELU, true, false, false, false>(
-            N, C, 0, output, transformed_output, nullptr, biases_, nullptr,
-            nullptr, nullptr, nullptr, sycl_queue);
+        OutputTransform<DataType, false, ACTIVATION_RELU, true, false, false,
+                        false>(N, C, 0, output, transformed_output, nullptr,
+                               biases_, nullptr, nullptr, nullptr, nullptr,
+                               sycl_queue);
     } else if (!has_se_ && use_bias_ && skip_add_)
-      OutputTransform<DataType, false, ACTIVATION_RELU, true, true, false, false>(
-          N, C, 0, output, transformed_output, input2, biases_, nullptr,
-          nullptr, nullptr, nullptr, sycl_queue);
+      OutputTransform<DataType, false, ACTIVATION_RELU, true, true, false,
+                      false>(N, C, 0, output, transformed_output, input2,
+                             biases_, nullptr, nullptr, nullptr, nullptr,
+                             sycl_queue);
     else
       throw Exception("unsupported network type!");
   } else if (act_ == ACTIVATION_MISH) {
     if (has_se_ && use_bias_ && skip_add_)
-      OutputTransform<DataType, true, ACTIVATION_MISH, true, true, false, false>(
-          N, C, se_k_, output, transformed_output, input2, biases_, w1_, b1_,
-          w2_, b2_, sycl_queue);
+      OutputTransform<DataType, true, ACTIVATION_MISH, true, true, false,
+                      false>(N, C, se_k_, output, transformed_output, input2,
+                             biases_, w1_, b1_, w2_, b2_, sycl_queue);
     else if (!has_se_ && use_bias_ && !skip_add_) {
       if (op_nhcw_)
-        OutputTransform<DataType, false, ACTIVATION_MISH, true, false, false, true>(
-            N, C, 0, output, transformed_output, nullptr, biases_, nullptr,
-            nullptr, nullptr, nullptr, sycl_queue);
+        OutputTransform<DataType, false, ACTIVATION_MISH, true, false, false,
+                        true>(N, C, 0, output, transformed_output, nullptr,
+                              biases_, nullptr, nullptr, nullptr, nullptr,
+                              sycl_queue);
       else
-        OutputTransform<DataType, false, ACTIVATION_MISH, true, false, false, false>(
-            N, C, 0, output, transformed_output, nullptr, biases_, nullptr,
-            nullptr, nullptr, nullptr, sycl_queue);
+        OutputTransform<DataType, false, ACTIVATION_MISH, true, false, false,
+                        false>(N, C, 0, output, transformed_output, nullptr,
+                               biases_, nullptr, nullptr, nullptr, nullptr,
+                               sycl_queue);
     } else if (!has_se_ && use_bias_ && skip_add_)
-      OutputTransform<DataType, false, ACTIVATION_MISH, true, true, false, false>(
-          N, C, 0, output, transformed_output, input2, biases_, nullptr,
-          nullptr, nullptr, nullptr, sycl_queue);
+      OutputTransform<DataType, false, ACTIVATION_MISH, true, true, false,
+                      false>(N, C, 0, output, transformed_output, input2,
+                             biases_, nullptr, nullptr, nullptr, nullptr,
+                             sycl_queue);
     else
       throw Exception("unsupported network type!");
   } else
@@ -1651,26 +1710,28 @@ Conv1Layer<DataType>::Conv1Layer(BaseLayer<DataType>* ip, int C, int H, int W,
       c_input_(Cin),
       act_(activation),
       use_bias_(bias) {
-
   // Allocate memory for weights (filter tensor) and biases.
   const size_t weight_size = sizeof(DataType) * c_input_ * C * 1 * 1;
-  weights_ = (DataType *)sycl::malloc_device(weight_size, sycl_queue_);
+  weights_ = (DataType*)sycl::malloc_device(weight_size, sycl_queue_);
 
   if (use_bias_) {
     const size_t bias_size = sizeof(DataType) * C;
-    //CERR << "Conv1Layer using bias " << bias_size; 
-    biases_ = (DataType *)sycl::malloc_device(bias_size, sycl_queue_);
+    // CERR << "Conv1Layer using bias " << bias_size;
+    biases_ = (DataType*)sycl::malloc_device(bias_size, sycl_queue_);
   }
 }
 
-template <typename DataType> void Conv1Layer<DataType>::LoadWeights(float* pfilter, float* pBias, void* scratch) {
+template <typename DataType>
+void Conv1Layer<DataType>::LoadWeights(float* pfilter, float* pBias,
+                                       void* scratch) {
   const size_t weight_size = sizeof(float) * c_input_ * C * 1 * 1;
   const size_t bias_size = sizeof(float) * C;
 
   assert(scratch);
 
   sycl_queue_.memcpy(scratch, pfilter, weight_size).wait();
-  copyTypeConverted((DataType*)weights_, (float*)scratch, C * c_input_ * 1 * 1, sycl_queue_);
+  copyTypeConverted((DataType*)weights_, (float*)scratch, C * c_input_ * 1 * 1,
+                    sycl_queue_);
 
   if (pBias) {
     sycl_queue_.memcpy(scratch, pBias, bias_size).wait();
@@ -1678,130 +1739,124 @@ template <typename DataType> void Conv1Layer<DataType>::LoadWeights(float* pfilt
   }
 }
 
-
 template <>
-  void Conv1Layer<sycl::half>::cublasSpecialMatrixMul(const sycl::half* A, const sycl::half* B,
-                                               sycl::half* Out, int M, int N, int K,
-                                               int batchSize, sycl::queue &sycl_queue) {
-
-   // Need to initialize 1.0 and 0.0 as hexadecimal for fp16 because typecasting
+void Conv1Layer<sycl::half>::cublasSpecialMatrixMul(const sycl::half* A,
+                                                    const sycl::half* B,
+                                                    sycl::half* Out, int M,
+                                                    int N, int K, int batchSize,
+                                                    sycl::queue& sycl_queue) {
+  // Need to initialize 1.0 and 0.0 as hexadecimal for fp16 because typecasting
   // float to sycl::half type doesn't work before CUDA 10.0
 
-  #ifdef USE_CUBLAS
-   cublasHandle_t handle = cuBlasContextManager::getcuBlasHandle_t();
-  #endif
+#ifdef USE_CUBLAS
+  cublasHandle_t handle = cuBlasContextManager::getcuBlasHandle_t();
+#endif
 
-  #ifdef USE_HIPBLAS
-   hipblasHandle_t handle = hipBlasContextManager::gethipBlasHandle_t();
-  #endif
-
-
-   #ifdef USE_CUBLAS
-    __half_raw one_h{0x3C00};
-    __half_raw zero_h{0};
-    half alpha = one_h;
-    half beta = zero_h;
-
-    #else
-    sycl::half alpha = 1;
-    sycl::half beta = 0;
-    #endif
+#ifdef USE_HIPBLAS
+  hipblasHandle_t handle = hipBlasContextManager::gethipBlasHandle_t();
+#endif
 
 #ifdef USE_CUBLAS
-    sycl_queue.submit([&](sycl::handler &cgh) {
-         
-         cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
-  
-          auto cudaStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
-          cublasSetStream(handle, cudaStreamHandle);
+  __half_raw one_h{0x3C00};
+  __half_raw zero_h{0};
+  half alpha = one_h;
+  half beta = zero_h;
 
-
-         ReportCUBLASErrors(cublasGemmStridedBatchedEx(
-         handle, transpose_type_notranspose, transpose_type_notranspose, N, M, K, &one_h, B, CUDA_R_16F, N,
-         N * K, A, CUDA_R_16F, K, 0, &zero_h, Out, CUDA_R_16F, N, N * M,
-         batchSize, CUDA_R_16F, CUBLAS_GEMM_DEFAULT));
-
-         });   
-   });
-#elif defined(USE_HIPBLAS)
-    sycl_queue.submit([&](sycl::handler &cgh) {
-      cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
-         auto hipStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
-         hipblasSetStream(handle, hipStreamHandle);
-         hipblasGemmStridedBatchedEx(
-              handle, transpose_type_notranspose, transpose_type_notranspose,
-              N, M, K, &alpha, B, HIPBLAS_R_16F, N, N * K, A, HIPBLAS_R_16F, K,
-              0, &beta, Out, HIPBLAS_R_16F, N, N * M, batchSize, HIPBLAS_COMPUTE_16F,
-              HIPBLAS_GEMM_DEFAULT);
-      });
-    });
 #else
-    syclGemmStridedBatched<sycl::half>(
-        sycl_queue, transpose_type_notranspose, transpose_type_notranspose, N,
-        M, K, alpha, B, N, N * K, A, K, 0, beta, Out, N, N * M, batchSize);
+  sycl::half alpha = 1;
+  sycl::half beta = 0;
+#endif
+
+#ifdef USE_CUBLAS
+  sycl_queue.submit([&](sycl::handler& cgh) {
+    cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+      auto cudaStreamHandle =
+          ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
+      cublasSetStream(handle, cudaStreamHandle);
+
+      ReportCUBLASErrors(cublasGemmStridedBatchedEx(
+          handle, transpose_type_notranspose, transpose_type_notranspose, N, M,
+          K, &one_h, B, CUDA_R_16F, N, N * K, A, CUDA_R_16F, K, 0, &zero_h, Out,
+          CUDA_R_16F, N, N * M, batchSize, CUDA_R_16F, CUBLAS_GEMM_DEFAULT));
+    });
+  });
+#elif defined(USE_HIPBLAS)
+  sycl_queue.submit([&](sycl::handler& cgh) {
+    cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+      auto hipStreamHandle =
+          ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
+      hipblasSetStream(handle, hipStreamHandle);
+      hipblasGemmStridedBatchedEx(
+          handle, transpose_type_notranspose, transpose_type_notranspose, N, M,
+          K, &alpha, B, HIPBLAS_R_16F, N, N * K, A, HIPBLAS_R_16F, K, 0, &beta,
+          Out, HIPBLAS_R_16F, N, N * M, batchSize, HIPBLAS_COMPUTE_16F,
+          HIPBLAS_GEMM_DEFAULT);
+    });
+  });
+#else
+  syclGemmStridedBatched<sycl::half>(
+      sycl_queue, transpose_type_notranspose, transpose_type_notranspose, N, M,
+      K, alpha, B, N, N * K, A, K, 0, beta, Out, N, N * M, batchSize);
 #endif
 }
 
 template <>
 void Conv1Layer<float>::cublasSpecialMatrixMul(const float* A, const float* B,
                                                float* Out, int M, int N, int K,
-                                               int batchSize, sycl::queue &sycl_queue) {
+                                               int batchSize,
+                                               sycl::queue& sycl_queue) {
   float floatOne = 1.0f;
   float floatZero = 0.0f;
-
 
   int64_t M_ = M;
   int64_t N_ = N;
   int64_t K_ = K;
 
-  #ifdef USE_CUBLAS
-   cublasHandle_t handle = cuBlasContextManager::getcuBlasHandle_t();
-  #endif
+#ifdef USE_CUBLAS
+  cublasHandle_t handle = cuBlasContextManager::getcuBlasHandle_t();
+#endif
 
-  #ifdef USE_HIPBLAS
-   hipblasHandle_t handle = hipBlasContextManager::gethipBlasHandle_t();
-  #endif
+#ifdef USE_HIPBLAS
+  hipblasHandle_t handle = hipBlasContextManager::gethipBlasHandle_t();
+#endif
 
   // NOTE strideB set to 0 below!
   {
-    #ifdef USE_CUBLAS
-    sycl_queue.submit([&](sycl::handler &cgh) {
-        
-        cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
-  
-         auto cudaStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
-         cublasSetStream(handle, cudaStreamHandle);
-
+#ifdef USE_CUBLAS
+    sycl_queue.submit([&](sycl::handler& cgh) {
+      cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+        auto cudaStreamHandle =
+            ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
+        cublasSetStream(handle, cudaStreamHandle);
 
         ReportCUBLASErrors(cublasGemmStridedBatchedEx(
-          handle, transpose_type_notranspose, transpose_type_notranspose, N, M, K, &floatOne, B, CUDA_R_32F, N,
-          N * K, A, CUDA_R_32F, K, 0, &floatZero, Out, CUDA_R_32F, N, N * M,
-          batchSize, CUDA_R_32F, CUBLAS_GEMM_DEFAULT));
-
-        });   
+            handle, transpose_type_notranspose, transpose_type_notranspose, N,
+            M, K, &floatOne, B, CUDA_R_32F, N, N * K, A, CUDA_R_32F, K, 0,
+            &floatZero, Out, CUDA_R_32F, N, N * M, batchSize, CUDA_R_32F,
+            CUBLAS_GEMM_DEFAULT));
+      });
     });
-    #elif defined(USE_HIPBLAS)
-    sycl_queue.submit([&](sycl::handler &cgh) {
-        
-        cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
-         auto hipStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
-  
-         hipblasSetStream(handle, hipStreamHandle);
+#elif defined(USE_HIPBLAS)
+    sycl_queue.submit([&](sycl::handler& cgh) {
+      cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+        auto hipStreamHandle =
+            ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
 
+        hipblasSetStream(handle, hipStreamHandle);
 
         hipblasGemmStridedBatchedEx(
-          handle, transpose_type_notranspose, transpose_type_notranspose, N, M, K, &floatOne, B, HIPBLAS_R_32F, N,
-          N * K, A, HIPBLAS_R_32F, K, 0, &floatZero, Out, HIPBLAS_R_32F, N, N * M,
-          batchSize, HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
-
-        });   
+            handle, transpose_type_notranspose, transpose_type_notranspose, N,
+            M, K, &floatOne, B, HIPBLAS_R_32F, N, N * K, A, HIPBLAS_R_32F, K, 0,
+            &floatZero, Out, HIPBLAS_R_32F, N, N * M, batchSize,
+            HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
+      });
     });
-    #else
-      syclGemmStridedBatched<float>(
-        sycl_queue, transpose_type_notranspose,
-        transpose_type_notranspose, N_, M_, K_, floatOne, B, N_, N_ * K_, A, K_,
-        0, floatZero, Out, N_, N_ * M_, batchSize); 
-    #endif
+#else
+    syclGemmStridedBatched<float>(sycl_queue, transpose_type_notranspose,
+                                  transpose_type_notranspose, N_, M_, K_,
+                                  floatOne, B, N_, N_ * K_, A, K_, 0, floatZero,
+                                  Out, N_, N_ * M_, batchSize);
+#endif
   }
 }
 
@@ -1809,35 +1864,36 @@ template <typename DataType>
 void Conv1Layer<DataType>::Eval(int N, DataType* output, const DataType* input,
                                 const DataType* /*input2*/, void* /*scratch*/,
                                 size_t /*scratch_size*/,
-                                sycl::queue &sycl_queue, DataType***) {
+                                sycl::queue& sycl_queue, DataType***) {
+  // CERR << "Conv1Layer<DataType>::Eval. ";
 
-  //CERR << "Conv1Layer<DataType>::Eval. ";
+  cublasSpecialMatrixMul(weights_, input, output, C, H * W, c_input_, N,
+                         sycl_queue);
+  // CERR << "cublasSpecialMatrixMul. ";
 
-  cublasSpecialMatrixMul(weights_, input, output, C, H * W, c_input_, N, sycl_queue);
- // CERR << "cublasSpecialMatrixMul. ";
-
-  if (use_bias_){
-  // CERR << "addBias. " << N << " " << C << " " << H << " " << W;
+  if (use_bias_) {
+    // CERR << "addBias. " << N << " " << C << " " << H << " " << W;
     addBias_NCHW(output, output, biases_, N, C, H, W, act_, sycl_queue);
   } else if (act_ != ACTIVATION_NONE) {
-    addVectors(output, output, (DataType*)nullptr, N * C * H * W, N * C * H * W, 0, act_, sycl_queue);
-  //  CERR << "addVectors. ";
+    addVectors(output, output, (DataType*)nullptr, N * C * H * W, N * C * H * W,
+               0, act_, sycl_queue);
+    //  CERR << "addVectors. ";
   }
 }
 
 template <typename DataType>
 Conv1Layer<DataType>::~Conv1Layer() {
- 
   sycl::free(weights_, sycl_queue_);
-  if (use_bias_) 
-    sycl::free(biases_, sycl_queue_);
+  if (use_bias_) sycl::free(biases_, sycl_queue_);
 }
 
 template <typename DataType>
 ResidualBlock<DataType>::ResidualBlock(BaseLayer<DataType>* ip, int C, bool se,
                                        int se_k, bool first, bool last,
                                        ActivationFunction activation,
-                                       int shared_mem_size, size_t max_work_group_size, sycl::queue &sycl_queue)
+                                       int shared_mem_size,
+                                       size_t max_work_group_size,
+                                       sycl::queue& sycl_queue)
     : BaseLayer<DataType>(C, 8, 8, ip, ip->isNHWC(), sycl_queue),
       has_se_(se),
       se_k_(se_k),
@@ -1847,7 +1903,6 @@ ResidualBlock<DataType>::ResidualBlock(BaseLayer<DataType>* ip, int C, bool se,
       shared_mem_size_(shared_mem_size),
       max_wg_size_(max_work_group_size),
       act_(activation) {
-
   if (act_ != ACTIVATION_RELU && act_ != ACTIVATION_MISH) {
     throw Exception("Unsupported activation for residual block.");
   }
@@ -1856,13 +1911,14 @@ ResidualBlock<DataType>::ResidualBlock(BaseLayer<DataType>* ip, int C, bool se,
   const size_t weight_size = sizeof(DataType) * C * C * 3 * 3;
 
   const size_t bias_size = sizeof(DataType) * C;
-  biases0_ = (DataType *)sycl::malloc_device(bias_size, sycl_queue_);
-  biases1_ = (DataType *)sycl::malloc_device(bias_size, sycl_queue_);
+  biases0_ = (DataType*)sycl::malloc_device(bias_size, sycl_queue_);
+  biases1_ = (DataType*)sycl::malloc_device(bias_size, sycl_queue_);
 
   // 6x6 transformed filter size, for 3x3 convolution
-  transformed_weights0_ = (DataType *)sycl::malloc_device(weight_size * 4, sycl_queue_);
-  transformed_weights1_ = (DataType *)sycl::malloc_device(weight_size * 4, sycl_queue_);  
-
+  transformed_weights0_ =
+      (DataType*)sycl::malloc_device(weight_size * 4, sycl_queue_);
+  transformed_weights1_ =
+      (DataType*)sycl::malloc_device(weight_size * 4, sycl_queue_);
 
   if (has_se_) {
     const size_t num_weights1 = C * se_k_;
@@ -1875,19 +1931,16 @@ ResidualBlock<DataType>::ResidualBlock(BaseLayer<DataType>* ip, int C, bool se,
     const size_t biases_size1 = sizeof(DataType) * num_biases1;
     const size_t biases_size2 = sizeof(DataType) * num_biases2;
 
-
-    w1_ = (DataType *)sycl::malloc_device(weight_size1, sycl_queue_);
-    w2_ = (DataType *)sycl::malloc_device(weight_size2, sycl_queue_);
-    b1_ = (DataType *)sycl::malloc_device(biases_size1, sycl_queue_);
-    b2_ = (DataType *)sycl::malloc_device(biases_size2, sycl_queue_);
-
+    w1_ = (DataType*)sycl::malloc_device(weight_size1, sycl_queue_);
+    w2_ = (DataType*)sycl::malloc_device(weight_size2, sycl_queue_);
+    b1_ = (DataType*)sycl::malloc_device(biases_size1, sycl_queue_);
+    b2_ = (DataType*)sycl::malloc_device(biases_size2, sycl_queue_);
   }
 }
 
 template <typename DataType>
 void ResidualBlock<DataType>::LoadWeights0(float* pfilter, float* pBias,
                                            void* scratch) {
-
   const size_t weight_size = sizeof(float) * c_input_ * C * 3 * 3;
   const size_t bias_size = sizeof(float) * C;
 
@@ -1899,7 +1952,8 @@ void ResidualBlock<DataType>::LoadWeights0(float* pfilter, float* pBias,
   assert(scratch);
   sycl_queue_.memcpy(scratch, pfilter, weight_size).wait();
 
-  copyTypeConverted((DataType*)weights, (float*)scratch, C * c_input_ * 3 * 3, sycl_queue_);
+  copyTypeConverted((DataType*)weights, (float*)scratch, C * c_input_ * 3 * 3,
+                    sycl_queue_);
 
   if (pBias) {
     sycl_queue_.memcpy(scratch, pBias, bias_size).wait();
@@ -1910,8 +1964,9 @@ void ResidualBlock<DataType>::LoadWeights0(float* pfilter, float* pBias,
   FilterTransform(C, c_input_, transformed_weights0_, weights, sycl_queue_);
 }
 
-template <typename DataType> void ResidualBlock<DataType>::LoadWeights1(float* pfilter, float* pBias, void* scratch) {
-  
+template <typename DataType>
+void ResidualBlock<DataType>::LoadWeights1(float* pfilter, float* pBias,
+                                           void* scratch) {
   const size_t weight_size = sizeof(float) * C * C * 3 * 3;
   const size_t bias_size = sizeof(float) * C;
 
@@ -1923,10 +1978,11 @@ template <typename DataType> void ResidualBlock<DataType>::LoadWeights1(float* p
   assert(scratch);
   sycl_queue_.memcpy(scratch, pfilter, weight_size).wait();
 
-  copyTypeConverted((DataType*)weights, (float*)scratch, C * C * 3 * 3, sycl_queue_);
+  copyTypeConverted((DataType*)weights, (float*)scratch, C * C * 3 * 3,
+                    sycl_queue_);
 
   if (pBias) {
-    sycl_queue_.memcpy(scratch, pBias, bias_size);
+    sycl_queue_.memcpy(scratch, pBias, bias_size).wait();
     copyTypeConverted((DataType*)biases1_, (float*)scratch, C, sycl_queue_);
   }
 
@@ -1934,8 +1990,9 @@ template <typename DataType> void ResidualBlock<DataType>::LoadWeights1(float* p
   FilterTransform(C, C, transformed_weights1_, weights, sycl_queue_);
 }
 
-template <typename DataType> void ResidualBlock<DataType>::LoadSEWeights(float* w1, float* b1, float* w2, float* b2, void* scratch) {
-
+template <typename DataType>
+void ResidualBlock<DataType>::LoadSEWeights(float* w1, float* b1, float* w2,
+                                            float* b2, void* scratch) {
   const size_t num_weights1 = C * se_k_;
   const size_t num_weights2 = num_weights1 * 2;
   const size_t num_biases1 = se_k_;
@@ -1945,31 +2002,40 @@ template <typename DataType> void ResidualBlock<DataType>::LoadSEWeights(float* 
   std::vector<float> temp_transposed(num_weights2);
 
   CpuTranspose(temp_transposed.data(), w1, se_k_, C);
-  
-  sycl_queue_.memcpy(scratch, temp_transposed.data(), num_weights1 * sizeof(float)).wait();
-  copyTypeConverted((DataType*)w1_, (float*)scratch, (int)num_weights1, sycl_queue_);
+
+  sycl_queue_
+      .memcpy(scratch, temp_transposed.data(), num_weights1 * sizeof(float))
+      .wait();
+  copyTypeConverted((DataType*)w1_, (float*)scratch, (int)num_weights1,
+                    sycl_queue_);
 
   CpuTranspose(temp_transposed.data(), w2, 2 * C, se_k_);
-  
-  sycl_queue_.memcpy(scratch, temp_transposed.data(), num_weights2 * sizeof(float)).wait(); 
-  copyTypeConverted((DataType*)w2_, (float*)scratch, (int)num_weights2, sycl_queue_);
 
-  
+  sycl_queue_
+      .memcpy(scratch, temp_transposed.data(), num_weights2 * sizeof(float))
+      .wait();
+  copyTypeConverted((DataType*)w2_, (float*)scratch, (int)num_weights2,
+                    sycl_queue_);
+
   sycl_queue_.memcpy(scratch, b1, num_biases1 * sizeof(float)).wait();
-  copyTypeConverted((DataType*)b1_, (float*)scratch, (int)num_biases1, sycl_queue_);
+  copyTypeConverted((DataType*)b1_, (float*)scratch, (int)num_biases1,
+                    sycl_queue_);
 
-  
   sycl_queue_.memcpy(scratch, b2, num_biases2 * sizeof(float)).wait();
-  copyTypeConverted((DataType*)b2_, (float*)scratch, (int)num_biases2, sycl_queue_);
+  copyTypeConverted((DataType*)b2_, (float*)scratch, (int)num_biases2,
+                    sycl_queue_);
 }
 
 template <typename DataType>
 void ResidualBlock<DataType>::Eval(int N, DataType* output,
                                    const DataType* input,
                                    const DataType* /*input2*/, void* scratch,
-                                   size_t scratch_size, sycl::queue &sycl_queue, DataType***) {
-
-  //CERR << "ResidualBlock<DataType>::Eval. ";
+                                   size_t scratch_size, sycl::queue& sycl_queue,
+                                   DataType***) {
+  /*CERR << "[SYCL TRACE] ResidualBlock::Eval (N=" << N << ", C=" << C
+       << ", first_block=" << (first_block_ ? "true" : "false")
+       << ", last_block=" << (last_block_ ? "true" : "false")
+       << ", scratch=" << (scratch ? "provided" : "null/L2cache") << ")";*/
   // normally:
   // - "output" initially contains the transformed input,
   //    and after this layer, it contains the transformed input for next layer
@@ -1984,7 +2050,16 @@ void ResidualBlock<DataType>::Eval(int N, DataType* output,
   DataType* transformed_input;
   DataType* transformed_output;
   if (!scratch) {
-    // Caller wants us to sub-allocate all memory we need from "output" tensor.
+    // Sub-allocate all memory we need from "output" tensor (tensor_mem[2]).
+    // The primary optimization for Intel GPUs is the sub-allocation memory
+    // packing trick that enableCacheOpt = true enables:
+    // It packs all intermediate transformed Winograd tensors into a single
+    // contiguous block of tensor_mem[2].
+    // Because res_block_mem <= device_cache_.l2_cache_size, this contiguous
+    // layout gives the Intel GPU hardware maximum spatial and temporal
+    // locality, naturally keeping the entire working set inside L2/L3 cache
+    // during the residual tower evaluation without needing explicit driver
+    // hints.
     transformed_input = output;  // This is true in normal cases too!
     transformed_output = transformed_input + (N * C * 8 * 8 * 36 / 16);
   } else {
@@ -1994,7 +2069,8 @@ void ResidualBlock<DataType>::Eval(int N, DataType* output,
   }
 
   if (first_block_) {
-    InputTransform<DataType, true>(N, c_input_, transformed_input, input, sycl_queue);
+    InputTransform<DataType, true>(N, c_input_, transformed_input, input,
+                                   sycl_queue);
     BaseLayer<DataType>::cublasRowMajorMatrixMul(
         transformed_input, transformed_weights0_, transformed_output, N * 4, C,
         c_input_, 36, sycl_queue);
@@ -2020,16 +2096,22 @@ void ResidualBlock<DataType>::Eval(int N, DataType* output,
       transformed_input, transformed_weights1_, transformed_output, N * 4, C, C,
       36, sycl_queue);
 
+  // allowFusing controls whether the SubGroup (warp-level) fused
+  // SE+output+input transform kernels are used. These kernels are FP16-only;
+  // for float (FP32), allowFusing is still computed for the channel-count
+  // guard but the if-constexpr branch below will not dispatch SubGroup kernels,
+  // falling through to the generic OutputInputTransform / OutputTransform path.
   const bool fp16 = std::is_same<sycl::half, DataType>::value;
   bool allowFusing =
       ((C <= kMaxResBlockFusingChannels) ||
        (fp16 && (shared_mem_size_ >= kMaxResBlockFusingSeFp16AmpereSmem) &&
         (C <= kMaxResBlockFusingSeKFp16Ampere))) &&
       (se_k_ <= C);
-       
+
   if constexpr (std::is_same_v<DataType, sycl::half>) {
     // SubGroup kernels launch with work-group size = C. Verify that the device
-    // can support this before enabling fusing to avoid crashes or silent errors.
+    // can support this before enabling fusing to avoid crashes or silent
+    // errors.
     allowFusing = allowFusing && (static_cast<size_t>(C) <= max_wg_size_);
   }
 
@@ -2039,12 +2121,16 @@ void ResidualBlock<DataType>::Eval(int N, DataType* output,
         if (allowFusing) {
           if constexpr (std::is_same_v<DataType, sycl::half>) {
             SubGroupOutputTransform<ACTIVATION_RELU, true, true, true, false>(
-                N, C, se_k_, (sycl::half*)output, (const sycl::half*)transformed_output, (const sycl::half*)input,
-                (const sycl::half*)biases1_, (const sycl::half*)w1_, (const sycl::half*)b1_, (const sycl::half*)w2_, (const sycl::half*)b2_, sycl_queue);
+                N, C, se_k_, (sycl::half*)output,
+                (const sycl::half*)transformed_output, (const sycl::half*)input,
+                (const sycl::half*)biases1_, (const sycl::half*)w1_,
+                (const sycl::half*)b1_, (const sycl::half*)w2_,
+                (const sycl::half*)b2_, sycl_queue);
           } else {
             OutputTransform<DataType, true, ACTIVATION_RELU, true, true, true,
-                            false>(N, C, se_k_, output, transformed_output, input,
-                                   biases1_, w1_, b1_, w2_, b2_, sycl_queue);
+                            false>(N, C, se_k_, output, transformed_output,
+                                   input, biases1_, w1_, b1_, w2_, b2_,
+                                   sycl_queue);
           }
         } else {
           OutputTransform<DataType, true, ACTIVATION_RELU, true, true, true,
@@ -2060,8 +2146,11 @@ void ResidualBlock<DataType>::Eval(int N, DataType* output,
         if (allowFusing) {
           if constexpr (std::is_same_v<DataType, sycl::half>) {
             SubGroupOutputInputTransform<ACTIVATION_RELU, true, true>(
-                N, C, se_k_, (sycl::half*)output, (const sycl::half*)transformed_output, (const sycl::half*)input,
-                (const sycl::half*)biases1_, (const sycl::half*)w1_, (const sycl::half*)b1_, (const sycl::half*)w2_, (const sycl::half*)b2_, sycl_queue);
+                N, C, se_k_, (sycl::half*)output,
+                (const sycl::half*)transformed_output, (const sycl::half*)input,
+                (const sycl::half*)biases1_, (const sycl::half*)w1_,
+                (const sycl::half*)b1_, (const sycl::half*)w2_,
+                (const sycl::half*)b2_, sycl_queue);
           } else {
             OutputInputTransform<DataType, true, ACTIVATION_RELU, true, true>(
                 N, C, se_k_, output, transformed_output, input, biases1_, w1_,
@@ -2086,12 +2175,16 @@ void ResidualBlock<DataType>::Eval(int N, DataType* output,
         if (allowFusing) {
           if constexpr (std::is_same_v<DataType, sycl::half>) {
             SubGroupOutputTransform<ACTIVATION_MISH, true, true, true, false>(
-                N, C, se_k_, (sycl::half*)output, (const sycl::half*)transformed_output, (const sycl::half*)input,
-                (const sycl::half*)biases1_, (const sycl::half*)w1_, (const sycl::half*)b1_, (const sycl::half*)w2_, (const sycl::half*)b2_, sycl_queue);
+                N, C, se_k_, (sycl::half*)output,
+                (const sycl::half*)transformed_output, (const sycl::half*)input,
+                (const sycl::half*)biases1_, (const sycl::half*)w1_,
+                (const sycl::half*)b1_, (const sycl::half*)w2_,
+                (const sycl::half*)b2_, sycl_queue);
           } else {
             OutputTransform<DataType, true, ACTIVATION_MISH, true, true, true,
-                            false>(N, C, se_k_, output, transformed_output, input,
-                                   biases1_, w1_, b1_, w2_, b2_, sycl_queue);
+                            false>(N, C, se_k_, output, transformed_output,
+                                   input, biases1_, w1_, b1_, w2_, b2_,
+                                   sycl_queue);
           }
         } else {
           OutputTransform<DataType, true, ACTIVATION_MISH, true, true, true,
@@ -2107,8 +2200,11 @@ void ResidualBlock<DataType>::Eval(int N, DataType* output,
         if (allowFusing) {
           if constexpr (std::is_same_v<DataType, sycl::half>) {
             SubGroupOutputInputTransform<ACTIVATION_MISH, true, true>(
-                N, C, se_k_, (sycl::half*)output, (const sycl::half*)transformed_output, (const sycl::half*)input,
-                (const sycl::half*)biases1_, (const sycl::half*)w1_, (const sycl::half*)b1_, (const sycl::half*)w2_, (const sycl::half*)b2_, sycl_queue);
+                N, C, se_k_, (sycl::half*)output,
+                (const sycl::half*)transformed_output, (const sycl::half*)input,
+                (const sycl::half*)biases1_, (const sycl::half*)w1_,
+                (const sycl::half*)b1_, (const sycl::half*)w2_,
+                (const sycl::half*)b2_, sycl_queue);
           } else {
             OutputInputTransform<DataType, true, ACTIVATION_MISH, true, true>(
                 N, C, se_k_, output, transformed_output, input, biases1_, w1_,
@@ -2134,7 +2230,6 @@ void ResidualBlock<DataType>::Eval(int N, DataType* output,
 
 template <typename DataType>
 ResidualBlock<DataType>::~ResidualBlock() {
-
   sycl::free(transformed_weights0_, sycl_queue_);
   sycl::free(biases0_, sycl_queue_);
   sycl::free(transformed_weights1_, sycl_queue_);
@@ -2149,22 +2244,22 @@ ResidualBlock<DataType>::~ResidualBlock() {
 
 template <typename DataType>
 void allocAndUpload(DataType** gpu_dest, std::vector<float> cpu_src,
-                    void* scratch, sycl::queue &sycl_queue) {
+                    void* scratch, sycl::queue& sycl_queue) {
   size_t size = cpu_src.size() * sizeof(DataType);
   if (size == 0) {
     *gpu_dest = nullptr;
     return;
   }
 
-  auto deleter = [&sycl_queue](DataType* ptr) {
-    sycl::free(ptr, sycl_queue);
-  };
+  auto deleter = [&sycl_queue](DataType* ptr) { sycl::free(ptr, sycl_queue); };
   std::unique_ptr<DataType, decltype(deleter)> ptr_guard(
       (DataType*)sycl::malloc_device(size, sycl_queue), deleter);
 
-  sycl_queue.memcpy(scratch, &cpu_src[0], cpu_src.size() * sizeof(float)).wait();
+  sycl_queue.memcpy(scratch, &cpu_src[0], cpu_src.size() * sizeof(float))
+      .wait();
 
-  copyTypeConverted((DataType*)ptr_guard.get(), (float*)scratch, (int)cpu_src.size(), sycl_queue);
+  copyTypeConverted((DataType*)ptr_guard.get(), (float*)scratch,
+                    (int)cpu_src.size(), sycl_queue);
 
   *gpu_dest = ptr_guard.release();
 }
@@ -2173,7 +2268,7 @@ template <typename DataType>
 AttentionPolicyHead<DataType>::AttentionPolicyHead(
     BaseLayer<DataType>* ip, const MultiHeadWeights::PolicyHead& weights,
     void* scratch, bool attention_body, ActivationFunction act,
-    int max_batch_size, sycl::queue &sycl_queue)
+    int max_batch_size, sycl::queue& sycl_queue)
     : BaseLayer<DataType>(64 * 64 + 24 * 8, 1, 1, ip, sycl_queue),
       attention_body_(attention_body),
       // Old networks without attention body (e.g. T79) use hardcoded SELU
@@ -2189,11 +2284,15 @@ AttentionPolicyHead<DataType>::AttentionPolicyHead(
   allocAndUpload<DataType>(&ip_pol_w_, weights.ip_pol_w, scratch, sycl_queue_);
   allocAndUpload<DataType>(&ip_pol_b_, weights.ip_pol_b, scratch, sycl_queue_);
 
-  allocAndUpload<DataType>(&ip2_pol_w_, weights.ip2_pol_w, scratch, sycl_queue_);
-  allocAndUpload<DataType>(&ip2_pol_b_, weights.ip2_pol_b, scratch, sycl_queue_);
+  allocAndUpload<DataType>(&ip2_pol_w_, weights.ip2_pol_w, scratch,
+                           sycl_queue_);
+  allocAndUpload<DataType>(&ip2_pol_b_, weights.ip2_pol_b, scratch,
+                           sycl_queue_);
 
-  allocAndUpload<DataType>(&ip3_pol_w_, weights.ip3_pol_w, scratch, sycl_queue_);
-  allocAndUpload<DataType>(&ip3_pol_b_, weights.ip3_pol_b, scratch, sycl_queue_);
+  allocAndUpload<DataType>(&ip3_pol_w_, weights.ip3_pol_w, scratch,
+                           sycl_queue_);
+  allocAndUpload<DataType>(&ip3_pol_b_, weights.ip3_pol_b, scratch,
+                           sycl_queue_);
 
   // big allocation to hold wq and wk weights one after the other
   {
@@ -2203,7 +2302,7 @@ AttentionPolicyHead<DataType>::AttentionPolicyHead(
     size_t size = elements * sizeof(DataType) * 2;
     wqk_w_ = (DataType*)sycl::malloc_device(size, sycl_queue_);
     sycl_queue_.memcpy(wqk_w_, ip2_pol_w_, size / 2);
-    
+
     sycl_queue_.memcpy(wqk_w_ + elements, ip3_pol_w_, size / 2);
 
     elements = weights.ip2_pol_b.size();
@@ -2213,17 +2312,18 @@ AttentionPolicyHead<DataType>::AttentionPolicyHead(
     sycl_queue_.memcpy(wqk_b_ + elements, ip3_pol_b_, size / 2);
   }
 
-  allocAndUpload<DataType>(&ip4_pol_w_, weights.ip4_pol_w, scratch, sycl_queue_);
+  allocAndUpload<DataType>(&ip4_pol_w_, weights.ip4_pol_w, scratch,
+                           sycl_queue_);
 
   for (const auto& enc : weights.pol_encoder) {
     EncoderBlock<DataType>* pW = new EncoderBlock<DataType>(
         enc, scratch, encoder_heads_, embedding_op_size_,
-        1.0f,  // using alpha = 1 for now (TODO: may change?)
+        1.0f,        // using alpha = 1 for now (TODO: may change?)
         nullptr, 0,  // smolgen weights not implemented in
                      // policy encoder heads yet.
-        max_batch_size, ACTIVATION_SWISH, act_,
-        1e-6, sycl_queue_);  // attentionbody nets don't have policy encoders, so using old
-                // epsilon for backward compatibility with T78.
+        max_batch_size, ACTIVATION_SWISH, act_, 1e-6,
+        sycl_queue_);  // attentionbody nets don't have policy encoders, so
+                       // using old epsilon for backward compatibility with T78.
     encoder_weights_.emplace_back(std::unique_ptr<EncoderBlock<DataType>>(pW));
   }
 }
@@ -2233,7 +2333,7 @@ EncoderBlock<DataType>::EncoderBlock(
     const MultiHeadWeights::EncoderLayer& cpu_weights, void* scratch, int heads,
     int size, float alpha, DataType* smolgen_global_scratch,
     int smolgen_global_size, int max_batch_size, ActivationFunction smolgen_act,
-    ActivationFunction ffn_act, float default_eps, sycl::queue &sycl_queue)
+    ActivationFunction ffn_act, float default_eps, sycl::queue& sycl_queue)
     : embedding_op_size_(size),
       encoder_heads_(heads),
       alpha_(alpha),
@@ -2263,7 +2363,7 @@ EncoderBlock<DataType>::EncoderBlock(
   {
     size_t elements = cpu_weights.mha.q_w.size();
     size_t size = elements * sizeof(DataType) * 3;
-    
+
     mha_qkv_w = (DataType*)sycl::malloc_device(size, sycl_queue_);
     sycl_queue_.memcpy(mha_qkv_w, mha_q_w, size / 3);
     sycl_queue_.memcpy(mha_qkv_w + elements, mha_k_w, size / 3);
@@ -2271,27 +2371,37 @@ EncoderBlock<DataType>::EncoderBlock(
 
     elements = cpu_weights.mha.q_b.size();
     size = elements * sizeof(DataType) * 3;
-    
+
     mha_qkv_b = (DataType*)sycl::malloc_device(size, sycl_queue_);
     sycl_queue_.memcpy(mha_qkv_b, mha_q_b, size / 3);
     sycl_queue_.memcpy(mha_qkv_b + elements, mha_k_b, size / 3);
     sycl_queue_.memcpy(mha_qkv_b + elements * 2, mha_v_b, size / 3);
   }
 
-  allocAndUpload<DataType>(&mha_dense_w, cpu_weights.mha.dense_w, scratch, sycl_queue_);
-  allocAndUpload<DataType>(&mha_dense_b, cpu_weights.mha.dense_b, scratch, sycl_queue_);
+  allocAndUpload<DataType>(&mha_dense_w, cpu_weights.mha.dense_w, scratch,
+                           sycl_queue_);
+  allocAndUpload<DataType>(&mha_dense_b, cpu_weights.mha.dense_b, scratch,
+                           sycl_queue_);
 
-  allocAndUpload<DataType>(&ln1_gammas, cpu_weights.ln1_gammas, scratch, sycl_queue_);
-  allocAndUpload<DataType>(&ln1_betas, cpu_weights.ln1_betas, scratch, sycl_queue_);
+  allocAndUpload<DataType>(&ln1_gammas, cpu_weights.ln1_gammas, scratch,
+                           sycl_queue_);
+  allocAndUpload<DataType>(&ln1_betas, cpu_weights.ln1_betas, scratch,
+                           sycl_queue_);
 
-  allocAndUpload<DataType>(&ffn_dense1_w, cpu_weights.ffn.dense1_w, scratch, sycl_queue_);
-  allocAndUpload<DataType>(&ffn_dense1_b, cpu_weights.ffn.dense1_b, scratch, sycl_queue_);
+  allocAndUpload<DataType>(&ffn_dense1_w, cpu_weights.ffn.dense1_w, scratch,
+                           sycl_queue_);
+  allocAndUpload<DataType>(&ffn_dense1_b, cpu_weights.ffn.dense1_b, scratch,
+                           sycl_queue_);
 
-  allocAndUpload<DataType>(&ffn_dense2_w, cpu_weights.ffn.dense2_w, scratch, sycl_queue_);
-  allocAndUpload<DataType>(&ffn_dense2_b, cpu_weights.ffn.dense2_b, scratch, sycl_queue_);
+  allocAndUpload<DataType>(&ffn_dense2_w, cpu_weights.ffn.dense2_w, scratch,
+                           sycl_queue_);
+  allocAndUpload<DataType>(&ffn_dense2_b, cpu_weights.ffn.dense2_b, scratch,
+                           sycl_queue_);
 
-  allocAndUpload<DataType>(&ln2_gammas, cpu_weights.ln2_gammas, scratch, sycl_queue_);
-  allocAndUpload<DataType>(&ln2_betas, cpu_weights.ln2_betas, scratch, sycl_queue_);
+  allocAndUpload<DataType>(&ln2_gammas, cpu_weights.ln2_gammas, scratch,
+                           sycl_queue_);
+  allocAndUpload<DataType>(&ln2_betas, cpu_weights.ln2_betas, scratch,
+                           sycl_queue_);
 
   // Smolgen weights.
   if (has_smolgen_) {
@@ -2312,11 +2422,13 @@ EncoderBlock<DataType>::EncoderBlock(
                              scratch, sycl_queue_);
 
     allocAndUpload<DataType>(&smol_ln1_gammas,
-                             cpu_weights.mha.smolgen.ln1_gammas, scratch, sycl_queue_);
+                             cpu_weights.mha.smolgen.ln1_gammas, scratch,
+                             sycl_queue_);
     allocAndUpload<DataType>(&smol_ln1_betas, cpu_weights.mha.smolgen.ln1_betas,
                              scratch, sycl_queue_);
     allocAndUpload<DataType>(&smol_ln2_gammas,
-                             cpu_weights.mha.smolgen.ln2_gammas, scratch, sycl_queue_);
+                             cpu_weights.mha.smolgen.ln2_gammas, scratch,
+                             sycl_queue_);
     allocAndUpload<DataType>(&smol_ln2_betas, cpu_weights.mha.smolgen.ln2_betas,
                              scratch, sycl_queue_);
 
@@ -2326,271 +2438,261 @@ EncoderBlock<DataType>::EncoderBlock(
 }
 
 template <typename DataType>
-static void cublasXgemm(transpose_type transa,
-                        transpose_type transb, int m, int n, int k,
-                        float alpha, const DataType* A, int lda,
+static void cublasXgemm(transpose_type transa, transpose_type transb, int m,
+                        int n, int k, float alpha, const DataType* A, int lda,
                         const DataType* B, int ldb, float beta, DataType* C,
-                        int ldc, sycl::queue &sycl_queue) {
-
-
-
+                        int ldc, sycl::queue& sycl_queue) {
   const bool fp16 = std::is_same<sycl::half, DataType>::value;
-  
-  #ifdef USE_CUBLAS
+
+#ifdef USE_CUBLAS
   cublasHandle_t handle = cuBlasContextManager::getcuBlasHandle_t();
   if (fp16) {
     unsigned short alpha_h = FP32toFP16(alpha);
     unsigned short beta_h = FP32toFP16(beta);
-    sycl_queue.submit([&](sycl::handler &cgh) {
-        cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
-        auto cudaStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
-        cublasSetStream(handle, cudaStreamHandle);    
-        ReportCUBLASErrors(cublasHgemm(
-          handle, transa, transb, m, n, k, (const half*)&alpha_h, ((const half *)A),
-          lda, ((const half *)B), ldb, (const half*)&beta_h, ((half *)C), ldc));
+    sycl_queue.submit([&](sycl::handler& cgh) {
+      cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+        auto cudaStreamHandle =
+            ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
+        cublasSetStream(handle, cudaStreamHandle);
+        ReportCUBLASErrors(cublasHgemm(handle, transa, transb, m, n, k,
+                                       (const half*)&alpha_h, ((const half*)A),
+                                       lda, ((const half*)B), ldb,
+                                       (const half*)&beta_h, ((half*)C), ldc));
       });
     });
-  } else { 
-    sycl_queue.submit([&](sycl::handler &cgh) {
-        cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {  
-        auto cudaStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
-        cublasSetStream(handle, cudaStreamHandle);  
+  } else {
+    sycl_queue.submit([&](sycl::handler& cgh) {
+      cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+        auto cudaStreamHandle =
+            ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
+        cublasSetStream(handle, cudaStreamHandle);
         ReportCUBLASErrors(cublasSgemm(handle, transa, transb, m, n, k, &alpha,
-                                   (const float*)A, lda, (const float*)B, ldb,
-                                   &beta, (float*)C, ldc));
-
-        });
+                                       (const float*)A, lda, (const float*)B,
+                                       ldb, &beta, (float*)C, ldc));
       });
+    });
   }
-  #elif defined(USE_HIPBLAS)
+#elif defined(USE_HIPBLAS)
   hipblasHandle_t handle = hipBlasContextManager::gethipBlasHandle_t();
   if (fp16) {
     unsigned short alpha_h = FP32toFP16(alpha);
     unsigned short beta_h = FP32toFP16(beta);
-    sycl_queue.submit([&](sycl::handler &cgh) {
+    sycl_queue.submit([&](sycl::handler& cgh) {
       cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
-        auto hipStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
+        auto hipStreamHandle =
+            ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
         hipblasSetStream(handle, hipStreamHandle);
-        hipblasHgemm(handle, transa, transb, m, n, k, &alpha_h, (const hipblasHalf*)A,
-          lda, (const hipblasHalf*)B, ldb, &beta_h, (hipblasHalf*)C, ldc);
-        });
+        hipblasHgemm(handle, transa, transb, m, n, k, &alpha_h,
+                     (const hipblasHalf*)A, lda, (const hipblasHalf*)B, ldb,
+                     &beta_h, (hipblasHalf*)C, ldc);
       });
+    });
   } else {
-    sycl_queue.submit([&](sycl::handler &cgh) {
-      cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {  
-        auto hipStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
-        hipblasSetStream(handle, hipStreamHandle);  
-        hipblasSgemm(handle, transa, transb, m, n, k, &alpha, (const float*)A, lda, (const float*)B, ldb, &beta, (float*)C, ldc);
-        });
+    sycl_queue.submit([&](sycl::handler& cgh) {
+      cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+        auto hipStreamHandle =
+            ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
+        hipblasSetStream(handle, hipStreamHandle);
+        hipblasSgemm(handle, transa, transb, m, n, k, &alpha, (const float*)A,
+                     lda, (const float*)B, ldb, &beta, (float*)C, ldc);
       });
+    });
   }
-  #else
-    syclGemm<DataType>(sycl_queue, transa, transb, m, n, k, alpha, (const DataType *)A, lda,
-        (const DataType *)B, ldb, beta, (DataType *)C, ldc);
-  #endif
-
+#else
+  syclGemm<DataType>(sycl_queue, transa, transb, m, n, k, alpha,
+                     (const DataType*)A, lda, (const DataType*)B, ldb, beta,
+                     (DataType*)C, ldc);
+#endif
 }
 
 template <typename DataType>
-static void cublasXGemmStridedBatched(transpose_type transa, transpose_type transb,
-    int m, int n, int k, float alpha, const void* A, int lda,
-    long long int strideA, const void* B, int ldb, long long int strideB,
-    float beta, void* C, int ldc, long long int strideC, int batchCount, sycl::queue &sycl_queue) {
-
+static void cublasXGemmStridedBatched(
+    transpose_type transa, transpose_type transb, int m, int n, int k,
+    float alpha, const void* A, int lda, long long int strideA, const void* B,
+    int ldb, long long int strideB, float beta, void* C, int ldc,
+    long long int strideC, int batchCount, sycl::queue& sycl_queue) {
   const bool fp16 = std::is_same<sycl::half, DataType>::value;
-  
-  #ifdef USE_CUBLAS
+
+#ifdef USE_CUBLAS
   cublasHandle_t handle = cuBlasContextManager::getcuBlasHandle_t();
   if (fp16) {
     unsigned short alpha_h = FP32toFP16(alpha);
     unsigned short beta_h = FP32toFP16(beta);
-    
-    sycl_queue.submit([&](sycl::handler &cgh) {
-        cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
-        auto cudaStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
-        cublasSetStream(handle, cudaStreamHandle);    
+
+    sycl_queue.submit([&](sycl::handler& cgh) {
+      cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+        auto cudaStreamHandle =
+            ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
+        cublasSetStream(handle, cudaStreamHandle);
 
         ReportCUBLASErrors(cublasGemmStridedBatchedEx(
-          handle, transa, transb, m, n, k, &alpha_h, A, CUDA_R_16F, lda, strideA,
-          B, CUDA_R_16F, ldb, strideB, &beta_h, C, CUDA_R_16F, ldc, strideC,
-          batchCount, CUDA_R_16F, CUBLAS_GEMM_DEFAULT));
-        
-
+            handle, transa, transb, m, n, k, &alpha_h, A, CUDA_R_16F, lda,
+            strideA, B, CUDA_R_16F, ldb, strideB, &beta_h, C, CUDA_R_16F, ldc,
+            strideC, batchCount, CUDA_R_16F, CUBLAS_GEMM_DEFAULT));
       });
-
     });
-  
-  } else { 
-    
-    sycl_queue.submit([&](sycl::handler &cgh) {
-        
-        cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
-    
-        auto cudaStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
-        cublasSetStream(handle, cudaStreamHandle);    
-    
+
+  } else {
+    sycl_queue.submit([&](sycl::handler& cgh) {
+      cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+        auto cudaStreamHandle =
+            ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
+        cublasSetStream(handle, cudaStreamHandle);
+
         ReportCUBLASErrors(cublasGemmStridedBatchedEx(
-        handle, transa, transb, m, n, k, &alpha, A, CUDA_R_32F, lda, strideA, B,
-        CUDA_R_32F, ldb, strideB, &beta, C, CUDA_R_32F, ldc, strideC,
-        batchCount, CUDA_R_32F, CUBLAS_GEMM_DEFAULT));
-  
-  
+            handle, transa, transb, m, n, k, &alpha, A, CUDA_R_32F, lda,
+            strideA, B, CUDA_R_32F, ldb, strideB, &beta, C, CUDA_R_32F, ldc,
+            strideC, batchCount, CUDA_R_32F, CUBLAS_GEMM_DEFAULT));
       });
     });
   }
-  #elif defined(USE_HIPBLAS)
+#elif defined(USE_HIPBLAS)
   hipblasHandle_t handle = hipBlasContextManager::gethipBlasHandle_t();
   if (fp16) {
     unsigned short alpha_h = FP32toFP16(alpha);
     unsigned short beta_h = FP32toFP16(beta);
 
-    sycl_queue.submit([&](sycl::handler &cgh) {
-
+    sycl_queue.submit([&](sycl::handler& cgh) {
       cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
-        auto hipStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
+        auto hipStreamHandle =
+            ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
 
         hipblasSetStream(handle, hipStreamHandle);
 
-        hipblasGemmStridedBatchedEx(
-        handle, transa, transb, m, n, k, &alpha_h, A, HIPBLAS_R_16F, lda, strideA, B,
-        HIPBLAS_R_16F, ldb, strideB, &beta_h, C, HIPBLAS_R_16F, ldc, strideC,
-        batchCount, HIPBLAS_COMPUTE_16F, HIPBLAS_GEMM_DEFAULT);
-
-
+        hipblasGemmStridedBatchedEx(handle, transa, transb, m, n, k, &alpha_h,
+                                    A, HIPBLAS_R_16F, lda, strideA, B,
+                                    HIPBLAS_R_16F, ldb, strideB, &beta_h, C,
+                                    HIPBLAS_R_16F, ldc, strideC, batchCount,
+                                    HIPBLAS_COMPUTE_16F, HIPBLAS_GEMM_DEFAULT);
       });
     });
   } else {
-    sycl_queue.submit([&](sycl::handler &cgh) {
-
+    sycl_queue.submit([&](sycl::handler& cgh) {
       cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
-        auto hipStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
-    
-        hipblasSetStream(handle, hipStreamHandle);    
-    
-        hipblasGemmStridedBatchedEx(
-        handle, transa, transb, m, n, k, &alpha, A, HIPBLAS_R_32F, lda, strideA, B,
-        HIPBLAS_R_32F, ldb, strideB, &beta, C, HIPBLAS_R_32F, ldc, strideC,
-        batchCount, HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
-  
-  
+        auto hipStreamHandle =
+            ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
+
+        hipblasSetStream(handle, hipStreamHandle);
+
+        hipblasGemmStridedBatchedEx(handle, transa, transb, m, n, k, &alpha, A,
+                                    HIPBLAS_R_32F, lda, strideA, B,
+                                    HIPBLAS_R_32F, ldb, strideB, &beta, C,
+                                    HIPBLAS_R_32F, ldc, strideC, batchCount,
+                                    HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
       });
     });
   }
-  #else
-  syclGemmStridedBatched<DataType>(sycl_queue, transa, transb, m, n, k, alpha, (const DataType *)A, lda, strideA, (const DataType *)B, ldb, strideB, beta, (DataType *)C, ldc, strideC, batchCount);
-  #endif
+#else
+  syclGemmStridedBatched<DataType>(sycl_queue, transa, transb, m, n, k, alpha,
+                                   (const DataType*)A, lda, strideA,
+                                   (const DataType*)B, ldb, strideB, beta,
+                                   (DataType*)C, ldc, strideC, batchCount);
+#endif
 }
 
 template <typename DataType>
-static void cublasXGemmBatched(transpose_type transa,
-                               transpose_type transb, int m, int n,
-                               int k, float alpha, DataType** A, int lda,
-                               DataType** B, int ldb, float beta, DataType** C,
-                               int ldc, int batchCount, sycl::queue &sycl_queue) {
-
+static void cublasXGemmBatched(transpose_type transa, transpose_type transb,
+                               int m, int n, int k, float alpha, DataType** A,
+                               int lda, DataType** B, int ldb, float beta,
+                               DataType** C, int ldc, int batchCount,
+                               sycl::queue& sycl_queue) {
   const bool fp16 = std::is_same<sycl::half, DataType>::value;
 
-  #ifdef USE_CUBLAS
+#ifdef USE_CUBLAS
   cublasHandle_t handle = cuBlasContextManager::getcuBlasHandle_t();
-  
+
   if (fp16) {
     unsigned short alpha_h = FP32toFP16(alpha);
     unsigned short beta_h = FP32toFP16(beta);
 
-
-    sycl_queue.submit([&](sycl::handler &cgh) {
-        cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
-        auto cudaStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
-        cublasSetStream(handle, cudaStreamHandle);    
+    sycl_queue.submit([&](sycl::handler& cgh) {
+      cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+        auto cudaStreamHandle =
+            ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
+        cublasSetStream(handle, cudaStreamHandle);
 
         ReportCUBLASErrors(cublasHgemmBatched(
-        handle, transa, transb, m, n, k, (const half*)&alpha_h, (half**)A, lda,
-        (half**)B, ldb, (const half*)&beta_h, (half**)C, ldc, batchCount));
-        
+            handle, transa, transb, m, n, k, (const half*)&alpha_h, (half**)A,
+            lda, (half**)B, ldb, (const half*)&beta_h, (half**)C, ldc,
+            batchCount));
       });
-
     });
 
   } else {
-    
-    sycl_queue.submit([&](sycl::handler &cgh) {
-        cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
-        auto cudaStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
-        cublasSetStream(handle, cudaStreamHandle);    
+    sycl_queue.submit([&](sycl::handler& cgh) {
+      cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+        auto cudaStreamHandle =
+            ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
+        cublasSetStream(handle, cudaStreamHandle);
 
         ReportCUBLASErrors(cublasSgemmBatched(
-        handle, transa, transb, m, n, k, &alpha, (float**)A, lda, (float**)B,
-        ldb, &beta, (float**)C, ldc, batchCount));
-        
+            handle, transa, transb, m, n, k, &alpha, (float**)A, lda,
+            (float**)B, ldb, &beta, (float**)C, ldc, batchCount));
       });
-
     });
   }
 
-  #elif defined(USE_HIPBLAS)
+#elif defined(USE_HIPBLAS)
 
-   hipblasHandle_t handle = hipBlasContextManager::gethipBlasHandle_t();
-  
+  hipblasHandle_t handle = hipBlasContextManager::gethipBlasHandle_t();
+
   if (fp16) {
     unsigned short alpha_h = FP32toFP16(alpha);
     unsigned short beta_h = FP32toFP16(beta);
 
+    sycl_queue.submit([&](sycl::handler& cgh) {
+      cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+        auto hipStreamHandle =
+            ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
 
-    sycl_queue.submit([&](sycl::handler &cgh) {
-        cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
-        auto hipStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
+        hipblasSetStream(handle, hipStreamHandle);
 
-        hipblasSetStream(handle, hipStreamHandle);       
-
-        hipblasHgemmBatched(
-        handle, transa, transb, m, n, k, (const hipblasHalf*)&alpha_h, (hipblasHalf**)A, lda,
-        (hipblasHalf**)B, ldb, (const hipblasHalf*)&beta_h, (hipblasHalf**)C, ldc, batchCount);
-        
+        hipblasHgemmBatched(handle, transa, transb, m, n, k,
+                            (const hipblasHalf*)&alpha_h, (hipblasHalf**)A, lda,
+                            (hipblasHalf**)B, ldb, (const hipblasHalf*)&beta_h,
+                            (hipblasHalf**)C, ldc, batchCount);
       });
-
     });
 
   } else {
-    
-    sycl_queue.submit([&](sycl::handler &cgh) {
-        cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
-        auto hipStreamHandle = ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
+    sycl_queue.submit([&](sycl::handler& cgh) {
+      cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+        auto hipStreamHandle =
+            ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
 
-        hipblasSetStream(handle, hipStreamHandle);        
+        hipblasSetStream(handle, hipStreamHandle);
 
-        hipblasSgemmBatched(
-        handle, transa, transb, m, n, k, &alpha, (float**)A, lda, (float**)B,
-        ldb, &beta, (float**)C, ldc, batchCount);
-        
-
+        hipblasSgemmBatched(handle, transa, transb, m, n, k, &alpha, (float**)A,
+                            lda, (float**)B, ldb, &beta, (float**)C, ldc,
+                            batchCount);
       });
-
     });
   }
 
-  #else
+#else
   if (fp16) {
     unsigned short alpha_h = FP32toFP16(alpha);
     unsigned short beta_h = FP32toFP16(beta);
 
     syclGemmBatched<sycl::half>(sycl_queue, transa, transb, m, n, k, alpha,
-        (sycl::half**)A, lda, (sycl::half**)B, ldb, beta, (sycl::half**)C, ldc, batchCount);
+                                (sycl::half**)A, lda, (sycl::half**)B, ldb,
+                                beta, (sycl::half**)C, ldc, batchCount);
   } else {
     syclGemmBatched<float>(sycl_queue, transa, transb, m, n, k, alpha,
-        (float**)A, lda, (float**)B, ldb, beta, (float**)C, ldc, batchCount);
+                           (float**)A, lda, (float**)B, ldb, beta, (float**)C,
+                           ldc, batchCount);
   }
 
-  #endif
+#endif
 }
 
 // input/output tensor is in_out_tensor, others are used as scratch.
 template <typename DataType>
 void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
                                   DataType* scratch, DataType* buffer1,
-                                  DataType* buffer2, sycl::queue &sycl_queue,
+                                  DataType* buffer2, sycl::queue& sycl_queue,
                                   DataType*** offset_pointers) {
-
-  //CERR << "EncoderBlock<DataType>::Eval. ";
+  // CERR << "EncoderBlock<DataType>::Eval. ";
 
   const int d_model = mha_q_size_;
   const int depth = d_model / encoder_heads_;
@@ -2605,10 +2707,10 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
       const int num_inputs = d_model;
       const int num_outputs = smol_compress_size_;
       const int batch = N * 64;
-      cublasXgemm<DataType>(transpose_type_transpose,
-          transpose_type_notranspose, num_outputs, batch, num_inputs,
-          1.0f, (const DataType*)smol_compress, num_inputs, in_out_tensor,
-          num_inputs, 0.0f, scratch, num_outputs, sycl_queue);
+      cublasXgemm<DataType>(
+          transpose_type_transpose, transpose_type_notranspose, num_outputs,
+          batch, num_inputs, 1.0f, (const DataType*)smol_compress, num_inputs,
+          in_out_tensor, num_inputs, 0.0f, scratch, num_outputs, sycl_queue);
     }
 
     {
@@ -2618,11 +2720,10 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
       const int num_inputs = 64 * smol_compress_size_;
       const int num_outputs = smol_dense_1_size_;
       const int batch = N;
-      cublasXgemm<DataType>(transpose_type_transpose,
-                            transpose_type_notranspose, num_outputs,
-                            batch, num_inputs, 1.0f,
-                            (const DataType*)smol_dense1_w, num_inputs, scratch,
-                            num_inputs, 0.0f, buffer1, num_outputs, sycl_queue);
+      cublasXgemm<DataType>(
+          transpose_type_transpose, transpose_type_notranspose, num_outputs,
+          batch, num_inputs, 1.0f, (const DataType*)smol_dense1_w, num_inputs,
+          scratch, num_inputs, 0.0f, buffer1, num_outputs, sycl_queue);
 
       LayerNorm<DataType>(batch, num_outputs, scratch, buffer1, smol_dense1_b,
                           (DataType*)nullptr, smol_ln1_gammas, smol_ln1_betas,
@@ -2636,11 +2737,10 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
       const int num_inputs = smol_dense_1_size_;
       const int num_outputs = smol_dense_2_size_;
       const int batch = N;
-      cublasXgemm<DataType>(transpose_type_transpose,
-                            transpose_type_notranspose, num_outputs,
-                            batch, num_inputs, 1.0f,
-                            (const DataType*)smol_dense2_w, num_inputs, scratch,
-                            num_inputs, 0.0f, buffer1, num_outputs, sycl_queue);
+      cublasXgemm<DataType>(
+          transpose_type_transpose, transpose_type_notranspose, num_outputs,
+          batch, num_inputs, 1.0f, (const DataType*)smol_dense2_w, num_inputs,
+          scratch, num_inputs, 0.0f, buffer1, num_outputs, sycl_queue);
 
       LayerNorm<DataType>(batch, num_outputs, scratch, buffer1, smol_dense2_b,
                           (DataType*)nullptr, smol_ln2_gammas, smol_ln2_betas,
@@ -2658,11 +2758,10 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
       const int num_outputs = smol_global_size_; /* hwhw: 64 * 64 */
       const int batch = N * encoder_heads_;
 
-      cublasXgemm<DataType>(transpose_type_transpose,
-                            transpose_type_notranspose, num_outputs,
-                            batch, num_inputs, 1.0f,
-                            (const DataType*)smol_global, num_inputs, scratch,
-                            num_inputs, 0.0f, buffer2, num_outputs, sycl_queue);
+      cublasXgemm<DataType>(
+          transpose_type_transpose, transpose_type_notranspose, num_outputs,
+          batch, num_inputs, 1.0f, (const DataType*)smol_global, num_inputs,
+          scratch, num_inputs, 0.0f, buffer2, num_outputs, sycl_queue);
     }
   }
 
@@ -2680,8 +2779,9 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
     mha_k = mha_q + num_outputs * max_batch;
     mha_v = mha_k + num_outputs * max_batch;
 
-    cublasXGemmStridedBatched<DataType>(transpose_type_transpose, transpose_type_notranspose,
-        num_outputs, batch, num_inputs, 1.0f, mha_qkv_w, num_inputs,
+    cublasXGemmStridedBatched<DataType>(
+        transpose_type_transpose, transpose_type_notranspose, num_outputs,
+        batch, num_inputs, 1.0f, mha_qkv_w, num_inputs,
         num_inputs * num_outputs, in_out_tensor, num_inputs, 0, 0.0f, mha_q,
         num_outputs, num_outputs * max_batch, 3, sycl_queue);
     addBiasBatched<DataType>(mha_q, mha_q, mha_qkv_b, 3, batch, num_outputs,
@@ -2710,22 +2810,21 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
   // matmul_qk = tf.matmul(q, k, transpose_b=True)
   {
     if (*offset_pointers == nullptr) {
-      
       *offset_pointers = sycl::malloc_device<DataType*>(
-                               encoder_heads_ * max_batch_size_ * 5,
-                               sycl_queue_);
+          encoder_heads_ * max_batch_size_ * 5, sycl_queue_);
       genOffsetPointers(*offset_pointers, encoder_heads_, max_batch_size_,
-                        depth, d_model, mha_k, mha_q, buffer1,
-                        mha_v, buffer2, sycl_queue_);
+                        depth, d_model, mha_k, mha_q, buffer1, mha_v, buffer2,
+                        sycl_queue_);
     }
 
-    cublasXGemmBatched<DataType>(transpose_type_transpose, transpose_type_notranspose,
-        64 /*M*/, 64 /*N*/, depth /*K*/,  // A/B, and M/N are swapped for
-                                          // row-major to col-major transform
-        factor,            // to handle "/ tf.math.sqrt(dk)"
-        *offset_pointers,  // mha_k + offset /*A*/,
-        d_model /*LDA*/,   // (d_model = depth * encoder_heads_) to skip over
-                           // other "depth" slices / heads
+    cublasXGemmBatched<DataType>(
+        transpose_type_transpose, transpose_type_notranspose, 64 /*M*/,
+        64 /*N*/, depth /*K*/,  // A/B, and M/N are swapped for
+                                // row-major to col-major transform
+        factor,                 // to handle "/ tf.math.sqrt(dk)"
+        *offset_pointers,       // mha_k + offset /*A*/,
+        d_model /*LDA*/,  // (d_model = depth * encoder_heads_) to skip over
+                          // other "depth" slices / heads
         // 64 * d_model,     /*strideA*/
         *offset_pointers +
             encoder_heads_ * max_batch_size_,  // mha_q + offset /*B*/,
@@ -2745,15 +2844,17 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
   if (has_smolgen_) {
     // Add smolgen weights to the scaled matmul_qk attention logits before
     // softmax.
-    Softmax(encoder_heads_ * N * 64, 64, buffer1, buffer1, buffer2, sycl_queue_);
+    Softmax(encoder_heads_ * N * 64, 64, buffer1, buffer1, buffer2,
+            sycl_queue_);
   } else {
     Softmax(encoder_heads_ * N * 64, 64, buffer1, buffer1,
             (const DataType*)nullptr, sycl_queue_);
   }
 
   {
-    cublasXGemmBatched<DataType>(transpose_type_notranspose,
-        transpose_type_notranspose, depth /*M*/, 64 /*N*/, 64 /*K*/, 1.0f,
+    cublasXGemmBatched<DataType>(
+        transpose_type_notranspose, transpose_type_notranspose, depth /*M*/,
+        64 /*N*/, 64 /*K*/, 1.0f,
         *offset_pointers + encoder_heads_ * max_batch_size_ *
                                3,  // mha_v + offset /*A*/,  // "v" matrix
         d_model /*LDA*/,           // to skip over other "depth" slices / heads
@@ -2775,10 +2876,10 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
     const int num_inputs = d_model;
     const int num_outputs = embedding_op_size_;
     const int batch = N * 64;
-    cublasXgemm(transpose_type_transpose,
-                transpose_type_notranspose, num_outputs, batch,
-                num_inputs, 1.0f, (const DataType*)mha_dense_w, num_inputs,
-                buffer2, num_inputs, 0.0f, buffer1, num_outputs, sycl_queue_);
+    cublasXgemm(transpose_type_transpose, transpose_type_notranspose,
+                num_outputs, batch, num_inputs, 1.0f,
+                (const DataType*)mha_dense_w, num_inputs, buffer2, num_inputs,
+                0.0f, buffer1, num_outputs, sycl_queue_);
   }
 
   // LN1: skip connection and layer normalization (also bias add of prev gemm)
@@ -2792,10 +2893,10 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
     const int num_inputs = embedding_op_size_;
     const int num_outputs = ffn_dense1_size_;  // encoder_dff
     const int batch = N * 64;
-    cublasXgemm(transpose_type_transpose,
-                transpose_type_notranspose, num_outputs, batch,
-                num_inputs, 1.0f, (const DataType*)ffn_dense1_w, num_inputs,
-                scratch, num_inputs, 0.0f, in_out_tensor, num_outputs, sycl_queue_);
+    cublasXgemm(transpose_type_transpose, transpose_type_notranspose,
+                num_outputs, batch, num_inputs, 1.0f,
+                (const DataType*)ffn_dense1_w, num_inputs, scratch, num_inputs,
+                0.0f, in_out_tensor, num_outputs, sycl_queue_);
     addBiasBatched(in_out_tensor, in_out_tensor, ffn_dense1_b, 1, batch,
                    num_outputs, ffn_activation_, sycl_queue_);
   }
@@ -2805,10 +2906,10 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
     const int num_inputs = ffn_dense1_size_;  // encoder_dff
     const int num_outputs = embedding_op_size_;
     const int batch = N * 64;
-    cublasXgemm(transpose_type_transpose,
-                transpose_type_notranspose, num_outputs, batch,
-                num_inputs, 1.0f, (const DataType*)ffn_dense2_w, num_inputs,
-                in_out_tensor, num_inputs, 0.0f, buffer1, num_outputs, sycl_queue_);
+    cublasXgemm(transpose_type_transpose, transpose_type_notranspose,
+                num_outputs, batch, num_inputs, 1.0f,
+                (const DataType*)ffn_dense2_w, num_inputs, in_out_tensor,
+                num_inputs, 0.0f, buffer1, num_outputs, sycl_queue_);
   }
 
   // LN2: skip connection and layer normilization (also bias add of prev gemm)
@@ -2819,11 +2920,13 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
 }
 
 template <typename DataType>
-void AttentionPolicyHead<DataType>::Eval(int N, DataType* output, const DataType* input,
-            const DataType* input2, void* scratch, size_t scratch_size,
-            sycl::queue &sycl_queue, DataType*** offset_pointers) {
-
-  //CERR << "AttentionPolicyHead<DataType>::Eval. ";
+void AttentionPolicyHead<DataType>::Eval(int N, DataType* output,
+                                         const DataType* input,
+                                         const DataType* input2, void* scratch,
+                                         size_t scratch_size,
+                                         sycl::queue& sycl_queue,
+                                         DataType*** offset_pointers) {
+  // CERR << "AttentionPolicyHead<DataType>::Eval. ";
 
   DataType* input2_tensor = (DataType*)input2;
   DataType* buffer1 = output + scratch_size / (2 * sizeof(DataType));
@@ -2831,7 +2934,8 @@ void AttentionPolicyHead<DataType>::Eval(int N, DataType* output, const DataType
 
   int inputC = this->input_->GetC();
   if (!attention_body_)
-    convertNCHWtoNHWC((DataType*)scratch, input, N, inputC, N, inputC, 8, 8, sycl_queue);
+    convertNCHWtoNHWC((DataType*)scratch, input, N, inputC, N, inputC, 8, 8,
+                      sycl_queue);
 
   // 1. Policy embedding (fully connected layer)
   // Input data in NHWC layout N*(64)*C, output is N*(64)*embedding_op_size_
@@ -2841,10 +2945,10 @@ void AttentionPolicyHead<DataType>::Eval(int N, DataType* output, const DataType
     const int num_inputs = inputC;
     const int batch = N * 64;
     cublasXgemm<DataType>(
-        transpose_type_transpose, transpose_type_notranspose,
-        num_outputs, batch, num_inputs, 1.0f, (const DataType*)ip_pol_w_,
-        num_inputs, attention_body_ ? input : (DataType*)scratch, num_inputs,
-        0.0f, pol_embedding, num_outputs, sycl_queue);
+        transpose_type_transpose, transpose_type_notranspose, num_outputs,
+        batch, num_inputs, 1.0f, (const DataType*)ip_pol_w_, num_inputs,
+        attention_body_ ? input : (DataType*)scratch, num_inputs, 0.0f,
+        pol_embedding, num_outputs, sycl_queue);
 
     addBiasBatched(pol_embedding, pol_embedding, ip_pol_b_, 1, batch,
                    num_outputs, act_, sycl_queue);
@@ -2852,7 +2956,8 @@ void AttentionPolicyHead<DataType>::Eval(int N, DataType* output, const DataType
 
   // 2. Encoder layers
   for (const auto& pEnc : encoder_weights_) {
-    pEnc->Eval(N, input2_tensor, (DataType*)scratch, buffer1, buffer2, sycl_queue, offset_pointers);
+    pEnc->Eval(N, input2_tensor, (DataType*)scratch, buffer1, buffer2,
+               sycl_queue, offset_pointers);
   }  // End of encoder blocks
 
   DataType* wq;
@@ -2865,10 +2970,10 @@ void AttentionPolicyHead<DataType>::Eval(int N, DataType* output, const DataType
     wk = wq + num_outputs * batch;
 
     cublasXGemmStridedBatched<DataType>(
-        transpose_type_transpose, transpose_type_notranspose,
-        num_outputs, batch, num_inputs, 1.0f, wqk_w_, num_inputs,
-        num_inputs * num_outputs, input2_tensor, num_inputs, 0, 0.0f, wq,
-        num_outputs, num_outputs * batch, 2, sycl_queue);
+        transpose_type_transpose, transpose_type_notranspose, num_outputs,
+        batch, num_inputs, 1.0f, wqk_w_, num_inputs, num_inputs * num_outputs,
+        input2_tensor, num_inputs, 0, 0.0f, wq, num_outputs,
+        num_outputs * batch, 2, sycl_queue);
 
     addBiasBatched<DataType>(wq, wq, wqk_b_, 2, batch, num_outputs,
                              ACTIVATION_NONE, sycl_queue);
@@ -2885,8 +2990,8 @@ void AttentionPolicyHead<DataType>::Eval(int N, DataType* output, const DataType
     // leave 8*24 after each batch to interleave promotion_logits (computed
     // later below)
     cublasXGemmStridedBatched<DataType>(
-        transpose_type_transpose, transpose_type_notranspose,
-        64 /*M*/, 64 /*N*/, policy_d_model_ /*K*/,
+        transpose_type_transpose, transpose_type_notranspose, 64 /*M*/,
+        64 /*N*/, policy_d_model_ /*K*/,
         factor,  // to handle "/ tf.math.sqrt(dk)"
         wk /*A*/, policy_d_model_ /*LDA*/, 64 * policy_d_model_, /*strideA*/
         wq /*B*/, policy_d_model_ /*LDB*/, 64 * policy_d_model_, /*strideB*/
@@ -2904,48 +3009,48 @@ void AttentionPolicyHead<DataType>::Eval(int N, DataType* output, const DataType
 
 template <typename DataType>
 AttentionPolicyHead<DataType>::~AttentionPolicyHead() {
-      sycl::free(ip_pol_w_, sycl_queue_);
-      sycl::free(ip_pol_b_, sycl_queue_);
-      sycl::free(ip2_pol_w_, sycl_queue_);
-      sycl::free(ip2_pol_b_, sycl_queue_);
-      sycl::free(ip3_pol_w_, sycl_queue_);
-      sycl::free(ip3_pol_b_, sycl_queue_);
-      sycl::free(ip4_pol_w_, sycl_queue_);
-      sycl::free(wqk_w_, sycl_queue_);
-      sycl::free(wqk_b_, sycl_queue_);
+  sycl::free(ip_pol_w_, sycl_queue_);
+  sycl::free(ip_pol_b_, sycl_queue_);
+  sycl::free(ip2_pol_w_, sycl_queue_);
+  sycl::free(ip2_pol_b_, sycl_queue_);
+  sycl::free(ip3_pol_w_, sycl_queue_);
+  sycl::free(ip3_pol_b_, sycl_queue_);
+  sycl::free(ip4_pol_w_, sycl_queue_);
+  sycl::free(wqk_w_, sycl_queue_);
+  sycl::free(wqk_b_, sycl_queue_);
   // encoder_weights_ is managed by std::unique_ptr
 }
 
 template <typename DataType>
 EncoderBlock<DataType>::~EncoderBlock() {
-      sycl::free(mha_q_w, sycl_queue_);
-      sycl::free(mha_q_b, sycl_queue_);
-      sycl::free(mha_k_w, sycl_queue_);
-      sycl::free(mha_k_b, sycl_queue_);
-      sycl::free(mha_v_w, sycl_queue_);
-      sycl::free(mha_v_b, sycl_queue_);
-      sycl::free(mha_qkv_w, sycl_queue_);
-      sycl::free(mha_qkv_b, sycl_queue_);
-      sycl::free(mha_dense_w, sycl_queue_);
-      sycl::free(mha_dense_b, sycl_queue_);
-      sycl::free(ln1_gammas, sycl_queue_);
-      sycl::free(ln1_betas, sycl_queue_);
-      sycl::free(ffn_dense1_w, sycl_queue_);
-      sycl::free(ffn_dense1_b, sycl_queue_);
-      sycl::free(ffn_dense2_w, sycl_queue_);
-      sycl::free(ffn_dense2_b, sycl_queue_);
-      sycl::free(ln2_gammas, sycl_queue_);
-      sycl::free(ln2_betas, sycl_queue_);
+  sycl::free(mha_q_w, sycl_queue_);
+  sycl::free(mha_q_b, sycl_queue_);
+  sycl::free(mha_k_w, sycl_queue_);
+  sycl::free(mha_k_b, sycl_queue_);
+  sycl::free(mha_v_w, sycl_queue_);
+  sycl::free(mha_v_b, sycl_queue_);
+  sycl::free(mha_qkv_w, sycl_queue_);
+  sycl::free(mha_qkv_b, sycl_queue_);
+  sycl::free(mha_dense_w, sycl_queue_);
+  sycl::free(mha_dense_b, sycl_queue_);
+  sycl::free(ln1_gammas, sycl_queue_);
+  sycl::free(ln1_betas, sycl_queue_);
+  sycl::free(ffn_dense1_w, sycl_queue_);
+  sycl::free(ffn_dense1_b, sycl_queue_);
+  sycl::free(ffn_dense2_w, sycl_queue_);
+  sycl::free(ffn_dense2_b, sycl_queue_);
+  sycl::free(ln2_gammas, sycl_queue_);
+  sycl::free(ln2_betas, sycl_queue_);
   if (has_smolgen_) {
-      sycl::free(smol_compress, sycl_queue_);
-      sycl::free(smol_dense1_w, sycl_queue_);
-      sycl::free(smol_dense1_b, sycl_queue_);
-      sycl::free(smol_dense2_w, sycl_queue_);
-      sycl::free(smol_dense2_b, sycl_queue_);
-      sycl::free(smol_ln1_gammas, sycl_queue_);
-      sycl::free(smol_ln1_betas, sycl_queue_);
-      sycl::free(smol_ln2_gammas, sycl_queue_);
-      sycl::free(smol_ln2_betas, sycl_queue_);
+    sycl::free(smol_compress, sycl_queue_);
+    sycl::free(smol_dense1_w, sycl_queue_);
+    sycl::free(smol_dense1_b, sycl_queue_);
+    sycl::free(smol_dense2_w, sycl_queue_);
+    sycl::free(smol_dense2_b, sycl_queue_);
+    sycl::free(smol_ln1_gammas, sycl_queue_);
+    sycl::free(smol_ln1_betas, sycl_queue_);
+    sycl::free(smol_ln2_gammas, sycl_queue_);
+    sycl::free(smol_ln2_betas, sycl_queue_);
   }
 }
 
@@ -2954,7 +3059,7 @@ EmbeddingLayer<DataType>::EmbeddingLayer(BaseLayer<DataType>* ip,
                                          const std::vector<float>& weights,
                                          const std::vector<float>& biases,
                                          void* scratch, ActivationFunction act,
-                                         sycl::queue &sycl_queue)
+                                         sycl::queue& sycl_queue)
     : BaseLayer<DataType>(biases.size(), 8, 8, ip, sycl_queue), act_(act) {
   allocAndUpload<DataType>(&weights_, weights, scratch, sycl_queue_);
   allocAndUpload<DataType>(&biases_, biases, scratch, sycl_queue_);
@@ -2962,25 +3067,27 @@ EmbeddingLayer<DataType>::EmbeddingLayer(BaseLayer<DataType>* ip,
 
 template <typename DataType>
 EmbeddingLayer<DataType>::~EmbeddingLayer() {
-    sycl::free(weights_, sycl_queue_);
-    sycl::free(biases_, sycl_queue_);
+  sycl::free(weights_, sycl_queue_);
+  sycl::free(biases_, sycl_queue_);
 }
 
 template <typename DataType>
-void EmbeddingLayer<DataType>::Eval(
-    int N, DataType* output, const DataType* input, const DataType* /*input2*/,
-    void* /*scratch*/, size_t /*scratch_size*/, sycl::queue &sycl_queue, DataType***) {
-
-  
-  //CERR << "EmbeddingLayer<DataType>::Eval. ";
+void EmbeddingLayer<DataType>::Eval(int N, DataType* output,
+                                    const DataType* input,
+                                    const DataType* /*input2*/,
+                                    void* /*scratch*/, size_t /*scratch_size*/,
+                                    sycl::queue& sycl_queue, DataType***) {
+  // CERR << "EmbeddingLayer<DataType>::Eval. ";
 
   const int num_outputs = this->GetC();
   const int num_inputs = this->input_->GetC();
   const int batch = N * 64;
-  cublasXgemm<DataType>(transpose_type_transpose, transpose_type_notranspose, num_outputs, batch,
-                        num_inputs, 1.0f, weights_, num_inputs, input,
-                        num_inputs, 0.0f, output, num_outputs, sycl_queue);
-  addBiasBatched(output, output, biases_, 1, batch, num_outputs, act_, sycl_queue);
+  cublasXgemm<DataType>(transpose_type_transpose, transpose_type_notranspose,
+                        num_outputs, batch, num_inputs, 1.0f, weights_,
+                        num_inputs, input, num_inputs, 0.0f, output,
+                        num_outputs, sycl_queue);
+  addBiasBatched(output, output, biases_, 1, batch, num_outputs, act_,
+                 sycl_queue);
 }
 
 template <typename DataType>
@@ -2989,7 +3096,7 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
                                        int num_res_blocks, int input_c,
                                        int max_batch_size,
                                        bool is_pe_dense_embedding,
-                                       sycl::queue &sycl_queue)
+                                       sycl::queue& sycl_queue)
     : BaseLayer<DataType>(weights.ip_emb_b.size(), 8, 8, nullptr, sycl_queue),
       embedding_op_size_(weights.ip_emb_b.size()),
       encoder_head_count_(weights.encoder_head_count),
@@ -3037,18 +3144,23 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
     size_t element_count = 64 * kNumPosEncodingChannels;
     size_t dest_byte_count = element_count * sizeof(DataType);
     size_t float_byte_count = element_count * sizeof(float);
-    pos_encoding_ = (DataType *)sycl::malloc_device(dest_byte_count, sycl_queue_);
+    pos_encoding_ =
+        (DataType*)sycl::malloc_device(dest_byte_count, sycl_queue_);
     sycl_queue_.memcpy(scratch, kPosEncoding, float_byte_count);
-    copyTypeConverted(pos_encoding_, (float*)scratch, static_cast<int>(element_count), sycl_queue_);
+    copyTypeConverted(pos_encoding_, (float*)scratch,
+                      static_cast<int>(element_count), sycl_queue_);
   }
 
   if (has_gating_) {
-    allocAndUpload<DataType>(&ip_mult_gate_, weights.ip_mult_gate, scratch, sycl_queue_);
-    allocAndUpload<DataType>(&ip_add_gate_, weights.ip_add_gate, scratch, sycl_queue_);
+    allocAndUpload<DataType>(&ip_mult_gate_, weights.ip_mult_gate, scratch,
+                             sycl_queue_);
+    allocAndUpload<DataType>(&ip_add_gate_, weights.ip_add_gate, scratch,
+                             sycl_queue_);
   }
 
   if (has_smolgen_) {
-    allocAndUpload<DataType>(&smolgen_global_, weights.smolgen_w, scratch, sycl_queue_);
+    allocAndUpload<DataType>(&smolgen_global_, weights.smolgen_w, scratch,
+                             sycl_queue_);
     smolgen_global_size_ = 64 * 64;
   }
 
@@ -3098,11 +3210,9 @@ template <typename DataType>
 void AttentionBody<DataType>::Eval(int N, DataType* output,
                                    const DataType* input,
                                    const DataType* input2, void* scratch,
-                                   size_t scratch_size, 
-                                   sycl::queue &sycl_queue,
+                                   size_t scratch_size, sycl::queue& sycl_queue,
                                    DataType*** offset_pointers) {
-
-  //CERR << "AttentionBody<DataType>::Eval. ";
+  // CERR << "AttentionBody<DataType>::Eval. ";
 
   DataType* output_tensor = (DataType*)output;
   DataType* buffer1 = (DataType*)input2;
@@ -3126,11 +3236,13 @@ void AttentionBody<DataType>::Eval(int N, DataType* output,
       const int num_inputs = 64 * 12;
       const int batch = N;
 
-      convertNCHWtoNHWC((DataType*)scratch, input, N, inputC, N, 12, 8, 8, sycl_queue);
-      cublasXgemm<DataType>(
-          transpose_type_transpose, transpose_type_notranspose, num_outputs, batch, num_inputs,
-          1.0f, (const DataType*)ip_emb_pre_w_, num_inputs,
-          (const DataType*)scratch, num_inputs, 0.0f, buffer1, num_outputs, sycl_queue);
+      convertNCHWtoNHWC((DataType*)scratch, input, N, inputC, N, 12, 8, 8,
+                        sycl_queue);
+      cublasXgemm<DataType>(transpose_type_transpose,
+                            transpose_type_notranspose, num_outputs, batch,
+                            num_inputs, 1.0f, (const DataType*)ip_emb_pre_w_,
+                            num_inputs, (const DataType*)scratch, num_inputs,
+                            0.0f, buffer1, num_outputs, sycl_queue);
 
       // addBiasBatched(buffer1, buffer1, ip_emb_pre_b_, batch, N, num_outputs,
       //               ACTIVATION_NONE, sycl_queue);
@@ -3161,7 +3273,8 @@ void AttentionBody<DataType>::Eval(int N, DataType* output,
     // #redirect flow through encoder blocks
     // flow = tf.transpose(flow, perm = [ 0, 2, 3, 1 ])
     // flow = tf.reshape(flow, [ -1, 64, self.RESIDUAL_FILTERS ])
-    convertNCHWtoNHWC((DataType*)scratch, input, N, inputC, N, inputC, 8, 8, sycl_queue);
+    convertNCHWtoNHWC((DataType*)scratch, input, N, inputC, N, inputC, 8, 8,
+                      sycl_queue);
   }
 
   if (is_pe_dense_embedding_) {
@@ -3173,10 +3286,10 @@ void AttentionBody<DataType>::Eval(int N, DataType* output,
       const int num_outputs = embedding_op_size_;
       const int num_inputs = inputC;
       const int batch = N * 64;
-      cublasXgemm<DataType>(transpose_type_transpose, transpose_type_notranspose, num_outputs,
-                            batch, num_inputs, 1.0f, (const DataType*)ip_emb_w_,
-                            num_inputs, temp, num_inputs, 0.0f, embedding,
-                            num_outputs, sycl_queue);
+      cublasXgemm<DataType>(
+          transpose_type_transpose, transpose_type_notranspose, num_outputs,
+          batch, num_inputs, 1.0f, (const DataType*)ip_emb_w_, num_inputs, temp,
+          num_inputs, 0.0f, embedding, num_outputs, sycl_queue);
       // embedding layer norm with fused in bias add of previous gemm.
       LayerNorm<DataType>(N * 64, embedding_op_size_, temp, embedding,
                           ip_emb_b_, (DataType*)nullptr, ip_emb_ln_g_,
@@ -3195,9 +3308,10 @@ void AttentionBody<DataType>::Eval(int N, DataType* output,
       const int num_inputs = embedding_ffn_size_;
       const int num_outputs = embedding_ffn_dff_;  // encoder_dff
       const int batch = N * 64;
-      cublasXgemm(transpose_type_transpose, transpose_type_notranspose, num_outputs, batch,
-                  num_inputs, 1.0f, (const DataType*)ip_emb_ffn_d1_w_,
-                  num_inputs, temp, num_inputs, 0.0f, buffer1, num_outputs, sycl_queue);
+      cublasXgemm(transpose_type_transpose, transpose_type_notranspose,
+                  num_outputs, batch, num_inputs, 1.0f,
+                  (const DataType*)ip_emb_ffn_d1_w_, num_inputs, temp,
+                  num_inputs, 0.0f, buffer1, num_outputs, sycl_queue);
       addBiasBatched(buffer1, buffer1, ip_emb_ffn_d1_b_, 1, batch, num_outputs,
                      activations_.ffn_activation, sycl_queue);
     }
@@ -3207,9 +3321,10 @@ void AttentionBody<DataType>::Eval(int N, DataType* output,
       const int num_inputs = embedding_ffn_dff_;  // encoder_dff
       const int num_outputs = embedding_ffn_size_;
       const int batch = N * 64;
-      cublasXgemm(transpose_type_transpose, transpose_type_notranspose, num_outputs, batch,
-                  num_inputs, 1.0f, (const DataType*)ip_emb_ffn_d2_w_,
-                  num_inputs, buffer1, num_inputs, 0.0f, buffer2, num_outputs, sycl_queue);
+      cublasXgemm(transpose_type_transpose, transpose_type_notranspose,
+                  num_outputs, batch, num_inputs, 1.0f,
+                  (const DataType*)ip_emb_ffn_d2_w_, num_inputs, buffer1,
+                  num_inputs, 0.0f, buffer2, num_outputs, sycl_queue);
       // Embedding LN: skip connection and layer normilization (also bias add of
       // prev gemm) buffer2 -> embedding
       float alpha = (float)pow(2. * encoder_weights_.size(), -0.25);
@@ -3227,8 +3342,9 @@ void AttentionBody<DataType>::Eval(int N, DataType* output,
       const int num_outputs = embedding_op_size_;
       const int num_inputs = inputC;
       const int batch = N * 64;
-      cublasXgemm<DataType>(transpose_type_transpose, transpose_type_notranspose, num_outputs,
-                            batch, num_inputs, 1.0f, (const DataType*)ip_emb_w_,
+      cublasXgemm<DataType>(transpose_type_transpose,
+                            transpose_type_notranspose, num_outputs, batch,
+                            num_inputs, 1.0f, (const DataType*)ip_emb_w_,
                             num_inputs, (DataType*)scratch, num_inputs, 0.0f,
                             embedding, num_outputs, sycl_queue);
       addBiasBatched(embedding, embedding, ip_emb_b_, 1, batch, num_outputs,
@@ -3244,7 +3360,8 @@ void AttentionBody<DataType>::Eval(int N, DataType* output,
 
   // 2. Encoder blocks
   for (const auto& pEnc : encoder_weights_) {
-    pEnc->Eval(N, output_tensor, (DataType*)scratch, buffer1, buffer2, sycl_queue, offset_pointers);
+    pEnc->Eval(N, output_tensor, (DataType*)scratch, buffer1, buffer2,
+               sycl_queue, offset_pointers);
   }  // End of encoder blocks
 }
 
@@ -3253,7 +3370,7 @@ ValueHead<DataType>::ValueHead(BaseLayer<DataType>* ip,
                                const MultiHeadWeights::ValueHead& weights,
                                void* scratch, bool attention_body, bool wdl,
                                ActivationFunction act, int max_batch_size,
-                               sycl::queue &sycl_queue)
+                               sycl::queue& sycl_queue)
     : BaseLayer<DataType>(weights.ip_val_b.size(), 8, 8, ip, sycl_queue),
       attention_body_(attention_body),
       embedding_size_(attention_body ? weights.ip_val_b.size()
@@ -3294,7 +3411,7 @@ ValueHead<DataType>::~ValueHead() {
 template <typename DataType>
 void ValueHead<DataType>::Eval(int N, DataType* output, const DataType* input,
                                const DataType* input2, void* scratch,
-                               size_t scratch_size, sycl::queue &sycl_queue,
+                               size_t scratch_size, sycl::queue& sycl_queue,
                                DataType***) {
   DataType* buffer = (DataType*)input2;
   {
@@ -3302,10 +3419,10 @@ void ValueHead<DataType>::Eval(int N, DataType* output, const DataType* input,
     const int num_outputs = embedding_size_;
     const int batch = N * 64;
     if (attention_body_) {
-      cublasXgemm<DataType>(transpose_type_transpose, transpose_type_notranspose, num_outputs,
-                            batch, num_inputs, 1.0f, (const DataType*)ip_val_w_,
-                            num_inputs, input, num_inputs, 0.0f, buffer,
-                            num_outputs, sycl_queue);
+      cublasXgemm<DataType>(
+          transpose_type_transpose, transpose_type_notranspose, num_outputs,
+          batch, num_inputs, 1.0f, (const DataType*)ip_val_w_, num_inputs,
+          input, num_inputs, 0.0f, buffer, num_outputs, sycl_queue);
       addBiasBatched<DataType>(buffer, buffer, ip_val_b_, 1, batch, num_outputs,
                                act_, sycl_queue);
 
@@ -3320,10 +3437,10 @@ void ValueHead<DataType>::Eval(int N, DataType* output, const DataType* input,
     const int num_outputs = value_hidden_size_;
     const int batch = N;
     DataType* layer_out = (DataType*)scratch;
-    cublasXgemm<DataType>(transpose_type_transpose, transpose_type_notranspose, num_outputs, batch,
-                          num_inputs, 1.0f, (const DataType*)ip1_val_w_,
-                          num_inputs, buffer, num_inputs, 0.0f, layer_out,
-                          num_outputs, sycl_queue);
+    cublasXgemm<DataType>(transpose_type_transpose, transpose_type_notranspose,
+                          num_outputs, batch, num_inputs, 1.0f,
+                          (const DataType*)ip1_val_w_, num_inputs, buffer,
+                          num_inputs, 0.0f, layer_out, num_outputs, sycl_queue);
     addBiasBatched<DataType>(layer_out, layer_out, ip1_val_b_, 1, batch,
                              num_outputs, act_, sycl_queue);
   }
@@ -3334,10 +3451,11 @@ void ValueHead<DataType>::Eval(int N, DataType* output, const DataType* input,
     const int num_outputs = wdl_ ? 3 : 1;
     const int batch = N;
     DataType* layer_out = (DataType*)output;
-    cublasXgemm<DataType>(transpose_type_transpose, transpose_type_notranspose, num_outputs, batch,
-                          num_inputs, 1.0f, (const DataType*)ip2_val_w_,
-                          num_inputs, (DataType*)scratch, num_inputs, 0.0f,
-                          layer_out, num_outputs, sycl_queue);
+    cublasXgemm<DataType>(transpose_type_transpose, transpose_type_notranspose,
+                          num_outputs, batch, num_inputs, 1.0f,
+                          (const DataType*)ip2_val_w_, num_inputs,
+                          (DataType*)scratch, num_inputs, 0.0f, layer_out,
+                          num_outputs, sycl_queue);
     addVectors(layer_out, layer_out, ip2_val_b_, num_outputs * batch,
                num_outputs * batch, num_outputs,
                wdl_ ? ACTIVATION_NONE : ACTIVATION_TANH, sycl_queue);

@@ -42,6 +42,11 @@
 #include "utils/bititer.h"
 #include "utils/exception.h"
 
+#ifdef USE_CUBLAS
+#include <cuda_runtime.h>
+#include <sycl/backend/cuda.hpp>
+#endif
+
 
 namespace lczero {
 using namespace sycldnn_backend;
@@ -238,6 +243,14 @@ class SyclNetwork : public Network {
                  nf.network() == NF::NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT;
 
     max_batch_size_ = options.GetOrDefault<int>("max_batch", 1024);
+    // min_batch_size_ is chosen as 4 as it is common that for sizes less than
+    // 4 that there is no performance gain, but there is variance in the
+    // outputs, which means that there is extra non-determinism in some
+    // scenarios, including using the multiplexing backend.
+    min_batch_size_ =
+        options.GetOrDefault<int>("min_batch", std::min(4, max_batch_size_));
+    if (max_batch_size_ < min_batch_size_)
+      throw Exception("Max batch must not be less than min_batch setting.");
 
     // Get all available platforms
     auto platforms = sycl::platform::get_platforms();
@@ -318,7 +331,7 @@ class SyclNetwork : public Network {
         residual_single_layer_weight_size * numBlocks_ * 2;
     size_t transformed_residual_weight_size = residual_weight_size * 4;
 
-    size_t global_mem_size = device_cache_.max_mem_alloc_size;
+    size_t global_mem_size = device_cache_.global_mem_size;
 
     if (transformed_residual_weight_size > 0.4 * global_mem_size) {
       CERR << "WARNING: Low GPU video memory. You may run into OOM errors. Try "
@@ -326,8 +339,16 @@ class SyclNetwork : public Network {
     }
 
     // Res block fusing option (fused winograd kernels).
-    use_res_block_winograd_fuse_opt_ =
-        options.GetOrDefault<bool>("res_block_fusing", false);
+    // Auto-enable for FP16 when filters are a multiple of 32, matching the
+    // CUDA backend behaviour. The user can override via res_block_fusing=.
+    if (kNumFilters % 32 == 0 && std::is_same<sycl::half, DataType>::value) {
+      use_res_block_winograd_fuse_opt_ = true;
+    } else {
+      use_res_block_winograd_fuse_opt_ = false;
+    }
+    if (options.Exists<bool>("res_block_fusing")) {
+      use_res_block_winograd_fuse_opt_ = options.Get<bool>("res_block_fusing");
+    }
 
     // 0. Check for SE.
     has_se_ = false;
@@ -625,6 +646,11 @@ class SyclNetwork : public Network {
   }
 
   void forwardEval(InputsOutputs* io, int batchSize) {
+    // It is safe to evaluate larger than the batchSize
+    // as all buffers are designed to handle max_batch_size
+    // and the extra invalid results are never read.
+    if (batchSize < min_batch_size_) batchSize = min_batch_size_;
+
     std::unique_lock<std::mutex> guard(lock_, std::defer_lock);
     if (!multi_stream_) guard.lock();
 
@@ -651,15 +677,11 @@ class SyclNetwork : public Network {
       scratch_mem = io->scratch_mem_;
       offset_pointers = (DataType***)&io->offset_pointers_;
       head_offset_pointers = (DataType***)&io->head_offset_pointers_;
-      // stream = io->stream_;
-      // cublas = io->cublas_;
     } else {
       for (int i = 0; i < 3; i++) tensor_mem[i] = tensor_mem_[i];
       scratch_mem = scratch_mem_;
       offset_pointers = (DataType***)&offset_pointers_;
       head_offset_pointers = (DataType***)&head_offset_pointers_;
-      // stream = &dpct::get_default_queue();  // default stream
-      // cublas = cublas_;
     }
 
     bool fp16 = std::is_same<sycl::half, DataType>::value;
@@ -695,6 +717,38 @@ class SyclNetwork : public Network {
       enableCacheOpt = true;
       skip_connection =
           tensor_mem[2] + 2 * transformed_tensor_size / sizeof(DataType);
+
+      // The primary optimization for Intel GPUs is the sub-allocation memory
+      // packing trick that enableCacheOpt = true enables:
+      // It packs all intermediate transformed Winograd tensors into a single
+      // contiguous block of tensor_mem[2].
+      // Because res_block_mem <= device_cache_.l2_cache_size, this contiguous
+      // layout gives the Intel GPU hardware maximum spatial and temporal
+      // locality, naturally keeping the entire working set inside L2/L3 cache
+      // during the residual tower evaluation without needing explicit driver
+      // hints.
+#if defined(USE_CUBLAS) && CUDART_VERSION >= 11000
+      if (io_sycl_queue_.get_backend() == sycl::backend::ext_oneapi_cuda) {
+        void* base_ptr = tensor_mem[2];
+        io_sycl_queue_.submit([=](sycl::handler& cgh) {
+          cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+            auto cudaStreamHandle =
+                ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
+            cudaStreamAttrValue stream_attribute = {};
+            stream_attribute.accessPolicyWindow.base_ptr = base_ptr;
+            stream_attribute.accessPolicyWindow.num_bytes = res_block_mem;
+            stream_attribute.accessPolicyWindow.hitRatio = 1.0f;
+            stream_attribute.accessPolicyWindow.hitProp =
+                cudaAccessPropertyPersisting;
+            stream_attribute.accessPolicyWindow.missProp =
+                cudaAccessPropertyStreaming;
+            cudaStreamSetAttribute(cudaStreamHandle,
+                                   cudaStreamAttributeAccessPolicyWindow,
+                                   &stream_attribute);
+          });
+        });
+      }
+#endif
     }
 
     int l = 0;
@@ -712,6 +766,9 @@ class SyclNetwork : public Network {
       // Residual block.
       for (int block = 0; block < numBlocks_; block++) {
         if (use_res_block_winograd_fuse_opt_) {
+          // Passing nullptr for scratch when enableCacheOpt is true triggers
+          // contiguous sub-allocation inside ResidualBlock::Eval, giving Intel GPUs
+          // maximum spatial and temporal L2/L3 cache locality.
           network_[l++]->Eval(batchSize, tensor_mem[2], skip_connection,
                               nullptr, enableCacheOpt ? nullptr : scratch_mem,
                               scratch_size_, io_sycl_queue_, nullptr);  // block
@@ -743,6 +800,24 @@ class SyclNetwork : public Network {
       spare1 = tensor_mem[0];
       spare2 = tensor_mem[2];
     }
+
+#if defined(USE_CUBLAS) && CUDART_VERSION >= 11000
+    if (enableCacheOpt &&
+        io_sycl_queue_.get_backend() == sycl::backend::ext_oneapi_cuda) {
+      io_sycl_queue_.submit([=](sycl::handler& cgh) {
+        cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+          auto cudaStreamHandle =
+              ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
+          cudaStreamAttrValue stream_attribute = {};
+          stream_attribute.accessPolicyWindow.num_bytes = 0;
+          cudaStreamSetAttribute(cudaStreamHandle,
+                                 cudaStreamAttributeAccessPolicyWindow,
+                                 &stream_attribute);
+          cudaCtxResetPersistingL2Cache();
+        });
+      });
+    }
+#endif
 
     // Policy head.
     if (attn_policy_) {
@@ -948,6 +1023,7 @@ class SyclNetwork : public Network {
   const NetworkCapabilities capabilities_;
   int gpu_id_;
   int max_batch_size_;
+  int min_batch_size_;
   bool wdl_;
   bool moves_left_;
   bool use_res_block_winograd_fuse_opt_;  // fuse operations inside the residual
