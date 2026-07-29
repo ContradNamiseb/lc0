@@ -235,7 +235,9 @@ class SyclNetwork : public Network {
                 << "Caught asynchronous SYCL exception during GEMM:\n"
                 << e.what() 
                 << "\n ";
-                std::terminate();
+                // Do NOT call std::terminate() here — wait_and_throw() will
+                // surface the same error as a synchronous sycl::exception that
+                // the caller can catch and handle cleanly.
             }
         }
     };
@@ -612,9 +614,11 @@ class SyclNetwork : public Network {
   }
 
   void forwardEval(InputsOutputs* io, int batchSize) {
-    
-    
-    if (!multi_stream_) lock_.lock();
+    // RAII guard so the mutex is released even when a SYCL exception fires
+    // mid-evaluation.  defer_lock + conditional lock mirrors the original
+    // !multi_stream_ branch without raw lock()/unlock() calls.
+    std::unique_lock<std::mutex> gpu_lock(lock_, std::defer_lock);
+    if (!multi_stream_) gpu_lock.lock();
 
 #ifdef DEBUG_RAW_NPS
     auto t_start = std::chrono::high_resolution_clock::now();
@@ -651,6 +655,10 @@ class SyclNetwork : public Network {
     }
 
     
+    // All GPU kernel submissions and the synchronising wait are wrapped in one
+    // try block so that sycl::exceptions (e.g. UR_RESULT_ERROR_DEVICE_LOST)
+    // propagate cleanly to the search worker rather than calling abort().
+    try {
     bool fp16 = std::is_same<sycl::half, DataType>::value;
     if (fp16) {
       expandPlanes_Fp16_NCHW((sycl::half*)(tensor_mem[0]), ipDataMasks, ipDataValues,
@@ -858,16 +866,32 @@ class SyclNetwork : public Network {
     }
     
     // Copy policy output from device memory to host memory.
-    auto event = io_sycl_queue_.memcpy(io->op_policy_mem_, io->op_policy_mem_gpu_, sizeof(float) * kNumOutputPolicy * batchSize);
+    io_sycl_queue_.memcpy(io->op_policy_mem_, io->op_policy_mem_gpu_,
+                          sizeof(float) * kNumOutputPolicy * batchSize);
 
-    if (!multi_stream_) {
-      //ReportCUDAErrors(
-        //  DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()));
-      // The next thread can start using the GPU now.
-      lock_.unlock();
+    // Release the GPU lock before blocking so the next search thread can begin
+    // submitting work to the device while we wait for this evaluation.
+    if (gpu_lock.owns_lock()) gpu_lock.unlock();
+
+    // Wait for all queued operations and surface any async device errors as a
+    // synchronous sycl::exception.
+    io_sycl_queue_.wait_and_throw();
+
+    } catch (const sycl::exception& e) {
+      if (gpu_lock.owns_lock()) gpu_lock.unlock();
+      CERR << "SYCL exception in forwardEval: " << e.what();
+      // UR_RESULT_ERROR_DEVICE_LOST (error code 20) indicates a TDR or
+      // driver-level GPU reset.  Distinguish it so callers can give a more
+      // actionable error message.
+      constexpr int kDeviceLost = 20;
+      if (e.code().value() == kDeviceLost) {
+        throw Exception(
+            "GPU device lost (UR_RESULT_ERROR_DEVICE_LOST) — a TDR or "
+            "power-state transition likely reset the GPU. "
+            "Original error: " + std::string(e.what()));
+      }
+      throw Exception("SYCL error in forwardEval: " + std::string(e.what()));
     }
-
-    event.wait();
 
     if (wdl_) {
       // Value softmax done cpu side.

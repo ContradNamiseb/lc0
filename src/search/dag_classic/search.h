@@ -29,6 +29,7 @@
 
 #include <array>
 #include <condition_variable>
+#include <exception>
 #include <functional>
 #include <optional>
 #include <shared_mutex>
@@ -123,6 +124,9 @@ class Search {
   void SendUciInfo(const classic::IterationStats& stats);
   // Sets stop to true and notifies watchdog thread.
   void FireStopInternal();
+  // Stores a worker exception and triggers a graceful search stop.
+  // Thread-safe; only the first call wins (subsequent exceptions are ignored).
+  void SetWorkerException(std::exception_ptr exc);
 
   void SendMovesStats() const;
   // Function which runs in a separate thread and watches for time and
@@ -157,6 +161,9 @@ class Search {
   // There is already one thread that responded bestmove, other threads
   // should not do that.
   bool bestmove_is_sent_ GUARDED_BY(counters_mutex_) = false;
+  // Exception captured from a search worker thread; rethrown in Wait() after
+  // all threads have joined so the caller receives it on the main thread.
+  std::exception_ptr worker_exception_ GUARDED_BY(counters_mutex_) = nullptr;
   // Node garbage collection has been started for this search.
   bool gc_started_ GUARDED_BY(counters_mutex_) = false;
   // Stored so that in the case of non-zero temperature GetBestMove() returns
@@ -269,9 +276,8 @@ class SearchWorker {
         ExecuteOneIteration();
       } while (search_->IsSearchActive());
     } catch (std::exception& e) {
-      std::cerr << "Unhandled exception in worker thread: " << e.what()
-                << std::endl;
-      abort();
+      CERR << "Exception in search worker: " << e.what();
+      search_->SetWorkerException(std::current_exception());
     }
   }
 

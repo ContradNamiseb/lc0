@@ -40,6 +40,7 @@
 #include <thread>
 
 #include "search/dag_classic/node.h"
+#include "utils/exception.h"
 #include "utils/fastmath.h"
 #include "utils/random.h"
 #include "utils/spinhelper.h"
@@ -1092,6 +1093,19 @@ void Search::FireStopInternal() {
   watchdog_cv_.notify_all();
 }
 
+void Search::SetWorkerException(std::exception_ptr exc) {
+  Mutex::Lock lock(counters_mutex_);
+  // Only the first exception is kept.
+  if (!worker_exception_) worker_exception_ = std::move(exc);
+  // When no nodes were ever evaluated the watchdog will never send bestmove
+  // on its own (it guards on total_nodes > 0). Mark the bestmove as sent so
+  // the watchdog can exit cleanly; Wait() will rethrow the exception.
+  if (!bestmove_is_sent_ && total_playouts_ == 0 && initial_visits_ == 0) {
+    bestmove_is_sent_ = true;
+  }
+  FireStopInternal();
+}
+
 void Search::Stop() {
   NodeGarbageCollector::Instance().Stop();
   Mutex::Lock lock(counters_mutex_);
@@ -1125,6 +1139,25 @@ void Search::Wait() {
     assert(root_node_->ZeroNInFlight());
   }
   LOGFILE << "Search threads cleaned.";
+
+  // If a worker thread encountered an exception, rethrow it now that all
+  // threads have joined. Wrap it as lczero::Exception so the engine loop's
+  // per-command catch block (which only catches Exception) handles it and
+  // forwards it to the GUI as "error <message>" rather than crashing.
+  std::exception_ptr exc;
+  {
+    Mutex::Lock ctr_lock(counters_mutex_);
+    exc = worker_exception_;
+  }
+  if (exc) {
+    try {
+      std::rethrow_exception(exc);
+    } catch (const std::exception& e) {
+      throw Exception(std::string("Search worker exception: ") + e.what());
+    } catch (...) {
+      throw Exception("Search worker: unknown exception");
+    }
+  }
 }
 
 void SearchWorker::CancelCollisions() {
@@ -1139,7 +1172,13 @@ void SearchWorker::CancelCollisions() {
 
 Search::~Search() {
   Abort();
-  Wait();
+  try {
+    Wait();
+  } catch (const std::exception& e) {
+    // Swallow any worker exception in the destructor — it was already logged
+    // by SetWorkerException and will surface via Wait() in normal stop paths.
+    LOGFILE << "Exception swallowed in Search destructor: " << e.what();
+  }
   LOGFILE << "Search destroyed.";
 }
 
