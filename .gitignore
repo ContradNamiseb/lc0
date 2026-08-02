@@ -21,6 +21,7 @@ compile_flags.txt
 .mesonpy*
 docs/findings.md
 docs/review.md
+*llm-log-files/
 
 # Test weights & scratch files
 *.pb.gz
