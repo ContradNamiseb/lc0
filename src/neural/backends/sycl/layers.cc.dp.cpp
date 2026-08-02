@@ -2369,8 +2369,15 @@ AttentionPolicyHead<DataType>::AttentionPolicyHead(
       // activations.
       act_(attention_body ? act : ACTIVATION_SELU) {
   embedding_op_size_ = weights.ip_pol_b.size();
-  wq_op_size_ = weights.ip2_pol_b.size();
-  wk_op_size_ = weights.ip3_pol_b.size();
+  wq_op_size_ = weights.ip2_pol_w.size() / embedding_op_size_;
+  wk_op_size_ = weights.ip3_pol_w.size() / embedding_op_size_;
+  if (wq_op_size_ <= 0 || wk_op_size_ != wq_op_size_ ||
+      static_cast<size_t>(wq_op_size_ * embedding_op_size_) !=
+          weights.ip2_pol_w.size() ||
+      static_cast<size_t>(wk_op_size_ * embedding_op_size_) !=
+          weights.ip3_pol_w.size()) {
+    throw Exception("Invalid attention policy projection dimensions.");
+  }
 
   encoder_heads_ = weights.pol_encoder_head_count;
   policy_d_model_ = wq_op_size_;
@@ -2400,10 +2407,15 @@ AttentionPolicyHead<DataType>::AttentionPolicyHead(
     sycl_queue_.memcpy(wqk_w_ + elements, ip3_pol_w_, size / 2);
 
     elements = weights.ip2_pol_b.size();
-    size = elements * sizeof(DataType) * 2;
-    wqk_b_ = (DataType*)sycl::malloc_device(size, sycl_queue_);
-    sycl_queue_.memcpy(wqk_b_, ip2_pol_b_, size / 2);
-    sycl_queue_.memcpy(wqk_b_ + elements, ip3_pol_b_, size / 2);
+    if (elements != 0) {
+      if (elements != weights.ip3_pol_b.size()) {
+        throw Exception("Attention policy Q/K bias dimensions differ.");
+      }
+      size = elements * sizeof(DataType) * 2;
+      wqk_b_ = (DataType*)sycl::malloc_device(size, sycl_queue_);
+      sycl_queue_.memcpy(wqk_b_, ip2_pol_b_, size / 2);
+      sycl_queue_.memcpy(wqk_b_ + elements, ip3_pol_b_, size / 2);
+    }
   }
 
   allocAndUpload<DataType>(&ip4_pol_w_, weights.ip4_pol_w, scratch,
@@ -2415,7 +2427,7 @@ AttentionPolicyHead<DataType>::AttentionPolicyHead(
         1.0f,        // using alpha = 1 for now (TODO: may change?)
         nullptr, 0,  // smolgen weights not implemented in
                      // policy encoder heads yet.
-        max_batch_size, ACTIVATION_SWISH, act_, 1e-6,
+        max_batch_size, ACTIVATION_SWISH, act_, 1e-6, {},
         sycl_queue_);  // attentionbody nets don't have policy encoders, so
                        // using old epsilon for backward compatibility with T78.
     encoder_weights_.emplace_back(std::unique_ptr<EncoderBlock<DataType>>(pW));
@@ -2427,55 +2439,144 @@ EncoderBlock<DataType>::EncoderBlock(
     const MultiHeadWeights::EncoderLayer& cpu_weights, void* scratch, int heads,
     int size, float alpha, DataType* smolgen_global_scratch,
     int smolgen_global_size, int max_batch_size, ActivationFunction smolgen_act,
-    ActivationFunction ffn_act, float default_eps, sycl::queue& sycl_queue)
+    ActivationFunction ffn_act, float default_eps,
+    const std::vector<int>& kda_directions, sycl::queue& sycl_queue)
     : embedding_op_size_(size),
       encoder_heads_(heads),
+      is_kda_(cpu_weights.is_kda),
+      kda_key_dim_(cpu_weights.kda.key_dim),
+      kda_value_dim_(cpu_weights.kda.value_dim),
+      kda_gate_rank_(cpu_weights.kda.gate_rank),
+      kda_rms_norm_epsilon_(cpu_weights.kda.rms_norm_epsilon),
+      kda_output_gate_(cpu_weights.kda.output_gate),
+      kda_output_rms_norm_(cpu_weights.kda.output_rms_norm),
+      kda_direction_count_(static_cast<int>(kda_directions.size())),
       alpha_(alpha),
-      has_smolgen_(cpu_weights.mha.has_smolgen),
+      has_smolgen_(!cpu_weights.is_kda && cpu_weights.mha.has_smolgen),
       smolgen_activation_(smolgen_act),
       ffn_activation_(ffn_act),
       max_batch_size_(max_batch_size),
       default_eps_(default_eps),
       sycl_queue_(sycl_queue) {
-  mha_q_size_ = cpu_weights.mha.q_b.size();
-  mha_k_size_ = cpu_weights.mha.k_b.size();
-  mha_v_size_ = cpu_weights.mha.v_b.size();
-  mha_dense_size_ = cpu_weights.mha.dense_b.size();
   ffn_dense1_size_ = cpu_weights.ffn.dense1_b.size();
   ffn_dense2_size_ = cpu_weights.ffn.dense2_b.size();
 
-  allocAndUpload<DataType>(&mha_q_w, cpu_weights.mha.q_w, scratch, sycl_queue_);
-  allocAndUpload<DataType>(&mha_q_b, cpu_weights.mha.q_b, scratch, sycl_queue_);
+  if (is_kda_) {
+    if (kda_key_dim_ <= 0 || kda_value_dim_ <= 0 || kda_gate_rank_ <= 0) {
+      throw Exception("Invalid KDA dimensions.");
+    }
+    if (kda_direction_count_ <= 0 || kda_direction_count_ > 4 ||
+        encoder_heads_ % kda_direction_count_ != 0) {
+      throw Exception("KDA directions must evenly divide the encoder heads.");
+    }
+    for (int i = 0; i < kda_direction_count_; ++i) {
+      if (kda_directions[i] < 1 || kda_directions[i] > 4) {
+        throw Exception("Unsupported KDA traversal direction.");
+      }
+      kda_directions_[i] = kda_directions[i];
+    }
+    if (kda_output_rms_norm_ && cpu_weights.kda.out_norm_gammas.empty()) {
+      throw Exception("KDA output RMS norm requested but out_norm_gammas is "
+                      "missing from the network.");
+    }
 
-  allocAndUpload<DataType>(&mha_k_w, cpu_weights.mha.k_w, scratch, sycl_queue_);
-  allocAndUpload<DataType>(&mha_k_b, cpu_weights.mha.k_b, scratch, sycl_queue_);
+    allocAndUpload<DataType>(&kda_q_w, cpu_weights.kda.q_w, scratch,
+                             sycl_queue_);
+    allocAndUpload<DataType>(&kda_q_b, cpu_weights.kda.q_b, scratch,
+                             sycl_queue_);
+    allocAndUpload<DataType>(&kda_k_w, cpu_weights.kda.k_w, scratch,
+                             sycl_queue_);
+    allocAndUpload<DataType>(&kda_k_b, cpu_weights.kda.k_b, scratch,
+                             sycl_queue_);
+    allocAndUpload<DataType>(&kda_v_w, cpu_weights.kda.v_w, scratch,
+                             sycl_queue_);
+    allocAndUpload<DataType>(&kda_v_b, cpu_weights.kda.v_b, scratch,
+                             sycl_queue_);
+    allocAndUpload<DataType>(&kda_decay_a_w, cpu_weights.kda.decay_a_w,
+                             scratch, sycl_queue_);
+    allocAndUpload<DataType>(&kda_decay_a_b, cpu_weights.kda.decay_a_b,
+                             scratch, sycl_queue_);
+    allocAndUpload<DataType>(&kda_decay_b_w, cpu_weights.kda.decay_b_w,
+                             scratch, sycl_queue_);
+    allocAndUpload<DataType>(&kda_decay_b_b, cpu_weights.kda.decay_b_b,
+                             scratch, sycl_queue_);
+    allocAndUpload<DataType>(&kda_beta_w, cpu_weights.kda.beta_w, scratch,
+                             sycl_queue_);
+    allocAndUpload<DataType>(&kda_beta_b, cpu_weights.kda.beta_b, scratch,
+                             sycl_queue_);
+    allocAndUpload<DataType>(&kda_a_log, cpu_weights.kda.a_log, scratch,
+                             sycl_queue_);
+    allocAndUpload<DataType>(&kda_dt_bias, cpu_weights.kda.dt_bias, scratch,
+                             sycl_queue_);
+    allocAndUpload<DataType>(&kda_gate_a_w, cpu_weights.kda.gate_a_w, scratch,
+                             sycl_queue_);
+    allocAndUpload<DataType>(&kda_gate_a_b, cpu_weights.kda.gate_a_b, scratch,
+                             sycl_queue_);
+    allocAndUpload<DataType>(&kda_gate_b_w, cpu_weights.kda.gate_b_w, scratch,
+                             sycl_queue_);
+    allocAndUpload<DataType>(&kda_gate_b_b, cpu_weights.kda.gate_b_b, scratch,
+                             sycl_queue_);
+    allocAndUpload<DataType>(&kda_out_norm_gammas,
+                             cpu_weights.kda.out_norm_gammas, scratch,
+                             sycl_queue_);
+    allocAndUpload<DataType>(&kda_dense_w, cpu_weights.kda.dense_w, scratch,
+                             sycl_queue_);
+    allocAndUpload<DataType>(&kda_dense_b, cpu_weights.kda.dense_b, scratch,
+                             sycl_queue_);
+  } else {
+    mha_q_size_ = cpu_weights.mha.q_w.size() / embedding_op_size_;
+    mha_k_size_ = cpu_weights.mha.k_w.size() / embedding_op_size_;
+    mha_v_size_ = cpu_weights.mha.v_w.size() / embedding_op_size_;
+    mha_dense_size_ = cpu_weights.mha.dense_b.size();
+    if (mha_q_size_ <= 0 || mha_k_size_ != mha_q_size_ ||
+      mha_v_size_ != mha_q_size_ ||
+      static_cast<size_t>(mha_q_size_ * embedding_op_size_) !=
+        cpu_weights.mha.q_w.size() ||
+      static_cast<size_t>(mha_k_size_ * embedding_op_size_) !=
+        cpu_weights.mha.k_w.size() ||
+      static_cast<size_t>(mha_v_size_ * embedding_op_size_) !=
+        cpu_weights.mha.v_w.size()) {
+      throw Exception("Invalid MHA projection dimensions.");
+    }
 
-  allocAndUpload<DataType>(&mha_v_w, cpu_weights.mha.v_w, scratch, sycl_queue_);
-  allocAndUpload<DataType>(&mha_v_b, cpu_weights.mha.v_b, scratch, sycl_queue_);
+    allocAndUpload<DataType>(&mha_q_w, cpu_weights.mha.q_w, scratch,
+                             sycl_queue_);
+    allocAndUpload<DataType>(&mha_q_b, cpu_weights.mha.q_b, scratch,
+                             sycl_queue_);
+    allocAndUpload<DataType>(&mha_k_w, cpu_weights.mha.k_w, scratch,
+                             sycl_queue_);
+    allocAndUpload<DataType>(&mha_k_b, cpu_weights.mha.k_b, scratch,
+                             sycl_queue_);
+    allocAndUpload<DataType>(&mha_v_w, cpu_weights.mha.v_w, scratch,
+                             sycl_queue_);
+    allocAndUpload<DataType>(&mha_v_b, cpu_weights.mha.v_b, scratch,
+                             sycl_queue_);
 
-  // big allocation to hold qkv weights one after the other
-  {
     size_t elements = cpu_weights.mha.q_w.size();
     size_t size = elements * sizeof(DataType) * 3;
-
     mha_qkv_w = (DataType*)sycl::malloc_device(size, sycl_queue_);
     sycl_queue_.memcpy(mha_qkv_w, mha_q_w, size / 3);
     sycl_queue_.memcpy(mha_qkv_w + elements, mha_k_w, size / 3);
     sycl_queue_.memcpy(mha_qkv_w + elements * 2, mha_v_w, size / 3);
 
     elements = cpu_weights.mha.q_b.size();
-    size = elements * sizeof(DataType) * 3;
+    if (elements != 0) {
+      if (elements != cpu_weights.mha.k_b.size() ||
+          elements != cpu_weights.mha.v_b.size()) {
+        throw Exception("MHA Q/K/V bias dimensions differ.");
+      }
+      size = elements * sizeof(DataType) * 3;
+      mha_qkv_b = (DataType*)sycl::malloc_device(size, sycl_queue_);
+      sycl_queue_.memcpy(mha_qkv_b, mha_q_b, size / 3);
+      sycl_queue_.memcpy(mha_qkv_b + elements, mha_k_b, size / 3);
+      sycl_queue_.memcpy(mha_qkv_b + elements * 2, mha_v_b, size / 3);
+    }
 
-    mha_qkv_b = (DataType*)sycl::malloc_device(size, sycl_queue_);
-    sycl_queue_.memcpy(mha_qkv_b, mha_q_b, size / 3);
-    sycl_queue_.memcpy(mha_qkv_b + elements, mha_k_b, size / 3);
-    sycl_queue_.memcpy(mha_qkv_b + elements * 2, mha_v_b, size / 3);
+    allocAndUpload<DataType>(&mha_dense_w, cpu_weights.mha.dense_w, scratch,
+                             sycl_queue_);
+    allocAndUpload<DataType>(&mha_dense_b, cpu_weights.mha.dense_b, scratch,
+                             sycl_queue_);
   }
-
-  allocAndUpload<DataType>(&mha_dense_w, cpu_weights.mha.dense_w, scratch,
-                           sycl_queue_);
-  allocAndUpload<DataType>(&mha_dense_b, cpu_weights.mha.dense_b, scratch,
-                           sycl_queue_);
 
   allocAndUpload<DataType>(&ln1_gammas, cpu_weights.ln1_gammas, scratch,
                            sycl_queue_);
@@ -2798,6 +2899,280 @@ static void cublasXGemmBatched(transpose_type transa, transpose_type transb,
 #endif
 }
 
+template <typename DataType>
+void EncoderBlock<DataType>::EvalKda(int N, DataType* in_out_tensor,
+                                     DataType* scratch, DataType* buffer1,
+                                     DataType* buffer2,
+                                     sycl::queue& sycl_queue) {
+  // Mirrors KDA_LOG_DECAY_FLOOR in the trainer, which clamps the per-token log
+  // decay so its chunkwise-parallel recurrence stays in the float32 range.
+  constexpr float kKdaLogDecayFloor = -10.0f;
+  const int tokens = N * 64;
+  const int max_tokens = max_batch_size_ * 64;
+  const int key_depth = encoder_heads_ * kda_key_dim_;
+  const int value_depth = encoder_heads_ * kda_value_dim_;
+
+  DataType* q = scratch;
+  DataType* k = q + max_tokens * key_depth;
+  DataType* v = k + max_tokens * key_depth;
+
+  cublasXgemm<DataType>(
+      transpose_type_transpose, transpose_type_notranspose, key_depth, tokens,
+      embedding_op_size_, 1.0f, kda_q_w, embedding_op_size_, in_out_tensor,
+      embedding_op_size_, 0.0f, q, key_depth, sycl_queue);
+  cublasXgemm<DataType>(
+      transpose_type_transpose, transpose_type_notranspose, key_depth, tokens,
+      embedding_op_size_, 1.0f, kda_k_w, embedding_op_size_, in_out_tensor,
+      embedding_op_size_, 0.0f, k, key_depth, sycl_queue);
+  cublasXgemm<DataType>(
+      transpose_type_transpose, transpose_type_notranspose, value_depth,
+      tokens, embedding_op_size_, 1.0f, kda_v_w, embedding_op_size_,
+      in_out_tensor, embedding_op_size_, 0.0f, v, value_depth, sycl_queue);
+  if (kda_q_b) {
+    addBiasBatched(q, q, kda_q_b, 1, tokens, key_depth, ACTIVATION_NONE,
+                   sycl_queue);
+  }
+  if (kda_k_b) {
+    addBiasBatched(k, k, kda_k_b, 1, tokens, key_depth, ACTIVATION_NONE,
+                   sycl_queue);
+  }
+  if (kda_v_b) {
+    addBiasBatched(v, v, kda_v_b, 1, tokens, value_depth, ACTIVATION_NONE,
+                   sycl_queue);
+  }
+
+  DataType* decay_hidden = buffer1;
+  DataType* raw_decay = buffer2;
+  cublasXgemm<DataType>(
+      transpose_type_transpose, transpose_type_notranspose, kda_gate_rank_,
+      tokens, embedding_op_size_, 1.0f, kda_decay_a_w, embedding_op_size_,
+      in_out_tensor, embedding_op_size_, 0.0f, decay_hidden, kda_gate_rank_,
+      sycl_queue);
+  if (kda_decay_a_b) {
+    addBiasBatched(decay_hidden, decay_hidden, kda_decay_a_b, 1, tokens,
+                   kda_gate_rank_, ACTIVATION_NONE, sycl_queue);
+  }
+  cublasXgemm<DataType>(
+      transpose_type_transpose, transpose_type_notranspose, key_depth, tokens,
+      kda_gate_rank_, 1.0f, kda_decay_b_w, kda_gate_rank_, decay_hidden,
+      kda_gate_rank_, 0.0f, raw_decay, key_depth, sycl_queue);
+  if (kda_decay_b_b) {
+    addBiasBatched(raw_decay, raw_decay, kda_decay_b_b, 1, tokens, key_depth,
+                   ACTIVATION_NONE, sycl_queue);
+  }
+
+  DataType* beta = buffer1 + max_tokens * value_depth;
+  cublasXgemm<DataType>(
+      transpose_type_transpose, transpose_type_notranspose, encoder_heads_,
+      tokens, embedding_op_size_, 1.0f, kda_beta_w, embedding_op_size_,
+      in_out_tensor, embedding_op_size_, 0.0f, beta, encoder_heads_,
+      sycl_queue);
+  if (kda_beta_b) {
+    addBiasBatched(beta, beta, kda_beta_b, 1, tokens, encoder_heads_,
+                   ACTIVATION_NONE, sycl_queue);
+  }
+
+  float* state = reinterpret_cast<float*>(v + max_tokens * value_depth);
+  const int heads = encoder_heads_;
+  const int key_dim = kda_key_dim_;
+  const int value_dim = kda_value_dim_;
+  const int direction_count = kda_direction_count_;
+  const int direction0 = kda_directions_[0];
+  const int direction1 = kda_directions_[1];
+  const int direction2 = kda_directions_[2];
+  const int direction3 = kda_directions_[3];
+  const DataType* a_log = kda_a_log;
+  const DataType* dt_bias = kda_dt_bias;
+  DataType* mixed = buffer1;
+  constexpr int kTargetStateElementsPerLaunch = 32 * 16 * 32 * 32;
+  const int state_elements_per_batch = heads * key_dim * value_dim;
+  const int batches_per_launch = std::max(
+      1, std::min(32,
+                  kTargetStateElementsPerLaunch / state_elements_per_batch));
+  for (int batch_base = 0; batch_base < N;
+       batch_base += batches_per_launch) {
+    const int launch_batches =
+        std::min(batches_per_launch, N - batch_base);
+    sycl_queue.parallel_for(
+        sycl::range<1>(launch_batches * heads), [=](sycl::id<1> item) {
+          const int local_index = static_cast<int>(item[0]);
+          const int batch = batch_base + local_index / heads;
+          const int head = local_index % heads;
+          float* head_state =
+              state + (batch * heads + head) * key_dim * value_dim;
+          for (int i = 0; i < key_dim * value_dim; ++i) {
+            head_state[i] = 0.0f;
+          }
+
+          const int direction_index = head / (heads / direction_count);
+          int direction = direction0;
+          if (direction_index == 1) direction = direction1;
+          if (direction_index == 2) direction = direction2;
+          if (direction_index == 3) direction = direction3;
+          const float scale =
+              1.0f / sycl::sqrt(static_cast<float>(key_dim));
+          const float decay_scale =
+              sycl::exp(static_cast<float>(a_log[head]));
+
+          for (int token = 0; token < 64; ++token) {
+            int square = token;
+            if (direction == 2) {
+              square = 63 - token;
+            } else if (direction == 3) {
+              square = (token % 8) * 8 + token / 8;
+            } else if (direction == 4) {
+              const int reverse = 63 - token;
+              square = (reverse % 8) * 8 + reverse / 8;
+            }
+
+            const int key_offset = (batch * 64 + square) * key_depth +
+                                   head * key_dim;
+            const int value_offset = (batch * 64 + square) * value_depth +
+                                     head * value_dim;
+            float q_norm_sq = 0.0f;
+            float k_norm_sq = 0.0f;
+            for (int key = 0; key < key_dim; ++key) {
+              const float q_value = static_cast<float>(q[key_offset + key]);
+              const float k_value = static_cast<float>(k[key_offset + key]);
+              q_norm_sq += q_value * q_value;
+              k_norm_sq += k_value * k_value;
+            }
+            const float q_norm = 1.0f / sycl::sqrt(
+                                                q_norm_sq > 1.0e-12f
+                                                    ? q_norm_sq
+                                                    : 1.0e-12f);
+            const float k_norm = 1.0f / sycl::sqrt(
+                                                k_norm_sq > 1.0e-12f
+                                                    ? k_norm_sq
+                                                    : 1.0e-12f);
+
+            for (int key = 0; key < key_dim; ++key) {
+              const float decay_input =
+                  static_cast<float>(raw_decay[key_offset + key]) +
+                  static_cast<float>(dt_bias[head * key_dim + key]);
+              const float softplus =
+                  (decay_input > 0.0f ? decay_input : 0.0f) +
+                  sycl::log1p(sycl::exp(-sycl::fabs(decay_input)));
+              const float log_decay =
+                  sycl::fmax(-decay_scale * softplus, kKdaLogDecayFloor);
+              const float decay = sycl::exp(log_decay);
+              for (int value = 0; value < value_dim; ++value) {
+                head_state[key * value_dim + value] *= decay;
+              }
+            }
+
+            const float beta_value = static_cast<float>(
+                beta[(batch * 64 + square) * heads + head]);
+            const float update_rate =
+                1.0f / (1.0f + sycl::exp(-beta_value));
+            for (int value = 0; value < value_dim; ++value) {
+              float prediction = 0.0f;
+              for (int key = 0; key < key_dim; ++key) {
+                prediction +=
+                    static_cast<float>(k[key_offset + key]) * k_norm *
+                    head_state[key * value_dim + value];
+              }
+              const float delta =
+                  update_rate *
+                  (static_cast<float>(v[value_offset + value]) - prediction);
+              float output = 0.0f;
+              for (int key = 0; key < key_dim; ++key) {
+                const int state_index = key * value_dim + value;
+                head_state[state_index] +=
+                    static_cast<float>(k[key_offset + key]) * k_norm * delta;
+                output += static_cast<float>(q[key_offset + key]) * q_norm *
+                          scale * head_state[state_index];
+              }
+              mixed[value_offset + value] = static_cast<DataType>(output);
+            }
+          }
+        });
+  }
+
+  DataType* gate = nullptr;
+  if (kda_output_gate_) {
+    DataType* gate_hidden = scratch;
+    gate = buffer2;
+    cublasXgemm<DataType>(
+        transpose_type_transpose, transpose_type_notranspose, kda_gate_rank_,
+        tokens, embedding_op_size_, 1.0f, kda_gate_a_w, embedding_op_size_,
+        in_out_tensor, embedding_op_size_, 0.0f, gate_hidden,
+        kda_gate_rank_, sycl_queue);
+    if (kda_gate_a_b) {
+      addBiasBatched(gate_hidden, gate_hidden, kda_gate_a_b, 1, tokens,
+                     kda_gate_rank_, ACTIVATION_NONE, sycl_queue);
+    }
+    cublasXgemm<DataType>(
+        transpose_type_transpose, transpose_type_notranspose, value_depth,
+        tokens, kda_gate_rank_, 1.0f, kda_gate_b_w, kda_gate_rank_,
+        gate_hidden, kda_gate_rank_, 0.0f, gate, value_depth, sycl_queue);
+    if (kda_gate_b_b) {
+      addBiasBatched(gate, gate, kda_gate_b_b, 1, tokens, value_depth,
+                     ACTIVATION_NONE, sycl_queue);
+    }
+  }
+
+  const DataType* norm_gammas = kda_out_norm_gammas;
+  const float norm_epsilon = kda_rms_norm_epsilon_;
+  const bool output_rms_norm = kda_output_rms_norm_;
+  if (output_rms_norm) {
+    sycl_queue.parallel_for(sycl::range<1>(tokens), [=](sycl::id<1> item) {
+      const int token = static_cast<int>(item[0]);
+      const int offset = token * value_depth;
+      float sum_squares = 0.0f;
+      for (int channel = 0; channel < value_depth; ++channel) {
+        const float value = static_cast<float>(mixed[offset + channel]);
+        sum_squares += value * value;
+      }
+      const float factor =
+          1.0f / sycl::sqrt(sum_squares / value_depth + norm_epsilon);
+      for (int channel = 0; channel < value_depth; ++channel) {
+        float value = static_cast<float>(mixed[offset + channel]) * factor *
+                      static_cast<float>(norm_gammas[channel]);
+        if (gate != nullptr) {
+          const float gate_value = static_cast<float>(gate[offset + channel]);
+          value *= 1.0f / (1.0f + sycl::exp(-gate_value));
+        }
+        mixed[offset + channel] = static_cast<DataType>(value);
+      }
+    });
+  } else if (gate != nullptr) {
+    sycl_queue.parallel_for(
+        sycl::range<1>(tokens * value_depth), [=](sycl::id<1> item) {
+          const int index = static_cast<int>(item[0]);
+          const float value = static_cast<float>(mixed[index]);
+          const float gate_value = static_cast<float>(gate[index]);
+          mixed[index] = static_cast<DataType>(
+              value / (1.0f + sycl::exp(-gate_value)));
+        });
+  }
+
+  cublasXgemm<DataType>(
+      transpose_type_transpose, transpose_type_notranspose,
+      embedding_op_size_, tokens, value_depth, 1.0f, kda_dense_w, value_depth,
+      mixed, value_depth, 0.0f, buffer2, embedding_op_size_, sycl_queue);
+  LayerNorm<DataType>(tokens, embedding_op_size_, scratch, buffer2,
+                      kda_dense_b, in_out_tensor, ln1_gammas, ln1_betas,
+                      default_eps_, alpha_, ACTIVATION_NONE, sycl_queue);
+
+  cublasXgemm<DataType>(
+      transpose_type_transpose, transpose_type_notranspose, ffn_dense1_size_,
+      tokens, embedding_op_size_, 1.0f, ffn_dense1_w, embedding_op_size_,
+      scratch, embedding_op_size_, 0.0f, in_out_tensor, ffn_dense1_size_,
+      sycl_queue);
+  addBiasBatched(in_out_tensor, in_out_tensor, ffn_dense1_b, 1, tokens,
+                 ffn_dense1_size_, ffn_activation_, sycl_queue);
+
+  cublasXgemm<DataType>(
+      transpose_type_transpose, transpose_type_notranspose,
+      embedding_op_size_, tokens, ffn_dense1_size_, 1.0f, ffn_dense2_w,
+      ffn_dense1_size_, in_out_tensor, ffn_dense1_size_, 0.0f, buffer1,
+      embedding_op_size_, sycl_queue);
+  LayerNorm<DataType>(tokens, embedding_op_size_, in_out_tensor, buffer1,
+                      ffn_dense2_b, scratch, ln2_gammas, ln2_betas,
+                      default_eps_, alpha_, ACTIVATION_NONE, sycl_queue);
+}
+
 // input/output tensor is in_out_tensor, others are used as scratch.
 template <typename DataType>
 void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
@@ -2805,6 +3180,11 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
                                   DataType* buffer2, sycl::queue& sycl_queue,
                                   DataType*** offset_pointers) {
   // CERR << "EncoderBlock<DataType>::Eval. ";
+
+  if (is_kda_) {
+    EvalKda(N, in_out_tensor, scratch, buffer1, buffer2, sycl_queue);
+    return;
+  }
 
   const int d_model = mha_q_size_;
   const int depth = d_model / encoder_heads_;
@@ -2896,8 +3276,10 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
         batch, num_inputs, 1.0f, mha_qkv_w, num_inputs,
         num_inputs * num_outputs, in_out_tensor, num_inputs, 0, 0.0f, mha_q,
         num_outputs, num_outputs * max_batch, 3, sycl_queue);
-    addBiasBatched<DataType>(mha_q, mha_q, mha_qkv_b, 3, batch, num_outputs,
-                             max_batch, ACTIVATION_NONE, sycl_queue);
+    if (mha_qkv_b) {
+      addBiasBatched<DataType>(mha_q, mha_q, mha_qkv_b, 3, batch, num_outputs,
+                               max_batch, ACTIVATION_NONE, sycl_queue);
+    }
   }
 
   // Apply split_heads() to q, k and v
@@ -3087,8 +3469,10 @@ void AttentionPolicyHead<DataType>::Eval(int N, DataType* output,
         input2_tensor, num_inputs, 0, 0.0f, wq, num_outputs,
         num_outputs * batch, 2, sycl_queue);
 
-    addBiasBatched<DataType>(wq, wq, wqk_b_, 2, batch, num_outputs,
-                             ACTIVATION_NONE, sycl_queue);
+    if (wqk_b_) {
+      addBiasBatched<DataType>(wq, wq, wqk_b_, 2, batch, num_outputs,
+                               ACTIVATION_NONE, sycl_queue);
+    }
   }
 
   // dk = tf.math.sqrt(tf.cast(tf.shape(keys)[-1], self.model_dtype))
@@ -3153,6 +3537,27 @@ EncoderBlock<DataType>::~EncoderBlock() {
   sycl::free(ffn_dense2_b, sycl_queue_);
   sycl::free(ln2_gammas, sycl_queue_);
   sycl::free(ln2_betas, sycl_queue_);
+  sycl::free(kda_q_w, sycl_queue_);
+  sycl::free(kda_q_b, sycl_queue_);
+  sycl::free(kda_k_w, sycl_queue_);
+  sycl::free(kda_k_b, sycl_queue_);
+  sycl::free(kda_v_w, sycl_queue_);
+  sycl::free(kda_v_b, sycl_queue_);
+  sycl::free(kda_decay_a_w, sycl_queue_);
+  sycl::free(kda_decay_a_b, sycl_queue_);
+  sycl::free(kda_decay_b_w, sycl_queue_);
+  sycl::free(kda_decay_b_b, sycl_queue_);
+  sycl::free(kda_beta_w, sycl_queue_);
+  sycl::free(kda_beta_b, sycl_queue_);
+  sycl::free(kda_a_log, sycl_queue_);
+  sycl::free(kda_dt_bias, sycl_queue_);
+  sycl::free(kda_gate_a_w, sycl_queue_);
+  sycl::free(kda_gate_a_b, sycl_queue_);
+  sycl::free(kda_gate_b_w, sycl_queue_);
+  sycl::free(kda_gate_b_b, sycl_queue_);
+  sycl::free(kda_out_norm_gammas, sycl_queue_);
+  sycl::free(kda_dense_w, sycl_queue_);
+  sycl::free(kda_dense_b, sycl_queue_);
   if (has_smolgen_) {
     sycl::free(smol_compress, sycl_queue_);
     sycl::free(smol_dense1_w, sycl_queue_);
@@ -3208,6 +3613,7 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
                                        int num_res_blocks, int input_c,
                                        int max_batch_size,
                                        bool is_pe_dense_embedding,
+                                       const std::vector<int>& kda_directions,
                                        sycl::queue& sycl_queue)
     : BaseLayer<DataType>(weights.ip_emb_b.size(), 8, 8, nullptr, sycl_queue),
       embedding_op_size_(weights.ip_emb_b.size()),
@@ -3283,7 +3689,7 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
         enc, scratch, encoder_head_count_, embedding_op_size_, alpha,
         smolgen_global_, smolgen_global_size_, max_batch_size,
         activations_.smolgen_activation, activations_.ffn_activation,
-        is_pe_dense_embedding_ ? 1e-3 : 1e-6, sycl_queue_);
+        is_pe_dense_embedding_ ? 1e-3 : 1e-6, kda_directions, sycl_queue_);
 
     encoder_weights_.emplace_back(std::unique_ptr<EncoderBlock<DataType>>(pW));
   }

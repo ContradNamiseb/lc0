@@ -58,6 +58,19 @@ class ProtoMessage {
     }
     out->append("]");
   }
+  template <typename T, typename NameFunction>
+  static void AppendJsonRepeatedEnumField(const std::string& name,
+                                          const std::vector<T>& val,
+                                          NameFunction name_function,
+                                          bool* is_first, std::string* out) {
+    AppendJsonFieldPrefix(name, is_first, out);
+    out->append("[");
+    for (std::size_t i = 0; i < val.size(); ++i) {
+      if (i > 0) out->append(",");
+      AppendJsonValue(name_function(val[i]), out);
+    }
+    out->append("]");
+  }
   template <typename T>
   static void AppendJsonField(const std::string& name, const T& val,
                               bool* is_first, std::string* out) {

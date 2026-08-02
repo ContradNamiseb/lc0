@@ -270,6 +270,7 @@ class SearchWorker {
     } catch (std::exception& e) {
       std::cerr << "Unhandled exception in worker thread: " << e.what()
                 << std::endl;
+      LOGFILE << "Unhandled exception in worker thread: " << e.what();
       abort();
     }
   }

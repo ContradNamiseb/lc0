@@ -319,8 +319,10 @@ class ProtoFieldParser:
                 value = float(lexer.Consume("fnumber").group(0))
             elif token == "number":
                 value = int(lexer.Consume("number").group(0))
+            elif token == "identifier":
+                value = lexer.Consume("identifier").group(0)
             else:
-                lexer.Error("Expected string or number as default value")
+                lexer.Error("Expected string, number, or identifier as default value")
             attributes[name] = value
             token, _ = lexer.Pick()
             if token == "]":
@@ -408,6 +410,12 @@ class ProtoFieldParser:
         name = self.name.group(0)
         if self.category == "repeated":
             prefix = "if (!%s_.empty())" % name
+            if self.type.IsEnumType():
+                w.Write(
+                    '%s AppendJsonRepeatedEnumField("%s", %s_, %s_Name, &first, &out);'
+                    % (prefix, name, name, self.type.GetCppType())
+                )
+                return
             funcname = "AppendJsonRepeatedField"
         else:
             prefix = "if (has_%s_)" % name

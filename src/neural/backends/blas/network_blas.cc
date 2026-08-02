@@ -69,7 +69,8 @@ class BlasComputation : public NetworkComputation {
                   const ActivationFunction smolgen_activation,
                   const ActivationFunction ffn_activation,
                   const bool attn_policy, const bool attn_body,
-                  bool is_pe_dense_embedding, int threads);
+                  bool is_pe_dense_embedding, std::vector<int> kda_directions,
+                  int threads);
 
   virtual ~BlasComputation() {}
 
@@ -123,6 +124,10 @@ class BlasComputation : public NetworkComputation {
       size_t batch_size, const MultiHeadWeights::EncoderLayer& layer,
       int embedding_size, int heads, ActivationFunction smolgen_activation,
       ActivationFunction ffn_activation, float alpha, float default_eps);
+  void ForwardKdaMixer(const std::vector<float>& input,
+                       std::vector<float>& output, size_t batch_size,
+                       const MultiHeadWeights::EncoderLayer& layer,
+                       int embedding_size, int heads);
 
   static constexpr auto kWidth = 8;
   static constexpr auto kHeight = 8;
@@ -144,6 +149,7 @@ class BlasComputation : public NetworkComputation {
   bool attn_policy_;
   bool attn_body_;
   bool is_pe_dense_embedding_;
+  std::vector<int> kda_directions_;
   ActivationFunction default_activation_;
   ActivationFunction smolgen_activation_;
   ActivationFunction ffn_activation_;
@@ -163,7 +169,7 @@ class BlasNetwork : public Network {
         this, weights_, policy_head_, value_head_, max_batch_size_, wdl_,
         moves_left_, conv_policy_, default_activation_, smolgen_activation_,
         ffn_activation_, attn_policy_, attn_body_, is_pe_dense_embedding_,
-        threads_);
+        kda_directions_, threads_);
   }
 
   const NetworkCapabilities& GetCapabilities() const override {
@@ -206,6 +212,7 @@ class BlasNetwork : public Network {
   bool attn_policy_;
   bool attn_body_;
   bool is_pe_dense_embedding_;
+  std::vector<int> kda_directions_;
   ActivationFunction default_activation_ = ACTIVATION_NONE;
   ActivationFunction smolgen_activation_ = ACTIVATION_NONE;
   ActivationFunction ffn_activation_ = ACTIVATION_NONE;
@@ -224,7 +231,7 @@ BlasComputation<use_eigen>::BlasComputation(
     const ActivationFunction smolgen_activation,
     const ActivationFunction ffn_activation, const bool attn_policy,
     const bool attn_body, bool is_pe_dense_embedding,
-    [[maybe_unused]] int threads)
+    std::vector<int> kda_directions, [[maybe_unused]] int threads)
     : weights_(weights),
       max_batch_size_(max_batch_size),
       policies_(0),
@@ -235,6 +242,7 @@ BlasComputation<use_eigen>::BlasComputation(
       attn_policy_(attn_policy),
       attn_body_(attn_body),
       is_pe_dense_embedding_(is_pe_dense_embedding),
+      kda_directions_(std::move(kda_directions)),
       default_activation_(default_activation),
       smolgen_activation_(smolgen_activation),
       ffn_activation_(ffn_activation),
@@ -268,6 +276,180 @@ void vec_adjust(std::vector<float>& vec, size_t size) {
   }
 }
 
+// Traversal order of the 64 squares for each KdaDirection value. Must match
+// KDA_TRAVERSALS in the trainer.
+static int KdaSquareForToken(int direction, int token) {
+  switch (direction) {
+    case 1:
+      return token;
+    case 2:
+      return 63 - token;
+    case 3:
+      return (token % 8) * 8 + token / 8;
+    case 4: {
+      const int reverse = 63 - token;
+      return (reverse % 8) * 8 + reverse / 8;
+    }
+    default:
+      throw Exception("Unsupported KDA traversal direction.");
+  }
+}
+
+// Reference implementation of the gated delta rule, written as the plain
+// sequential recurrence the trainer's chunkwise-parallel form is equivalent to.
+template <bool use_eigen>
+void BlasComputation<use_eigen>::ForwardKdaMixer(
+    const std::vector<float>& input, std::vector<float>& output,
+    size_t batch_size, const MultiHeadWeights::EncoderLayer& layer,
+    int embedding_size, int heads) {
+  // Mirrors KDA_LOG_DECAY_FLOOR in the trainer.
+  constexpr float kLogDecayFloor = -10.0f;
+  const auto& kda = layer.kda;
+  const int key_dim = kda.key_dim;
+  const int value_dim = kda.value_dim;
+  const int gate_rank = kda.gate_rank;
+  const int key_depth = heads * key_dim;
+  const int value_depth = heads * value_dim;
+  const size_t tokens = batch_size * kSquares;
+  const int direction_count = static_cast<int>(kda_directions_.size());
+
+  if (key_dim <= 0 || value_dim <= 0 || gate_rank <= 0) {
+    throw Exception("Invalid KDA dimensions.");
+  }
+  if (direction_count <= 0 || heads % direction_count != 0) {
+    throw Exception("KDA directions must evenly divide the encoder heads.");
+  }
+  if (kda.output_rms_norm && kda.out_norm_gammas.empty()) {
+    throw Exception(
+        "KDA output RMS norm requested but out_norm_gammas is missing.");
+  }
+  const int heads_per_direction = heads / direction_count;
+
+  auto bias = [](const MultiHeadWeights::Vec& v) {
+    return v.empty() ? nullptr : v.data();
+  };
+
+  std::vector<float> q(tokens * key_depth);
+  std::vector<float> k(tokens * key_depth);
+  std::vector<float> v(tokens * value_depth);
+  std::vector<float> raw_decay(tokens * key_depth);
+  std::vector<float> beta(tokens * heads);
+  std::vector<float> hidden(tokens * gate_rank);
+  std::vector<float> mixed(tokens * value_depth);
+
+  FullyConnectedLayer<use_eigen>::Forward1D(
+      tokens, embedding_size, key_depth, input.data(), kda.q_w.data(),
+      bias(kda.q_b), ACTIVATION_NONE, q.data());
+  FullyConnectedLayer<use_eigen>::Forward1D(
+      tokens, embedding_size, key_depth, input.data(), kda.k_w.data(),
+      bias(kda.k_b), ACTIVATION_NONE, k.data());
+  FullyConnectedLayer<use_eigen>::Forward1D(
+      tokens, embedding_size, value_depth, input.data(), kda.v_w.data(),
+      bias(kda.v_b), ACTIVATION_NONE, v.data());
+
+  FullyConnectedLayer<use_eigen>::Forward1D(
+      tokens, embedding_size, gate_rank, input.data(), kda.decay_a_w.data(),
+      bias(kda.decay_a_b), ACTIVATION_NONE, hidden.data());
+  FullyConnectedLayer<use_eigen>::Forward1D(
+      tokens, gate_rank, key_depth, hidden.data(), kda.decay_b_w.data(),
+      bias(kda.decay_b_b), ACTIVATION_NONE, raw_decay.data());
+
+  FullyConnectedLayer<use_eigen>::Forward1D(
+      tokens, embedding_size, heads, input.data(), kda.beta_w.data(),
+      bias(kda.beta_b), ACTIVATION_NONE, beta.data());
+
+  std::vector<float> state(static_cast<size_t>(key_dim) * value_dim);
+  for (size_t batch = 0; batch < batch_size; batch++) {
+    for (int head = 0; head < heads; head++) {
+      const int direction = kda_directions_[head / heads_per_direction];
+      const float decay_scale = std::exp(kda.a_log[head]);
+      const float scale = 1.0f / std::sqrt(static_cast<float>(key_dim));
+      std::fill(state.begin(), state.end(), 0.0f);
+
+      for (int token = 0; token < kSquares; token++) {
+        const size_t square = batch * kSquares + KdaSquareForToken(
+                                                     direction, token);
+        const size_t key_offset = square * key_depth + head * key_dim;
+        const size_t value_offset = square * value_depth + head * value_dim;
+
+        float q_norm_sq = 0.0f;
+        float k_norm_sq = 0.0f;
+        for (int key = 0; key < key_dim; key++) {
+          q_norm_sq += q[key_offset + key] * q[key_offset + key];
+          k_norm_sq += k[key_offset + key] * k[key_offset + key];
+        }
+        const float q_norm = 1.0f / std::sqrt(std::max(q_norm_sq, 1.0e-12f));
+        const float k_norm = 1.0f / std::sqrt(std::max(k_norm_sq, 1.0e-12f));
+
+        for (int key = 0; key < key_dim; key++) {
+          const float x = raw_decay[key_offset + key] +
+                          kda.dt_bias[head * key_dim + key];
+          const float softplus =
+              std::max(x, 0.0f) + std::log1p(std::exp(-std::abs(x)));
+          const float decay =
+              std::exp(std::max(-decay_scale * softplus, kLogDecayFloor));
+          for (int value = 0; value < value_dim; value++) {
+            state[key * value_dim + value] *= decay;
+          }
+        }
+
+        const float beta_raw = beta[square * heads + head];
+        const float update_rate = 1.0f / (1.0f + std::exp(-beta_raw));
+        for (int value = 0; value < value_dim; value++) {
+          float prediction = 0.0f;
+          for (int key = 0; key < key_dim; key++) {
+            prediction += k[key_offset + key] * k_norm *
+                          state[key * value_dim + value];
+          }
+          const float delta =
+              update_rate * (v[value_offset + value] - prediction);
+          float sum = 0.0f;
+          for (int key = 0; key < key_dim; key++) {
+            const int index = key * value_dim + value;
+            state[index] += k[key_offset + key] * k_norm * delta;
+            sum += q[key_offset + key] * q_norm * scale * state[index];
+          }
+          mixed[value_offset + value] = sum;
+        }
+      }
+    }
+  }
+
+  if (kda.output_rms_norm) {
+    for (size_t token = 0; token < tokens; token++) {
+      float sum_squares = 0.0f;
+      for (int channel = 0; channel < value_depth; channel++) {
+        const float value = mixed[token * value_depth + channel];
+        sum_squares += value * value;
+      }
+      const float factor =
+          1.0f / std::sqrt(sum_squares / value_depth + kda.rms_norm_epsilon);
+      for (int channel = 0; channel < value_depth; channel++) {
+        mixed[token * value_depth + channel] *=
+            factor * kda.out_norm_gammas[channel];
+      }
+    }
+  }
+
+  if (kda.output_gate) {
+    std::vector<float> gate(tokens * value_depth);
+    FullyConnectedLayer<use_eigen>::Forward1D(
+        tokens, embedding_size, gate_rank, input.data(), kda.gate_a_w.data(),
+        bias(kda.gate_a_b), ACTIVATION_NONE, hidden.data());
+    FullyConnectedLayer<use_eigen>::Forward1D(
+        tokens, gate_rank, value_depth, hidden.data(), kda.gate_b_w.data(),
+        bias(kda.gate_b_b), ACTIVATION_NONE, gate.data());
+    for (size_t i = 0; i < mixed.size(); i++) {
+      mixed[i] *= 1.0f / (1.0f + std::exp(-gate[i]));
+    }
+  }
+
+  vec_adjust(output, tokens * embedding_size);
+  FullyConnectedLayer<use_eigen>::Forward1D(
+      tokens, value_depth, embedding_size, mixed.data(), kda.dense_w.data(),
+      bias(kda.dense_b), ACTIVATION_NONE, output.data());
+}
+
 template <bool use_eigen>
 void BlasComputation<use_eigen>::ForwardEncoderLayer(
     std::vector<float>& encoder_buffer, std::vector<float>& encoder_buffer2,
@@ -275,7 +457,9 @@ void BlasComputation<use_eigen>::ForwardEncoderLayer(
     size_t batch_size, const MultiHeadWeights::EncoderLayer& layer,
     int embedding_size, int heads, ActivationFunction smolgen_activation,
     ActivationFunction ffn_activation, float alpha, float default_eps) {
-  const int d_model = layer.mha.q_b.size();
+  // Derived from the weights rather than the bias: nets trained with
+  // omit_qkv_biases have no q_b at all.
+  const int d_model = layer.mha.q_w.size() / embedding_size;
   const int dff_size = layer.ffn.dense1_b.size();
   const int hidden_channels =
       layer.mha.has_smolgen ? layer.mha.smolgen.compress.size() / embedding_size
@@ -296,6 +480,14 @@ void BlasComputation<use_eigen>::ForwardEncoderLayer(
              largest_batch_size * std::max(d_model * kSquares, hidden_sz));
   vec_adjust(encoder_buffer4,
              batch_size * kSquares * std::max(kSquares * heads, dff_size));
+
+  // Both mixers leave their pre-normalization output in encoder_buffer3. The
+  // MHA branch below is left at its original indentation to keep the diff
+  // reviewable.
+  if (layer.is_kda) {
+    ForwardKdaMixer(encoder_buffer, encoder_buffer3, batch_size, layer,
+                    embedding_size, heads);
+  } else {
 
   // Smolgen.
   if (layer.mha.has_smolgen) {
@@ -443,6 +635,8 @@ void BlasComputation<use_eigen>::ForwardEncoderLayer(
       batch_size * kSquares, d_model, embedding_size, encoder_buffer2.data(),
       layer.mha.dense_w.data(), layer.mha.dense_b.data(), ACTIVATION_NONE,
       encoder_buffer3.data());
+
+  }  // End of the MHA mixer branch.
 
   // Layer Norm + skip connection.
   LayerNorm2DWithSkipConnection(batch_size * kSquares, embedding_size,
@@ -827,7 +1021,8 @@ void BlasComputation<use_eigen>::ComputeBlocking() {
               : ACTIVATION_SELU,  // SELU activation hardcoded for apmish nets.
           buffer2.data());
 
-      const size_t policy_d_model = policy_head.ip2_pol_b.size();
+      const size_t policy_d_model =
+          policy_head.ip2_pol_w.size() / policy_embedding_size;
 
       for (auto& layer : policy_head.pol_encoder) {
         ForwardEncoderLayer(
@@ -1005,7 +1200,16 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
   attn_policy_ = nf.policy() == NF::POLICY_ATTENTION;
 
   attn_body_ = nf.network() == NF::NETWORK_ATTENTIONBODY_WITH_HEADFORMAT ||
-               nf.network() == NF::NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT;
+               nf.network() == NF::NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT ||
+               nf.network() == NF::NETWORK_KDA_HYBRID_WITH_MULTIHEADFORMAT;
+
+  kda_directions_.assign(nf.kda_directions().begin(),
+                         nf.kda_directions().end());
+  for (const int direction : kda_directions_) {
+    if (direction < 1 || direction > 4) {
+      throw Exception("Unsupported KDA traversal direction.");
+    }
+  }
 
   default_activation_ = nf.default_activation() == NF::DEFAULT_ACTIVATION_MISH
                             ? ACTIVATION_MISH
@@ -1127,6 +1331,7 @@ std::unique_ptr<Network> MakeBlasNetwork(const std::optional<WeightsFile>& w,
     case NF::NETWORK_SE_WITH_HEADFORMAT:
     case NF::NETWORK_ATTENTIONBODY_WITH_HEADFORMAT:
     case NF::NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT:
+    case NF::NETWORK_KDA_HYBRID_WITH_MULTIHEADFORMAT:
       break;
     default:
       throw Exception("Network format " +

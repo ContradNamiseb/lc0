@@ -23,8 +23,10 @@
 
 #include <sycl/sycl.hpp>
 
+#include <array>
 #include <cstddef>
 #include <memory>
+#include <vector>
 
 #include "sycl_common.h"
 #include "neural/backends/shared/activation.h"
@@ -305,7 +307,9 @@ class EncoderBlock {
                int heads, int size, float alpha,
                DataType* smolgen_global_scratch, int smolgen_global_size,
                int max_batch_size, ActivationFunction smolgen_act,
-               ActivationFunction ffn_act, float default_eps, sycl::queue &sycl_queue);
+               ActivationFunction ffn_act, float default_eps,
+               const std::vector<int>& kda_directions,
+               sycl::queue &sycl_queue);
   ~EncoderBlock();
 
   void Eval(int N, DataType* inpop, DataType* scratch0, DataType* scratch1,
@@ -313,6 +317,10 @@ class EncoderBlock {
             DataType*** offset_pointers);
 
  private:
+  void EvalKda(int N, DataType* in_out_tensor, DataType* scratch,
+               DataType* buffer1, DataType* buffer2,
+               sycl::queue& sycl_queue);
+
   // GPU side device memory pointers
   DataType *mha_q_w = nullptr, *mha_q_b = nullptr;
   DataType *mha_k_w = nullptr, *mha_k_b = nullptr;
@@ -326,6 +334,18 @@ class EncoderBlock {
   DataType *ffn_dense2_w = nullptr, *ffn_dense2_b = nullptr;
 
   DataType *ln2_gammas = nullptr, *ln2_betas = nullptr;
+
+  DataType *kda_q_w = nullptr, *kda_q_b = nullptr;
+  DataType *kda_k_w = nullptr, *kda_k_b = nullptr;
+  DataType *kda_v_w = nullptr, *kda_v_b = nullptr;
+  DataType *kda_decay_a_w = nullptr, *kda_decay_a_b = nullptr;
+  DataType *kda_decay_b_w = nullptr, *kda_decay_b_b = nullptr;
+  DataType *kda_beta_w = nullptr, *kda_beta_b = nullptr;
+  DataType *kda_a_log = nullptr, *kda_dt_bias = nullptr;
+  DataType *kda_gate_a_w = nullptr, *kda_gate_a_b = nullptr;
+  DataType *kda_gate_b_w = nullptr, *kda_gate_b_b = nullptr;
+  DataType *kda_out_norm_gammas = nullptr;
+  DataType *kda_dense_w = nullptr, *kda_dense_b = nullptr;
 
   DataType *smol_compress = nullptr;
   DataType *smol_dense1_w = nullptr, *smol_dense1_b = nullptr;
@@ -344,6 +364,15 @@ class EncoderBlock {
 
   int embedding_op_size_;
   int encoder_heads_;
+  bool is_kda_;
+  int kda_key_dim_;
+  int kda_value_dim_;
+  int kda_gate_rank_;
+  float kda_rms_norm_epsilon_;
+  bool kda_output_gate_;
+  bool kda_output_rms_norm_;
+  std::array<int, 4> kda_directions_{};
+  int kda_direction_count_;
 
   float alpha_;  // scale to apply to skip connection add
   float default_eps_;  // value of epsilon where it wasn't specified in training
@@ -445,6 +474,7 @@ class AttentionBody : public BaseLayer<DataType> {
   AttentionBody(const MultiHeadWeights& weights, void* scratch,
                 Activations activations, int num_res_blocks, int input_c,
                 int max_batch_size, bool is_pe_dense_embedding,
+                const std::vector<int>& kda_directions,
                 sycl::queue &sycl_queue);
   ~AttentionBody();
 

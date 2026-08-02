@@ -21,16 +21,17 @@
 
 #pragma once
 
-#include <algorithm>
 #include <string>
 #include <sycl/sycl.hpp>
 
 #include "utils/exception.h"
 
-#if defined(__HIP_PLATFORM_AMD__) && (defined(__GFX9__) || defined(__GFX8__))
+#if defined(USE_HIPBLAS)
 #define SYCL_SUB_GROUP_SIZE 64
-#else
+#elif defined(USE_CUBLAS)
 #define SYCL_SUB_GROUP_SIZE 32
+#else
+#define SYCL_SUB_GROUP_SIZE 16
 #endif
 
 namespace lczero {
@@ -72,16 +73,6 @@ struct SyclDeviceCache {
   bool is_gpu = false;
   std::string device_name;
 };
-
-inline int GetSubGroupSize(const sycl::queue& q) {
-  auto sg_sizes = q.get_device().get_info<sycl::info::device::sub_group_sizes>();
-  if (std::find(sg_sizes.begin(), sg_sizes.end(), 32) != sg_sizes.end()) {
-    return 32;
-  } else if (!sg_sizes.empty()) {
-    return static_cast<int>(sg_sizes.back());
-  }
-  return 32;
-}
 
 }  // namespace sycldnn_backend
 }  // namespace lczero

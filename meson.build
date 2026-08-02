@@ -1171,38 +1171,3 @@ if get_option('python_bindings')
     install: true,
   )
 endif
-
-#############################################################################
-
-## Python bindings
-
-#############################################################################
-
-
-if get_option('python_bindings')
-  pymod = import('python')
-  python = pymod.find_installation('python3')
-  if not python.language_version().version_compare('>3.7')
-    error('You need python 3.7 or newer')
-  endif
-  py_bindings_generator = find_program('scripts/gen_py_bindings.py')
-
-  gen_py_bindings = custom_target(
-    'backends',
-    input: [],
-    output: ['backends.cc'],
-    command: [py_bindings_generator, '@OUTPUT0@'],
-  )
-
-  py_files = [gen_py_bindings]
-
-  cpython = dependency('python3')
-  python.extension_module(
-    'backends',
-    [py_files + files],
-    include_directories: [includes],
-    dependencies: [cpython] + deps,
-    subdir: 'lczero',
-    install: true,
-  )
-endif
