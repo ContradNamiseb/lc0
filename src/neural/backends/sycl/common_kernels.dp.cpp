@@ -1152,7 +1152,7 @@ void softmax_opt_64_kernel(T* output, const T* input,
 template <typename T>
 void softmax_kernel(T* output, const T* input, const T* input2,
                     const sycl::nd_item<3> &item_ct1, float &localsum,
-                    float &localmax, int sg_size) {
+                    float &localmax) {
   int n = item_ct1.get_group(2);
   int c = item_ct1.get_local_id(2);
   int C = item_ct1.get_local_range(2);
@@ -1177,7 +1177,8 @@ void softmax_kernel(T* output, const T* input, const T* input2,
 
   // Get max across warp first, and then update across C dimension
   float warpmax = warpMax(x, item_ct1);
-  int sg_mask = sg_size - 1;
+  int actual_sg_size = item_ct1.get_sub_group().get_local_linear_range();
+  int sg_mask = actual_sg_size - 1;
   if ((c & sg_mask) == 0) maxval.fetch_max(warpmax);
 
   
@@ -1202,9 +1203,10 @@ void softmax_kernel(T* output, const T* input, const T* input2,
 
 template <typename T>
 void Softmax(int N, int C, T* output, const T* input, const T* input2, sycl::queue &sycl_queue) {
+#if SYCL_SUB_GROUP_SIZE == 32
   if (C == 64) {
-    int sg_size = GetSubGroupSize(sycl_queue);
-    int size = N * (64 / sg_size) * sg_size;  // Total no of threads needed
+    constexpr int kSubGroupSize = 32;
+    int size = N * (64 / 2);  // Each thread processes two elements.
     const int kBlockSize = 256;
     int blocks = DivUp(size, kBlockSize);
     {
@@ -1213,17 +1215,20 @@ void Softmax(int N, int C, T* output, const T* input, const T* input2, sycl::que
           sycl::nd_range<3>(
               sycl::range<3>(1, 1, blocks) * sycl::range<3>(1, 1, kBlockSize),
               sycl::range<3>(1, 1, kBlockSize)),
-          [=](sycl::nd_item<3> item_ct1) {
-            softmax_opt_64_kernel<T>(output, input, input2, size, item_ct1, sg_size);
+          [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(SYCL_SUB_GROUP_SIZE)]] {
+                softmax_opt_64_kernel<T>(output, input, input2, size, item_ct1,
+                                         kSubGroupSize);
           });
     }
-  } else {
+        return;
+      }
+    #endif
+      {
     /*
     DPCT1049:15: The work-group size passed to the SYCL kernel may exceed the
     limit. To get the device limit, query info::device::max_work_group_size.
     Adjust the work-group size if needed.
     */
-    int sg_size = GetSubGroupSize(sycl_queue);
     sycl_queue.submit([&](sycl::handler& cgh) {
       sycl::local_accessor<float, 0> sum_acc_ct1(cgh);
       sycl::local_accessor<float, 0> maxval_acc_ct1(cgh);
@@ -1233,7 +1238,7 @@ void Softmax(int N, int C, T* output, const T* input, const T* input2, sycl::que
                             sycl::range<3>(1, 1, C)),
           [=](sycl::nd_item<3> item_ct1) {
             softmax_kernel<T>(output, input, input2, item_ct1, sum_acc_ct1,
-                              maxval_acc_ct1, sg_size);
+                              maxval_acc_ct1);
           });
     });
   }
@@ -1295,21 +1300,25 @@ void layer_norm_kernel(int N, int C, T* output, const T* input, const T* bias,
       for (int i = 0; i < 8; i++) val[i] = (float)inp[i];
       copyAs<sycl::uint4>(&inp[0], &input[tensorIndex + 8]);
       for (int i = 0; i < 8; i++) val[i + 8] = (float)inp[i];
-      copyAs<sycl::uint4>(&inp[0], &bias[biasIndex]);
-      for (int i = 0; i < 8; i++) oth[i] = (float)inp[i];
-      copyAs<sycl::uint4>(&inp[0], &bias[biasIndex + 8]);
-      for (int i = 0; i < 8; i++) oth[i + 8] = (float)inp[i];
-      for (int i = 0; i < 16; i++) val[i] += oth[i];
+      if (bias != nullptr) {
+        copyAs<sycl::uint4>(&inp[0], &bias[biasIndex]);
+        for (int i = 0; i < 8; i++) oth[i] = (float)inp[i];
+        copyAs<sycl::uint4>(&inp[0], &bias[biasIndex + 8]);
+        for (int i = 0; i < 8; i++) oth[i + 8] = (float)inp[i];
+        for (int i = 0; i < 16; i++) val[i] += oth[i];
+      }
     } else {
       copyAs<sycl::uint4>(&val[0], &input[tensorIndex]);
       copyAs<sycl::uint4>(&val[4], &input[tensorIndex + 4]);
       copyAs<sycl::uint4>(&val[8], &input[tensorIndex + 8]);
       copyAs<sycl::uint4>(&val[12], &input[tensorIndex + 12]);
-      copyAs<sycl::uint4>(&oth[0], &bias[biasIndex]);
-      copyAs<sycl::uint4>(&oth[4], &bias[biasIndex + 4]);
-      copyAs<sycl::uint4>(&oth[8], &bias[biasIndex + 8]);
-      copyAs<sycl::uint4>(&oth[12], &bias[biasIndex + 12]);
-      for (int i = 0; i < 16; i++) val[i] += oth[i];
+      if (bias != nullptr) {
+        copyAs<sycl::uint4>(&oth[0], &bias[biasIndex]);
+        copyAs<sycl::uint4>(&oth[4], &bias[biasIndex + 4]);
+        copyAs<sycl::uint4>(&oth[8], &bias[biasIndex + 8]);
+        copyAs<sycl::uint4>(&oth[12], &bias[biasIndex + 12]);
+        for (int i = 0; i < 16; i++) val[i] += oth[i];
+      }
     }
 
     if (skip != nullptr) {
@@ -1357,21 +1366,25 @@ void layer_norm_kernel(int N, int C, T* output, const T* input, const T* bias,
       for (int i = 0; i < 8; i++) val[i] = (float)inp[i];
       copyAs<sycl::uint4>(&inp[0], &input[tensorIndex + 8]);
       for (int i = 0; i < 8; i++) val[i + 8] = (float)inp[i];
-      copyAs<sycl::uint4>(&inp[0], &bias[biasIndex]);
-      for (int i = 0; i < 8; i++) oth[i] = (float)inp[i];
-      copyAs<sycl::uint4>(&inp[0], &bias[biasIndex + 8]);
-      for (int i = 0; i < 8; i++) oth[i + 8] = (float)inp[i];
-      for (int i = 0; i < 16; i++) val[i] += oth[i];
+      if (bias != nullptr) {
+        copyAs<sycl::uint4>(&inp[0], &bias[biasIndex]);
+        for (int i = 0; i < 8; i++) oth[i] = (float)inp[i];
+        copyAs<sycl::uint4>(&inp[0], &bias[biasIndex + 8]);
+        for (int i = 0; i < 8; i++) oth[i + 8] = (float)inp[i];
+        for (int i = 0; i < 16; i++) val[i] += oth[i];
+      }
     } else {
       copyAs<sycl::uint4>(&val[0], &input[tensorIndex]);
       copyAs<sycl::uint4>(&val[4], &input[tensorIndex + 4]);
       copyAs<sycl::uint4>(&val[8], &input[tensorIndex + 8]);
       copyAs<sycl::uint4>(&val[12], &input[tensorIndex + 12]);
-      copyAs<sycl::uint4>(&oth[0], &bias[biasIndex]);
-      copyAs<sycl::uint4>(&oth[4], &bias[biasIndex + 4]);
-      copyAs<sycl::uint4>(&oth[8], &bias[biasIndex + 8]);
-      copyAs<sycl::uint4>(&oth[12], &bias[biasIndex + 12]);
-      for (int i = 0; i < 16; i++) val[i] += oth[i];
+      if (bias != nullptr) {
+        copyAs<sycl::uint4>(&oth[0], &bias[biasIndex]);
+        copyAs<sycl::uint4>(&oth[4], &bias[biasIndex + 4]);
+        copyAs<sycl::uint4>(&oth[8], &bias[biasIndex + 8]);
+        copyAs<sycl::uint4>(&oth[12], &bias[biasIndex + 12]);
+        for (int i = 0; i < 16; i++) val[i] += oth[i];
+      }
     }
 
     if (skip != nullptr) {
@@ -1465,16 +1478,24 @@ void layer_norm_kernel(int N, int C, T* output, const T* input, const T* bias,
     }
 
     if (fp16) {
-      sycl::half inp[8];
-      copyAs<sycl::uint4>(&inp[0], &gammas[biasIndex]);
-      for (int i = 0; i < 8; i++) oth[i] = (float)inp[i];
-      copyAs<sycl::uint4>(&inp[0], &gammas[biasIndex + 8]);
-      for (int i = 0; i < 8; i++) oth[i + 8] = (float)inp[i];
+      if (gammas != nullptr) {
+        sycl::half inp[8];
+        copyAs<sycl::uint4>(&inp[0], &gammas[biasIndex]);
+        for (int i = 0; i < 8; i++) oth[i] = (float)inp[i];
+        copyAs<sycl::uint4>(&inp[0], &gammas[biasIndex + 8]);
+        for (int i = 0; i < 8; i++) oth[i + 8] = (float)inp[i];
+      } else {
+        for (int i = 0; i < 16; i++) oth[i] = 1.0f;
+      }
     } else {
-      copyAs<sycl::uint4>(&oth[0], &gammas[biasIndex]);
-      copyAs<sycl::uint4>(&oth[4], &gammas[biasIndex + 4]);
-      copyAs<sycl::uint4>(&oth[8], &gammas[biasIndex + 8]);
-      copyAs<sycl::uint4>(&oth[12], &gammas[biasIndex + 12]);
+      if (gammas != nullptr) {
+        copyAs<sycl::uint4>(&oth[0], &gammas[biasIndex]);
+        copyAs<sycl::uint4>(&oth[4], &gammas[biasIndex + 4]);
+        copyAs<sycl::uint4>(&oth[8], &gammas[biasIndex + 8]);
+        copyAs<sycl::uint4>(&oth[12], &gammas[biasIndex + 12]);
+      } else {
+        for (int i = 0; i < 16; i++) oth[i] = 1.0f;
+      }
     }
 
     for (int i = 0; i < 16; i++) {
@@ -1485,16 +1506,24 @@ void layer_norm_kernel(int N, int C, T* output, const T* input, const T* bias,
     }
 
     if (fp16) {
-      sycl::half inp[8];
-      copyAs<sycl::uint4>(&inp[0], &betas[biasIndex]);
-      for (int i = 0; i < 8; i++) oth[i] = (float)inp[i];
-      copyAs<sycl::uint4>(&inp[0], &betas[biasIndex + 8]);
-      for (int i = 0; i < 8; i++) oth[i + 8] = (float)inp[i];
+      if (betas != nullptr) {
+        sycl::half inp[8];
+        copyAs<sycl::uint4>(&inp[0], &betas[biasIndex]);
+        for (int i = 0; i < 8; i++) oth[i] = (float)inp[i];
+        copyAs<sycl::uint4>(&inp[0], &betas[biasIndex + 8]);
+        for (int i = 0; i < 8; i++) oth[i + 8] = (float)inp[i];
+      } else {
+        for (int i = 0; i < 16; i++) oth[i] = 0.0f;
+      }
     } else {
-      copyAs<sycl::uint4>(&oth[0], &betas[biasIndex]);
-      copyAs<sycl::uint4>(&oth[4], &betas[biasIndex + 4]);
-      copyAs<sycl::uint4>(&oth[8], &betas[biasIndex + 8]);
-      copyAs<sycl::uint4>(&oth[12], &betas[biasIndex + 12]);
+      if (betas != nullptr) {
+        copyAs<sycl::uint4>(&oth[0], &betas[biasIndex]);
+        copyAs<sycl::uint4>(&oth[4], &betas[biasIndex + 4]);
+        copyAs<sycl::uint4>(&oth[8], &betas[biasIndex + 8]);
+        copyAs<sycl::uint4>(&oth[12], &betas[biasIndex + 12]);
+      } else {
+        for (int i = 0; i < 16; i++) oth[i] = 0.0f;
+      }
     }
 
     for (int i = 0; i < 16; i++) {
@@ -1529,6 +1558,12 @@ void LayerNorm(int N, int C, T* output, const T* input, const T* bias,
 
   // Max 256 threads per batch to respect max_work_group_size on most Intel devices.
   int threads_per_batch = std::min(C / 16, 256);
+  if (threads_per_batch < SYCL_SUB_GROUP_SIZE) {
+    threads_per_batch = SYCL_SUB_GROUP_SIZE;
+  } else {
+    threads_per_batch = (threads_per_batch / SYCL_SUB_GROUP_SIZE) * SYCL_SUB_GROUP_SIZE;
+  }
+  if (threads_per_batch == 0) threads_per_batch = SYCL_SUB_GROUP_SIZE;
   sycl::range<1> blockDim(threads_per_batch);
   sycl::range<1> gridDim(N * threads_per_batch);
 
@@ -1566,10 +1601,6 @@ void promotion_logits_kernel(int C, T* output, const T* keys,
   int threadInGroup = item_ct1.get_local_id(1) * 24 + item_ct1.get_local_id(2);
 
   // phase 1 : compute promotion_offsets by multiplying keys and ppo matrices
-  // Each of the 32 matrix elements is computed cooperatively by all 32 threads:
-  // thread `t` accumulates partial sums from positions i = t, t+32, t+64, ...
-  // then a group reduce collapses them. This ensures fully coalesced reads
-  // across adjacent threads (stride-1 access over i).
   const T* keys_start =
       keys + n * 64 * C + C * 56;  // we are interested only in last 8 out of 64
                                    // 'rows' of keys matrix
@@ -1578,12 +1609,9 @@ void promotion_logits_kernel(int C, T* output, const T* keys,
     int elem_x = threadInGroup % 4;   // which ppo row (0..3)
     int elem_y = threadInGroup / 4;   // which keys row (0..7)
 
-    // Each thread accumulates partial sums for its own unique (elem_x, elem_y)
-    // element. We stride the inner loop by 32 so that adjacent threads (with
-    // consecutive threadInGroup values) access consecutive memory addresses on
-    // each iteration, yielding fully coalesced global loads.
+    // Each thread computes one complete dot product.
     float S = 0;
-    for (int i = threadInGroup; i < C; i += 32) {
+    for (int i = 0; i < C; i++) {
       float a = (float)keys_start[elem_y * C + i];
       float b = (float)ppo[elem_x * C + i];  // weight matrix is col-major
       S += a * b;
@@ -1709,20 +1737,18 @@ void inputPreprocessForAttentionBody(T* output, const T* input,
 
 template <typename T>
 void input_gating_kernel(T* output, const T* input, const T* mult,
-                                    const T* add, int HW, int C,
-                                    const sycl::nd_item<3> &item_ct1) {
+                         const T* add, int HW, int C,
+                         const sycl::nd_item<3>& item_ct1) {
   int n_offset = item_ct1.get_group(0) * HW * C;
   int idx = item_ct1.get_local_id(1) * C +
             item_ct1.get_group(2) * item_ct1.get_local_range(2) +
-            item_ct1.get_local_id(2);  // index in input
+            item_ct1.get_local_id(2);
   int idxT = (item_ct1.get_group(2) * item_ct1.get_local_range(2) +
               item_ct1.get_local_id(2)) *
                  HW +
-             item_ct1.get_local_id(
-                 1);  // index in transposed weights arrays mult and add.
+             item_ct1.get_local_id(1);
 
   if (idx < HW * C) {
-    // Combine multiply gating, add gating and weights transpose.
     float op =
         (float)input[n_offset + idx] * (float)mult[idxT] + (float)add[idxT];
     output[n_offset + idx] = (T)op;
@@ -1732,23 +1758,14 @@ void input_gating_kernel(T* output, const T* input, const T* mult,
 template <typename T>
 void applyInputGating(T* output, const T* input, const T* mult, const T* add,
                       int N, int HW, int C, sycl::queue &sycl_queue) {
-  // Multiple blocks to fit into each input area / volume
-  // Block x position indicates horizontal section of area
-  // Block y position indicates batch
-  // Each thread computes a single output element
-  sycl::range<3> blockSize(1, 1, 1), gridSize(1, 1, 1);
-  blockSize[2] = DivUp(512, HW);
-  blockSize[1] = HW;
-  blockSize[0] = 1;
-  gridSize[2] = DivUp(C, blockSize[2]);
-  gridSize[1] = 1;
-  gridSize[0] = N;
-  
-  sycl_queue.parallel_for(sycl::nd_range<3>(gridSize * blockSize, blockSize),
-                       [=](sycl::nd_item<3> item_ct1) {
-                         input_gating_kernel<T>(output, input, mult, add, HW, C,
-                                                item_ct1);
-                       });
+  sycl::range<3> block_size(1, HW, DivUp(512, HW));
+  sycl::range<3> grid_size(N, 1, DivUp(C, block_size[2]));
+
+  sycl_queue.parallel_for(
+      sycl::nd_range<3>(grid_size * block_size, block_size),
+      [=](sycl::nd_item<3> item_ct1) {
+        input_gating_kernel<T>(output, input, mult, add, HW, C, item_ct1);
+      });
 }
 
 template<typename T, int kWorkPerThread>
