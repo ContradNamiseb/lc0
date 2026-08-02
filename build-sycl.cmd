@@ -31,8 +31,11 @@ if not exist "%OPENCL_LIB_PATH%\OpenCL.lib" (
 )
 
 rem 3. In most cases you won't need to change anything further down.
+call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat"
+if errorlevel 1 exit /b
+
 echo Deleting build directory:
-rd /s /q build
+if exist build rd /s /q build
 
 rem Use Intel compilers for SYCL and proper archiver
 set CC=icx

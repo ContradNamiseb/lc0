@@ -57,8 +57,9 @@ SyclDeviceCache InitDeviceCache(const sycl::queue& q) {
   SyclDeviceCache cache;
   auto device = q.get_device();
   auto sg_sizes = device.get_info<sycl::info::device::sub_group_sizes>();
-  if (std::find(sg_sizes.begin(), sg_sizes.end(), 32) != sg_sizes.end()) {
-    cache.sub_group_size = 32;
+  if (std::find(sg_sizes.begin(), sg_sizes.end(), SYCL_SUB_GROUP_SIZE) !=
+      sg_sizes.end()) {
+    cache.sub_group_size = SYCL_SUB_GROUP_SIZE;
   } else if (!sg_sizes.empty()) {
     cache.sub_group_size = sg_sizes.back();
   } else {
