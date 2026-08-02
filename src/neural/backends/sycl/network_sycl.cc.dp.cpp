@@ -94,18 +94,27 @@ class SyclNetwork;
 static size_t getMaxAttentionHeadSize(
     const MultiHeadWeights::PolicyHead& weights, int N) {
   const size_t embedding_op_size = weights.ip_pol_b.size();
-  const size_t policy_d_model = weights.ip2_pol_b.size();
-  assert(policy_d_model == weights.ip3_pol_b.size());
+  const size_t policy_d_model =
+      weights.ip2_pol_w.size() / embedding_op_size;
+  assert(policy_d_model * embedding_op_size == weights.ip2_pol_w.size());
+  assert(weights.ip3_pol_w.size() == weights.ip2_pol_w.size());
+  assert(weights.ip2_pol_b.empty() ||
+         policy_d_model == weights.ip2_pol_b.size());
+  assert(weights.ip3_pol_b.empty() ||
+         policy_d_model == weights.ip3_pol_b.size());
 
   size_t encoder_d_model = 0;
   size_t encoder_dff = 0;
 
   if (weights.pol_encoder.size() > 0) {
-    encoder_d_model = weights.pol_encoder[0].mha.q_b.size();
+    encoder_d_model =
+        weights.pol_encoder[0].mha.q_w.size() / embedding_op_size;
     encoder_dff = weights.pol_encoder[0].ffn.dense1_b.size();
 
-    assert(encoder_d_model == weights.pol_encoder[0].mha.k_b.size());
-    assert(encoder_d_model == weights.pol_encoder[0].mha.v_b.size());
+    assert(weights.pol_encoder[0].mha.k_w.size() ==
+           weights.pol_encoder[0].mha.q_w.size());
+    assert(weights.pol_encoder[0].mha.v_w.size() ==
+           weights.pol_encoder[0].mha.q_w.size());
     assert(embedding_op_size == weights.pol_encoder[0].ffn.dense2_b.size());
   }
 
@@ -133,13 +142,16 @@ static size_t getMaxAttentionBodySize(const MultiHeadWeights& weights, int N) {
   size_t encoder_d_model = 0;
   size_t encoder_dff = 0;
 
-  if (weights.encoder.size() > 0) {
-    encoder_d_model = weights.encoder[0].mha.q_b.size();
-    encoder_dff = weights.encoder[0].ffn.dense1_b.size();
+  for (const auto& encoder : weights.encoder) {
+    encoder_dff = std::max(encoder_dff, encoder.ffn.dense1_b.size());
+    assert(embedding_op_size == encoder.ffn.dense2_b.size());
+    if (encoder.is_kda) continue;
 
-    assert(encoder_d_model == weights.encoder[0].mha.k_b.size());
-    assert(encoder_d_model == weights.encoder[0].mha.v_b.size());
-    assert(embedding_op_size == weights.encoder[0].ffn.dense2_b.size());
+    const size_t d_model = encoder.mha.q_w.size() / embedding_op_size;
+    assert(d_model * embedding_op_size == encoder.mha.q_w.size());
+    assert(encoder.mha.k_w.size() == encoder.mha.q_w.size());
+    assert(encoder.mha.v_w.size() == encoder.mha.q_w.size());
+    encoder_d_model = std::max(encoder_d_model, d_model);
   }
 
   const size_t encoder_heads = weights.encoder_head_count;
@@ -157,6 +169,30 @@ static size_t getMaxAttentionBodySize(const MultiHeadWeights& weights, int N) {
   // We store qkv in single allocation, and other intermediate tensors are
   // sometimes stored by splitting an allocation into two halves.
   size = std::max(2 * size, 3 * qkv_size);
+  return size;
+}
+
+template <typename DataType>
+static size_t getMaxKdaBodySize(const MultiHeadWeights& weights, int N) {
+  size_t size = 0;
+  for (const auto& encoder : weights.encoder) {
+    if (!encoder.is_kda) continue;
+    const size_t heads = weights.encoder_head_count;
+    const size_t key_depth = heads * encoder.kda.key_dim;
+    const size_t value_depth = heads * encoder.kda.value_dim;
+    const size_t tokens = static_cast<size_t>(N) * 64;
+    const size_t qkv_size =
+        tokens * (2 * key_depth + value_depth) * sizeof(DataType);
+    const size_t state_size = static_cast<size_t>(N) * heads *
+                              encoder.kda.key_dim * encoder.kda.value_dim *
+                              sizeof(float);
+    const size_t raw_decay_size = tokens * key_depth * sizeof(DataType);
+    const size_t output_beta_size =
+        tokens * (value_depth + heads) * sizeof(DataType);
+    size = std::max(
+        size, std::max(qkv_size + state_size,
+                       2 * std::max(raw_decay_size, output_beta_size)));
+  }
   return size;
 }
 
@@ -240,7 +276,8 @@ class SyclNetwork : public Network {
     conv_policy_ = nf.policy() == NF::POLICY_CONVOLUTION;
     attn_policy_ = nf.policy() == NF::POLICY_ATTENTION;
     attn_body_ = nf.network() == NF::NETWORK_ATTENTIONBODY_WITH_HEADFORMAT ||
-                 nf.network() == NF::NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT;
+                 nf.network() == NF::NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT ||
+                 nf.network() == NF::NETWORK_KDA_HYBRID_WITH_MULTIHEADFORMAT;
 
     max_batch_size_ = options.GetOrDefault<int>("max_batch", 1024);
     // min_batch_size_ is chosen as 4 as it is common that for sizes less than
@@ -399,8 +436,12 @@ class SyclNetwork : public Network {
 
     const size_t attentionBodySize =
         getMaxAttentionBodySize(weights, max_batch_size_) * sizeof(DataType);
-    scratch_size_ = std::max(scratch_size_,
-                             std::max(attentionPolicySize, attentionBodySize));
+    const size_t kdaBodySize =
+        getMaxKdaBodySize<DataType>(weights, max_batch_size_);
+    scratch_size_ = std::max(
+        scratch_size_,
+        std::max(attentionPolicySize,
+                 std::max(attentionBodySize, kdaBodySize)));
 
     scratch_mem_ = (void*)sycl::malloc_device(scratch_size_, *sycl_queue_);
     scratch_mem_owner_ = DeviceMem(scratch_mem_, sycl_queue_.get());
@@ -497,6 +538,8 @@ class SyclNetwork : public Network {
           static_cast<InputEmbedding>(
               file.format().network_format().input_embedding()) ==
               InputEmbedding::INPUT_EMBEDDING_PE_DENSE,
+          std::vector<int>(nf.kda_directions().begin(),
+                   nf.kda_directions().end()),
           *sycl_queue_);
       network_.emplace_back(std::move(attention_body));
 
@@ -1176,6 +1219,7 @@ std::unique_ptr<Network> MakeSyclNetwork(const std::optional<WeightsFile>& w,
     case NF::NETWORK_SE_WITH_HEADFORMAT:
     case NF::NETWORK_ATTENTIONBODY_WITH_HEADFORMAT:
     case NF::NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT:
+    case NF::NETWORK_KDA_HYBRID_WITH_MULTIHEADFORMAT:
       break;
     default:
       throw Exception("Network format " +

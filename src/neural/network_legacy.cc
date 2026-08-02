@@ -154,9 +154,42 @@ BaseWeights::FFN::FFN(const pblczero::Weights::FFN& ffn)
       dense2_w(LayerAdapter(ffn.dense2_w()).as_vector()),
       dense2_b(LayerAdapter(ffn.dense2_b()).as_vector()) {}
 
+BaseWeights::KDA::KDA(const pblczero::Weights::KDA& kda)
+    : q_w(LayerAdapter(kda.q_w()).as_vector()),
+      q_b(LayerAdapter(kda.q_b()).as_vector()),
+      k_w(LayerAdapter(kda.k_w()).as_vector()),
+      k_b(LayerAdapter(kda.k_b()).as_vector()),
+      v_w(LayerAdapter(kda.v_w()).as_vector()),
+      v_b(LayerAdapter(kda.v_b()).as_vector()),
+      decay_a_w(LayerAdapter(kda.decay_a_w()).as_vector()),
+      decay_a_b(LayerAdapter(kda.decay_a_b()).as_vector()),
+      decay_b_w(LayerAdapter(kda.decay_b_w()).as_vector()),
+      decay_b_b(LayerAdapter(kda.decay_b_b()).as_vector()),
+      beta_w(LayerAdapter(kda.beta_w()).as_vector()),
+      beta_b(LayerAdapter(kda.beta_b()).as_vector()),
+      a_log(LayerAdapter(kda.a_log()).as_vector()),
+      dt_bias(LayerAdapter(kda.dt_bias()).as_vector()),
+      gate_a_w(LayerAdapter(kda.gate_a_w()).as_vector()),
+      gate_a_b(LayerAdapter(kda.gate_a_b()).as_vector()),
+      gate_b_w(LayerAdapter(kda.gate_b_w()).as_vector()),
+      gate_b_b(LayerAdapter(kda.gate_b_b()).as_vector()),
+      out_norm_gammas(
+          LayerAdapter(kda.out_norm_gammas()).as_vector()),
+      dense_w(LayerAdapter(kda.dense_w()).as_vector()),
+      dense_b(LayerAdapter(kda.dense_b()).as_vector()),
+      key_dim(kda.key_dim()),
+      value_dim(kda.value_dim()),
+      gate_rank(kda.gate_rank()),
+      rms_norm_epsilon(kda.rms_norm_epsilon()),
+      output_gate(kda.output_gate()),
+      output_rms_norm(kda.output_rms_norm()) {}
+
 BaseWeights::EncoderLayer::EncoderLayer(
     const pblczero::Weights::EncoderLayer& encoder)
     : mha(MHA(encoder.mha())),
+      kda(KDA(encoder.kda())),
+      is_kda(encoder.mixer() ==
+             pblczero::Weights::EncoderLayer::MIXER_KDA),
       ln1_gammas(LayerAdapter(encoder.ln1_gammas()).as_vector()),
       ln1_betas(LayerAdapter(encoder.ln1_betas()).as_vector()),
       ffn(FFN(encoder.ffn())),

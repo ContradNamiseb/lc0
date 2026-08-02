@@ -91,9 +91,42 @@ struct BaseWeights {
     Vec dense2_b;
   };
 
+  struct KDA {
+    explicit KDA(const pblczero::Weights::KDA& kda);
+    Vec q_w;
+    Vec q_b;
+    Vec k_w;
+    Vec k_b;
+    Vec v_w;
+    Vec v_b;
+    Vec decay_a_w;
+    Vec decay_a_b;
+    Vec decay_b_w;
+    Vec decay_b_b;
+    Vec beta_w;
+    Vec beta_b;
+    Vec a_log;
+    Vec dt_bias;
+    Vec gate_a_w;
+    Vec gate_a_b;
+    Vec gate_b_w;
+    Vec gate_b_b;
+    Vec out_norm_gammas;
+    Vec dense_w;
+    Vec dense_b;
+    int key_dim;
+    int value_dim;
+    int gate_rank;
+    float rms_norm_epsilon;
+    bool output_gate;
+    bool output_rms_norm;
+  };
+
   struct EncoderLayer {
     explicit EncoderLayer(const pblczero::Weights::EncoderLayer& encoder);
     MHA mha;
+    KDA kda;
+    bool is_kda;
     Vec ln1_gammas;
     Vec ln1_betas;
     FFN ffn;

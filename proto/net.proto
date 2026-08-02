@@ -113,13 +113,50 @@ message Weights {
     // reserved 5 - 10 for int8 quantization
   }
 
+  message KDA {
+    optional Layer q_w = 1;
+    optional Layer q_b = 2;
+    optional Layer k_w = 3;
+    optional Layer k_b = 4;
+    optional Layer v_w = 5;
+    optional Layer v_b = 6;
+    optional Layer decay_a_w = 7;
+    optional Layer decay_a_b = 8;
+    optional Layer decay_b_w = 9;
+    optional Layer decay_b_b = 10;
+    optional Layer beta_w = 11;
+    optional Layer beta_b = 12;
+    optional Layer a_log = 13;
+    optional Layer dt_bias = 14;
+    optional Layer gate_a_w = 15;
+    optional Layer gate_a_b = 16;
+    optional Layer gate_b_w = 17;
+    optional Layer gate_b_b = 18;
+    optional Layer out_norm_gammas = 19;
+    optional Layer dense_w = 20;
+    optional Layer dense_b = 21;
+    optional uint32 key_dim = 22;
+    optional uint32 value_dim = 23;
+    optional uint32 gate_rank = 24;
+    optional float rms_norm_epsilon = 25;
+    optional bool output_gate = 26 [default = true];
+    optional bool output_rms_norm = 27 [default = true];
+  }
+
   message EncoderLayer {
+    enum MixerType {
+      MIXER_MHA = 0;
+      MIXER_KDA = 1;
+    }
+
     optional MHA mha = 1;
     optional Layer ln1_gammas = 2;
     optional Layer ln1_betas = 3;
     optional FFN ffn = 4;
     optional Layer ln2_gammas = 5;
     optional Layer ln2_betas = 6;
+    optional MixerType mixer = 7 [default = MIXER_MHA];
+    optional KDA kda = 8;
   }
 
   message PolicyHead {
@@ -307,6 +344,7 @@ message NetworkFormat {
     NETWORK_ATTENTIONBODY_WITH_HEADFORMAT = 6;
     NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT = 7;
     NETWORK_AB_LEGACY_WITH_MULTIHEADFORMAT = 134;
+    NETWORK_KDA_HYBRID_WITH_MULTIHEADFORMAT = 135;
   }
   optional NetworkStructure network = 3;
 
@@ -364,6 +402,15 @@ message NetworkFormat {
     INPUT_EMBEDDING_PE_DENSE = 2;
   }
   optional InputEmbeddingFormat input_embedding = 10;
+
+  enum KdaDirection {
+    KDA_DIRECTION_UNKNOWN = 0;
+    KDA_DIRECTION_RANK_FORWARD = 1;
+    KDA_DIRECTION_RANK_REVERSE = 2;
+    KDA_DIRECTION_FILE_FORWARD = 3;
+    KDA_DIRECTION_FILE_REVERSE = 4;
+  }
+  repeated KdaDirection kda_directions = 11;
 }
 
 message Format {
