@@ -149,7 +149,35 @@ void ShowNetworkWeightsBodyInfo(const pblczero::Net& weights) {
     COUT << Justify("Encoders") << w.encoder_size();
     COUT << Justify("Encoder heads") << w.headcount();
     COUT << Justify("Embedding size") << w.ip_emb_b().params().size() / 2;
-    COUT << Justify("Dmodel") << w.encoder(0).mha().q_b().params().size() / 2;
+
+    // Layers can be a mix of MHA and KDA mixers, so Dmodel must be read from
+    // the first layer of each type rather than assuming index 0 is MHA.
+    int mha_count = 0, kda_count = 0;
+    int first_mha = -1, first_kda = -1;
+    for (size_t i = 0; i < w.encoder_size(); i++) {
+      const bool is_kda = w.encoder(i).mixer() ==
+                          pblczero::Weights::EncoderLayer::MIXER_KDA;
+      if (is_kda) {
+        kda_count++;
+        if (first_kda == -1) first_kda = i;
+      } else {
+        mha_count++;
+        if (first_mha == -1) first_mha = i;
+      }
+    }
+    if (mha_count > 0 && kda_count > 0) {
+      COUT << Justify("MHA / KDA layers") << mha_count << " / " << kda_count;
+    }
+    if (first_mha != -1) {
+      COUT << Justify("MHA Dmodel")
+           << w.encoder(first_mha).mha().q_b().params().size() / 2;
+    }
+    if (first_kda != -1) {
+      const auto& kda = w.encoder(first_kda).kda();
+      COUT << Justify("KDA key dim") << kda.key_dim();
+      COUT << Justify("KDA value dim") << kda.value_dim();
+      COUT << Justify("KDA gate rank") << kda.gate_rank();
+    }
     COUT << Justify("Encoder DFF")
          << w.encoder(0).ffn().dense1_b().params().size() / 2;
   } else {
@@ -194,7 +222,11 @@ void ShowNetworkWeightsPolicyInfo(const pblczero::Net& weights) {
       COUT << Justify("Policy FFN activation")
            << NetworkFormat::ActivationFunction_Name(ffn_activation);
     }
-    COUT << Justify("Policy Dmodel") << w.ip2_pol_b().params().size() / 2;
+    // Multihead nets leave the top-level policy fields empty.
+    const auto& pol_head =
+        w.has_policy_heads() ? w.policy_heads().vanilla().ip2_pol_b()
+                             : w.ip2_pol_b();
+    COUT << Justify("Policy Dmodel") << pol_head.params().size() / 2;
   } else {
     COUT << Justify("Policy") << (w.has_policy1() ? "Convolution" : "Dense");
     COUT << Justify("Policy activation")
@@ -218,8 +250,12 @@ void ShowNetworkWeightsInfo(const pblczero::Net& weights) {
   ShowNetworkWeightsPolicyInfo(weights);
 
   const auto& w = weights.weights();
+  // Multihead nets leave the top-level value fields empty.
+  const auto& ip2_val_w = w.has_value_heads()
+                              ? w.value_heads().winner().ip2_val_w()
+                              : w.ip2_val_w();
   COUT << Justify("Value")
-       << (w.ip2_val_w().params().size() / 2 % 3 == 0 ? "WDL" : "Classical");
+       << (ip2_val_w.params().size() / 2 % 3 == 0 ? "WDL" : "Classical");
   COUT << Justify("MLH") << (w.has_ip2_mov_w() ? "Present" : "Absent");
 }
 
