@@ -2523,6 +2523,56 @@ EncoderBlock<DataType>::EncoderBlock(
                              sycl_queue_);
     allocAndUpload<DataType>(&kda_dense_b, cpu_weights.kda.dense_b, scratch,
                              sycl_queue_);
+
+    const int key_depth = encoder_heads_ * kda_key_dim_;
+    const int value_depth = encoder_heads_ * kda_value_dim_;
+    const int qkv_depth = 2 * key_depth + value_depth;
+    size_t qkv_w_elements = static_cast<size_t>(qkv_depth) * embedding_op_size_;
+    kda_qkv_w = static_cast<DataType*>(sycl::malloc_device(
+        qkv_w_elements * sizeof(DataType), sycl_queue_));
+    sycl_queue_.memcpy(kda_qkv_w, kda_q_w,
+                       cpu_weights.kda.q_w.size() * sizeof(DataType));
+    sycl_queue_.memcpy(kda_qkv_w + cpu_weights.kda.q_w.size(), kda_k_w,
+                       cpu_weights.kda.k_w.size() * sizeof(DataType));
+    sycl_queue_.memcpy(
+        kda_qkv_w + cpu_weights.kda.q_w.size() + cpu_weights.kda.k_w.size(),
+        kda_v_w, cpu_weights.kda.v_w.size() * sizeof(DataType));
+
+    if (kda_q_b && kda_k_b && kda_v_b) {
+      kda_qkv_b = static_cast<DataType*>(
+          sycl::malloc_device(qkv_depth * sizeof(DataType), sycl_queue_));
+      sycl_queue_.memcpy(kda_qkv_b, kda_q_b,
+                         cpu_weights.kda.q_b.size() * sizeof(DataType));
+      sycl_queue_.memcpy(kda_qkv_b + cpu_weights.kda.q_b.size(), kda_k_b,
+                         cpu_weights.kda.k_b.size() * sizeof(DataType));
+      sycl_queue_.memcpy(
+          kda_qkv_b + cpu_weights.kda.q_b.size() + cpu_weights.kda.k_b.size(),
+          kda_v_b, cpu_weights.kda.v_b.size() * sizeof(DataType));
+    }
+
+    if (kda_output_gate_ && !cpu_weights.kda.gate_a_w.empty()) {
+      size_t decay_gate_a_elements =
+          static_cast<size_t>(2 * kda_gate_rank_) * embedding_op_size_;
+      kda_decay_gate_a_w = static_cast<DataType*>(sycl::malloc_device(
+          decay_gate_a_elements * sizeof(DataType), sycl_queue_));
+      sycl_queue_.memcpy(
+          kda_decay_gate_a_w, kda_decay_a_w,
+          cpu_weights.kda.decay_a_w.size() * sizeof(DataType));
+      sycl_queue_.memcpy(
+          kda_decay_gate_a_w + cpu_weights.kda.decay_a_w.size(), kda_gate_a_w,
+          cpu_weights.kda.gate_a_w.size() * sizeof(DataType));
+
+      if (kda_decay_a_b && kda_gate_a_b) {
+        kda_decay_gate_a_b = static_cast<DataType*>(sycl::malloc_device(
+            (2 * kda_gate_rank_) * sizeof(DataType), sycl_queue_));
+        sycl_queue_.memcpy(
+            kda_decay_gate_a_b, kda_decay_a_b,
+            cpu_weights.kda.decay_a_b.size() * sizeof(DataType));
+        sycl_queue_.memcpy(
+            kda_decay_gate_a_b + cpu_weights.kda.decay_a_b.size(),
+            kda_gate_a_b, cpu_weights.kda.gate_a_b.size() * sizeof(DataType));
+      }
+    }
   } else {
     mha_q_size_ = cpu_weights.mha.q_w.size() / embedding_op_size_;
     mha_k_size_ = cpu_weights.mha.k_w.size() / embedding_op_size_;
@@ -2916,42 +2966,82 @@ void EncoderBlock<DataType>::EvalKda(int N, DataType* in_out_tensor,
   DataType* k = q + max_tokens * key_depth;
   DataType* v = k + max_tokens * key_depth;
 
-  cublasXgemm<DataType>(
-      transpose_type_transpose, transpose_type_notranspose, key_depth, tokens,
-      embedding_op_size_, 1.0f, kda_q_w, embedding_op_size_, in_out_tensor,
-      embedding_op_size_, 0.0f, q, key_depth, sycl_queue);
-  cublasXgemm<DataType>(
-      transpose_type_transpose, transpose_type_notranspose, key_depth, tokens,
-      embedding_op_size_, 1.0f, kda_k_w, embedding_op_size_, in_out_tensor,
-      embedding_op_size_, 0.0f, k, key_depth, sycl_queue);
-  cublasXgemm<DataType>(
-      transpose_type_transpose, transpose_type_notranspose, value_depth,
-      tokens, embedding_op_size_, 1.0f, kda_v_w, embedding_op_size_,
-      in_out_tensor, embedding_op_size_, 0.0f, v, value_depth, sycl_queue);
-  if (kda_q_b) {
-    addBiasBatched(q, q, kda_q_b, 1, tokens, key_depth, ACTIVATION_NONE,
-                   sycl_queue);
-  }
-  if (kda_k_b) {
-    addBiasBatched(k, k, kda_k_b, 1, tokens, key_depth, ACTIVATION_NONE,
-                   sycl_queue);
-  }
-  if (kda_v_b) {
-    addBiasBatched(v, v, kda_v_b, 1, tokens, value_depth, ACTIVATION_NONE,
-                   sycl_queue);
+  if (kda_qkv_w) {
+    const int qkv_depth = 2 * key_depth + value_depth;
+    cublasXgemm<DataType>(
+        transpose_type_transpose, transpose_type_notranspose, qkv_depth,
+        tokens, embedding_op_size_, 1.0f, kda_qkv_w, embedding_op_size_,
+        in_out_tensor, embedding_op_size_, 0.0f, q, qkv_depth, sycl_queue);
+    if (kda_qkv_b) {
+      addBiasBatched(q, q, kda_qkv_b, 1, tokens, qkv_depth, ACTIVATION_NONE,
+                     sycl_queue);
+    }
+  } else {
+    cublasXgemm<DataType>(
+        transpose_type_transpose, transpose_type_notranspose, key_depth,
+        tokens, embedding_op_size_, 1.0f, kda_q_w, embedding_op_size_,
+        in_out_tensor, embedding_op_size_, 0.0f, q, key_depth, sycl_queue);
+    cublasXgemm<DataType>(
+        transpose_type_transpose, transpose_type_notranspose, key_depth,
+        tokens, embedding_op_size_, 1.0f, kda_k_w, embedding_op_size_,
+        in_out_tensor, embedding_op_size_, 0.0f, k, key_depth, sycl_queue);
+    cublasXgemm<DataType>(
+        transpose_type_transpose, transpose_type_notranspose, value_depth,
+        tokens, embedding_op_size_, 1.0f, kda_v_w, embedding_op_size_,
+        in_out_tensor, embedding_op_size_, 0.0f, v, value_depth, sycl_queue);
+    if (kda_q_b) {
+      addBiasBatched(q, q, kda_q_b, 1, tokens, key_depth, ACTIVATION_NONE,
+                     sycl_queue);
+    }
+    if (kda_k_b) {
+      addBiasBatched(k, k, kda_k_b, 1, tokens, key_depth, ACTIVATION_NONE,
+                     sycl_queue);
+    }
+    if (kda_v_b) {
+      addBiasBatched(v, v, kda_v_b, 1, tokens, value_depth, ACTIVATION_NONE,
+                     sycl_queue);
+    }
   }
 
   DataType* decay_hidden = buffer1;
-  DataType* raw_decay = buffer2;
-  cublasXgemm<DataType>(
-      transpose_type_transpose, transpose_type_notranspose, kda_gate_rank_,
-      tokens, embedding_op_size_, 1.0f, kda_decay_a_w, embedding_op_size_,
-      in_out_tensor, embedding_op_size_, 0.0f, decay_hidden, kda_gate_rank_,
-      sycl_queue);
-  if (kda_decay_a_b) {
-    addBiasBatched(decay_hidden, decay_hidden, kda_decay_a_b, 1, tokens,
-                   kda_gate_rank_, ACTIVATION_NONE, sycl_queue);
+  DataType* gate_hidden = kda_output_gate_ ? (scratch + max_tokens * (2 * key_depth + value_depth)) : nullptr;
+
+  if (kda_output_gate_ && kda_decay_gate_a_w) {
+    cublasXgemm<DataType>(
+        transpose_type_transpose, transpose_type_notranspose,
+        2 * kda_gate_rank_, tokens, embedding_op_size_, 1.0f,
+        kda_decay_gate_a_w, embedding_op_size_, in_out_tensor,
+        embedding_op_size_, 0.0f, decay_hidden, 2 * kda_gate_rank_,
+        sycl_queue);
+    if (kda_decay_gate_a_b) {
+      addBiasBatched(decay_hidden, decay_hidden, kda_decay_gate_a_b, 1,
+                     tokens, 2 * kda_gate_rank_, ACTIVATION_NONE, sycl_queue);
+    }
+    gate_hidden = decay_hidden + max_tokens * kda_gate_rank_;
+  } else {
+    cublasXgemm<DataType>(
+        transpose_type_transpose, transpose_type_notranspose, kda_gate_rank_,
+        tokens, embedding_op_size_, 1.0f, kda_decay_a_w, embedding_op_size_,
+        in_out_tensor, embedding_op_size_, 0.0f, decay_hidden, kda_gate_rank_,
+        sycl_queue);
+    if (kda_decay_a_b) {
+      addBiasBatched(decay_hidden, decay_hidden, kda_decay_a_b, 1, tokens,
+                     kda_gate_rank_, ACTIVATION_NONE, sycl_queue);
+    }
+    if (kda_output_gate_) {
+      cublasXgemm<DataType>(
+          transpose_type_transpose, transpose_type_notranspose, kda_gate_rank_,
+          tokens, embedding_op_size_, 1.0f, kda_gate_a_w, embedding_op_size_,
+          in_out_tensor, embedding_op_size_, 0.0f, gate_hidden,
+          kda_gate_rank_, sycl_queue);
+      if (kda_gate_a_b) {
+        addBiasBatched(gate_hidden, gate_hidden, kda_gate_a_b, 1, tokens,
+                       kda_gate_rank_, ACTIVATION_NONE, sycl_queue);
+      }
+    }
   }
+
+  DataType* raw_decay = buffer2;
   cublasXgemm<DataType>(
       transpose_type_transpose, transpose_type_notranspose, key_depth, tokens,
       kda_gate_rank_, 1.0f, kda_decay_b_w, kda_gate_rank_, decay_hidden,
@@ -2972,136 +3062,9 @@ void EncoderBlock<DataType>::EvalKda(int N, DataType* in_out_tensor,
                    ACTIVATION_NONE, sycl_queue);
   }
 
-  float* state = reinterpret_cast<float*>(v + max_tokens * value_depth);
-  const int heads = encoder_heads_;
-  const int key_dim = kda_key_dim_;
-  const int value_dim = kda_value_dim_;
-  const int direction_count = kda_direction_count_;
-  const int direction0 = kda_directions_[0];
-  const int direction1 = kda_directions_[1];
-  const int direction2 = kda_directions_[2];
-  const int direction3 = kda_directions_[3];
-  const DataType* a_log = kda_a_log;
-  const DataType* dt_bias = kda_dt_bias;
-  DataType* mixed = buffer1;
-  constexpr int kTargetStateElementsPerLaunch = 32 * 16 * 32 * 32;
-  const int state_elements_per_batch = heads * key_dim * value_dim;
-  const int batches_per_launch = std::max(
-      1, std::min(32,
-                  kTargetStateElementsPerLaunch / state_elements_per_batch));
-  for (int batch_base = 0; batch_base < N;
-       batch_base += batches_per_launch) {
-    const int launch_batches =
-        std::min(batches_per_launch, N - batch_base);
-    sycl_queue.parallel_for(
-        sycl::range<1>(launch_batches * heads), [=](sycl::id<1> item) {
-          const int local_index = static_cast<int>(item[0]);
-          const int batch = batch_base + local_index / heads;
-          const int head = local_index % heads;
-          float* head_state =
-              state + (batch * heads + head) * key_dim * value_dim;
-          for (int i = 0; i < key_dim * value_dim; ++i) {
-            head_state[i] = 0.0f;
-          }
-
-          const int direction_index = head / (heads / direction_count);
-          int direction = direction0;
-          if (direction_index == 1) direction = direction1;
-          if (direction_index == 2) direction = direction2;
-          if (direction_index == 3) direction = direction3;
-          const float scale =
-              1.0f / sycl::sqrt(static_cast<float>(key_dim));
-          const float decay_scale =
-              sycl::exp(static_cast<float>(a_log[head]));
-
-          for (int token = 0; token < 64; ++token) {
-            int square = token;
-            if (direction == 2) {
-              square = 63 - token;
-            } else if (direction == 3) {
-              square = (token % 8) * 8 + token / 8;
-            } else if (direction == 4) {
-              const int reverse = 63 - token;
-              square = (reverse % 8) * 8 + reverse / 8;
-            }
-
-            const int key_offset = (batch * 64 + square) * key_depth +
-                                   head * key_dim;
-            const int value_offset = (batch * 64 + square) * value_depth +
-                                     head * value_dim;
-            float q_norm_sq = 0.0f;
-            float k_norm_sq = 0.0f;
-            for (int key = 0; key < key_dim; ++key) {
-              const float q_value = static_cast<float>(q[key_offset + key]);
-              const float k_value = static_cast<float>(k[key_offset + key]);
-              q_norm_sq += q_value * q_value;
-              k_norm_sq += k_value * k_value;
-            }
-            const float q_norm = 1.0f / sycl::sqrt(
-                                                q_norm_sq > 1.0e-12f
-                                                    ? q_norm_sq
-                                                    : 1.0e-12f);
-            const float k_norm = 1.0f / sycl::sqrt(
-                                                k_norm_sq > 1.0e-12f
-                                                    ? k_norm_sq
-                                                    : 1.0e-12f);
-
-            for (int key = 0; key < key_dim; ++key) {
-              const float decay_input =
-                  static_cast<float>(raw_decay[key_offset + key]) +
-                  static_cast<float>(dt_bias[head * key_dim + key]);
-              const float softplus =
-                  (decay_input > 0.0f ? decay_input : 0.0f) +
-                  sycl::log1p(sycl::exp(-sycl::fabs(decay_input)));
-              const float log_decay =
-                  sycl::fmax(-decay_scale * softplus, kKdaLogDecayFloor);
-              const float decay = sycl::exp(log_decay);
-              for (int value = 0; value < value_dim; ++value) {
-                head_state[key * value_dim + value] *= decay;
-              }
-            }
-
-            const float beta_value = static_cast<float>(
-                beta[(batch * 64 + square) * heads + head]);
-            const float update_rate =
-                1.0f / (1.0f + sycl::exp(-beta_value));
-            for (int value = 0; value < value_dim; ++value) {
-              float prediction = 0.0f;
-              for (int key = 0; key < key_dim; ++key) {
-                prediction +=
-                    static_cast<float>(k[key_offset + key]) * k_norm *
-                    head_state[key * value_dim + value];
-              }
-              const float delta =
-                  update_rate *
-                  (static_cast<float>(v[value_offset + value]) - prediction);
-              float output = 0.0f;
-              for (int key = 0; key < key_dim; ++key) {
-                const int state_index = key * value_dim + value;
-                head_state[state_index] +=
-                    static_cast<float>(k[key_offset + key]) * k_norm * delta;
-                output += static_cast<float>(q[key_offset + key]) * q_norm *
-                          scale * head_state[state_index];
-              }
-              mixed[value_offset + value] = static_cast<DataType>(output);
-            }
-          }
-        });
-  }
-
   DataType* gate = nullptr;
   if (kda_output_gate_) {
-    DataType* gate_hidden = scratch;
-    gate = buffer2;
-    cublasXgemm<DataType>(
-        transpose_type_transpose, transpose_type_notranspose, kda_gate_rank_,
-        tokens, embedding_op_size_, 1.0f, kda_gate_a_w, embedding_op_size_,
-        in_out_tensor, embedding_op_size_, 0.0f, gate_hidden,
-        kda_gate_rank_, sycl_queue);
-    if (kda_gate_a_b) {
-      addBiasBatched(gate_hidden, gate_hidden, kda_gate_a_b, 1, tokens,
-                     kda_gate_rank_, ACTIVATION_NONE, sycl_queue);
-    }
+    gate = buffer2 + max_tokens * key_depth;
     cublasXgemm<DataType>(
         transpose_type_transpose, transpose_type_notranspose, value_depth,
         tokens, kda_gate_rank_, 1.0f, kda_gate_b_w, kda_gate_rank_,
@@ -3112,10 +3075,17 @@ void EncoderBlock<DataType>::EvalKda(int N, DataType* in_out_tensor,
     }
   }
 
-  const DataType* norm_gammas = kda_out_norm_gammas;
-  const float norm_epsilon = kda_rms_norm_epsilon_;
-  const bool output_rms_norm = kda_output_rms_norm_;
-  if (output_rms_norm) {
+  DataType* mixed = buffer1;
+  const DataType* qkv = kda_qkv_w ? scratch : nullptr;
+  const int qkv_stride = 2 * key_depth + value_depth;
+  kdaRecurrenceValueParallel<DataType>(
+      N, encoder_heads_, kda_key_dim_, kda_value_dim_, kda_direction_count_,
+      kda_directions_, kKdaLogDecayFloor, qkv, qkv_stride, q, k, v, raw_decay,
+      kda_dt_bias, kda_a_log, beta, gate, mixed, sycl_queue);
+
+  if (kda_output_rms_norm_) {
+    const DataType* norm_gammas = kda_out_norm_gammas;
+    const float norm_epsilon = kda_rms_norm_epsilon_;
     sycl_queue.parallel_for(sycl::range<1>(tokens), [=](sycl::id<1> item) {
       const int token = static_cast<int>(item[0]);
       const int offset = token * value_depth;
@@ -3129,22 +3099,9 @@ void EncoderBlock<DataType>::EvalKda(int N, DataType* in_out_tensor,
       for (int channel = 0; channel < value_depth; ++channel) {
         float value = static_cast<float>(mixed[offset + channel]) * factor *
                       static_cast<float>(norm_gammas[channel]);
-        if (gate != nullptr) {
-          const float gate_value = static_cast<float>(gate[offset + channel]);
-          value *= 1.0f / (1.0f + sycl::exp(-gate_value));
-        }
         mixed[offset + channel] = static_cast<DataType>(value);
       }
     });
-  } else if (gate != nullptr) {
-    sycl_queue.parallel_for(
-        sycl::range<1>(tokens * value_depth), [=](sycl::id<1> item) {
-          const int index = static_cast<int>(item[0]);
-          const float value = static_cast<float>(mixed[index]);
-          const float gate_value = static_cast<float>(gate[index]);
-          mixed[index] = static_cast<DataType>(
-              value / (1.0f + sycl::exp(-gate_value)));
-        });
   }
 
   cublasXgemm<DataType>(
@@ -3558,6 +3515,10 @@ EncoderBlock<DataType>::~EncoderBlock() {
   sycl::free(kda_out_norm_gammas, sycl_queue_);
   sycl::free(kda_dense_w, sycl_queue_);
   sycl::free(kda_dense_b, sycl_queue_);
+  sycl::free(kda_qkv_w, sycl_queue_);
+  sycl::free(kda_qkv_b, sycl_queue_);
+  sycl::free(kda_decay_gate_a_w, sycl_queue_);
+  sycl::free(kda_decay_gate_a_b, sycl_queue_);
   if (has_smolgen_) {
     sycl::free(smol_compress, sycl_queue_);
     sycl::free(smol_dense1_w, sycl_queue_);

@@ -2101,5 +2101,160 @@ template void genOffsetPointers<float>(float** offsets, int heads, int max_batch
 template void genOffsetPointers<sycl::half>(sycl::half** offsets, int heads, int max_batch, int depth,
                        int d_model, sycl::half* k, sycl::half* q, sycl::half* b1,
                        sycl::half* v, sycl::half* b2, sycl::queue& sycl_queue);
+
+template <typename T>
+void kdaRecurrenceValueParallel(
+    int N, int heads, int key_dim, int value_dim, int direction_count,
+    const std::array<int, 4>& directions, float log_decay_floor, const T* qkv,
+    int qkv_stride, const T* q, const T* k, const T* v, const T* raw_decay,
+    const T* dt_bias, const T* a_log, const T* beta, const T* gate, T* mixed,
+    sycl::queue& sycl_queue) {
+  const int d0 = directions[0];
+  const int d1 = direction_count > 1 ? directions[1] : d0;
+  const int d2 = direction_count > 2 ? directions[2] : d0;
+  const int d3 = direction_count > 3 ? directions[3] : d0;
+
+  sycl::range<2> global_range(N * heads, value_dim);
+  sycl::range<2> local_range(1, value_dim);
+
+  sycl_queue.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<float, 1> p_q(sycl::range<1>(key_dim), cgh);
+    sycl::local_accessor<float, 1> p_k(sycl::range<1>(key_dim), cgh);
+    sycl::local_accessor<float, 1> p_decay(sycl::range<1>(key_dim), cgh);
+
+    cgh.parallel_for(
+        sycl::nd_range<2>(global_range, local_range),
+        [=](sycl::nd_item<2> item) {
+          const int local_id = static_cast<int>(item.get_local_id(1));
+          const int global_batch_head =
+              static_cast<int>(item.get_global_id(0));
+          const int batch = global_batch_head / heads;
+          const int head = global_batch_head % heads;
+
+          const int direction_index = head / (heads / direction_count);
+          int direction = d0;
+          if (direction_index == 1) direction = d1;
+          else if (direction_index == 2) direction = d2;
+          else if (direction_index == 3) direction = d3;
+
+          const float scale = 1.0f / sycl::sqrt(static_cast<float>(key_dim));
+          const float decay_scale =
+              sycl::exp(static_cast<float>(a_log[head]));
+          const int key_depth = heads * key_dim;
+          const int value_depth = heads * value_dim;
+
+          float state[32];
+          for (int i = 0; i < key_dim && i < 32; ++i) {
+            state[i] = 0.0f;
+          }
+
+          for (int token = 0; token < 64; ++token) {
+            int square = token;
+            if (direction == 2) {
+              square = 63 - token;
+            } else if (direction == 3) {
+              square = (token % 8) * 8 + token / 8;
+            } else if (direction == 4) {
+              const int reverse = 63 - token;
+              square = (reverse % 8) * 8 + reverse / 8;
+            }
+
+            const int token_idx = batch * 64 + square;
+            const T* q_ptr;
+            const T* k_ptr;
+            const T* v_ptr;
+
+            if (qkv != nullptr) {
+              q_ptr = qkv + token_idx * qkv_stride + head * key_dim;
+              k_ptr = qkv + token_idx * qkv_stride + key_depth + head * key_dim;
+              v_ptr = qkv + token_idx * qkv_stride + 2 * key_depth + head * value_dim;
+            } else {
+              q_ptr = q + token_idx * key_depth + head * key_dim;
+              k_ptr = k + token_idx * key_depth + head * key_dim;
+              v_ptr = v + token_idx * value_depth + head * value_dim;
+            }
+
+            const int raw_decay_offset = token_idx * key_depth + head * key_dim;
+            const int value_offset = token_idx * value_depth + head * value_dim;
+
+            if (local_id < key_dim) {
+              p_q[local_id] = static_cast<float>(q_ptr[local_id]);
+              p_k[local_id] = static_cast<float>(k_ptr[local_id]);
+
+              const float decay_input =
+                  static_cast<float>(raw_decay[raw_decay_offset + local_id]) +
+                  static_cast<float>(dt_bias[head * key_dim + local_id]);
+              const float softplus =
+                  (decay_input > 0.0f ? decay_input : 0.0f) +
+                  sycl::log1p(sycl::exp(-sycl::fabs(decay_input)));
+              const float log_decay =
+                  sycl::fmax(-decay_scale * softplus, log_decay_floor);
+              p_decay[local_id] = sycl::exp(log_decay);
+            }
+
+            item.barrier(sycl::access::fence_space::local_space);
+
+            float q_norm_sq = 0.0f;
+            float k_norm_sq = 0.0f;
+            for (int key = 0; key < key_dim; ++key) {
+              q_norm_sq += p_q[key] * p_q[key];
+              k_norm_sq += p_k[key] * p_k[key];
+            }
+            const float q_norm =
+                1.0f / sycl::sqrt(q_norm_sq > 1.0e-12f ? q_norm_sq : 1.0e-12f);
+            const float k_norm =
+                1.0f / sycl::sqrt(k_norm_sq > 1.0e-12f ? k_norm_sq : 1.0e-12f);
+
+            for (int key = 0; key < key_dim; ++key) {
+              state[key] *= p_decay[key];
+            }
+
+            const float beta_value = static_cast<float>(
+                beta[token_idx * heads + head]);
+            const float update_rate =
+                1.0f / (1.0f + sycl::exp(-beta_value));
+
+            float prediction = 0.0f;
+            for (int key = 0; key < key_dim; ++key) {
+              prediction += p_k[key] * k_norm * state[key];
+            }
+
+            const float delta =
+                update_rate *
+                (static_cast<float>(v_ptr[local_id]) - prediction);
+
+            float output = 0.0f;
+            for (int key = 0; key < key_dim; ++key) {
+              state[key] += p_k[key] * k_norm * delta;
+              output += p_q[key] * q_norm * scale * state[key];
+            }
+
+            if (gate != nullptr) {
+              const float gate_value =
+                  static_cast<float>(gate[value_offset + local_id]);
+              output *= 1.0f / (1.0f + sycl::exp(-gate_value));
+            }
+
+            mixed[value_offset + local_id] = static_cast<T>(output);
+          }
+        });
+  });
+}
+
+template void kdaRecurrenceValueParallel<float>(
+    int N, int heads, int key_dim, int value_dim, int direction_count,
+    const std::array<int, 4>& directions, float log_decay_floor, const float* qkv,
+    int qkv_stride, const float* q, const float* k, const float* v,
+    const float* raw_decay, const float* dt_bias, const float* a_log,
+    const float* beta, const float* gate, float* mixed, sycl::queue& sycl_queue);
+
+template void kdaRecurrenceValueParallel<sycl::half>(
+    int N, int heads, int key_dim, int value_dim, int direction_count,
+    const std::array<int, 4>& directions, float log_decay_floor, const sycl::half* qkv,
+    int qkv_stride, const sycl::half* q, const sycl::half* k, const sycl::half* v,
+    const sycl::half* raw_decay, const sycl::half* dt_bias, const sycl::half* a_log,
+    const sycl::half* beta, const sycl::half* gate, sycl::half* mixed,
+    sycl::queue& sycl_queue);
+
 }  // namespace sycldnn_backend
 }  // namespace lczero

@@ -338,12 +338,14 @@ class EncoderBlock {
   DataType *kda_q_w = nullptr, *kda_q_b = nullptr;
   DataType *kda_k_w = nullptr, *kda_k_b = nullptr;
   DataType *kda_v_w = nullptr, *kda_v_b = nullptr;
+  DataType *kda_qkv_w = nullptr, *kda_qkv_b = nullptr;
   DataType *kda_decay_a_w = nullptr, *kda_decay_a_b = nullptr;
   DataType *kda_decay_b_w = nullptr, *kda_decay_b_b = nullptr;
   DataType *kda_beta_w = nullptr, *kda_beta_b = nullptr;
   DataType *kda_a_log = nullptr, *kda_dt_bias = nullptr;
   DataType *kda_gate_a_w = nullptr, *kda_gate_a_b = nullptr;
   DataType *kda_gate_b_w = nullptr, *kda_gate_b_b = nullptr;
+  DataType *kda_decay_gate_a_w = nullptr, *kda_decay_gate_a_b = nullptr;
   DataType *kda_out_norm_gammas = nullptr;
   DataType *kda_dense_w = nullptr, *kda_dense_b = nullptr;
 
@@ -543,6 +545,14 @@ class ValueHead : public BaseLayer<DataType> {
   bool attention_body_;
   ActivationFunction act_;
 };
+
+template <typename T>
+void kdaRecurrenceValueParallel(
+    int N, int heads, int key_dim, int value_dim, int direction_count,
+    const std::array<int, 4>& directions, float log_decay_floor, const T* qkv,
+    int qkv_stride, const T* q, const T* k, const T* v, const T* raw_decay,
+    const T* dt_bias, const T* a_log, const T* beta, const T* gate, T* mixed,
+    sycl::queue& sycl_queue);
 
 }  // namespace sycldnn_backend
 }  // namespace lczero

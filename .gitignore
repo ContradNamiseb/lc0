@@ -21,3 +21,12 @@ compile_flags.txt
 .mesonpy*
 docs/findings.md
 docs/review.md
+
+# Test weights & scratch files
+*.pb.gz
+implementation_plan.md
+kd-perf-plan-review.md
+*plan-review.md
+setup_dumps.ps1
+replace.py
+_split_msg.txt

@@ -180,18 +180,14 @@ static size_t getMaxKdaBodySize(const MultiHeadWeights& weights, int N) {
     const size_t heads = weights.encoder_head_count;
     const size_t key_depth = heads * encoder.kda.key_dim;
     const size_t value_depth = heads * encoder.kda.value_dim;
+    const size_t gate_rank = encoder.kda.gate_rank;
     const size_t tokens = static_cast<size_t>(N) * 64;
     const size_t qkv_size =
-        tokens * (2 * key_depth + value_depth) * sizeof(DataType);
-    const size_t state_size = static_cast<size_t>(N) * heads *
-                              encoder.kda.key_dim * encoder.kda.value_dim *
-                              sizeof(float);
-    const size_t raw_decay_size = tokens * key_depth * sizeof(DataType);
-    const size_t output_beta_size =
-        tokens * (value_depth + heads) * sizeof(DataType);
-    size = std::max(
-        size, std::max(qkv_size + state_size,
-                       2 * std::max(raw_decay_size, output_beta_size)));
+        tokens * (2 * key_depth + value_depth + gate_rank) * sizeof(DataType);
+    const size_t aux_buffer_size =
+        tokens * std::max(2 * gate_rank, key_depth + value_depth + heads) *
+        sizeof(DataType);
+    size = std::max(size, std::max(qkv_size, 2 * aux_buffer_size));
   }
   return size;
 }

@@ -774,16 +774,21 @@ if get_option('build_backends')
 
     if get_option('sycl') == 'l0'
       message('Building SYCL for the L0 backend')
+      mkl_libdirs = get_option('mkl_libdirs')
+      mkl_inc = get_option('mkl_include')
+      if run_command('scripts/checkdir.py', mkl_inc, check: false).returncode() == 0
+        includes += include_directories(mkl_inc)
+      endif
       add_project_arguments('-DMKL_ILP64', language: 'cpp')
       add_project_arguments('-DUSE_INTEL=1', language: 'cpp')
       if host_machine.system() == 'windows'
-        deps += cc.find_library('mkl_sycl_blas_dll', required: true)
+        deps += cc.find_library('mkl_sycl_blas_dll', dirs: mkl_libdirs, required: true)
       else
-        deps += cc.find_library('mkl_sycl', required: true)
+        deps += cc.find_library('mkl_sycl', dirs: mkl_libdirs, required: true)
       endif
-      deps += cc.find_library('mkl_intel_ilp64', required: true)
-      deps += cc.find_library('mkl_sequential', required: true)
-      deps += cc.find_library('mkl_core', required: true)
+      deps += cc.find_library('mkl_intel_ilp64', dirs: mkl_libdirs, required: true)
+      deps += cc.find_library('mkl_sequential', dirs: mkl_libdirs, required: true)
+      deps += cc.find_library('mkl_core', dirs: mkl_libdirs, required: true)
       deps += cc.find_library('OpenCL', required: true)
     elif get_option('sycl') == 'amd'
       hip_libdirs = get_option('hip_libdirs')
