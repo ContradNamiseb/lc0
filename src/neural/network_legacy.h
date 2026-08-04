@@ -114,12 +114,15 @@ struct BaseWeights {
     Vec out_norm_gammas;
     Vec dense_w;
     Vec dense_b;
+    Vec local_conv_w;
+    Vec local_conv_b;
     int key_dim;
     int value_dim;
     int gate_rank;
     float rms_norm_epsilon;
     bool output_gate;
     bool output_rms_norm;
+    bool local_conv;
   };
 
   struct EncoderLayer {

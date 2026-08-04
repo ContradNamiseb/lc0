@@ -141,6 +141,9 @@ message Weights {
     optional float rms_norm_epsilon = 25;
     optional bool output_gate = 26 [default = true];
     optional bool output_rms_norm = 27 [default = true];
+    optional Layer local_conv_w = 28;
+    optional Layer local_conv_b = 29;
+    optional bool local_conv = 30 [default = false];
   }
 
   message EncoderLayer {
@@ -409,6 +412,10 @@ message NetworkFormat {
     KDA_DIRECTION_RANK_REVERSE = 2;
     KDA_DIRECTION_FILE_FORWARD = 3;
     KDA_DIRECTION_FILE_REVERSE = 4;
+    KDA_DIRECTION_DIAG_FORWARD = 5;
+    KDA_DIRECTION_DIAG_REVERSE = 6;
+    KDA_DIRECTION_ANTI_DIAG_FORWARD = 7;
+    KDA_DIRECTION_ANTI_DIAG_REVERSE = 8;
   }
   repeated KdaDirection kda_directions = 11;
 }

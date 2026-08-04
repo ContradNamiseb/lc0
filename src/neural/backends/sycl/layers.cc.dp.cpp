@@ -2450,6 +2450,7 @@ EncoderBlock<DataType>::EncoderBlock(
       kda_rms_norm_epsilon_(cpu_weights.kda.rms_norm_epsilon),
       kda_output_gate_(cpu_weights.kda.output_gate),
       kda_output_rms_norm_(cpu_weights.kda.output_rms_norm),
+      kda_local_conv_(cpu_weights.kda.local_conv),
       kda_direction_count_(static_cast<int>(kda_directions.size())),
       alpha_(alpha),
       has_smolgen_(!cpu_weights.is_kda && cpu_weights.mha.has_smolgen),
@@ -2465,12 +2466,12 @@ EncoderBlock<DataType>::EncoderBlock(
     if (kda_key_dim_ <= 0 || kda_value_dim_ <= 0 || kda_gate_rank_ <= 0) {
       throw Exception("Invalid KDA dimensions.");
     }
-    if (kda_direction_count_ <= 0 || kda_direction_count_ > 4 ||
+    if (kda_direction_count_ <= 0 || kda_direction_count_ > 16 ||
         encoder_heads_ % kda_direction_count_ != 0) {
       throw Exception("KDA directions must evenly divide the encoder heads.");
     }
     for (int i = 0; i < kda_direction_count_; ++i) {
-      if (kda_directions[i] < 1 || kda_directions[i] > 4) {
+      if (kda_directions[i] < 1 || kda_directions[i] > 8) {
         throw Exception("Unsupported KDA traversal direction.");
       }
       kda_directions_[i] = kda_directions[i];
@@ -2478,6 +2479,16 @@ EncoderBlock<DataType>::EncoderBlock(
     if (kda_output_rms_norm_ && cpu_weights.kda.out_norm_gammas.empty()) {
       throw Exception("KDA output RMS norm requested but out_norm_gammas is "
                       "missing from the network.");
+    }
+    if (kda_local_conv_ &&
+        encoder_heads_ * kda_key_dim_ < embedding_op_size_) {
+      // EvalKda() reuses buffer2 -- sized max_tokens * key_depth for the
+      // later gate computation -- as scratch for the local-conv output,
+      // which needs max_tokens * embedding_op_size_. Without this check a
+      // net with too few key dims would silently write past the buffer.
+      throw Exception(
+          "KDA local_conv requires encoder_heads * kda_key_dim >= "
+          "embedding_op_size.");
     }
 
     allocAndUpload<DataType>(&kda_q_w, cpu_weights.kda.q_w, scratch,
@@ -2523,6 +2534,15 @@ EncoderBlock<DataType>::EncoderBlock(
                              sycl_queue_);
     allocAndUpload<DataType>(&kda_dense_b, cpu_weights.kda.dense_b, scratch,
                              sycl_queue_);
+
+    if (kda_local_conv_) {
+      allocAndUpload<DataType>(&kda_local_conv_w, cpu_weights.kda.local_conv_w,
+                               scratch, sycl_queue_);
+      if (!cpu_weights.kda.local_conv_b.empty()) {
+        allocAndUpload<DataType>(&kda_local_conv_b, cpu_weights.kda.local_conv_b,
+                                 scratch, sycl_queue_);
+      }
+    }
 
     const int key_depth = encoder_heads_ * kda_key_dim_;
     const int value_depth = encoder_heads_ * kda_value_dim_;
@@ -2961,6 +2981,18 @@ void EncoderBlock<DataType>::EvalKda(int N, DataType* in_out_tensor,
   const int max_tokens = max_batch_size_ * 64;
   const int key_depth = encoder_heads_ * kda_key_dim_;
   const int value_depth = encoder_heads_ * kda_value_dim_;
+
+  // Apply the optional 3x3 depthwise board convolution before projections.
+  // The conv output is accumulated into scratch_conv (borrowing the end of
+  // buffer2 which is not yet used at this point), and the residual result is
+  // written back to in_out_tensor.
+  if (kda_local_conv_) {
+    // Use buffer2 as scratch for the conv intermediate; it is large enough
+    // (allocated as max_tokens * key_depth) and unused at this point.
+    applyKdaLocalDepthwiseConv<DataType>(
+        N, embedding_op_size_, in_out_tensor, kda_local_conv_w,
+        kda_local_conv_b, buffer2, in_out_tensor, sycl_queue);
+  }
 
   DataType* q = scratch;
   DataType* k = q + max_tokens * key_depth;
@@ -3515,6 +3547,8 @@ EncoderBlock<DataType>::~EncoderBlock() {
   sycl::free(kda_out_norm_gammas, sycl_queue_);
   sycl::free(kda_dense_w, sycl_queue_);
   sycl::free(kda_dense_b, sycl_queue_);
+  sycl::free(kda_local_conv_w, sycl_queue_);
+  sycl::free(kda_local_conv_b, sycl_queue_);
   sycl::free(kda_qkv_w, sycl_queue_);
   sycl::free(kda_qkv_b, sycl_queue_);
   sycl::free(kda_decay_gate_a_w, sycl_queue_);

@@ -348,6 +348,7 @@ class EncoderBlock {
   DataType *kda_decay_gate_a_w = nullptr, *kda_decay_gate_a_b = nullptr;
   DataType *kda_out_norm_gammas = nullptr;
   DataType *kda_dense_w = nullptr, *kda_dense_b = nullptr;
+  DataType *kda_local_conv_w = nullptr, *kda_local_conv_b = nullptr;
 
   DataType *smol_compress = nullptr;
   DataType *smol_dense1_w = nullptr, *smol_dense1_b = nullptr;
@@ -373,7 +374,8 @@ class EncoderBlock {
   float kda_rms_norm_epsilon_;
   bool kda_output_gate_;
   bool kda_output_rms_norm_;
-  std::array<int, 4> kda_directions_{};
+  bool kda_local_conv_;
+  std::array<int, 16> kda_directions_{};
   int kda_direction_count_;
 
   float alpha_;  // scale to apply to skip connection add
@@ -549,10 +551,15 @@ class ValueHead : public BaseLayer<DataType> {
 template <typename T>
 void kdaRecurrenceValueParallel(
     int N, int heads, int key_dim, int value_dim, int direction_count,
-    const std::array<int, 4>& directions, float log_decay_floor, const T* qkv,
+    const std::array<int, 16>& directions, float log_decay_floor, const T* qkv,
     int qkv_stride, const T* q, const T* k, const T* v, const T* raw_decay,
     const T* dt_bias, const T* a_log, const T* beta, const T* gate, T* mixed,
     sycl::queue& sycl_queue);
+
+template <typename T>
+void applyKdaLocalDepthwiseConv(
+    int N, int emb_size, const T* input, const T* conv_w, const T* conv_b,
+    T* scratch, T* output, sycl::queue& sycl_queue);
 
 }  // namespace sycldnn_backend
 }  // namespace lczero

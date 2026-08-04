@@ -290,6 +290,42 @@ static int KdaSquareForToken(int direction, int token) {
       const int reverse = 63 - token;
       return (reverse % 8) * 8 + reverse / 8;
     }
+    case 5: {
+      static constexpr int kTable[64] = {
+        7, 6, 15, 5, 14, 23, 4, 13, 22, 31, 3, 12, 21, 30, 39, 2,
+        11, 20, 29, 38, 47, 1, 10, 19, 28, 37, 46, 55, 0, 9, 18, 27,
+        36, 45, 54, 63, 8, 17, 26, 35, 44, 53, 62, 16, 25, 34, 43, 52,
+        61, 24, 33, 42, 51, 60, 32, 41, 50, 59, 40, 49, 58, 48, 57, 56
+      };
+      return kTable[token];
+    }
+    case 6: {
+      static constexpr int kTable[64] = {
+        56, 57, 48, 58, 49, 40, 59, 50, 41, 32, 60, 51, 42, 33, 24, 61,
+        52, 43, 34, 25, 16, 62, 53, 44, 35, 26, 17, 8, 63, 54, 45, 36,
+        27, 18, 9, 0, 55, 46, 37, 28, 19, 10, 1, 47, 38, 29, 20,
+        11, 2, 39, 30, 21, 12, 3, 31, 22, 13, 4, 23, 14, 5, 15, 6, 7
+      };
+      return kTable[token];
+    }
+    case 7: {
+      static constexpr int kTable[64] = {
+        0, 1, 8, 2, 9, 16, 3, 10, 17, 24, 4, 11, 18, 25, 32, 5,
+        12, 19, 26, 33, 40, 6, 13, 20, 27, 34, 41, 48, 7, 14, 21, 28,
+        35, 42, 49, 56, 15, 22, 29, 36, 43, 50, 57, 23, 30, 37, 44, 51,
+        58, 31, 38, 45, 52, 59, 39, 46, 53, 60, 47, 54, 61, 55, 62, 63
+      };
+      return kTable[token];
+    }
+    case 8: {
+      static constexpr int kTable[64] = {
+        63, 62, 55, 61, 54, 47, 60, 53, 46, 39, 59, 52, 45, 38, 31, 58,
+        51, 44, 37, 30, 23, 57, 50, 43, 36, 29, 22, 15, 56, 49, 42, 35,
+        28, 21, 14, 7, 48, 41, 34, 27, 20, 13, 6, 40, 33, 26, 19, 12,
+        5, 32, 25, 18, 11, 4, 24, 17, 10, 3, 16, 9, 2, 8, 1, 0
+      };
+      return kTable[token];
+    }
     default:
       throw Exception("Unsupported KDA traversal direction.");
   }
@@ -329,6 +365,44 @@ void BlasComputation<use_eigen>::ForwardKdaMixer(
     return v.empty() ? nullptr : v.data();
   };
 
+  // Apply the optional 3x3 depthwise board convolution (residual) before
+  // the Q/K/V projections. Matches kda_local_conv in the trainer.
+  // local_conv_w layout: [emb_size, 1, 3, 3] flattened =
+  //   w[c * 9 + kr * 3 + kf] for channel c, kernel row offset kr, col kf.
+  const std::vector<float>* proj_input_ptr = &input;
+  std::vector<float> conv_input;
+  if (kda.local_conv && !kda.local_conv_w.empty()) {
+    conv_input = input;
+    for (size_t batch = 0; batch < batch_size; ++batch) {
+      for (int rank = 0; rank < 8; ++rank) {
+        for (int file = 0; file < 8; ++file) {
+          const int square = static_cast<int>(batch) * kSquares + rank * 8 + file;
+          for (int c = 0; c < embedding_size; ++c) {
+            float sum = 0.0f;
+            for (int kr = 0; kr < 3; ++kr) {
+              const int nr = rank + kr - 1;
+              if (nr < 0 || nr > 7) continue;
+              for (int kf = 0; kf < 3; ++kf) {
+                const int nf = file + kf - 1;
+                if (nf < 0 || nf > 7) continue;
+                const int nbr = static_cast<int>(batch) * kSquares +
+                                nr * 8 + nf;
+                sum += kda.local_conv_w[c * 9 + kr * 3 + kf] *
+                       input[nbr * embedding_size + c];
+              }
+            }
+            if (!kda.local_conv_b.empty()) {
+              sum += kda.local_conv_b[c];
+            }
+            conv_input[square * embedding_size + c] += sum;
+          }
+        }
+      }
+    }
+    proj_input_ptr = &conv_input;
+  }
+  const std::vector<float>& proj_input = *proj_input_ptr;
+
   std::vector<float> q(tokens * key_depth);
   std::vector<float> k(tokens * key_depth);
   std::vector<float> v(tokens * value_depth);
@@ -338,24 +412,25 @@ void BlasComputation<use_eigen>::ForwardKdaMixer(
   std::vector<float> mixed(tokens * value_depth);
 
   FullyConnectedLayer<use_eigen>::Forward1D(
-      tokens, embedding_size, key_depth, input.data(), kda.q_w.data(),
+      tokens, embedding_size, key_depth, proj_input.data(), kda.q_w.data(),
       bias(kda.q_b), ACTIVATION_NONE, q.data());
   FullyConnectedLayer<use_eigen>::Forward1D(
-      tokens, embedding_size, key_depth, input.data(), kda.k_w.data(),
+      tokens, embedding_size, key_depth, proj_input.data(), kda.k_w.data(),
       bias(kda.k_b), ACTIVATION_NONE, k.data());
   FullyConnectedLayer<use_eigen>::Forward1D(
-      tokens, embedding_size, value_depth, input.data(), kda.v_w.data(),
+      tokens, embedding_size, value_depth, proj_input.data(), kda.v_w.data(),
       bias(kda.v_b), ACTIVATION_NONE, v.data());
 
   FullyConnectedLayer<use_eigen>::Forward1D(
-      tokens, embedding_size, gate_rank, input.data(), kda.decay_a_w.data(),
-      bias(kda.decay_a_b), ACTIVATION_NONE, hidden.data());
+      tokens, embedding_size, gate_rank, proj_input.data(),
+      kda.decay_a_w.data(), bias(kda.decay_a_b), ACTIVATION_NONE,
+      hidden.data());
   FullyConnectedLayer<use_eigen>::Forward1D(
       tokens, gate_rank, key_depth, hidden.data(), kda.decay_b_w.data(),
       bias(kda.decay_b_b), ACTIVATION_NONE, raw_decay.data());
 
   FullyConnectedLayer<use_eigen>::Forward1D(
-      tokens, embedding_size, heads, input.data(), kda.beta_w.data(),
+      tokens, embedding_size, heads, proj_input.data(), kda.beta_w.data(),
       bias(kda.beta_b), ACTIVATION_NONE, beta.data());
 
   std::vector<float> state(static_cast<size_t>(key_dim) * value_dim);
@@ -434,8 +509,9 @@ void BlasComputation<use_eigen>::ForwardKdaMixer(
   if (kda.output_gate) {
     std::vector<float> gate(tokens * value_depth);
     FullyConnectedLayer<use_eigen>::Forward1D(
-        tokens, embedding_size, gate_rank, input.data(), kda.gate_a_w.data(),
-        bias(kda.gate_a_b), ACTIVATION_NONE, hidden.data());
+        tokens, embedding_size, gate_rank, proj_input.data(),
+        kda.gate_a_w.data(), bias(kda.gate_a_b), ACTIVATION_NONE,
+        hidden.data());
     FullyConnectedLayer<use_eigen>::Forward1D(
         tokens, gate_rank, value_depth, hidden.data(), kda.gate_b_w.data(),
         bias(kda.gate_b_b), ACTIVATION_NONE, gate.data());
@@ -1206,7 +1282,7 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
   kda_directions_.assign(nf.kda_directions().begin(),
                          nf.kda_directions().end());
   for (const int direction : kda_directions_) {
-    if (direction < 1 || direction > 4) {
+    if (direction < 1 || direction > 8) {
       throw Exception("Unsupported KDA traversal direction.");
     }
   }

@@ -177,12 +177,15 @@ BaseWeights::KDA::KDA(const pblczero::Weights::KDA& kda)
           LayerAdapter(kda.out_norm_gammas()).as_vector()),
       dense_w(LayerAdapter(kda.dense_w()).as_vector()),
       dense_b(LayerAdapter(kda.dense_b()).as_vector()),
+      local_conv_w(LayerAdapter(kda.local_conv_w()).as_vector()),
+      local_conv_b(LayerAdapter(kda.local_conv_b()).as_vector()),
       key_dim(kda.key_dim()),
       value_dim(kda.value_dim()),
       gate_rank(kda.gate_rank()),
       rms_norm_epsilon(kda.rms_norm_epsilon()),
       output_gate(kda.output_gate()),
-      output_rms_norm(kda.output_rms_norm()) {}
+      output_rms_norm(kda.output_rms_norm()),
+      local_conv(kda.local_conv()) {}
 
 BaseWeights::EncoderLayer::EncoderLayer(
     const pblczero::Weights::EncoderLayer& encoder)
