@@ -182,8 +182,14 @@ static size_t getMaxKdaBodySize(const MultiHeadWeights& weights, int N) {
     const size_t value_depth = heads * encoder.kda.value_dim;
     const size_t gate_rank = encoder.kda.gate_rank;
     const size_t tokens = static_cast<size_t>(N) * 64;
+    // With local_conv, EvalKda keeps the convolved projection input in a
+    // persistent region past q/k/v and the non-fused gate_hidden, so that
+    // in_out_tensor survives untouched as the LN1 residual skip.
+    const size_t conv_input_width =
+        encoder.kda.local_conv ? weights.ip_emb_b.size() : 0;
     const size_t qkv_size =
-        tokens * (2 * key_depth + value_depth + gate_rank) * sizeof(DataType);
+        tokens * (2 * key_depth + value_depth + gate_rank + conv_input_width) *
+        sizeof(DataType);
     const size_t aux_buffer_size =
         tokens * std::max(2 * gate_rank, key_depth + value_depth + heads) *
         sizeof(DataType);

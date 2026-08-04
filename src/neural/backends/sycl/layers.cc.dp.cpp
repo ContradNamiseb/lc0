@@ -2486,6 +2486,14 @@ EncoderBlock<DataType>::EncoderBlock(
             std::to_string(max_wg_size) + ").");
       }
     }
+    if (kda_output_gate_ &&
+        2 * kda_gate_rank_ > encoder_heads_ * kda_value_dim_) {
+      // The fused decay+gate gemm fills buffer1 with tokens * 2*gate_rank
+      // interleaved rows, while EvalKda places beta at
+      // buffer1 + max_tokens * value_depth. Without this the two overlap.
+      throw Exception(
+          "KDA requires 2 * gate_rank <= encoder_heads * value_dim.");
+    }
     if (kda_direction_count_ <= 0 || kda_direction_count_ > 16 ||
         encoder_heads_ % kda_direction_count_ != 0) {
       throw Exception("KDA directions must evenly divide the encoder heads.");
@@ -3087,15 +3095,22 @@ void EncoderBlock<DataType>::EvalKda(int N, DataType* in_out_tensor,
   const int value_depth = encoder_heads_ * kda_value_dim_;
 
   // Apply the optional 3x3 depthwise board convolution before projections.
-  // The conv output is accumulated into scratch_conv (borrowing the end of
-  // buffer2 which is not yet used at this point), and the residual result is
-  // written back to in_out_tensor.
+  // The convolved tensor feeds the projections only -- it must NOT overwrite
+  // in_out_tensor, because the encoder residual added at LN1 below is the
+  // pre-mixer layer input x, not x + conv(x). The trainer (kda() rebinds a
+  // local `inputs`, encoder_layer still adds the original) and the BLAS
+  // reference (conv writes a separate conv_input; encoder_buffer stays x)
+  // both keep the original input as the skip.
+  DataType* proj_input = in_out_tensor;
   if (kda_local_conv_) {
-    // Use buffer2 as scratch for the conv intermediate; it is large enough
-    // (allocated as max_tokens * key_depth) and unused at this point.
+    // Persistent region past q/k/v and the non-fused gate_hidden; it has to
+    // stay live until the last projection (beta) reads it. buffer2 is still
+    // free here, so it serves as the conv kernel's transient intermediate.
+    proj_input =
+        scratch + max_tokens * (2 * key_depth + value_depth + kda_gate_rank_);
     applyKdaLocalDepthwiseConv<DataType>(
         N, embedding_op_size_, in_out_tensor, kda_local_conv_w,
-        kda_local_conv_b, buffer2, in_out_tensor, sycl_queue);
+        kda_local_conv_b, buffer2, proj_input, sycl_queue);
   }
 
   DataType* q = scratch;
@@ -3107,7 +3122,7 @@ void EncoderBlock<DataType>::EvalKda(int N, DataType* in_out_tensor,
     cublasXgemm<DataType>(
         transpose_type_transpose, transpose_type_notranspose, qkv_depth,
         tokens, embedding_op_size_, 1.0f, kda_qkv_w, embedding_op_size_,
-        in_out_tensor, embedding_op_size_, 0.0f, q, qkv_depth, sycl_queue);
+        proj_input, embedding_op_size_, 0.0f, q, qkv_depth, sycl_queue);
     if (kda_qkv_b) {
       addBiasBatched(q, q, kda_qkv_b, 1, tokens, qkv_depth, ACTIVATION_NONE,
                      sycl_queue);
@@ -3116,15 +3131,15 @@ void EncoderBlock<DataType>::EvalKda(int N, DataType* in_out_tensor,
     cublasXgemm<DataType>(
         transpose_type_transpose, transpose_type_notranspose, key_depth,
         tokens, embedding_op_size_, 1.0f, kda_q_w, embedding_op_size_,
-        in_out_tensor, embedding_op_size_, 0.0f, q, key_depth, sycl_queue);
+        proj_input, embedding_op_size_, 0.0f, q, key_depth, sycl_queue);
     cublasXgemm<DataType>(
         transpose_type_transpose, transpose_type_notranspose, key_depth,
         tokens, embedding_op_size_, 1.0f, kda_k_w, embedding_op_size_,
-        in_out_tensor, embedding_op_size_, 0.0f, k, key_depth, sycl_queue);
+        proj_input, embedding_op_size_, 0.0f, k, key_depth, sycl_queue);
     cublasXgemm<DataType>(
         transpose_type_transpose, transpose_type_notranspose, value_depth,
         tokens, embedding_op_size_, 1.0f, kda_v_w, embedding_op_size_,
-        in_out_tensor, embedding_op_size_, 0.0f, v, value_depth, sycl_queue);
+        proj_input, embedding_op_size_, 0.0f, v, value_depth, sycl_queue);
     if (kda_q_b) {
       addBiasBatched(q, q, kda_q_b, 1, tokens, key_depth, ACTIVATION_NONE,
                      sycl_queue);
@@ -3141,24 +3156,35 @@ void EncoderBlock<DataType>::EvalKda(int N, DataType* in_out_tensor,
 
   DataType* decay_hidden = buffer1;
   DataType* gate_hidden = kda_output_gate_ ? (scratch + max_tokens * (2 * key_depth + value_depth)) : nullptr;
+  // Distance between consecutive tokens in decay_hidden / gate_hidden. The
+  // fused gemm below writes ONE interleaved row per token
+  // ([decay_a | gate_a], width 2*gate_rank, because ldc = 2*gate_rank in
+  // column-major), so its consumers have to stride by the full fused width
+  // and find the gate half gate_rank into each row. The non-fused path
+  // instead writes two separately packed buffers of width gate_rank each.
+  // Getting this wrong silently feeds decay_b the previous token's gate_a.
+  int decay_hidden_ld = kda_gate_rank_;
+  int gate_hidden_ld = kda_gate_rank_;
 
   if (kda_output_gate_ && kda_decay_gate_a_w) {
     cublasXgemm<DataType>(
         transpose_type_transpose, transpose_type_notranspose,
         2 * kda_gate_rank_, tokens, embedding_op_size_, 1.0f,
-        kda_decay_gate_a_w, embedding_op_size_, in_out_tensor,
+        kda_decay_gate_a_w, embedding_op_size_, proj_input,
         embedding_op_size_, 0.0f, decay_hidden, 2 * kda_gate_rank_,
         sycl_queue);
     if (kda_decay_gate_a_b) {
       addBiasBatched(decay_hidden, decay_hidden, kda_decay_gate_a_b, 1,
                      tokens, 2 * kda_gate_rank_, ACTIVATION_NONE, sycl_queue);
     }
-    gate_hidden = decay_hidden + max_tokens * kda_gate_rank_;
+    decay_hidden_ld = 2 * kda_gate_rank_;
+    gate_hidden_ld = 2 * kda_gate_rank_;
+    gate_hidden = decay_hidden + kda_gate_rank_;
   } else {
     cublasXgemm<DataType>(
         transpose_type_transpose, transpose_type_notranspose, kda_gate_rank_,
         tokens, embedding_op_size_, 1.0f, kda_decay_a_w, embedding_op_size_,
-        in_out_tensor, embedding_op_size_, 0.0f, decay_hidden, kda_gate_rank_,
+        proj_input, embedding_op_size_, 0.0f, decay_hidden, kda_gate_rank_,
         sycl_queue);
     if (kda_decay_a_b) {
       addBiasBatched(decay_hidden, decay_hidden, kda_decay_a_b, 1, tokens,
@@ -3168,7 +3194,7 @@ void EncoderBlock<DataType>::EvalKda(int N, DataType* in_out_tensor,
       cublasXgemm<DataType>(
           transpose_type_transpose, transpose_type_notranspose, kda_gate_rank_,
           tokens, embedding_op_size_, 1.0f, kda_gate_a_w, embedding_op_size_,
-          in_out_tensor, embedding_op_size_, 0.0f, gate_hidden,
+          proj_input, embedding_op_size_, 0.0f, gate_hidden,
           kda_gate_rank_, sycl_queue);
       if (kda_gate_a_b) {
         addBiasBatched(gate_hidden, gate_hidden, kda_gate_a_b, 1, tokens,
@@ -3181,7 +3207,7 @@ void EncoderBlock<DataType>::EvalKda(int N, DataType* in_out_tensor,
   cublasXgemm<DataType>(
       transpose_type_transpose, transpose_type_notranspose, key_depth, tokens,
       kda_gate_rank_, 1.0f, kda_decay_b_w, kda_gate_rank_, decay_hidden,
-      kda_gate_rank_, 0.0f, raw_decay, key_depth, sycl_queue);
+      decay_hidden_ld, 0.0f, raw_decay, key_depth, sycl_queue);
   if (kda_decay_b_b) {
     addBiasBatched(raw_decay, raw_decay, kda_decay_b_b, 1, tokens, key_depth,
                    ACTIVATION_NONE, sycl_queue);
@@ -3191,7 +3217,7 @@ void EncoderBlock<DataType>::EvalKda(int N, DataType* in_out_tensor,
   cublasXgemm<DataType>(
       transpose_type_transpose, transpose_type_notranspose, encoder_heads_,
       tokens, embedding_op_size_, 1.0f, kda_beta_w, embedding_op_size_,
-      in_out_tensor, embedding_op_size_, 0.0f, beta, encoder_heads_,
+      proj_input, embedding_op_size_, 0.0f, beta, encoder_heads_,
       sycl_queue);
   if (kda_beta_b) {
     addBiasBatched(beta, beta, kda_beta_b, 1, tokens, encoder_heads_,
@@ -3204,7 +3230,7 @@ void EncoderBlock<DataType>::EvalKda(int N, DataType* in_out_tensor,
     cublasXgemm<DataType>(
         transpose_type_transpose, transpose_type_notranspose, value_depth,
         tokens, kda_gate_rank_, 1.0f, kda_gate_b_w, kda_gate_rank_,
-        gate_hidden, kda_gate_rank_, 0.0f, gate, value_depth, sycl_queue);
+        gate_hidden, gate_hidden_ld, 0.0f, gate, value_depth, sycl_queue);
     if (kda_gate_b_b) {
       addBiasBatched(gate, gate, kda_gate_b_b, 1, tokens, value_depth,
                      ACTIVATION_NONE, sycl_queue);
