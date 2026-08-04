@@ -2236,6 +2236,15 @@ void kdaRecurrenceValueParallel(
             }
 
             mixed[value_offset + local_id] = static_cast<T>(output);
+
+            // p_q/p_k/p_decay are read by every work-item above (the
+            // q_norm_sq/k_norm_sq/prediction/output loops over key_dim), but
+            // only written by the first key_dim work-items at the top of the
+            // next iteration. Without this barrier, a writer thread can loop
+            // back and overwrite them before a slower reader thread has
+            // finished consuming this token's values -- nothing upstream
+            // guarantees the work-items in this group stay in lockstep.
+            item.barrier(sycl::access::fence_space::local_space);
           }
         });
   });
