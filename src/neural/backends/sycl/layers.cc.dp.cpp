@@ -2486,14 +2486,6 @@ EncoderBlock<DataType>::EncoderBlock(
             std::to_string(max_wg_size) + ").");
       }
     }
-    if (kda_output_gate_ &&
-        2 * kda_gate_rank_ > encoder_heads_ * kda_value_dim_) {
-      // The fused decay+gate gemm fills buffer1 with tokens * 2*gate_rank
-      // interleaved rows, while EvalKda places beta at
-      // buffer1 + max_tokens * value_depth. Without this the two overlap.
-      throw Exception(
-          "KDA requires 2 * gate_rank <= encoder_heads * value_dim.");
-    }
     if (kda_direction_count_ <= 0 || kda_direction_count_ > 16 ||
         encoder_heads_ % kda_direction_count_ != 0) {
       throw Exception("KDA directions must evenly divide the encoder heads.");
@@ -3213,17 +3205,12 @@ void EncoderBlock<DataType>::EvalKda(int N, DataType* in_out_tensor,
                    ACTIVATION_NONE, sycl_queue);
   }
 
-  DataType* beta = buffer1 + max_tokens * value_depth;
-  cublasXgemm<DataType>(
-      transpose_type_transpose, transpose_type_notranspose, encoder_heads_,
-      tokens, embedding_op_size_, 1.0f, kda_beta_w, embedding_op_size_,
-      proj_input, embedding_op_size_, 0.0f, beta, encoder_heads_,
-      sycl_queue);
-  if (kda_beta_b) {
-    addBiasBatched(beta, beta, kda_beta_b, 1, tokens, encoder_heads_,
-                   ACTIVATION_NONE, sycl_queue);
-  }
-
+  // The gate gemm must run BEFORE the beta gemm. In the fused path
+  // gate_hidden points into buffer1 (decay_hidden + gate_rank, spanning up to
+  // tokens * 2*gate_rank), while beta is written at
+  // buffer1 + max_tokens * value_depth. Those regions are disjoint only while
+  // 2*gate_rank <= value_depth; consuming gate_hidden first makes the
+  // ordering safe for any dims instead of relying on that inequality.
   DataType* gate = nullptr;
   if (kda_output_gate_) {
     gate = buffer2 + max_tokens * key_depth;
@@ -3235,6 +3222,17 @@ void EncoderBlock<DataType>::EvalKda(int N, DataType* in_out_tensor,
       addBiasBatched(gate, gate, kda_gate_b_b, 1, tokens, value_depth,
                      ACTIVATION_NONE, sycl_queue);
     }
+  }
+
+  DataType* beta = buffer1 + max_tokens * value_depth;
+  cublasXgemm<DataType>(
+      transpose_type_transpose, transpose_type_notranspose, encoder_heads_,
+      tokens, embedding_op_size_, 1.0f, kda_beta_w, embedding_op_size_,
+      proj_input, embedding_op_size_, 0.0f, beta, encoder_heads_,
+      sycl_queue);
+  if (kda_beta_b) {
+    addBiasBatched(beta, beta, kda_beta_b, 1, tokens, encoder_heads_,
+                   ACTIVATION_NONE, sycl_queue);
   }
 
   DataType* mixed = buffer1;
