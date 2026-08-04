@@ -2466,6 +2466,26 @@ EncoderBlock<DataType>::EncoderBlock(
     if (kda_key_dim_ <= 0 || kda_value_dim_ <= 0 || kda_gate_rank_ <= 0) {
       throw Exception("Invalid KDA dimensions.");
     }
+    if (kda_key_dim_ > 32) {
+      // kdaRecurrenceValueParallel keeps the recurrence state in a
+      // fixed-size private `float state[32]` array per work-item.
+      throw Exception("KDA key_dim > 32 is not supported by the SYCL "
+                      "backend.");
+    }
+    {
+      // kdaRecurrenceValueParallel launches one work-group of kda_value_dim_
+      // work-items per (batch, head). An oversized config would otherwise
+      // fail at kernel launch with an opaque runtime error instead of here.
+      const size_t max_wg_size =
+          sycl_queue_.get_device()
+              .get_info<sycl::info::device::max_work_group_size>();
+      if (static_cast<size_t>(kda_value_dim_) > max_wg_size) {
+        throw Exception(
+            "KDA value_dim (" + std::to_string(kda_value_dim_) +
+            ") exceeds the device's max work-group size (" +
+            std::to_string(max_wg_size) + ").");
+      }
+    }
     if (kda_direction_count_ <= 0 || kda_direction_count_ > 16 ||
         encoder_heads_ % kda_direction_count_ != 0) {
       throw Exception("KDA directions must evenly divide the encoder heads.");
@@ -2489,6 +2509,87 @@ EncoderBlock<DataType>::EncoderBlock(
       throw Exception(
           "KDA local_conv requires encoder_heads * kda_key_dim >= "
           "embedding_op_size.");
+    }
+
+    // KDA's proto makes most biases optional (unlike MHA), so a malformed
+    // net silently becomes an out-of-bounds gemm/kernel read instead of a
+    // load-time error unless every weight is shape-checked here.
+    const int key_depth = encoder_heads_ * kda_key_dim_;
+    const int value_depth = encoder_heads_ * kda_value_dim_;
+    auto require_exact = [](const char* name, const std::vector<float>& v,
+                            size_t expected) {
+      if (v.size() != expected) {
+        throw Exception(
+            "KDA weight '" + std::string(name) + "' has size " +
+            std::to_string(v.size()) + ", expected " +
+            std::to_string(expected) + ".");
+      }
+    };
+    auto check_if_present = [](const char* name, const std::vector<float>& v,
+                               size_t expected) {
+      if (!v.empty() && v.size() != expected) {
+        throw Exception(
+            "KDA weight '" + std::string(name) + "' has size " +
+            std::to_string(v.size()) + ", expected " +
+            std::to_string(expected) + ".");
+      }
+    };
+    require_exact("q_w", cpu_weights.kda.q_w,
+                  static_cast<size_t>(embedding_op_size_) * key_depth);
+    require_exact("k_w", cpu_weights.kda.k_w,
+                  static_cast<size_t>(embedding_op_size_) * key_depth);
+    require_exact("v_w", cpu_weights.kda.v_w,
+                  static_cast<size_t>(embedding_op_size_) * value_depth);
+    require_exact("decay_a_w", cpu_weights.kda.decay_a_w,
+                  static_cast<size_t>(embedding_op_size_) * kda_gate_rank_);
+    require_exact("decay_b_w", cpu_weights.kda.decay_b_w,
+                  static_cast<size_t>(kda_gate_rank_) * key_depth);
+    require_exact("beta_w", cpu_weights.kda.beta_w,
+                  static_cast<size_t>(embedding_op_size_) * encoder_heads_);
+    require_exact("dt_bias", cpu_weights.kda.dt_bias,
+                  static_cast<size_t>(key_depth));
+    require_exact("a_log", cpu_weights.kda.a_log,
+                  static_cast<size_t>(encoder_heads_));
+    require_exact("dense_w", cpu_weights.kda.dense_w,
+                  static_cast<size_t>(value_depth) * embedding_op_size_);
+    // dense_b is required, not optional: EvalKda's LN1 dereferences it
+    // unconditionally (unlike q_b/k_b/v_b/etc., which are only applied if
+    // present).
+    require_exact("dense_b", cpu_weights.kda.dense_b,
+                  static_cast<size_t>(embedding_op_size_));
+    check_if_present("q_b", cpu_weights.kda.q_b,
+                     static_cast<size_t>(key_depth));
+    check_if_present("k_b", cpu_weights.kda.k_b,
+                     static_cast<size_t>(key_depth));
+    check_if_present("v_b", cpu_weights.kda.v_b,
+                     static_cast<size_t>(value_depth));
+    check_if_present("decay_a_b", cpu_weights.kda.decay_a_b,
+                     static_cast<size_t>(kda_gate_rank_));
+    check_if_present("decay_b_b", cpu_weights.kda.decay_b_b,
+                     static_cast<size_t>(key_depth));
+    check_if_present("beta_b", cpu_weights.kda.beta_b,
+                     static_cast<size_t>(encoder_heads_));
+    if (kda_output_rms_norm_) {
+      require_exact("out_norm_gammas", cpu_weights.kda.out_norm_gammas,
+                    static_cast<size_t>(value_depth));
+    }
+    if (kda_output_gate_) {
+      // Required, not optional: EvalKda's non-fused branch gemms with
+      // kda_gate_a_w/kda_gate_b_w unconditionally once output_gate is set.
+      require_exact("gate_a_w", cpu_weights.kda.gate_a_w,
+                    static_cast<size_t>(embedding_op_size_) * kda_gate_rank_);
+      require_exact("gate_b_w", cpu_weights.kda.gate_b_w,
+                    static_cast<size_t>(kda_gate_rank_) * value_depth);
+      check_if_present("gate_a_b", cpu_weights.kda.gate_a_b,
+                       static_cast<size_t>(kda_gate_rank_));
+      check_if_present("gate_b_b", cpu_weights.kda.gate_b_b,
+                       static_cast<size_t>(value_depth));
+    }
+    if (kda_local_conv_) {
+      require_exact("local_conv_w", cpu_weights.kda.local_conv_w,
+                    static_cast<size_t>(embedding_op_size_) * 9);
+      check_if_present("local_conv_b", cpu_weights.kda.local_conv_b,
+                       static_cast<size_t>(embedding_op_size_));
     }
 
     allocAndUpload<DataType>(&kda_q_w, cpu_weights.kda.q_w, scratch,
@@ -2544,8 +2645,6 @@ EncoderBlock<DataType>::EncoderBlock(
       }
     }
 
-    const int key_depth = encoder_heads_ * kda_key_dim_;
-    const int value_depth = encoder_heads_ * kda_value_dim_;
     const int qkv_depth = 2 * key_depth + value_depth;
     size_t qkv_w_elements = static_cast<size_t>(qkv_depth) * embedding_op_size_;
     kda_qkv_w = static_cast<DataType*>(sycl::malloc_device(
@@ -2662,6 +2761,11 @@ EncoderBlock<DataType>::EncoderBlock(
                            sycl_queue_);
   allocAndUpload<DataType>(&ffn_dense2_b, cpu_weights.ffn.dense2_b, scratch,
                            sycl_queue_);
+  if (!ffn_dense1_b || !ffn_dense2_b) {
+    // addBiasBatched() dereferences these unconditionally in Eval/EvalKda;
+    // a net that omits them loads fine but crashes mid-eval instead of here.
+    throw Exception("FFN dense1/dense2 bias is missing from the network.");
+  }
 
   allocAndUpload<DataType>(&ln2_gammas, cpu_weights.ln2_gammas, scratch,
                            sycl_queue_);
@@ -3110,10 +3214,15 @@ void EncoderBlock<DataType>::EvalKda(int N, DataType* in_out_tensor,
   DataType* mixed = buffer1;
   const DataType* qkv = kda_qkv_w ? scratch : nullptr;
   const int qkv_stride = 2 * key_depth + value_depth;
+  // q/k/v describe the non-fused layout and are meaningless once qkv
+  // (fused) is set -- the kernel takes the qkv branch exclusively in that
+  // case and never dereferences them, so pass nullptr rather than pointers
+  // a future reader might mistake for the fused layout.
   kdaRecurrenceValueParallel<DataType>(
       N, encoder_heads_, kda_key_dim_, kda_value_dim_, kda_direction_count_,
-      kda_directions_, kKdaLogDecayFloor, qkv, qkv_stride, q, k, v, raw_decay,
-      kda_dt_bias, kda_a_log, beta, gate, mixed, sycl_queue);
+      kda_directions_, kKdaLogDecayFloor, qkv, qkv_stride,
+      qkv ? nullptr : q, qkv ? nullptr : k, qkv ? nullptr : v, raw_decay,
+      kda_dt_bias, kda_a_log, beta, mixed, sycl_queue);
 
   if (kda_output_rms_norm_) {
     const DataType* norm_gammas = kda_out_norm_gammas;
@@ -3134,6 +3243,15 @@ void EncoderBlock<DataType>::EvalKda(int N, DataType* in_out_tensor,
         mixed[offset + channel] = static_cast<DataType>(value);
       }
     });
+  }
+
+  // The gate must apply after the (optional) RMS norm, not before: they do
+  // not commute, since the gate rescales each element before the norm would
+  // divide by the resulting RMS. The trainer and BLAS reference both
+  // normalize first and gate second.
+  if (kda_output_gate_) {
+    applyKdaOutputGate<DataType>(tokens * value_depth, mixed, gate,
+                                 sycl_queue);
   }
 
   cublasXgemm<DataType>(
@@ -3526,33 +3644,36 @@ EncoderBlock<DataType>::~EncoderBlock() {
   sycl::free(ffn_dense2_b, sycl_queue_);
   sycl::free(ln2_gammas, sycl_queue_);
   sycl::free(ln2_betas, sycl_queue_);
-  sycl::free(kda_q_w, sycl_queue_);
-  sycl::free(kda_q_b, sycl_queue_);
-  sycl::free(kda_k_w, sycl_queue_);
-  sycl::free(kda_k_b, sycl_queue_);
-  sycl::free(kda_v_w, sycl_queue_);
-  sycl::free(kda_v_b, sycl_queue_);
-  sycl::free(kda_decay_a_w, sycl_queue_);
-  sycl::free(kda_decay_a_b, sycl_queue_);
-  sycl::free(kda_decay_b_w, sycl_queue_);
-  sycl::free(kda_decay_b_b, sycl_queue_);
-  sycl::free(kda_beta_w, sycl_queue_);
-  sycl::free(kda_beta_b, sycl_queue_);
-  sycl::free(kda_a_log, sycl_queue_);
-  sycl::free(kda_dt_bias, sycl_queue_);
-  sycl::free(kda_gate_a_w, sycl_queue_);
-  sycl::free(kda_gate_a_b, sycl_queue_);
-  sycl::free(kda_gate_b_w, sycl_queue_);
-  sycl::free(kda_gate_b_b, sycl_queue_);
-  sycl::free(kda_out_norm_gammas, sycl_queue_);
-  sycl::free(kda_dense_w, sycl_queue_);
-  sycl::free(kda_dense_b, sycl_queue_);
-  sycl::free(kda_local_conv_w, sycl_queue_);
-  sycl::free(kda_local_conv_b, sycl_queue_);
-  sycl::free(kda_qkv_w, sycl_queue_);
-  sycl::free(kda_qkv_b, sycl_queue_);
-  sycl::free(kda_decay_gate_a_w, sycl_queue_);
-  sycl::free(kda_decay_gate_a_b, sycl_queue_);
+  // The SYCL spec requires sycl::free's pointer to come from a USM
+  // allocation; pure-MHA layers leave every kda_* member null, so guard
+  // each one rather than rely on it being a no-op in practice.
+  if (kda_q_w) sycl::free(kda_q_w, sycl_queue_);
+  if (kda_q_b) sycl::free(kda_q_b, sycl_queue_);
+  if (kda_k_w) sycl::free(kda_k_w, sycl_queue_);
+  if (kda_k_b) sycl::free(kda_k_b, sycl_queue_);
+  if (kda_v_w) sycl::free(kda_v_w, sycl_queue_);
+  if (kda_v_b) sycl::free(kda_v_b, sycl_queue_);
+  if (kda_decay_a_w) sycl::free(kda_decay_a_w, sycl_queue_);
+  if (kda_decay_a_b) sycl::free(kda_decay_a_b, sycl_queue_);
+  if (kda_decay_b_w) sycl::free(kda_decay_b_w, sycl_queue_);
+  if (kda_decay_b_b) sycl::free(kda_decay_b_b, sycl_queue_);
+  if (kda_beta_w) sycl::free(kda_beta_w, sycl_queue_);
+  if (kda_beta_b) sycl::free(kda_beta_b, sycl_queue_);
+  if (kda_a_log) sycl::free(kda_a_log, sycl_queue_);
+  if (kda_dt_bias) sycl::free(kda_dt_bias, sycl_queue_);
+  if (kda_gate_a_w) sycl::free(kda_gate_a_w, sycl_queue_);
+  if (kda_gate_a_b) sycl::free(kda_gate_a_b, sycl_queue_);
+  if (kda_gate_b_w) sycl::free(kda_gate_b_w, sycl_queue_);
+  if (kda_gate_b_b) sycl::free(kda_gate_b_b, sycl_queue_);
+  if (kda_out_norm_gammas) sycl::free(kda_out_norm_gammas, sycl_queue_);
+  if (kda_dense_w) sycl::free(kda_dense_w, sycl_queue_);
+  if (kda_dense_b) sycl::free(kda_dense_b, sycl_queue_);
+  if (kda_local_conv_w) sycl::free(kda_local_conv_w, sycl_queue_);
+  if (kda_local_conv_b) sycl::free(kda_local_conv_b, sycl_queue_);
+  if (kda_qkv_w) sycl::free(kda_qkv_w, sycl_queue_);
+  if (kda_qkv_b) sycl::free(kda_qkv_b, sycl_queue_);
+  if (kda_decay_gate_a_w) sycl::free(kda_decay_gate_a_w, sycl_queue_);
+  if (kda_decay_gate_a_b) sycl::free(kda_decay_gate_a_b, sycl_queue_);
   if (has_smolgen_) {
     sycl::free(smol_compress, sycl_queue_);
     sycl::free(smol_dense1_w, sycl_queue_);

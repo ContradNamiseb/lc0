@@ -553,8 +553,12 @@ void kdaRecurrenceValueParallel(
     int N, int heads, int key_dim, int value_dim, int direction_count,
     const std::array<int, 16>& directions, float log_decay_floor, const T* qkv,
     int qkv_stride, const T* q, const T* k, const T* v, const T* raw_decay,
-    const T* dt_bias, const T* a_log, const T* beta, const T* gate, T* mixed,
+    const T* dt_bias, const T* a_log, const T* beta, T* mixed,
     sycl::queue& sycl_queue);
+
+template <typename T>
+void applyKdaOutputGate(int N, T* mixed, const T* gate,
+                        sycl::queue& sycl_queue);
 
 template <typename T>
 void applyKdaLocalDepthwiseConv(

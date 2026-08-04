@@ -2195,7 +2195,7 @@ void kdaRecurrenceValueParallel(
     int N, int heads, int key_dim, int value_dim, int direction_count,
     const std::array<int, 16>& directions, float log_decay_floor, const T* qkv,
     int qkv_stride, const T* q, const T* k, const T* v, const T* raw_decay,
-    const T* dt_bias, const T* a_log, const T* beta, const T* gate, T* mixed,
+    const T* dt_bias, const T* a_log, const T* beta, T* mixed,
     sycl::queue& sycl_queue) {
   sycl::range<2> global_range(N * heads, value_dim);
   sycl::range<2> local_range(1, value_dim);
@@ -2264,19 +2264,23 @@ void kdaRecurrenceValueParallel(
             const int raw_decay_offset = token_idx * key_depth + head * key_dim;
             const int value_offset = token_idx * value_depth + head * value_dim;
 
-            if (local_id < key_dim) {
-              p_q[local_id] = static_cast<float>(q_ptr[local_id]);
-              p_k[local_id] = static_cast<float>(k_ptr[local_id]);
+            // Strided rather than a single `local_id < key_dim` guard: the
+            // work-group only has value_dim lanes, so when key_dim >
+            // value_dim a single pass would leave p_q/p_k/p_decay[value_dim,
+            // key_dim) unwritten and later read as garbage.
+            for (int i = local_id; i < key_dim; i += value_dim) {
+              p_q[i] = static_cast<float>(q_ptr[i]);
+              p_k[i] = static_cast<float>(k_ptr[i]);
 
               const float decay_input =
-                  static_cast<float>(raw_decay[raw_decay_offset + local_id]) +
-                  static_cast<float>(dt_bias[head * key_dim + local_id]);
+                  static_cast<float>(raw_decay[raw_decay_offset + i]) +
+                  static_cast<float>(dt_bias[head * key_dim + i]);
               const float softplus =
                   (decay_input > 0.0f ? decay_input : 0.0f) +
                   sycl::log1p(sycl::exp(-sycl::fabs(decay_input)));
               const float log_decay =
                   sycl::fmax(-decay_scale * softplus, log_decay_floor);
-              p_decay[local_id] = sycl::exp(log_decay);
+              p_decay[i] = sycl::exp(log_decay);
             }
 
             item.barrier(sycl::access::fence_space::local_space);
@@ -2315,12 +2319,6 @@ void kdaRecurrenceValueParallel(
               output += p_q[key] * q_norm * scale * state[key];
             }
 
-            if (gate != nullptr) {
-              const float gate_value =
-                  static_cast<float>(gate[value_offset + local_id]);
-              output *= 1.0f / (1.0f + sycl::exp(-gate_value));
-            }
-
             mixed[value_offset + local_id] = static_cast<T>(output);
 
             // p_q/p_k/p_decay are read by every work-item above (the
@@ -2341,7 +2339,7 @@ template void kdaRecurrenceValueParallel<float>(
     const std::array<int, 16>& directions, float log_decay_floor,
     const float* qkv, int qkv_stride, const float* q, const float* k,
     const float* v, const float* raw_decay, const float* dt_bias,
-    const float* a_log, const float* beta, const float* gate, float* mixed,
+    const float* a_log, const float* beta, float* mixed,
     sycl::queue& sycl_queue);
 
 template void kdaRecurrenceValueParallel<sycl::half>(
@@ -2350,7 +2348,30 @@ template void kdaRecurrenceValueParallel<sycl::half>(
     const sycl::half* qkv, int qkv_stride, const sycl::half* q,
     const sycl::half* k, const sycl::half* v, const sycl::half* raw_decay,
     const sycl::half* dt_bias, const sycl::half* a_log, const sycl::half* beta,
-    const sycl::half* gate, sycl::half* mixed, sycl::queue& sycl_queue);
+    sycl::half* mixed, sycl::queue& sycl_queue);
+
+// Applies the sigmoid output gate to the mixer output. Must run after the
+// optional RMS norm (EvalKda), not before: the trainer and BLAS reference
+// both normalize first and gate second, and the two do not commute since the
+// gate rescales each element before the norm would divide by the resulting
+// RMS.
+template <typename T>
+void applyKdaOutputGate(int N, T* mixed, const T* gate,
+                        sycl::queue& sycl_queue) {
+  sycl_queue.parallel_for(sycl::range<1>(N), [=](sycl::id<1> idx) {
+    const int i = static_cast<int>(idx[0]);
+    const float gate_value = static_cast<float>(gate[i]);
+    const float sigmoid = 1.0f / (1.0f + sycl::exp(-gate_value));
+    mixed[i] = static_cast<T>(static_cast<float>(mixed[i]) * sigmoid);
+  });
+}
+
+template void applyKdaOutputGate<float>(int N, float* mixed,
+                                        const float* gate,
+                                        sycl::queue& sycl_queue);
+template void applyKdaOutputGate<sycl::half>(int N, sycl::half* mixed,
+                                             const sycl::half* gate,
+                                             sycl::queue& sycl_queue);
 
 // Applies a 3x3 same-padded depthwise convolution over the 8x8 board and adds
 // the result to the input (residual).  Matches the training Python
