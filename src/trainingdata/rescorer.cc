@@ -928,8 +928,18 @@ void ApplyDTZCorrections(FileData<FrameType>& data, SyzygyTablebase* tablebase) 
   for (size_t i = 0; i < data.moves.size(); i++) {
     history.Append(data.moves[i]);
     const auto& board = history.Last().GetBoard();
+    // The "<= 3" here is a fixed cap on top of the tablebase's own
+    // capability, not a substitute for it -- without also checking
+    // max_cardinality(), this unconditionally calls probe_wdl() on any
+    // <=3-piece pawnless position (K-vs-K, KR-vs-K, ...), which are common
+    // in real games, even when no tablebase was successfully loaded
+    // (max_cardinality() == 0, impl_ == nullptr), crashing on the null
+    // impl_ inside SyzygyTablebase::search().
     if (board.castlings().no_legal_castle() &&
-        (board.ours() | board.theirs()).count() <= 3 && board.pawns().empty()) {
+        (board.ours() | board.theirs()).count() <= 3 &&
+        (board.ours() | board.theirs()).count() <=
+            tablebase->max_cardinality() &&
+        board.pawns().empty()) {
       ProbeState state;
       WDLScore wdl = tablebase->probe_wdl(history.Last(), &state);
       // Only fail state means the WDL is wrong, probe_wdl may produce

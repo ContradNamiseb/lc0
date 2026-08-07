@@ -1479,6 +1479,12 @@ bool SyzygyTablebase::init(const std::string& paths) {
   max_cardinality_ = impl_->max_cardinality();
   if (max_cardinality_ <= 2) {
     impl_ = nullptr;
+    // Callers gate every probe on cardinality <= max_cardinality(), so a
+    // stale cached value here (e.g. 2, from the boundary check above)
+    // would let a bare K-vs-K position slip through and dereference the
+    // now-null impl_. Reset it alongside impl_ so max_cardinality()
+    // correctly reports "nothing usable" after a failed init.
+    max_cardinality_ = 0;
     return false;
   }
   return true;
