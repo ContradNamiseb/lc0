@@ -107,15 +107,54 @@ for (int token = 0; token < 64; ++token) {
   against the new table for all 8 directions × 64 tokens (512 cases) — exact
   match, 0 mismatches.
 
-**Not performed:** an on-hardware `backendbench` before/after run. This
-machine has a real Intel iGPU (`Iris(R) Xe Graphics`, confirmed via
-`sycl-ls`), but `build-sycl.cmd` builds this repo as a multi-backend binary
-that also requires a CUDA v10.0 + cuDNN toolchain at a hardcoded path, which
-this machine doesn't have — a full build here would likely fail for reasons
-unrelated to this change. The change is correctness-verified but not yet
-perf-measured; treat the "removes redundant per-iteration branching" framing
-as the rationale, not a measured number, until it's benchmarked in an
-environment that can build `backendbench` cleanly.
+**Perf-measured on hardware — result: no measurable win.** Built a
+SYCL-only `lc0.exe` locally (working around this machine's broken oneAPI env
+propagation and adding the `mkl_sycl_blas_dll`/OpenCL deps the `sycl=l0`
+meson path requires but the general `-Dmkl`/`-Dopencl` flags don't cover —
+see `build-sycl-local.cmd`) and ran `backendbench -b sycl` against a real
+KDA net (`kda-native-410835.pb.gz`) on the machine's Intel Iris Xe iGPU, two
+full sweeps (batch sizes 1-32, 200 batches each) per side:
+
+| | mean nps, pooled over 2 runs |
+|---|---|
+| Before (branch chain) | baseline |
+| After (table lookup) | **-1.0% average**, ranging -14.2% to +6.4% across batch sizes |
+
+The catch: run-to-run noise on this box is large enough to swallow the
+signal. Two runs of the *identical* before-fix binary differed by a mean
+12.35% (up to ~20% at some batch sizes) — bigger than the average
+before/after gap, and bigger than every individual before/after delta except
+the two worst outliers (batch 24: -14.2%, batch 29: -9.9%), which themselves
+don't exceed what same-binary noise already produced elsewhere in the sweep.
+14/32 batch sizes favored "after", 18/32 favored "before" — no consistent
+direction. Likely cause: a single laptop iGPU with no thermal/background-load
+isolation between ~5-minute sweeps, not a real regression or a real win.
+
+**Verdict: keep the change for its stated reason (removes a per-iteration
+branch that's redundant given `direction` is already loop-invariant, unifies
+the previously-inconsistent orthogonal/diagonal code paths), but do not cite
+it as a measured speedup.** It is correctness-neutral (bit-exact equivalence
+confirmed above) and stylistically an improvement per the guide, not a
+proven perf win on this hardware. Re-measuring on a machine with a
+discrete GPU and better run-to-run isolation (dedicated benchmarking box,
+more repeats, interleaved A/B ordering to cancel thermal drift) would be
+needed before this could honestly be called a speedup.
+
+**Direction-table correctness — cross-checked against the actual spec, not
+just self-consistency.** Beyond compile + old-SYCL-vs-new-SYCL equivalence
+(above), independently re-derived all 8 directions from two upstream
+references and diffed against the committed `kKdaDirectionOrder` table,
+512/512 exact matches against each:
+- `KdaSquareForToken` in `src/neural/backends/blas/network_blas.cc:281`
+  (the BLAS backend's reference implementation, explicitly commented "Must
+  match KDA_TRAVERSALS in the trainer").
+- `KDA_TRAVERSALS` in `tf/tfprocess.py:107` in the training repo (the actual
+  trainer ground truth) — regenerated all 8 direction orders from its
+  Python generator expressions and compared token-by-token.
+
+So the direction semantics were already correct before this refactor, and
+the refactor preserved them exactly; this was purely a shape/branching
+change, not a behavior change.
 
 ## Drive-by note (not a guide finding — flagging separately)
 
@@ -144,14 +183,14 @@ justify its own change.
 | Strings in hot path | Clean |
 | Small fixed storage | Clean |
 | Dispatch granularity | Clean |
-| Runtime branching in inner loop | **1 finding — fixed** (direction lookup table, common_kernels.dp.cpp) |
+| Runtime branching in inner loop | **1 finding — fixed, correctness-verified, perf-measured neutral** (direction lookup table, common_kernels.dp.cpp) |
 | Unrelated safety nit | `sprintf` in `CublasError`, cold path only — not fixed, flagged only |
 
 The direction-lookup fix is applied on this branch
-(`perf/sycl-cstyle-audit`) and correctness-verified (compile + exact
-behavioral equivalence, see above), but **not yet perf-benchmarked on
-hardware** — this machine can't build `backendbench` cleanly (see note
-above). Run `build-sycl.cmd` → `backendbench` before/after this commit on a
-machine that can build the full multi-backend binary before relying on this
-as a measured win. The `sprintf` note is a drive-by observation, not acted
-on.
+(`perf/sycl-cstyle-audit`), correctness-verified three ways (compile,
+old-vs-new equivalence, and cross-check against the BLAS reference and the
+trainer's actual `KDA_TRAVERSALS` spec — 512/512 matches each), and
+perf-measured on real Intel iGPU hardware. The perf result was a wash
+(-1.0% average, within this machine's run-to-run noise floor) — see above
+for the full before/after data. Keep the change for code quality, not as a
+claimed speedup. The `sprintf` note is a drive-by observation, not acted on.
