@@ -79,7 +79,7 @@ message AttributeProto {
     INT = 2;
     STRING = 3;
     TENSOR = 4;
-    // GRAPH = 5;
+    GRAPH = 5;
 
     FLOATS = 6;
     INTS = 7;
@@ -95,7 +95,14 @@ message AttributeProto {
   optional int64 i = 3;               // int
   optional bytes s = 4;               // UTF-8 string
   optional TensorProto t = 5;         // tensor value
-  // optional GraphProto g = 6;          // graph
+  // Graph attribute (subgraph of a control-flow op such as Scan). Declared as
+  // bytes holding an already-serialized GraphProto rather than as the message
+  // type: GraphProto -> NodeProto -> AttributeProto is a cycle, and the
+  // generated classes store optional messages by value, so a real nested
+  // message would be an incomplete type here. An embedded message and a bytes
+  // field are both length-delimited, so this is wire-identical to
+  // `optional GraphProto g = 6`.
+  optional bytes g = 6;               // graph
 
   repeated float floats = 7;          // list of floats
   repeated int64 ints = 8;            // list of ints

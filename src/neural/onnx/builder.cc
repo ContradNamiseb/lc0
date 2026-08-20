@@ -98,7 +98,47 @@ void AddIntsAttribute(pblczero::NodeProto* node, const std::string& name,
   for (const int x : vals) attr->add_ints(x);
 }
 
+void AddIntsAttribute(pblczero::NodeProto* node, const std::string& name,
+                      const std::vector<int>& vals) {
+  auto* attr = node->add_attribute();
+  attr->set_name(name);
+  attr->set_type(pblczero::AttributeProto::INTS);
+  for (const int x : vals) attr->add_ints(x);
+}
+
+// The `g` field is declared as bytes holding a serialized GraphProto -- see
+// the comment on it in proto/onnx.proto for why. This is wire-identical to a
+// nested message field.
+void AddGraphAttribute(pblczero::NodeProto* node, const std::string& name,
+                       const pblczero::GraphProto& graph) {
+  auto* attr = node->add_attribute();
+  attr->set_name(name);
+  attr->set_type(pblczero::AttributeProto::GRAPH);
+  attr->set_g(graph.OutputAsString());
+}
+
+void FillValueInfoV(pblczero::ValueInfoProto* vip, const std::string& name,
+                    const std::vector<int>& dims,
+                    pblczero::TensorProto::DataType datatype) {
+  vip->set_name(name);
+  auto* type = vip->mutable_type()->mutable_tensor_type();
+  type->set_elem_type(datatype);
+  auto* shape = type->mutable_shape();
+  for (const auto d : dims) {
+    auto* dim = shape->add_dim();
+    if (d < 0) {
+      dim->set_dim_param("batch");
+    } else {
+      dim->set_dim_value(d);
+    }
+  }
+}
+
 }  // namespace
+
+pblczero::GraphProto* OnnxBuilder::TargetGraph() {
+  return subgraph_ ? subgraph_ : model_.mutable_graph();
+}
 
 void OnnxBuilder::AddInput(const std::string& name,
                            std::initializer_list<int> dims,
@@ -142,7 +182,7 @@ std::string OnnxBuilder::Conv(const std::string& name,
                               const std::string& input_name,
                               const OnnxConst& kernel_weights,
                               const OnnxConst& bias_weights, int pads) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   auto shape = kernel_weights.GetDimensions().back();
   auto out = PopulateStdNodeFields(node, name, input_name, "Conv");
   node->add_input(AddInitializer(name + "/w/kernel", kernel_weights));
@@ -154,7 +194,7 @@ std::string OnnxBuilder::Conv(const std::string& name,
 
 std::string OnnxBuilder::Add(const std::string& name, const std::string& input1,
                              const std::string& input2) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   auto out = PopulateStdNodeFields(node, name, input1, "Add");
   node->add_input(input2);
   return out;
@@ -162,7 +202,7 @@ std::string OnnxBuilder::Add(const std::string& name, const std::string& input1,
 
 std::string OnnxBuilder::Add(const std::string& name, const std::string& input1,
                              const OnnxConst& input2) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   auto out = PopulateStdNodeFields(node, name, input1, "Add");
   node->add_input(AddInitializer(name + "/w", input2));
   return out;
@@ -170,14 +210,14 @@ std::string OnnxBuilder::Add(const std::string& name, const std::string& input1,
 
 std::string OnnxBuilder::GlobalAveragePool(const std::string& name,
                                            const std::string& input) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   return PopulateStdNodeFields(node, name, input, "GlobalAveragePool");
 }
 
 std::string OnnxBuilder::Squeeze(const std::string& name,
                                  const std::string& input,
                                  std::initializer_list<int> axes) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   auto out = PopulateStdNodeFields(node, name, input, "Squeeze");
   if (opset_ < 13) {
     AddIntsAttribute(node, "axes", axes);
@@ -192,7 +232,7 @@ std::string OnnxBuilder::Squeeze(const std::string& name,
 
 std::string OnnxBuilder::Mul(const std::string& name, const std::string& input1,
                              const std::string& input2) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   auto out = PopulateStdNodeFields(node, name, input1, "Mul");
   node->add_input(input2);
   return out;
@@ -200,7 +240,7 @@ std::string OnnxBuilder::Mul(const std::string& name, const std::string& input1,
 
 std::string OnnxBuilder::Mul(const std::string& name, const std::string& input1,
                              const OnnxConst& input2) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   auto out = PopulateStdNodeFields(node, name, input1, "Mul");
   node->add_input(AddInitializer(name + "/w", input2));
   return out;
@@ -209,7 +249,7 @@ std::string OnnxBuilder::Mul(const std::string& name, const std::string& input1,
 std::string OnnxBuilder::MatMul(const std::string& name,
                                 const std::string& input1,
                                 const OnnxConst& input2) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   auto out = PopulateStdNodeFields(node, name, input1, "MatMul");
   node->add_input(AddInitializer(name + "/w", input2));
   return out;
@@ -218,7 +258,7 @@ std::string OnnxBuilder::MatMul(const std::string& name,
 std::string OnnxBuilder::MatMul(const std::string& name,
                                 const std::string& input1,
                                 const std::string& input2) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   auto out = PopulateStdNodeFields(node, name, input1, "MatMul");
   node->add_input(input2);
   return out;
@@ -226,19 +266,19 @@ std::string OnnxBuilder::MatMul(const std::string& name,
 
 std::string OnnxBuilder::Relu(const std::string& name,
                               const std::string& input) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   return PopulateStdNodeFields(node, name, input, "Relu");
 }
 
 std::string OnnxBuilder::Tanh(const std::string& name,
                               const std::string& input) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   return PopulateStdNodeFields(node, name, input, "Tanh");
 }
 
 std::string OnnxBuilder::Softmax(const std::string& name,
                                  const std::string& input, int axis) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   auto out = PopulateStdNodeFields(node, name, input, "Softmax");
   AddIntAttribute(node, "axis", axis);
   return out;
@@ -247,7 +287,7 @@ std::string OnnxBuilder::Softmax(const std::string& name,
 std::string OnnxBuilder::Reshape(const std::string& name,
                                  const std::string& input,
                                  const std::string& shape) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   auto out = PopulateStdNodeFields(node, name, input, "Reshape");
   node->add_input(shape);
   return out;
@@ -256,7 +296,7 @@ std::string OnnxBuilder::Reshape(const std::string& name,
 std::string OnnxBuilder::Transpose(const std::string& name,
                                    const std::string& input,
                                    std::initializer_list<int> perm) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   auto out = PopulateStdNodeFields(node, name, input, "Transpose");
   AddIntsAttribute(node, "perm", perm);
   return out;
@@ -264,7 +304,7 @@ std::string OnnxBuilder::Transpose(const std::string& name,
 
 std::string OnnxBuilder::Pad(const std::string& name, const std::string& input,
                              std::initializer_list<int> pads) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   auto out = PopulateStdNodeFields(node, name, input, "Pad");
   AddIntsAttribute(node, "pads", pads);
   return out;
@@ -273,7 +313,7 @@ std::string OnnxBuilder::Pad(const std::string& name, const std::string& input,
 std::string OnnxBuilder::Gather(const std::string& name,
                                 const std::string& input1,
                                 const std::string& input2, int axis) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   auto out = PopulateStdNodeFields(node, name, input1, "Gather");
   node->add_input(input2);
   AddIntAttribute(node, "axis", axis);
@@ -282,19 +322,19 @@ std::string OnnxBuilder::Gather(const std::string& name,
 
 std::string OnnxBuilder::Softplus(const std::string& name,
                                   const std::string& input) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   return PopulateStdNodeFields(node, name, input, "Softplus");
 }
 
 std::string OnnxBuilder::Identity(const std::string& name,
                                   const std::string& input) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   return PopulateStdNodeFields(node, name, input, "Identity");
 }
 
 std::string OnnxBuilder::Selu(const std::string& name,
                               const std::string& input) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   return PopulateStdNodeFields(node, name, input, "Selu");
 }
 
@@ -311,7 +351,7 @@ std::string OnnxBuilder::Elu(const std::string& name, const std::string& input,
 std::vector<std::string> OnnxBuilder::Split(const std::string& name,
                                             const std::string& input, int axis,
                                             std::initializer_list<int> split) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   node->set_name(name);
   node->set_op_type("Split");
   node->add_input(input);
@@ -342,7 +382,7 @@ std::string OnnxBuilder::Slice(const std::string& name,
                                const std::string& input,
                                std::initializer_list<int> starts,
                                std::initializer_list<int> ends) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   auto out = PopulateStdNodeFields(node, name, input, "Slice");
   if (opset_ < 10) {
     AddIntsAttribute(node, "starts", starts);
@@ -361,7 +401,7 @@ std::string OnnxBuilder::Slice(const std::string& name,
 std::string OnnxBuilder::Concat(const std::string& name,
                                 const std::vector<std::string>& input,
                                 int axis) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   node->set_name(name);
   node->set_op_type("Concat");
   for (const auto& in : input) {
@@ -374,7 +414,7 @@ std::string OnnxBuilder::Concat(const std::string& name,
 
 std::string OnnxBuilder::Sigmoid(const std::string& name,
                                  const std::string& input) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   return PopulateStdNodeFields(node, name, input, "Sigmoid");
 }
 
@@ -384,7 +424,7 @@ std::string OnnxBuilder::LayerNormalization(const std::string& name,
                                             const OnnxConst& scale,
                                             const OnnxConst& bias, int axis,
                                             float epsilon) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   auto out = PopulateStdNodeFields(node, name, input, "LayerNormalization");
   node->add_input(AddInitializer(name + "/w/scale", scale));
   node->add_input(AddInitializer(name + "/w/bias", bias));
@@ -396,7 +436,7 @@ std::string OnnxBuilder::LayerNormalization(const std::string& name,
 std::string OnnxBuilder::Expand(const std::string& name,
                                 const std::string& input,
                                 const std::string& shape) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   auto out = PopulateStdNodeFields(node, name, input, "Expand");
   node->add_input(shape);
   return out;
@@ -404,19 +444,19 @@ std::string OnnxBuilder::Expand(const std::string& name,
 
 std::string OnnxBuilder::Shape(const std::string& name,
                                const std::string& input) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   return PopulateStdNodeFields(node, name, input, "Shape");
 }
 
 std::string OnnxBuilder::Exp(const std::string& name,
                              const std::string& input) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   return PopulateStdNodeFields(node, name, input, "Exp");
 }
 
 std::string OnnxBuilder::Div(const std::string& name, const std::string& input1,
                              const std::string& input2) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   auto out = PopulateStdNodeFields(node, name, input1, "Div");
   node->add_input(input2);
   return out;
@@ -424,7 +464,7 @@ std::string OnnxBuilder::Div(const std::string& name, const std::string& input1,
 
 std::string OnnxBuilder::Sub(const std::string& name, const std::string& input1,
                              const std::string& input2) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   auto out = PopulateStdNodeFields(node, name, input1, "Sub");
   node->add_input(input2);
   return out;
@@ -433,7 +473,7 @@ std::string OnnxBuilder::Sub(const std::string& name, const std::string& input1,
 std::string OnnxBuilder::Greater(const std::string& name,
                                  const std::string& input1,
                                  const OnnxConst& input2) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   auto out = PopulateStdNodeFields(node, name, input1, "Greater");
   node->add_input(AddInitializer(name + "/threshold", input2));
   return out;
@@ -443,7 +483,7 @@ std::string OnnxBuilder::Where(const std::string& name,
                                const std::string& input1,
                                const std::string& input2,
                                const std::string& input3) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   auto out = PopulateStdNodeFields(node, name, input1, "Where");
   node->add_input(input2);
   node->add_input(input3);
@@ -452,25 +492,25 @@ std::string OnnxBuilder::Where(const std::string& name,
 
 std::string OnnxBuilder::Mish(const std::string& name,
                               const std::string& input) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   return PopulateStdNodeFields(node, name, input, "Mish");
 }
 
 std::string OnnxBuilder::Sqrt(const std::string& name,
                               const std::string& input) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   return PopulateStdNodeFields(node, name, input, "Sqrt");
 }
 
 std::string OnnxBuilder::Reciprocal(const std::string& name,
                                     const std::string& input) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   return PopulateStdNodeFields(node, name, input, "Reciprocal");
 }
 
 std::string OnnxBuilder::Cast(const std::string& name, const std::string& input,
                               pblczero::TensorProto::DataType type) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   auto out = PopulateStdNodeFields(node, name, input, "Cast");
   AddIntAttribute(node, "to", type);
   return out;
@@ -480,7 +520,7 @@ std::string OnnxBuilder::ReduceMean(const std::string& name,
                                     const std::string& input,
                                     std::initializer_list<int> axes,
                                     bool keepdims) {
-  auto* node = model_.mutable_graph()->add_node();
+  auto* node = TargetGraph()->add_node();
   auto out = PopulateStdNodeFields(node, name, input, "ReduceMean");
   if (opset_ < 18) {
     AddIntsAttribute(node, "axes", axes);
@@ -492,6 +532,96 @@ std::string OnnxBuilder::ReduceMean(const std::string& name,
   }
   AddIntAttribute(node, "keepdims", keepdims);
   return out;
+}
+
+std::vector<std::string> OnnxBuilder::Scan(
+    const std::string& name, const std::vector<ScanIO>& states,
+    const std::vector<ScanIO>& scan_inputs, int axis,
+    const std::vector<std::vector<int>>& scan_output_dims,
+    const std::function<
+        std::pair<std::vector<std::string>, std::vector<std::string>>(
+            OnnxBuilder*, const std::vector<std::string>&,
+            const std::vector<std::string>&)>& body) {
+  if (opset_ < 9) {
+    throw Exception("The Scan operator requires ONNX opset 9 or later.");
+  }
+  if (subgraph_) {
+    throw Exception("Nested Scan bodies are not supported.");
+  }
+
+  // Build the body into a standalone graph first. Keeping it local (rather
+  // than writing straight into the node's attribute) means adding
+  // initializers, which grow the main graph, cannot invalidate the pointer
+  // we are appending body nodes through.
+  pblczero::GraphProto body_graph;
+  body_graph.set_name(name + "/body");
+
+  std::vector<std::string> body_state_names;
+  for (size_t i = 0; i < states.size(); i++) {
+    auto edge = name + "/body/state" + std::to_string(i);
+    FillValueInfoV(body_graph.add_input(), edge, states[i].dims,
+                   pblczero::TensorProto::FLOAT);
+    body_state_names.push_back(edge);
+  }
+  std::vector<std::string> body_input_names;
+  for (size_t i = 0; i < scan_inputs.size(); i++) {
+    auto edge = name + "/body/in" + std::to_string(i);
+    FillValueInfoV(body_graph.add_input(), edge, scan_inputs[i].dims,
+                   pblczero::TensorProto::FLOAT);
+    body_input_names.push_back(edge);
+  }
+
+  subgraph_ = &body_graph;
+  std::vector<std::string> new_states;
+  std::vector<std::string> scan_outputs;
+  try {
+    auto result = body(this, body_state_names, body_input_names);
+    new_states = std::move(result.first);
+    scan_outputs = std::move(result.second);
+  } catch (...) {
+    subgraph_ = nullptr;
+    throw;
+  }
+  subgraph_ = nullptr;
+
+  if (new_states.size() != states.size()) {
+    throw Exception("Scan body returned the wrong number of states.");
+  }
+  if (scan_outputs.size() != scan_output_dims.size()) {
+    throw Exception("Scan body returned the wrong number of scan outputs.");
+  }
+  for (size_t i = 0; i < new_states.size(); i++) {
+    FillValueInfoV(body_graph.add_output(), new_states[i], states[i].dims,
+                   pblczero::TensorProto::FLOAT);
+  }
+  for (size_t i = 0; i < scan_outputs.size(); i++) {
+    FillValueInfoV(body_graph.add_output(), scan_outputs[i],
+                   scan_output_dims[i], pblczero::TensorProto::FLOAT);
+  }
+
+  auto* node = TargetGraph()->add_node();
+  node->set_name(name);
+  node->set_op_type("Scan");
+  for (const auto& state : states) node->add_input(state.name);
+  for (const auto& input : scan_inputs) node->add_input(input.name);
+
+  std::vector<std::string> outputs;
+  for (size_t i = 0; i < states.size(); i++) {
+    outputs.push_back(name + "/state_out" + std::to_string(i));
+  }
+  for (size_t i = 0; i < scan_output_dims.size(); i++) {
+    outputs.push_back(name + "/out" + std::to_string(i));
+  }
+  for (const auto& output : outputs) node->add_output(output);
+
+  AddIntAttribute(node, "num_scan_inputs",
+                  static_cast<int>(scan_inputs.size()));
+  AddIntsAttribute(node, "scan_input_axes",
+                   std::vector<int>(scan_inputs.size(), axis));
+  AddIntsAttribute(node, "scan_output_axes",
+                   std::vector<int>(scan_output_dims.size(), axis));
+  AddGraphAttribute(node, "body", body_graph);
+  return outputs;
 }
 
 }  // namespace lczero
