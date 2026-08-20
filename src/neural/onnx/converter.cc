@@ -32,6 +32,8 @@
 #include <cstddef>
 #include <initializer_list>
 #include <memory>
+#include <utility>
+#include <vector>
 
 #include "neural/loader.h"
 #include "neural/network.h"
@@ -784,160 +786,185 @@ std::string Converter::MakeKdaMixer(OnnxBuilder* builder,
         {INT_MAX, INT_MAX, (g + 1) * heads_per_direction, last_dim});
   };
 
-  std::vector<std::string> group_outputs(direction_count);
+  // The recurrence is expressed as a single Scan over the 64 board squares
+  // rather than unrolled, which keeps the exported graph a few hundred nodes
+  // instead of tens of thousands (an unrolled 8-direction KDA layer emits
+  // ~25k nodes, enough to make the model unloadable in viewers and very slow
+  // for ONNX Runtime to optimize).
+  //
+  // Every head runs the same recurrence and differs only in the order the
+  // squares are fed in, so each direction group is gathered into its own
+  // traversal order first and the groups are then concatenated back along the
+  // head axis. Group g owns heads [g*heads_per_direction, (g+1)*...), so that
+  // concatenation restores the original head order and the per-head constants
+  // (dt_bias, exp(a_log)) can be used unpermuted.
+  if (options_.opset < 9) {
+    throw Exception(
+        "Exporting KDA networks requires ONNX opset 9 or later (Scan); "
+        "pass --onnx-opset=9 or higher.");
+  }
+
+  std::vector<std::string> q_parts, k_parts, v_parts, decay_parts, beta_parts;
   for (int g = 0; g < direction_count; ++g) {
     const std::string gname = name + "/dir" + std::to_string(g);
     const int direction = directions[g];
-    auto q_g = slice_heads(q4, key_dim, g, gname + "/q");
-    auto k_g = slice_heads(k4, key_dim, g, gname + "/k");
-    auto v_g = slice_heads(v4, value_dim, g, gname + "/v");
-    auto decay_g = slice_heads(raw_decay4, key_dim, g, gname + "/decay");
-    auto beta_g = slice_heads(beta4, 1, g, gname + "/beta");
-
-    // dt_bias and the per-head decay scale (exp(a_log)) are trained
-    // per-head scalars/vectors, known at conversion time -- baked as plain
-    // constants rather than emitted as Exp nodes over a weight tensor.
-    std::vector<float> dt_bias_g(heads_per_direction * key_dim);
-    std::vector<float> neg_decay_scale_g(heads_per_direction);
-    for (int h = 0; h < heads_per_direction; ++h) {
-      const int head = g * heads_per_direction + h;
-      neg_decay_scale_g[h] = -std::exp(kda.a_log[head]);
-      for (int kk = 0; kk < key_dim; ++kk) {
-        dt_bias_g[h * key_dim + kk] = kda.dt_bias[head * key_dim + kk];
-      }
-    }
-    auto dt_bias_const = builder->AddInitializer(
-        gname + "/dt_bias",
-        *GetWeghtsConverter(dt_bias_g, {1, heads_per_direction, key_dim}));
-    auto neg_decay_scale_const = builder->AddInitializer(
-        gname + "/neg_decay_scale",
-        *GetWeghtsConverter(neg_decay_scale_g, {1, heads_per_direction, 1}));
-
-    auto batch_shape = builder->Concat(
-        gname + "/state/shape",
-        {builder->Slice(gname + "/state/batch",
-                        builder->Shape(gname + "/state/in_shape", q_g), {0},
-                        {1}),
-         builder->AddInitializer(
-             gname + "/state/shape/tail",
-             Int64OnnxConst({heads_per_direction, key_dim, value_dim}, {3}))},
-        0);
-    std::string state = builder->Expand(
-        gname + "/state/init",
-        builder->AddInitializer(gname + "/state/zero",
-                                FloatOnnxConst({0.0f}, {1, 1, 1, 1})),
-        batch_shape);
-
-    std::vector<std::string> token_outputs(64);
+    std::vector<int64_t> order(64);
     for (int token = 0; token < 64; ++token) {
-      const int square = KdaSquareForToken(direction, token);
-      const std::string tname =
-          gname + "/t" + std::to_string(token);
-      auto idx_const = builder->AddInitializer(
-          tname + "/index",
-          Int64OnnxConst(std::vector<int64_t>{square}, {1}));
-      auto gather4 = [&](const std::string& flow, int last_dim,
-                         const std::string& gtname) {
-        auto g4 = builder->Gather(gtname + "/gather", flow, idx_const, 1);
-        return builder->Reshape(
-            gtname, g4,
-            builder->AddInitializer(
-                gtname + "/shape",
-                Int64OnnxConst({-1, heads_per_direction, last_dim}, {3})));
-      };
-      auto q_t = gather4(q_g, key_dim, tname + "/q");
-      auto k_t = gather4(k_g, key_dim, tname + "/k");
-      auto v_t = gather4(v_g, value_dim, tname + "/v");
-      auto decay_t = gather4(decay_g, key_dim, tname + "/decay");
-      auto beta_t = gather4(beta_g, 1, tname + "/beta");
-
-      auto q_norm_sq = MakeReduceSum(builder, builder->Mul(tname + "/q/sq", q_t, q_t),
-                                     2, key_dim, true, tname + "/q/norm_sq");
-      auto q_norm = builder->Reciprocal(
-          tname + "/q/norm_recip",
-          builder->Sqrt(tname + "/q/norm_sqrt",
-                        MakeScalarLowerClamp(builder, q_norm_sq, 1e-12f,
-                                             tname + "/q/norm_clamp")));
-      auto k_norm_sq = MakeReduceSum(builder, builder->Mul(tname + "/k/sq", k_t, k_t),
-                                     2, key_dim, true, tname + "/k/norm_sq");
-      auto k_norm = builder->Reciprocal(
-          tname + "/k/norm_recip",
-          builder->Sqrt(tname + "/k/norm_sqrt",
-                        MakeScalarLowerClamp(builder, k_norm_sq, 1e-12f,
-                                             tname + "/k/norm_clamp")));
-
-      auto decay_x = builder->Add(tname + "/decay/x", decay_t, dt_bias_const);
-      auto softplus = builder->Softplus(tname + "/decay/softplus", decay_x);
-      auto neg_scaled =
-          builder->Mul(tname + "/decay/scaled", softplus, neg_decay_scale_const);
-      auto log_decay = MakeScalarLowerClamp(builder, neg_scaled, kLogDecayFloor,
-                                            tname + "/decay/floor");
-      auto decay = builder->Exp(tname + "/decay/exp", log_decay);
-      auto decay4 = builder->Reshape(
-          tname + "/decay/reshape4", decay,
-          builder->AddInitializer(
-              tname + "/decay/reshape4/shape",
-              Int64OnnxConst({-1, heads_per_direction, key_dim, 1}, {4})));
-      state = builder->Mul(tname + "/state/decay", state, decay4);
-
-      auto k_normed = builder->Mul(tname + "/k/normed", k_t, k_norm);
-      auto k_normed4 = builder->Reshape(
-          tname + "/k/normed4", k_normed,
-          builder->AddInitializer(
-              tname + "/k/normed4/shape",
-              Int64OnnxConst({-1, heads_per_direction, key_dim, 1}, {4})));
-      auto prediction =
-          MakeReduceSum(builder, builder->Mul(tname + "/predict/mul", k_normed4, state),
-                       2, key_dim, false, tname + "/predict");
-      auto update_rate = builder->Sigmoid(tname + "/beta/sigmoid", beta_t);
-      auto delta = builder->Mul(
-          tname + "/delta", update_rate,
-          builder->Sub(tname + "/delta/diff", v_t, prediction));
-      auto delta4 = builder->Reshape(
-          tname + "/delta4", delta,
-          builder->AddInitializer(
-              tname + "/delta4/shape",
-              Int64OnnxConst({-1, heads_per_direction, 1, value_dim}, {4})));
-      auto update = builder->Mul(tname + "/update", k_normed4, delta4);
-      state = builder->Add(tname + "/state/update", state, update);
-
-      auto q_scale = builder->Mul(tname + "/q/scale", q_norm,
-                                  *GetScalarConverter(scale));
-      auto q_normed = builder->Mul(tname + "/q/normed", q_t, q_scale);
-      auto q_normed4 = builder->Reshape(
-          tname + "/q/normed4", q_normed,
-          builder->AddInitializer(
-              tname + "/q/normed4/shape",
-              Int64OnnxConst({-1, heads_per_direction, key_dim, 1}, {4})));
-      auto out_t =
-          MakeReduceSum(builder, builder->Mul(tname + "/out/mul", q_normed4, state),
-                       2, key_dim, false, tname + "/out");
-      token_outputs[token] = builder->Reshape(
-          tname + "/out/reshape4", out_t,
-          builder->AddInitializer(
-              tname + "/out/reshape4/shape",
-              Int64OnnxConst({-1, 1, heads_per_direction, value_dim}, {4})));
+      order[token] = KdaSquareForToken(direction, token);
     }
+    auto order_const = builder->AddInitializer(
+        gname + "/order", Int64OnnxConst(order, {64}));
+    auto reorder = [&](const std::string& flow, int last_dim,
+                       const std::string& rname) {
+      return builder->Gather(rname, slice_heads(flow, last_dim, g, rname + "/heads"),
+                             order_const, 1);
+    };
+    q_parts.push_back(reorder(q4, key_dim, gname + "/q"));
+    k_parts.push_back(reorder(k4, key_dim, gname + "/k"));
+    v_parts.push_back(reorder(v4, value_dim, gname + "/v"));
+    decay_parts.push_back(reorder(raw_decay4, key_dim, gname + "/decay"));
+    beta_parts.push_back(reorder(beta4, 1, gname + "/beta"));
+  }
 
-    auto token_major =
-        builder->Concat(gname + "/token_major", token_outputs, 1);
-    // Inverse permutation: token_major is ordered by token index (i.e. by
-    // traversal order); square_order[token] = square, so inv_order[square]
-    // = token recovers natural square-major order in one Gather, the same
-    // trick the trainer uses (tf.argsort(order)) -- see
-    // kda-feature-comparison.txt.
+  auto join = [&](const std::vector<std::string>& parts,
+                  const std::string& jname) {
+    return parts.size() == 1 ? parts[0] : builder->Concat(jname, parts, 2);
+  };
+  auto q_scan = join(q_parts, name + "/scan/q");
+  auto k_scan = join(k_parts, name + "/scan/k");
+  auto v_scan = join(v_parts, name + "/scan/v");
+  auto decay_scan = join(decay_parts, name + "/scan/decay");
+  auto beta_scan = join(beta_parts, name + "/scan/beta");
+
+  std::vector<float> dt_bias_all(kda.dt_bias.begin(),
+                                 kda.dt_bias.begin() + heads * key_dim);
+  std::vector<float> neg_decay_scale_all(heads);
+  for (int head = 0; head < heads; ++head) {
+    neg_decay_scale_all[head] = -std::exp(kda.a_log[head]);
+  }
+  auto dt_bias_const = builder->AddInitializer(
+      name + "/dt_bias",
+      *GetWeghtsConverter(dt_bias_all, {1, heads, key_dim}));
+  auto neg_decay_scale_const = builder->AddInitializer(
+      name + "/neg_decay_scale",
+      *GetWeghtsConverter(neg_decay_scale_all, {1, heads, 1}));
+
+  auto state_shape = builder->Concat(
+      name + "/state/shape",
+      {builder->Slice(name + "/state/batch",
+                      builder->Shape(name + "/state/in_shape", q_scan), {0},
+                      {1}),
+       builder->AddInitializer(
+           name + "/state/shape/tail",
+           Int64OnnxConst({heads, key_dim, value_dim}, {3}))},
+      0);
+  auto state_init = builder->Expand(
+      name + "/state/init",
+      builder->AddInitializer(name + "/state/zero",
+                              FloatOnnxConst({0.0f}, {1, 1, 1, 1})),
+      state_shape);
+
+  // Shapes used inside the body. The batch dimension stays dynamic (-1).
+  auto state4_shape = builder->AddInitializer(
+      name + "/body/state4/shape",
+      Int64OnnxConst({-1, heads, key_dim, 1}, {4}));
+  auto delta4_shape = builder->AddInitializer(
+      name + "/body/delta4/shape",
+      Int64OnnxConst({-1, heads, 1, value_dim}, {4}));
+
+  const std::string bname = name + "/body";
+  auto scan_out = builder->Scan(
+      name + "/scan",
+      {{state_init, {-1, heads, key_dim, value_dim}}},
+      {{q_scan, {-1, heads, key_dim}},
+       {k_scan, {-1, heads, key_dim}},
+       {v_scan, {-1, heads, value_dim}},
+       {decay_scan, {-1, heads, key_dim}},
+       {beta_scan, {-1, heads, 1}}},
+      1, {{-1, heads, value_dim}},
+      [&](OnnxBuilder* b, const std::vector<std::string>& states,
+          const std::vector<std::string>& inputs) {
+        const std::string& state = states[0];
+        const std::string& q_t = inputs[0];
+        const std::string& k_t = inputs[1];
+        const std::string& v_t = inputs[2];
+        const std::string& decay_t = inputs[3];
+        const std::string& beta_t = inputs[4];
+
+        auto q_norm_sq = MakeReduceSum(b, b->Mul(bname + "/q/sq", q_t, q_t), 2,
+                                       key_dim, true, bname + "/q/norm_sq");
+        auto q_norm = b->Reciprocal(
+            bname + "/q/norm_recip",
+            b->Sqrt(bname + "/q/norm_sqrt",
+                    MakeScalarLowerClamp(b, q_norm_sq, 1e-12f,
+                                         bname + "/q/norm_clamp")));
+        auto k_norm_sq = MakeReduceSum(b, b->Mul(bname + "/k/sq", k_t, k_t), 2,
+                                       key_dim, true, bname + "/k/norm_sq");
+        auto k_norm = b->Reciprocal(
+            bname + "/k/norm_recip",
+            b->Sqrt(bname + "/k/norm_sqrt",
+                    MakeScalarLowerClamp(b, k_norm_sq, 1e-12f,
+                                         bname + "/k/norm_clamp")));
+
+        auto decay_x = b->Add(bname + "/decay/x", decay_t, dt_bias_const);
+        auto softplus = b->Softplus(bname + "/decay/softplus", decay_x);
+        auto neg_scaled =
+            b->Mul(bname + "/decay/scaled", softplus, neg_decay_scale_const);
+        auto log_decay = MakeScalarLowerClamp(b, neg_scaled, kLogDecayFloor,
+                                              bname + "/decay/floor");
+        auto decay = b->Exp(bname + "/decay/exp", log_decay);
+        auto decay4 = b->Reshape(bname + "/decay/reshape4", decay,
+                                 state4_shape);
+        auto decayed = b->Mul(bname + "/state/decay", state, decay4);
+
+        auto k_normed = b->Mul(bname + "/k/normed", k_t, k_norm);
+        auto k_normed4 =
+            b->Reshape(bname + "/k/normed4", k_normed, state4_shape);
+        auto prediction =
+            MakeReduceSum(b, b->Mul(bname + "/predict/mul", k_normed4, decayed),
+                          2, key_dim, false, bname + "/predict");
+        auto update_rate = b->Sigmoid(bname + "/beta/sigmoid", beta_t);
+        auto delta = b->Mul(bname + "/delta", update_rate,
+                            b->Sub(bname + "/delta/diff", v_t, prediction));
+        auto delta4 = b->Reshape(bname + "/delta4", delta, delta4_shape);
+        auto new_state =
+            b->Add(bname + "/state/update", decayed,
+                   b->Mul(bname + "/update", k_normed4, delta4));
+
+        auto q_scale =
+            b->Mul(bname + "/q/scale", q_norm, *GetScalarConverter(scale));
+        auto q_normed = b->Mul(bname + "/q/normed", q_t, q_scale);
+        auto q_normed4 =
+            b->Reshape(bname + "/q/normed4", q_normed, state4_shape);
+        auto out_t =
+            MakeReduceSum(b, b->Mul(bname + "/out/mul", q_normed4, new_state),
+                          2, key_dim, false, bname + "/out");
+        return std::make_pair(std::vector<std::string>{new_state},
+                              std::vector<std::string>{out_t});
+      });
+  // scan_out[0] is the final state, which is not needed.
+  const std::string& token_major = scan_out[1];
+
+  // Undo each group's traversal order to get back to square-major layout.
+  // inv_order[square] = token, the same argsort the trainer applies.
+  std::vector<std::string> group_outputs(direction_count);
+  for (int g = 0; g < direction_count; ++g) {
+    const std::string gname = name + "/dir" + std::to_string(g);
     std::vector<int64_t> inv_order(64);
     for (int token = 0; token < 64; ++token) {
-      inv_order[KdaSquareForToken(direction, token)] = token;
+      inv_order[KdaSquareForToken(directions[g], token)] = token;
     }
     group_outputs[g] = builder->Gather(
-        gname + "/square_major", token_major,
+        gname + "/square_major",
+        slice_heads(token_major, value_dim, g, gname + "/out/heads"),
         builder->AddInitializer(gname + "/inv_order",
                                 Int64OnnxConst(inv_order, {64})),
         1);
   }
 
-  auto mixed4 = builder->Concat(name + "/mixed4", group_outputs, 2);
+  auto mixed4 = direction_count == 1
+                    ? group_outputs[0]
+                    : builder->Concat(name + "/mixed4", group_outputs, 2);
   auto mixed = builder->Reshape(
       name + "/mixed", mixed4,
       builder->AddInitializer(name + "/mixed/shape",

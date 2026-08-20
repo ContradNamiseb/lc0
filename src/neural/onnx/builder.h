@@ -27,8 +27,11 @@
 
 #pragma once
 
+#include <functional>
 #include <initializer_list>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "proto/onnx.pb.h"
 
@@ -126,14 +129,52 @@ class OnnxBuilder {
                    pblczero::TensorProto::DataType type);
   std::string ReduceMean(const std::string& name, const std::string& input,
                          std::initializer_list<int> axes, bool keepdims = true);
+
+  // One input or output of a Scan body subgraph: the tensor name in the
+  // enclosing graph, plus the shape it has *inside* the body. For a scan
+  // input that is the shape with the scanned axis removed; for a loop-carried
+  // state it is the full state shape. Use -1 for the dynamic batch dimension.
+  struct ScanIO {
+    std::string name;
+    std::vector<int> dims;
+  };
+  // Emits a Scan node (requires opset >= 9), used to express a recurrence
+  // without unrolling it into the graph.
+  //
+  // @states are loop-carried dependencies: the values passed in are the
+  // initial states, and @body must return one new value for each.
+  // @scan_inputs are sliced along @axis, one slice per iteration.
+  // @body is invoked exactly once to populate the body subgraph. It receives
+  // the body-local edge names of the states and of the current input slices,
+  // and returns {new_states, scan_outputs}. Nodes it creates land in the body,
+  // while any initializer it adds goes to the main graph and is reached from
+  // the body by ONNX's outer-scope name resolution.
+  //
+  // Returns the Scan node's outputs: the final states, followed by the scan
+  // outputs stacked along @axis.
+  std::vector<std::string> Scan(
+      const std::string& name, const std::vector<ScanIO>& states,
+      const std::vector<ScanIO>& scan_inputs, int axis,
+      const std::vector<std::vector<int>>& scan_output_dims,
+      const std::function<
+          std::pair<std::vector<std::string>, std::vector<std::string>>(
+              OnnxBuilder*, const std::vector<std::string>&,
+              const std::vector<std::string>&)>& body);
+
   // Returns ONNX model as protobuf.
   const pblczero::ModelProto& as_proto() const { return model_; }
   // Returns serialized model.
   std::string OutputAsString() const { return model_.OutputAsString(); }
 
  private:
+  // Graph that newly created nodes are appended to. This is the model's main
+  // graph except while Scan() is populating a body subgraph. Initializers are
+  // deliberately not redirected -- they always live in the main graph.
+  pblczero::GraphProto* TargetGraph();
+
   const int opset_;
   pblczero::ModelProto model_;
+  pblczero::GraphProto* subgraph_ = nullptr;
 };
 
 }  // namespace lczero
