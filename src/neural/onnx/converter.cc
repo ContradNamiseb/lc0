@@ -50,6 +50,61 @@
 namespace lczero {
 namespace {
 
+// Traversal order of the 64 squares for each KdaDirection value. Kept in
+// sync with the identical function of the same name in
+// src/neural/backends/blas/network_blas.cc (itself commented "Must match
+// KDA_TRAVERSALS in the trainer") -- duplicated rather than shared across a
+// translation-unit boundary since it's a small, stable, pure function and
+// the ONNX converter has no other dependency on the BLAS backend.
+int KdaSquareForToken(int direction, int token) {
+  switch (direction) {
+    case 1:
+      return token;
+    case 2:
+      return 63 - token;
+    case 3:
+      return (token % 8) * 8 + token / 8;
+    case 4: {
+      const int reverse = 63 - token;
+      return (reverse % 8) * 8 + reverse / 8;
+    }
+    case 5: {
+      static constexpr int kTable[64] = {
+          7,  6,  15, 5,  14, 23, 4,  13, 22, 31, 3,  12, 21, 30, 39, 2,
+          11, 20, 29, 38, 47, 1,  10, 19, 28, 37, 46, 55, 0,  9,  18, 27,
+          36, 45, 54, 63, 8,  17, 26, 35, 44, 53, 62, 16, 25, 34, 43, 52,
+          61, 24, 33, 42, 51, 60, 32, 41, 50, 59, 40, 49, 58, 48, 57, 56};
+      return kTable[token];
+    }
+    case 6: {
+      static constexpr int kTable[64] = {
+          56, 57, 48, 58, 49, 40, 59, 50, 41, 32, 60, 51, 42, 33, 24, 61,
+          52, 43, 34, 25, 16, 62, 53, 44, 35, 26, 17, 8,  63, 54, 45, 36,
+          27, 18, 9,  0,  55, 46, 37, 28, 19, 10, 1,  47, 38, 29, 20, 11,
+          2,  39, 30, 21, 12, 3,  31, 22, 13, 4,  23, 14, 5,  15, 6,  7};
+      return kTable[token];
+    }
+    case 7: {
+      static constexpr int kTable[64] = {
+          0,  1,  8,  2,  9,  16, 3,  10, 17, 24, 4,  11, 18, 25, 32, 5,
+          12, 19, 26, 33, 40, 6,  13, 20, 27, 34, 41, 48, 7,  14, 21, 28,
+          35, 42, 49, 56, 15, 22, 29, 36, 43, 50, 57, 23, 30, 37, 44, 51,
+          58, 31, 38, 45, 52, 59, 39, 46, 53, 60, 47, 54, 61, 55, 62, 63};
+      return kTable[token];
+    }
+    case 8: {
+      static constexpr int kTable[64] = {
+          63, 62, 55, 61, 54, 47, 60, 53, 46, 39, 59, 52, 45, 38, 31, 58,
+          51, 44, 37, 30, 23, 57, 50, 43, 36, 29, 22, 15, 56, 49, 42, 35,
+          28, 21, 14, 7,  48, 41, 34, 27, 20, 13, 6,  40, 33, 26, 19, 12,
+          5,  32, 25, 18, 11, 4,  24, 17, 10, 3,  16, 9,  2,  8,  1,  0};
+      return kTable[token];
+    }
+    default:
+      throw Exception("Unsupported KDA traversal direction.");
+  }
+}
+
 class Converter {
  public:
   Converter(const pblczero::Net& net,
@@ -124,6 +179,47 @@ class Converter {
                           int embedding_size, int heads,
                           const std::string& encoder_in,
                           const std::string& name);
+
+  // Unrolled ONNX graph for the KDA mixer. Mirrors
+  // BlasComputation::ForwardKdaMixer (network_blas.cc) exactly: per-head
+  // gated delta-rule recurrence over the 64 board squares, traversed in one
+  // of 8 fixed orders depending on which direction group the head belongs
+  // to. ONNX has no native sequential-scan op usable here without pulling in
+  // Loop/Scan (deliberately avoided to keep this in the same unrolled style
+  // as the rest of this file), so each of the 64 steps is emitted as its own
+  // chain of ops per direction group; heads in the same direction group are
+  // batched together as one tensor axis since their traversal order is
+  // identical, so only the token dimension is actually unrolled.
+  std::string MakeKdaMixer(OnnxBuilder* builder,
+                           const MultiHeadWeights::EncoderLayer& layer,
+                           int embedding_size, int heads,
+                           const std::string& encoder_in,
+                           const std::string& name);
+
+  // 3x3 zero-padded depthwise board convolution (residual), used by
+  // MakeKdaMixer when kda.local_conv is set. Same 9-tap unrolled approach as
+  // MakeKdaMixer's token loop: no groups-aware Conv wrapper exists in this
+  // file, and adding one would affect every other backend's conv path, so
+  // this stays local to KDA and uses the same zero-pad-row + Gather trick as
+  // the per-token square lookup, applied per (kernel-row, kernel-col) tap.
+  std::string MakeKdaLocalConv(OnnxBuilder* builder,
+                               const MultiHeadWeights::KDA& kda,
+                               int embedding_size, const std::string& input,
+                               const std::string& name);
+
+  // Clamps a tensor from below against a compile-time-known scalar. Builder
+  // has no direct Max op; Greater only accepts a constant second operand, so
+  // this is the composition the rest of this file already leans on
+  // elsewhere for similar clamps.
+  std::string MakeScalarLowerClamp(OnnxBuilder* builder,
+                                   const std::string& input, float floor,
+                                   const std::string& name);
+
+  // Sum over `axis`, built as ReduceMean * axis_size since builder has no
+  // ReduceSum. `axis_size` must be the static size of that axis.
+  std::string MakeReduceSum(OnnxBuilder* builder, const std::string& input,
+                            int axis, int axis_size, bool keepdims,
+                            const std::string& name);
 
   std::string MakeLayerNorm(OnnxBuilder* builder, const std::string& input,
                             const std::string& name,
@@ -508,17 +604,399 @@ std::string Converter::MakeFFN(OnnxBuilder* builder,
   return flow;
 }
 
+std::string Converter::MakeScalarLowerClamp(OnnxBuilder* builder,
+                                            const std::string& input,
+                                            float floor,
+                                            const std::string& name) {
+  auto cond = builder->Greater(name + "/cond", input, *GetScalarConverter(floor));
+  return builder->Where(name, cond, input,
+                        builder->AddInitializer(name + "/floor",
+                                                *GetScalarConverter(floor)));
+}
+
+std::string Converter::MakeReduceSum(OnnxBuilder* builder,
+                                     const std::string& input, int axis,
+                                     int axis_size, bool keepdims,
+                                     const std::string& name) {
+  auto mean = builder->ReduceMean(name + "/mean", input, {axis}, keepdims);
+  return builder->Mul(name, mean, *GetScalarConverter(static_cast<float>(axis_size)));
+}
+
+std::string Converter::MakeKdaLocalConv(OnnxBuilder* builder,
+                                        const MultiHeadWeights::KDA& kda,
+                                        int embedding_size,
+                                        const std::string& input,
+                                        const std::string& name) {
+  // input is [tokens, embedding_size] (tokens = batch * 64, flattened, same
+  // convention as encoder_in elsewhere in this file).
+  auto shaped = builder->Reshape(
+      name + "/reshape_in", input,
+      builder->AddInitializer(name + "/reshape_in/shape",
+                              Int64OnnxConst({-1, 64, embedding_size}, {3})));
+  // Zero-padded row appended at square index 64, used as the "off the board"
+  // neighbour for edge/corner squares -- same trick as a one-past-the-end
+  // sentinel, since Gather has no bounds-checked/masked variant here.
+  auto batch = builder->Slice(name + "/batch",
+                              builder->Shape(name + "/shape", shaped), {0}, {1});
+  auto zero_row_shape = builder->Concat(
+      name + "/zero_row_shape",
+      {batch, builder->AddInitializer(
+                 name + "/zero_row_shape/tail",
+                 Int64OnnxConst({1, embedding_size}, {2}))},
+      0);
+  auto zero_row = builder->Expand(
+      name + "/zero_row",
+      builder->AddInitializer(name + "/zero_scalar",
+                              FloatOnnxConst({0.0f}, {1, 1, 1})),
+      zero_row_shape);
+  auto padded = builder->Concat(name + "/padded", {shaped, zero_row}, 1);
+
+  std::string conv_sum;
+  for (int kr = 0; kr < 3; ++kr) {
+    for (int kf = 0; kf < 3; ++kf) {
+      const int tap = kr * 3 + kf;
+      std::vector<int64_t> idx(64);
+      for (int square = 0; square < 64; ++square) {
+        const int rank = square / 8;
+        const int file = square % 8;
+        const int nr = rank + kr - 1;
+        const int nf = file + kf - 1;
+        idx[square] = (nr >= 0 && nr < 8 && nf >= 0 && nf < 8)
+                          ? static_cast<int64_t>(nr * 8 + nf)
+                          : int64_t{64};
+      }
+      const std::string tap_name = name + "/tap" + std::to_string(tap);
+      auto neighbour = builder->Gather(
+          tap_name + "/gather", padded,
+          builder->AddInitializer(tap_name + "/index",
+                                  Int64OnnxConst(idx, {64})),
+          1);
+      // local_conv_w layout (from the proto, see model-design.md): flattened
+      // [emb_size, 1, 3, 3] as w[c*9 + kr*3 + kf].
+      std::vector<float> tap_w(embedding_size);
+      for (int c = 0; c < embedding_size; ++c) {
+        tap_w[c] = kda.local_conv_w[c * 9 + tap];
+      }
+      auto weighted = builder->Mul(
+          tap_name + "/weighted", neighbour,
+          *GetWeghtsConverter(tap_w, {1, 1, embedding_size}));
+      conv_sum = conv_sum.empty()
+                     ? weighted
+                     : builder->Add(tap_name + "/accum", conv_sum, weighted);
+    }
+  }
+  if (!kda.local_conv_b.empty()) {
+    conv_sum = builder->Add(
+        name + "/bias", conv_sum,
+        *GetWeghtsConverter(kda.local_conv_b, {1, 1, embedding_size}));
+  }
+  auto with_conv = builder->Add(name + "/residual", shaped, conv_sum);
+  return builder->Reshape(
+      name + "/reshape_out", with_conv,
+      builder->AddInitializer(name + "/reshape_out/shape",
+                              Int64OnnxConst({-1, embedding_size}, {2})));
+}
+
+std::string Converter::MakeKdaMixer(OnnxBuilder* builder,
+                                    const MultiHeadWeights::EncoderLayer& layer,
+                                    int embedding_size, int heads,
+                                    const std::string& encoder_in,
+                                    const std::string& name) {
+  // Mirrors BlasComputation::ForwardKdaMixer (network_blas.cc) and
+  // EncoderBlock::EvalKda (sycl/layers.cc.dp.cpp) exactly -- see those for
+  // the derivation of each step. Reference: docs/model-design.md KDA
+  // section.
+  constexpr float kLogDecayFloor = -10.0f;
+  const auto& kda = layer.kda;
+  const int key_dim = kda.key_dim;
+  const int value_dim = kda.value_dim;
+  const int gate_rank = kda.gate_rank;
+  const int key_depth = heads * key_dim;
+  const int value_depth = heads * value_dim;
+  if (key_dim <= 0 || value_dim <= 0 || gate_rank <= 0) {
+    throw Exception("Invalid KDA dimensions.");
+  }
+  std::vector<int> directions(
+      src_.format().network_format().kda_directions().begin(),
+      src_.format().network_format().kda_directions().end());
+  const int direction_count = static_cast<int>(directions.size());
+  if (direction_count <= 0 || heads % direction_count != 0) {
+    throw Exception("KDA directions must evenly divide the encoder heads.");
+  }
+  if (kda.output_rms_norm && kda.out_norm_gammas.empty()) {
+    throw Exception(
+        "KDA output RMS norm requested but out_norm_gammas is missing.");
+  }
+  const int heads_per_direction = heads / direction_count;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(key_dim));
+
+  std::string proj_input = encoder_in;
+  if (kda.local_conv && !kda.local_conv_w.empty()) {
+    proj_input = MakeKdaLocalConv(builder, kda, embedding_size, encoder_in,
+                                  name + "/local_conv");
+  }
+
+  auto MakeProjection = [&](const MultiHeadWeights::Vec& w,
+                            const MultiHeadWeights::Vec& b, int out_dim,
+                            const std::string& proj_name) {
+    auto flow = builder->MatMul(
+        proj_name + "/w", proj_input,
+        *GetWeghtsConverter(w, {embedding_size, out_dim}, {1, 0}));
+    if (!b.empty()) {
+      flow = builder->Add(proj_name + "/b", flow,
+                          *GetWeghtsConverter(b, {out_dim}));
+    }
+    return flow;
+  };
+
+  auto q = MakeProjection(kda.q_w, kda.q_b, key_depth, name + "/q");
+  auto k = MakeProjection(kda.k_w, kda.k_b, key_depth, name + "/k");
+  auto v = MakeProjection(kda.v_w, kda.v_b, value_depth, name + "/v");
+  auto decay_hidden = MakeProjection(kda.decay_a_w, kda.decay_a_b, gate_rank,
+                                     name + "/decay_a");
+  auto raw_decay = builder->MatMul(
+      name + "/decay_b/w", decay_hidden,
+      *GetWeghtsConverter(kda.decay_b_w, {gate_rank, key_depth}, {1, 0}));
+  if (!kda.decay_b_b.empty()) {
+    raw_decay = builder->Add(name + "/decay_b/b", raw_decay,
+                             *GetWeghtsConverter(kda.decay_b_b, {key_depth}));
+  }
+  auto beta = MakeProjection(kda.beta_w, kda.beta_b, heads, name + "/beta");
+
+  auto reshape4 = [&](const std::string& flow, int last_dim,
+                      const std::string& rname) {
+    return builder->Reshape(
+        rname, flow,
+        builder->AddInitializer(
+            rname + "/shape",
+            Int64OnnxConst({-1, 64, heads, last_dim}, {4})));
+  };
+  auto q4 = reshape4(q, key_dim, name + "/q/reshape");
+  auto k4 = reshape4(k, key_dim, name + "/k/reshape");
+  auto v4 = reshape4(v, value_dim, name + "/v/reshape");
+  auto raw_decay4 = reshape4(raw_decay, key_dim, name + "/decay/reshape");
+  auto beta4 = reshape4(beta, 1, name + "/beta/reshape");
+
+  auto slice_heads = [&](const std::string& flow, int last_dim, int g,
+                         const std::string& sname) {
+    return builder->Slice(
+        sname, flow, {0, 0, g * heads_per_direction, 0},
+        {INT_MAX, INT_MAX, (g + 1) * heads_per_direction, last_dim});
+  };
+
+  std::vector<std::string> group_outputs(direction_count);
+  for (int g = 0; g < direction_count; ++g) {
+    const std::string gname = name + "/dir" + std::to_string(g);
+    const int direction = directions[g];
+    auto q_g = slice_heads(q4, key_dim, g, gname + "/q");
+    auto k_g = slice_heads(k4, key_dim, g, gname + "/k");
+    auto v_g = slice_heads(v4, value_dim, g, gname + "/v");
+    auto decay_g = slice_heads(raw_decay4, key_dim, g, gname + "/decay");
+    auto beta_g = slice_heads(beta4, 1, g, gname + "/beta");
+
+    // dt_bias and the per-head decay scale (exp(a_log)) are trained
+    // per-head scalars/vectors, known at conversion time -- baked as plain
+    // constants rather than emitted as Exp nodes over a weight tensor.
+    std::vector<float> dt_bias_g(heads_per_direction * key_dim);
+    std::vector<float> neg_decay_scale_g(heads_per_direction);
+    for (int h = 0; h < heads_per_direction; ++h) {
+      const int head = g * heads_per_direction + h;
+      neg_decay_scale_g[h] = -std::exp(kda.a_log[head]);
+      for (int kk = 0; kk < key_dim; ++kk) {
+        dt_bias_g[h * key_dim + kk] = kda.dt_bias[head * key_dim + kk];
+      }
+    }
+    auto dt_bias_const = builder->AddInitializer(
+        gname + "/dt_bias",
+        *GetWeghtsConverter(dt_bias_g, {1, heads_per_direction, key_dim}));
+    auto neg_decay_scale_const = builder->AddInitializer(
+        gname + "/neg_decay_scale",
+        *GetWeghtsConverter(neg_decay_scale_g, {1, heads_per_direction, 1}));
+
+    auto batch_shape = builder->Concat(
+        gname + "/state/shape",
+        {builder->Slice(gname + "/state/batch",
+                        builder->Shape(gname + "/state/in_shape", q_g), {0},
+                        {1}),
+         builder->AddInitializer(
+             gname + "/state/shape/tail",
+             Int64OnnxConst({heads_per_direction, key_dim, value_dim}, {3}))},
+        0);
+    std::string state = builder->Expand(
+        gname + "/state/init",
+        builder->AddInitializer(gname + "/state/zero",
+                                FloatOnnxConst({0.0f}, {1, 1, 1, 1})),
+        batch_shape);
+
+    std::vector<std::string> token_outputs(64);
+    for (int token = 0; token < 64; ++token) {
+      const int square = KdaSquareForToken(direction, token);
+      const std::string tname =
+          gname + "/t" + std::to_string(token);
+      auto idx_const = builder->AddInitializer(
+          tname + "/index",
+          Int64OnnxConst(std::vector<int64_t>{square}, {1}));
+      auto gather4 = [&](const std::string& flow, int last_dim,
+                         const std::string& gtname) {
+        auto g4 = builder->Gather(gtname + "/gather", flow, idx_const, 1);
+        return builder->Reshape(
+            gtname, g4,
+            builder->AddInitializer(
+                gtname + "/shape",
+                Int64OnnxConst({-1, heads_per_direction, last_dim}, {3})));
+      };
+      auto q_t = gather4(q_g, key_dim, tname + "/q");
+      auto k_t = gather4(k_g, key_dim, tname + "/k");
+      auto v_t = gather4(v_g, value_dim, tname + "/v");
+      auto decay_t = gather4(decay_g, key_dim, tname + "/decay");
+      auto beta_t = gather4(beta_g, 1, tname + "/beta");
+
+      auto q_norm_sq = MakeReduceSum(builder, builder->Mul(tname + "/q/sq", q_t, q_t),
+                                     2, key_dim, true, tname + "/q/norm_sq");
+      auto q_norm = builder->Reciprocal(
+          tname + "/q/norm_recip",
+          builder->Sqrt(tname + "/q/norm_sqrt",
+                        MakeScalarLowerClamp(builder, q_norm_sq, 1e-12f,
+                                             tname + "/q/norm_clamp")));
+      auto k_norm_sq = MakeReduceSum(builder, builder->Mul(tname + "/k/sq", k_t, k_t),
+                                     2, key_dim, true, tname + "/k/norm_sq");
+      auto k_norm = builder->Reciprocal(
+          tname + "/k/norm_recip",
+          builder->Sqrt(tname + "/k/norm_sqrt",
+                        MakeScalarLowerClamp(builder, k_norm_sq, 1e-12f,
+                                             tname + "/k/norm_clamp")));
+
+      auto decay_x = builder->Add(tname + "/decay/x", decay_t, dt_bias_const);
+      auto softplus = builder->Softplus(tname + "/decay/softplus", decay_x);
+      auto neg_scaled =
+          builder->Mul(tname + "/decay/scaled", softplus, neg_decay_scale_const);
+      auto log_decay = MakeScalarLowerClamp(builder, neg_scaled, kLogDecayFloor,
+                                            tname + "/decay/floor");
+      auto decay = builder->Exp(tname + "/decay/exp", log_decay);
+      auto decay4 = builder->Reshape(
+          tname + "/decay/reshape4", decay,
+          builder->AddInitializer(
+              tname + "/decay/reshape4/shape",
+              Int64OnnxConst({-1, heads_per_direction, key_dim, 1}, {4})));
+      state = builder->Mul(tname + "/state/decay", state, decay4);
+
+      auto k_normed = builder->Mul(tname + "/k/normed", k_t, k_norm);
+      auto k_normed4 = builder->Reshape(
+          tname + "/k/normed4", k_normed,
+          builder->AddInitializer(
+              tname + "/k/normed4/shape",
+              Int64OnnxConst({-1, heads_per_direction, key_dim, 1}, {4})));
+      auto prediction =
+          MakeReduceSum(builder, builder->Mul(tname + "/predict/mul", k_normed4, state),
+                       2, key_dim, false, tname + "/predict");
+      auto update_rate = builder->Sigmoid(tname + "/beta/sigmoid", beta_t);
+      auto delta = builder->Mul(
+          tname + "/delta", update_rate,
+          builder->Sub(tname + "/delta/diff", v_t, prediction));
+      auto delta4 = builder->Reshape(
+          tname + "/delta4", delta,
+          builder->AddInitializer(
+              tname + "/delta4/shape",
+              Int64OnnxConst({-1, heads_per_direction, 1, value_dim}, {4})));
+      auto update = builder->Mul(tname + "/update", k_normed4, delta4);
+      state = builder->Add(tname + "/state/update", state, update);
+
+      auto q_scale = builder->Mul(tname + "/q/scale", q_norm,
+                                  *GetScalarConverter(scale));
+      auto q_normed = builder->Mul(tname + "/q/normed", q_t, q_scale);
+      auto q_normed4 = builder->Reshape(
+          tname + "/q/normed4", q_normed,
+          builder->AddInitializer(
+              tname + "/q/normed4/shape",
+              Int64OnnxConst({-1, heads_per_direction, key_dim, 1}, {4})));
+      auto out_t =
+          MakeReduceSum(builder, builder->Mul(tname + "/out/mul", q_normed4, state),
+                       2, key_dim, false, tname + "/out");
+      token_outputs[token] = builder->Reshape(
+          tname + "/out/reshape4", out_t,
+          builder->AddInitializer(
+              tname + "/out/reshape4/shape",
+              Int64OnnxConst({-1, 1, heads_per_direction, value_dim}, {4})));
+    }
+
+    auto token_major =
+        builder->Concat(gname + "/token_major", token_outputs, 1);
+    // Inverse permutation: token_major is ordered by token index (i.e. by
+    // traversal order); square_order[token] = square, so inv_order[square]
+    // = token recovers natural square-major order in one Gather, the same
+    // trick the trainer uses (tf.argsort(order)) -- see
+    // kda-feature-comparison.txt.
+    std::vector<int64_t> inv_order(64);
+    for (int token = 0; token < 64; ++token) {
+      inv_order[KdaSquareForToken(direction, token)] = token;
+    }
+    group_outputs[g] = builder->Gather(
+        gname + "/square_major", token_major,
+        builder->AddInitializer(gname + "/inv_order",
+                                Int64OnnxConst(inv_order, {64})),
+        1);
+  }
+
+  auto mixed4 = builder->Concat(name + "/mixed4", group_outputs, 2);
+  auto mixed = builder->Reshape(
+      name + "/mixed", mixed4,
+      builder->AddInitializer(name + "/mixed/shape",
+                              Int64OnnxConst({-1, value_depth}, {2})));
+
+  if (kda.output_rms_norm) {
+    auto mean_sq = builder->ReduceMean(name + "/rmsnorm/mean_sq",
+                                       builder->Mul(name + "/rmsnorm/sq", mixed, mixed),
+                                       {1}, true);
+    auto factor = builder->Reciprocal(
+        name + "/rmsnorm/recip",
+        builder->Sqrt(name + "/rmsnorm/sqrt",
+                      builder->Add(name + "/rmsnorm/eps", mean_sq,
+                                  *GetScalarConverter(kda.rms_norm_epsilon))));
+    mixed = builder->Mul(
+        name + "/rmsnorm/scale", builder->Mul(name + "/rmsnorm/mul", mixed, factor),
+        *GetWeghtsConverter(kda.out_norm_gammas, {1, value_depth}));
+  }
+
+  if (kda.output_gate) {
+    auto gate_hidden = MakeProjection(kda.gate_a_w, kda.gate_a_b, gate_rank,
+                                      name + "/gate_a");
+    auto gate = builder->MatMul(
+        name + "/gate_b/w", gate_hidden,
+        *GetWeghtsConverter(kda.gate_b_w, {gate_rank, value_depth}, {1, 0}));
+    if (!kda.gate_b_b.empty()) {
+      gate = builder->Add(name + "/gate_b/b", gate,
+                          *GetWeghtsConverter(kda.gate_b_b, {value_depth}));
+    }
+    mixed = builder->Mul(name + "/gate", mixed,
+                         builder->Sigmoid(name + "/gate/sigmoid", gate));
+  }
+
+  auto output = builder->MatMul(
+      name + "/dense/w", mixed,
+      *GetWeghtsConverter(kda.dense_w, {value_depth, embedding_size}, {1, 0}));
+  if (!kda.dense_b.empty()) {
+    output = builder->Add(name + "/dense/b", output,
+                          *GetWeghtsConverter(kda.dense_b, {embedding_size}));
+  }
+  return output;
+}
+
 std::string Converter::MakeEncoderLayer(
     OnnxBuilder* builder, const MultiHeadWeights::EncoderLayer& layer,
     int embedding_size, int heads, const std::string& encoder_in,
     const std::string& name, ActivationFunction activation, float alpha) {
+  std::string flow;
+  if (layer.is_kda) {
+    flow = MakeKdaMixer(builder, layer, embedding_size, heads, encoder_in,
+                        name);
+  } else {
   const int d_model = layer.mha.q_b.size();
   const int depth = d_model / heads;
 
   auto mha_shape =
       builder->AddInitializer("/const" + name + "/mha/shape",
                               Int64OnnxConst({-1, 64, heads, depth}, {4}));
-  auto flow = builder->MatMul(
+  flow = builder->MatMul(
       name + "/mha/Q/w", encoder_in,
       *GetWeghtsConverter(layer.mha.q_w, {embedding_size, d_model}, {1, 0}));
   flow = builder->Add(name + "/mha/Q/b", flow,
@@ -562,6 +1040,7 @@ std::string Converter::MakeEncoderLayer(
                                           {d_model, embedding_size}, {1, 0}));
   flow = builder->Add(name + "/mha/out/dense/b", flow,
                       *GetWeghtsConverter(layer.mha.dense_b, {embedding_size}));
+  }
   if (alpha != 1.0) {
     flow =
         builder->Mul(name + "/alpha*input", flow, *GetScalarConverter(alpha));
@@ -1158,6 +1637,7 @@ void CheckSrcFormat(const pblczero::NetworkFormat& nf) {
     case pblczero::NetworkFormat::NETWORK_SE_WITH_HEADFORMAT:
     case pblczero::NetworkFormat::NETWORK_ATTENTIONBODY_WITH_HEADFORMAT:
     case pblczero::NetworkFormat::NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT:
+    case pblczero::NetworkFormat::NETWORK_KDA_HYBRID_WITH_MULTIHEADFORMAT:
       break;
     default:
       throw Exception(
