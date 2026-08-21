@@ -895,6 +895,19 @@ endif
   configure_file(output : 'trace_config.h',
                  configuration : trace_config)
 
+  ## ~~~~~~~~~
+  ## DirectMLX
+  ## ~~~~~~~~~
+  if get_option('directml')
+      has_backends = true
+      message('Building DirectMLX backend')
+      files += 'src/neural/backends/directml/network_directml.cc'
+      deps += cc.find_library('directml', required: true)
+      deps += cc.find_library('d3d12', required: true)
+      deps += cc.find_library('dxgi', required: true)
+      add_project_arguments('-DUSE_DIRECTML=1', language : 'cpp')
+  endif
+
   ## ~~~~~~~~
   ## Profiler
   ## ~~~~~~~~

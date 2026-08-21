@@ -269,3 +269,8 @@ option('nvcc',
        type: 'boolean',
        value: true,
        description: 'Use nvcc: required for cuda, optional for onnx')
+
+option('directml',
+       type: 'boolean',
+       value: false,
+       description: 'Enable native DirectMLX backend')
