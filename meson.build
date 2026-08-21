@@ -896,6 +896,24 @@ endif
                  configuration : trace_config)
 
   ## ~~~~~~~~
+  ## OpenVINO
+  ## ~~~~~~~~
+  if get_option('openvino')
+      has_backends = true
+      message('Building OpenVINO backend')
+      openvino_include = get_option('openvino_include')
+      openvino_libdirs = get_option('openvino_libdirs')
+      foreach inc : openvino_include
+        if run_command('scripts/checkdir.py', inc, check : false).returncode() == 0
+          includes += include_directories(inc, is_system: true)
+        endif
+      endforeach
+      files += 'src/neural/backends/openvino/network_openvino.cc'
+      deps += cc.find_library('openvino', dirs: openvino_libdirs, required: true)
+      add_project_arguments('-DUSE_OPENVINO=1', language : 'cpp')
+  endif
+
+  ## ~~~~~~~~
   ## Profiler
   ## ~~~~~~~~
   if get_option('buildtype') != 'release'

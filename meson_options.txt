@@ -269,3 +269,18 @@ option('nvcc',
        type: 'boolean',
        value: true,
        description: 'Use nvcc: required for cuda, optional for onnx')
+
+option('openvino',
+       type: 'boolean',
+       value: false,
+       description: 'Enable native OpenVINO backend')
+
+option('openvino_include',
+       type: 'array',
+       value: [],
+       description: 'Paths to OpenVINO include directories')
+
+option('openvino_libdirs',
+       type: 'array',
+       value: [],
+       description: 'Paths to OpenVINO library directories')
