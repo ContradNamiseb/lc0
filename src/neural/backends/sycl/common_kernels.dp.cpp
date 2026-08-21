@@ -2201,9 +2201,9 @@ void kdaRecurrenceValueParallel(
   sycl::range<2> local_range(1, value_dim);
 
   sycl_queue.submit([&](sycl::handler& cgh) {
-    sycl::local_accessor<float, 1> p_q(sycl::range<1>(key_dim), cgh);
-    sycl::local_accessor<float, 1> p_k(sycl::range<1>(key_dim), cgh);
-    sycl::local_accessor<float, 1> p_decay(sycl::range<1>(key_dim), cgh);
+    sycl::local_accessor<T, 1> p_q(sycl::range<1>(key_dim), cgh);
+    sycl::local_accessor<T, 1> p_k(sycl::range<1>(key_dim), cgh);
+    sycl::local_accessor<T, 1> p_decay(sycl::range<1>(key_dim), cgh);
 
     cgh.parallel_for(
         sycl::nd_range<2>(global_range, local_range),
@@ -2216,14 +2216,15 @@ void kdaRecurrenceValueParallel(
           const int direction_index = head / (heads / direction_count);
           const int direction = directions[direction_index];
 
-          const float scale = 1.0f / sycl::sqrt(static_cast<float>(key_dim));
+          const float scale_f = 1.0f / sycl::sqrt(static_cast<float>(key_dim));
+          const T scale = static_cast<T>(scale_f);
           const float decay_scale = sycl::exp(static_cast<float>(a_log[head]));
           const int key_depth = heads * key_dim;
           const int value_depth = heads * value_dim;
 
-          float state[32];
+          T state[32];
           for (int i = 0; i < key_dim && i < 32; ++i) {
-            state[i] = 0.0f;
+            state[i] = static_cast<T>(0.0f);
           }
 
           for (int token = 0; token < 64; ++token) {
@@ -2264,13 +2265,10 @@ void kdaRecurrenceValueParallel(
             const int raw_decay_offset = token_idx * key_depth + head * key_dim;
             const int value_offset = token_idx * value_depth + head * value_dim;
 
-            // Strided rather than a single `local_id < key_dim` guard: the
-            // work-group only has value_dim lanes, so when key_dim >
-            // value_dim a single pass would leave p_q/p_k/p_decay[value_dim,
-            // key_dim) unwritten and later read as garbage.
+            // Strided write into local memory
             for (int i = local_id; i < key_dim; i += value_dim) {
-              p_q[i] = static_cast<float>(q_ptr[i]);
-              p_k[i] = static_cast<float>(k_ptr[i]);
+              p_q[i] = q_ptr[i];
+              p_k[i] = k_ptr[i];
 
               const float decay_input =
                   static_cast<float>(raw_decay[raw_decay_offset + i]) +
@@ -2280,7 +2278,7 @@ void kdaRecurrenceValueParallel(
                   sycl::log1p(sycl::exp(-sycl::fabs(decay_input)));
               const float log_decay =
                   sycl::fmax(-decay_scale * softplus, log_decay_floor);
-              p_decay[i] = sycl::exp(log_decay);
+              p_decay[i] = static_cast<T>(sycl::exp(log_decay));
             }
 
             item.barrier(sycl::access::fence_space::local_space);
@@ -2288,46 +2286,40 @@ void kdaRecurrenceValueParallel(
             float q_norm_sq = 0.0f;
             float k_norm_sq = 0.0f;
             for (int key = 0; key < key_dim; ++key) {
-              q_norm_sq += p_q[key] * p_q[key];
-              k_norm_sq += p_k[key] * p_k[key];
+              const float q_val = static_cast<float>(p_q[key]);
+              const float k_val = static_cast<float>(p_k[key]);
+              q_norm_sq += q_val * q_val;
+              k_norm_sq += k_val * k_val;
             }
-            const float q_norm =
-                1.0f / sycl::sqrt(q_norm_sq > 1.0e-12f ? q_norm_sq : 1.0e-12f);
-            const float k_norm =
-                1.0f / sycl::sqrt(k_norm_sq > 1.0e-12f ? k_norm_sq : 1.0e-12f);
+            const T q_norm = static_cast<T>(
+                1.0f / sycl::sqrt(q_norm_sq > 1.0e-12f ? q_norm_sq : 1.0e-12f));
+            const T k_norm = static_cast<T>(
+                1.0f / sycl::sqrt(k_norm_sq > 1.0e-12f ? k_norm_sq : 1.0e-12f));
 
             for (int key = 0; key < key_dim; ++key) {
-              state[key] *= p_decay[key];
+              state[key] = state[key] * p_decay[key];
             }
 
             const float beta_value =
                 static_cast<float>(beta[token_idx * heads + head]);
-            const float update_rate = 1.0f / (1.0f + sycl::exp(-beta_value));
+            const T update_rate =
+                static_cast<T>(1.0f / (1.0f + sycl::exp(-beta_value)));
 
-            float prediction = 0.0f;
+            T prediction = static_cast<T>(0.0f);
             for (int key = 0; key < key_dim; ++key) {
               prediction += p_k[key] * k_norm * state[key];
             }
 
-            const float delta =
-                update_rate *
-                (static_cast<float>(v_ptr[local_id]) - prediction);
+            const T delta = update_rate * (v_ptr[local_id] - prediction);
 
-            float output = 0.0f;
+            T output = static_cast<T>(0.0f);
             for (int key = 0; key < key_dim; ++key) {
               state[key] += p_k[key] * k_norm * delta;
               output += p_q[key] * q_norm * scale * state[key];
             }
 
-            mixed[value_offset + local_id] = static_cast<T>(output);
+            mixed[value_offset + local_id] = output;
 
-            // p_q/p_k/p_decay are read by every work-item above (the
-            // q_norm_sq/k_norm_sq/prediction/output loops over key_dim), but
-            // only written by the first key_dim work-items at the top of the
-            // next iteration. Without this barrier, a writer thread can loop
-            // back and overwrite them before a slower reader thread has
-            // finished consuming this token's values -- nothing upstream
-            // guarantees the work-items in this group stay in lockstep.
             item.barrier(sycl::access::fence_space::local_space);
           }
         });
@@ -2374,17 +2366,9 @@ template void applyKdaOutputGate<sycl::half>(int N, sycl::half* mixed,
                                              sycl::queue& sycl_queue);
 
 // Applies a 3x3 same-padded depthwise convolution over the 8x8 board and adds
-// the result to the input (residual).  Matches the training Python
-//   DepthwiseConv2D(kernel_size=3, padding="same")
+// the result to the input (residual). Matches the training Python
+// DepthwiseConv2D(kernel_size=3, padding="same")
 // which is applied before the KDA Q/K/V projections when kda_local_conv=true.
-//
-// Tensor layout: [N * 64, emb_size]  (token-major, rank*8+file order).
-// Kernel layout from proto: [emb_size, 1, 3, 3] flattened as
-//   w[c * 9 + kr * 3 + kf]  for channel c, kernel row offset kr in {0,1,2},
-//   kernel file offset kf in {0,1,2}.  The center element is at kr=1, kf=1.
-// conv_b may be nullptr (no bias).
-// scratch: temporary buffer of at least N*64*emb_size elements.
-// output and input may alias (the kernel writes to scratch first, then adds).
 template <typename T>
 void applyKdaLocalDepthwiseConv(int N, int emb_size, const T* input,
                                 const T* conv_w, const T* conv_b, T* scratch,
@@ -2398,10 +2382,9 @@ void applyKdaLocalDepthwiseConv(int N, int emb_size, const T* input,
         // Board coordinates: token = rank * 8 + file.
         const int rank = token / 8;
         const int file = token % 8;
-        // Batch index; the local 8x8 grid starts at batch * 64.
         const int batch_base = (token / 64) * 64;
 
-        float sum = 0.0f;
+        T sum = (conv_b != nullptr) ? conv_b[c] : static_cast<T>(0.0f);
         // 3x3 neighbourhood with same (zero) padding.
         for (int kr = 0; kr < 3; ++kr) {
           const int nr = rank + kr - 1;  // neighbour rank
@@ -2410,25 +2393,17 @@ void applyKdaLocalDepthwiseConv(int N, int emb_size, const T* input,
             const int nf = file + kf - 1;  // neighbour file
             if (nf < 0 || nf > 7) continue;
             const int neighbour_token = batch_base + nr * 8 + nf;
-            const float w =
-                static_cast<float>(conv_w[c * 9 + kr * 3 + kf]);
-            const float x =
-                static_cast<float>(input[neighbour_token * emb_size + c]);
-            sum += w * x;
+            sum += conv_w[c * 9 + kr * 3 + kf] * input[neighbour_token * emb_size + c];
           }
         }
-        if (conv_b != nullptr) {
-          sum += static_cast<float>(conv_b[c]);
-        }
-        scratch[token * emb_size + c] = static_cast<T>(sum);
+        scratch[token * emb_size + c] = sum;
       });
 
   // Add convolution output to original input (residual connection).
   sycl_queue.parallel_for(
       sycl::range<1>(tokens * emb_size), [=](sycl::id<1> idx) {
         const int i = static_cast<int>(idx[0]);
-        output[i] = static_cast<T>(static_cast<float>(input[i]) +
-                                   static_cast<float>(scratch[i]));
+        output[i] = input[i] + scratch[i];
       });
 }
 
