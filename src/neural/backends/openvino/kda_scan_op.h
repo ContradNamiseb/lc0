@@ -70,8 +70,21 @@ class KdaScanOp : public ov::op::Op {
                 const ov::TensorVector& inputs) const override;
   bool has_evaluate() const override;
 
+  // Static dims, resolved by validate_and_infer_types() from input shapes
+  // (only the batch dim is ever dynamic). -1 until shape inference has run.
+  // Used by network_openvino.cc to JIT-compile the GPU custom-layer kernel
+  // for the exact dims this model instance uses.
+  int heads() const { return heads_; }
+  int key_dim() const { return key_dim_; }
+  int value_dim() const { return value_dim_; }
+
   // Lower clamp on log_decay. Must match converter.cc's kLogDecayFloor.
   static constexpr float kLogDecayFloor = -10.0f;
+
+ private:
+  int heads_ = -1;
+  int key_dim_ = -1;
+  int value_dim_ = -1;
 };
 
 }  // namespace openvino_backend

@@ -41,14 +41,18 @@ void KdaScanOp::validate_and_infer_types() {
   const auto& q_shape = get_input_partial_shape(0);
   const auto& v_shape = get_input_partial_shape(2);
   ov::Dimension value_dim = ov::Dimension::dynamic();
-  if (v_shape.rank().is_static() && v_shape.size() == 4) {
+  if (v_shape.rank().is_static() && v_shape.size() == 4 &&
+      v_shape[3].is_static()) {
     value_dim = v_shape[3];
+    value_dim_ = static_cast<int>(v_shape[3].get_length());
   }
   ov::PartialShape out_shape{ov::Dimension::dynamic(), 64,
                              ov::Dimension::dynamic(), value_dim};
   if (q_shape.rank().is_static() && q_shape.size() == 4) {
     out_shape[0] = q_shape[0];
     out_shape[2] = q_shape[2];
+    if (q_shape[2].is_static()) heads_ = static_cast<int>(q_shape[2].get_length());
+    if (q_shape[3].is_static()) key_dim_ = static_cast<int>(q_shape[3].get_length());
   }
   set_output_type(0, get_input_element_type(0), out_shape);
 }

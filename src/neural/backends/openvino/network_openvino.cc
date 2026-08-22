@@ -30,6 +30,8 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -50,6 +52,7 @@
 #include "utils/logging.h"
 
 #include "neural/backends/openvino/inputs_outputs.h"
+#include "neural/backends/openvino/kda_scan_kernel_source.h"
 #include "neural/backends/openvino/kda_scan_op.h"
 #include "neural/backends/openvino/kda_scan_pass.h"
 
@@ -221,6 +224,72 @@ float OpenVinoNetworkComputation::GetMVal(int sample) const {
   return 0.0f;
 }
 
+namespace {
+
+// Writes the GPU custom-layer kernel source and its CONFIG_FILE XML for
+// this model's specific KDA dims (heads/key_dim/value_dim are static per
+// net but not portable across different net shapes, so the kernel is
+// JIT-compiled per model rather than shipped pre-built). Returns the XML
+// path to hand to ov::Core::set_property("GPU", {{"CONFIG_FILE", ...}}).
+// Must be called before compile_model().
+std::filesystem::path WriteKdaScanGpuConfig(int heads, int key_dim,
+                                            int value_dim) {
+  namespace fs = std::filesystem;
+  fs::path dir = fs::temp_directory_path() / "lc0_openvino_kda_scan";
+  std::error_code ec;
+  fs::create_directories(dir, ec);
+  if (ec) {
+    throw Exception("OpenVINO: could not create temp dir for the KdaScan "
+                    "GPU kernel config: " + ec.message());
+  }
+
+  fs::path cl_path = dir / "kda_scan.cl";
+  std::ofstream cl(cl_path, std::ios::trunc);
+  cl << kKdaScanKernelSource;
+  cl.close();
+
+  fs::path xml_path = dir / ("kda_scan_" + std::to_string(heads) + "x" +
+                             std::to_string(key_dim) + "x" +
+                             std::to_string(value_dim) + ".xml");
+  std::ofstream xml(xml_path, std::ios::trunc);
+  // Source filename is resolved relative to the CONFIG_FILE's own
+  // directory (not the executable, despite what the docs say, and not
+  // usable as an absolute path -- it gets concatenated onto that
+  // directory regardless). Both files are written into the same dir
+  // above, so a bare filename is enough.
+  xml << "<CustomLayer name=\"KdaScan\" type=\"SimpleGPU\" version=\"1\">\n"
+      << "  <Kernel entry=\"kda_scan_kernel\">\n"
+      << "    <Source filename=\"" << cl_path.filename().string() << "\"/>\n"
+      << "  </Kernel>\n"
+      << "  <Buffers>\n"
+      << "    <Tensor arg-index=\"0\" type=\"input\" port-index=\"0\" "
+        "format=\"BFYX\"/>\n"
+      << "    <Tensor arg-index=\"1\" type=\"input\" port-index=\"1\" "
+        "format=\"BFYX\"/>\n"
+      << "    <Tensor arg-index=\"2\" type=\"input\" port-index=\"2\" "
+        "format=\"BFYX\"/>\n"
+      << "    <Tensor arg-index=\"3\" type=\"input\" port-index=\"3\" "
+        "format=\"BFYX\"/>\n"
+      << "    <Tensor arg-index=\"4\" type=\"input\" port-index=\"4\" "
+        "format=\"BFYX\"/>\n"
+      << "    <Tensor arg-index=\"5\" type=\"input\" port-index=\"5\" "
+        "format=\"BFYX\"/>\n"
+      << "    <Tensor arg-index=\"6\" type=\"input\" port-index=\"6\" "
+        "format=\"BFYX\"/>\n"
+      << "    <Tensor arg-index=\"7\" type=\"output\" port-index=\"0\" "
+        "format=\"BFYX\"/>\n"
+      << "  </Buffers>\n"
+      << "  <CompilerOptions options=\"-D HEADS_=" << heads
+      << " -D KEY_DIM_=" << key_dim << " -D VALUE_DIM_=" << value_dim
+      << "\"/>\n"
+      << "  <WorkSizes global=\"B*Y,X,1\" local=\"1,X,1\" dim=\"output\"/>\n"
+      << "</CustomLayer>\n";
+  xml.close();
+  return xml_path;
+}
+
+}  // namespace
+
 OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
                                  const OptionsDict& options) {
   std::string device = options.GetOrDefault<std::string>("device", "GPU");
@@ -283,6 +352,32 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
         ov::hint::PerformanceMode::LATENCY;
     device_config[ov::hint::execution_mode.name()] =
         ov::hint::ExecutionMode::PERFORMANCE;
+
+    // The GPU plugin defaults to running the whole graph in fp16
+    // (INFERENCE_PRECISION_HINT) regardless of the model's declared f32
+    // data type. The framework's own ops (FullyConnected etc.) handle that
+    // transparently, but KdaScanOp's OpenCL kernel reads/writes raw
+    // `float` buffers -- under silent fp16 execution it was actually being
+    // handed `half` data through a `float*`, i.e. reading every value at
+    // half the correct stride, which is indistinguishable from garbage.
+    // Force f32 so the kernel's buffer layout assumption holds; the
+    // non-KDA ops are >98% of nodes but <2% of runtime (see the profiling
+    // note on ReplaceKdaScan), so losing their fp16 speedup here is noise.
+    device_config[ov::hint::inference_precision.name()] = ov::element::f32;
+
+    // The GPU plugin has no built-in fallback for an unrecognized op type
+    // the way the CPU plugin does (which is what makes KdaScanOp::evaluate()
+    // usable as a CPU reference at all) -- it needs an actual OpenCL kernel,
+    // wired through the legacy-but-still-supported GPU custom-layer
+    // mechanism. Only bother if this model actually has a KDA layer.
+    for (const auto& node : model->get_ops()) {
+      auto kda = ov::as_type_ptr<KdaScanOp>(node);
+      if (!kda) continue;
+      auto xml_path = WriteKdaScanGpuConfig(kda->heads(), kda->key_dim(),
+                                            kda->value_dim());
+      device_config["CONFIG_FILE"] = xml_path.string();
+      break;
+    }
   }
 
   compiled_model_ = core_.compile_model(model, device, device_config);

@@ -277,10 +277,15 @@ if get_option('build_backends')
   if get_option('blas')
     if get_option('mkl') and mkl_lib.found()
       mkl_inc = get_option('mkl_include')
+      mkl_inc_dirs = []
       if run_command('scripts/checkdir.py', mkl_inc, check : false).returncode() == 0
-        includes += include_directories(mkl_inc)
+        mkl_inc_dirs = include_directories(mkl_inc)
+        includes += mkl_inc_dirs
       endif
-      if cc.has_header('mkl.h')
+      # has_header() needs the include dir passed explicitly -- it doesn't
+      # see the project-wide `includes` list above, which only applies to
+      # actual file compilation, not this standalone compiler check.
+      if cc.has_header('mkl.h', include_directories: mkl_inc_dirs)
         add_project_arguments(['-DUSE_MKL', '-DUSE_BLAS'], language : 'cpp')
         deps += [ mkl_lib ]
       endif
