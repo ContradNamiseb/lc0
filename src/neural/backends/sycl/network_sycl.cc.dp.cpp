@@ -95,6 +95,14 @@ class SyclNetwork;
 static size_t getMaxAttentionHeadSize(
     const MultiHeadWeights::PolicyHead& weights, int N) {
   const size_t embedding_op_size = weights.ip_pol_b.size();
+  // A convolution-policy net has no attention-policy embedding at all, so
+  // ip_pol_b is empty and this head needs none of the scratch sized below.
+  // Without this guard the division was 0/0: the assert that would have
+  // caught it is compiled out in release builds, and the resulting garbage
+  // policy_d_model inflated scratch_size_ enough that the subsequent
+  // malloc_device stalled -- which is what made every conv-policy net hang
+  // at construction while attention-policy nets were unaffected.
+  if (embedding_op_size == 0) return 0;
   const size_t policy_d_model =
       weights.ip2_pol_w.size() / embedding_op_size;
   assert(policy_d_model * embedding_op_size == weights.ip2_pol_w.size());
@@ -803,6 +811,7 @@ class SyclNetwork : public Network {
     DataType* spare1 = tensor_mem[1];
     DataType* spare2 = tensor_mem[2];
 
+
     if (numBlocks_ > 0) {
       // Input.
       network_[l++]->Eval(batchSize, skip_connection, tensor_mem[0], nullptr,
@@ -968,6 +977,7 @@ class SyclNetwork : public Network {
                             nullptr);
       }
     }
+
 
     // Copy policy output from device memory to host memory.
 #ifndef USE_INTEL
