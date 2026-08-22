@@ -748,6 +748,16 @@ if get_option('build_backends')
       if get_option('sycl') == 'l0'
         message('Building SYCL for the L0 backend')
         add_project_arguments('-DMKL_ILP64', language : 'cpp')
+        # layers.cc.dp.cpp includes <oneapi/mkl.hpp> directly. Unlike the
+        # generic blas=mkl path above, this doesn't go through
+        # get_option('mkl'), so it needs its own include_directories --
+        # otherwise this silently depends on oneAPI's setvars.bat having
+        # populated INCLUDE with MKL's headers, which it doesn't always do.
+        foreach mkl_inc_dir : get_option('mkl_include')
+          if run_command('scripts/checkdir.py', mkl_inc_dir, check : false).returncode() == 0
+            includes += include_directories(mkl_inc_dir)
+          endif
+        endforeach
         mkl_libdirs = get_option('mkl_libdirs')
         opencl_libdirs = get_option('opencl_libdirs')
         mkl_sycl_dep = cc.find_library('mkl_sycl_blas_dll', dirs: mkl_libdirs, required: false)
