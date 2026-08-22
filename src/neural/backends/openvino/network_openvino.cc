@@ -112,6 +112,7 @@ class OpenVinoNetwork : public Network {
   bool IsCpu() const override { return is_cpu_; }
 
   const CachedOutputPorts& ports() const { return ports_; }
+  bool is_ir_model() const { return is_ir_model_; }
 
   // Mirrors sycl/network_sycl.cc.dp.cpp's GetInputsOutputs/
   // ReleaseInputsOutputs free-list: an InferRequest plus its bound tensors
@@ -139,6 +140,13 @@ class OpenVinoNetwork : public Network {
   CachedOutputPorts ports_;
   NetworkCapabilities capabilities_;
   bool is_cpu_ = false;
+  // True when this model came from a pre-converted IR file (ir_path) rather
+  // than ConvertWeightsToOnnx. An IR-loaded graph never contains KdaScanOp
+  // (nothing matches ReplaceKdaScan's TensorIterator pattern in the first
+  // place), so it skips the GPU custom-layer kernel setup -- but it still
+  // needs the forced-f32 precision hint, for its own separate reason. See
+  // the device_config block in the constructor.
+  bool is_ir_model_ = false;
 
   std::mutex io_mutex_;
   std::list<std::unique_ptr<InputsOutputs>> free_inputs_outputs_;
@@ -179,10 +187,27 @@ void OpenVinoNetworkComputation::AddInput(InputPlanes&& input) {
 void OpenVinoNetworkComputation::ComputeBlocking() {
   if (batch_size_ == 0) return;
 
-  // Zero-copy dynamic-batch view over the pre-allocated input tensor.
-  ov::Tensor batch_view(io_->input_tensor_, {0, 0, 0, 0},
-                        {static_cast<size_t>(batch_size_), kInputPlanes, 8, 8});
-  io_->infer_request_.set_input_tensor(batch_view);
+  if (network_->is_ir_model()) {
+    // The zero-copy ROI view below hands the graph a tensor whose strides
+    // still describe the full kMaxBatchSize backing buffer. The ONNX path
+    // tolerates that; the TF-imported graph does not -- with the view, a
+    // batch of 1 matches the reference but every larger batch is wrong,
+    // the classic stride signature. Copying into an exactly-sized tensor
+    // costs one memcpy of at most a few hundred KB per call and is also
+    // what the Python verification of this IR actually exercised.
+    ov::Tensor exact(io_->input_tensor_.get_element_type(),
+                     {static_cast<size_t>(batch_size_), kInputPlanes, 8, 8});
+    std::memcpy(exact.data<float>(), io_->input_val_mem_,
+                static_cast<size_t>(batch_size_) * kInputPlanes * 64 *
+                    sizeof(float));
+    io_->infer_request_.set_input_tensor(exact);
+  } else {
+    // Zero-copy dynamic-batch view over the pre-allocated input tensor.
+    ov::Tensor batch_view(
+        io_->input_tensor_, {0, 0, 0, 0},
+        {static_cast<size_t>(batch_size_), kInputPlanes, 8, 8});
+    io_->infer_request_.set_input_tensor(batch_view);
+  }
 
   io_->infer_request_.infer();
 
@@ -302,20 +327,39 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
 
   CERR << "Initializing OpenVINO backend on device [" << device << "]...";
 
-  WeightsToOnnxConverterOptions converter_options;
-  converter_options.opset = 17;
-  converter_options.data_type =
-      WeightsToOnnxConverterOptions::DataType::kFloat32;
-  converter_options.policy_head = "vanilla";
-  converter_options.value_head = "winner";
+  // ir_path opts into loading a pre-converted OpenVINO IR (.xml/.bin) file
+  // directly, bypassing ConvertWeightsToOnnx entirely -- see
+  // lc0-training/tf/net_to_openvino_ir.py. That pipeline imports the net
+  // straight from its TensorFlow training-time definition, where the KDA
+  // recurrence is a chunked matmul-parallel formulation with no
+  // TensorIterator/Loop at all (unlike the sequential-loop ONNX export),
+  // which OpenVINO's own compiler handles far better. The weights file
+  // passed via -w is still required and still gets parsed by the shared
+  // loader (see loader.cc) even though it goes unused here -- deliberately
+  // not touching that shared path just to let this one backend skip it.
+  const std::string ir_path = options.GetOrDefault<std::string>("ir_path", "");
+  is_ir_model_ = !ir_path.empty();
 
-  pblczero::Net onnx_net = ConvertWeightsToOnnx(weights, converter_options);
-  std::string_view model_bytes = onnx_net.onnx_model().model();
+  std::shared_ptr<ov::Model> model;
+  if (is_ir_model_) {
+    CERR << "Loading pre-converted OpenVINO IR from: " << ir_path;
+    model = core_.read_model(ir_path);
+  } else {
+    WeightsToOnnxConverterOptions converter_options;
+    converter_options.opset = 17;
+    converter_options.data_type =
+        WeightsToOnnxConverterOptions::DataType::kFloat32;
+    converter_options.policy_head = "vanilla";
+    converter_options.value_head = "winner";
 
-  std::shared_ptr<ov::Model> model = core_.read_model(
-      std::string(model_bytes),
-      ov::Tensor(ov::element::u8, {model_bytes.size()},
-                 const_cast<char*>(model_bytes.data())));
+    pblczero::Net onnx_net = ConvertWeightsToOnnx(weights, converter_options);
+    std::string_view model_bytes = onnx_net.onnx_model().model();
+
+    model = core_.read_model(
+        std::string(model_bytes),
+        ov::Tensor(ov::element::u8, {model_bytes.size()},
+                   const_cast<char*>(model_bytes.data())));
+  }
 
   // Dynamic batch shape: -1 lets OpenVINO recompile internal shape-dependent
   // constants once here rather than reshaping (and paying that cost) inside
@@ -335,8 +379,13 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
   }
   if (!ports_.policy_port.get_node() || !ports_.value_port.get_node()) {
     throw Exception(
-        "OpenVINO: converted ONNX graph is missing a policy or value "
-        "output -- ConvertWeightsToOnnx's naming must have changed.");
+        "OpenVINO: model is missing a policy or value output -- " +
+        std::string(is_ir_model_
+                        ? "the IR file's output names don't match what "
+                          "this backend expects (policy/wdl/value/mlh "
+                          "substrings)."
+                        : "ConvertWeightsToOnnx's naming must have "
+                          "changed."));
   }
 
   core_.add_extension(ov::OpExtension<KdaScanOp>());
@@ -355,33 +404,33 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
 
     // The GPU plugin defaults to running the whole graph in fp16
     // (INFERENCE_PRECISION_HINT) regardless of the model's declared f32
-    // data type. The framework's own ops (FullyConnected etc.) handle that
-    // transparently, but KdaScanOp's OpenCL kernel reads/writes raw
-    // `float` buffers -- under silent fp16 execution it was actually being
-    // handed `half` data through a `float*`, i.e. reading every value at
-    // half the correct stride, which is indistinguishable from garbage.
-    // Force f32 so the kernel's buffer layout assumption holds. Re-profiled
-    // after KdaScanOp replaced TensorIterator: KdaScan is now only ~7% of
-    // total runtime (the ~200 small FullyConnected/Gemm ops elsewhere in
-    // the graph now dominate, likely per-op GPU dispatch overhead rather
-    // than any single op's compute cost -- see kda_scan_pass.h's comment),
-    // so losing fp16 on those ops costs more than this comment used to
-    // assume; has not been re-measured against leaving fp16 on for the
-    // non-KDA ops specifically.
+    // data type. Both model paths need this forced back to f32, for
+    // different reasons:
+    //   ONNX/KdaScanOp path: its OpenCL kernel reads/writes raw `float`
+    //     buffers, so under silent fp16 it was handed `half` data through
+    //     a `float*` -- every value read at half the correct stride, which
+    //     is indistinguishable from garbage.
+    //   IR path: the TF-imported graph's KDA recurrence is a chunked
+    //     Neumann-series matmul chain, and fp16 there diverges from the
+    //     reference backends well past any sane tolerance once a batch
+    //     holds more than one position.
     device_config[ov::hint::inference_precision.name()] = ov::element::f32;
 
-    // The GPU plugin has no built-in fallback for an unrecognized op type
-    // the way the CPU plugin does (which is what makes KdaScanOp::evaluate()
-    // usable as a CPU reference at all) -- it needs an actual OpenCL kernel,
-    // wired through the legacy-but-still-supported GPU custom-layer
-    // mechanism. Only bother if this model actually has a KDA layer.
-    for (const auto& node : model->get_ops()) {
-      auto kda = ov::as_type_ptr<KdaScanOp>(node);
-      if (!kda) continue;
-      auto xml_path = WriteKdaScanGpuConfig(kda->heads(), kda->key_dim(),
-                                            kda->value_dim());
-      device_config["CONFIG_FILE"] = xml_path.string();
-      break;
+    if (!is_ir_model_) {
+      // The GPU plugin has no built-in fallback for an unrecognized op
+      // type the way the CPU plugin does (which is what makes
+      // KdaScanOp::evaluate() usable as a CPU reference at all) -- it
+      // needs an actual OpenCL kernel, wired through the
+      // legacy-but-still-supported GPU custom-layer mechanism. Only bother
+      // if this model actually has a KDA layer.
+      for (const auto& node : model->get_ops()) {
+        auto kda = ov::as_type_ptr<KdaScanOp>(node);
+        if (!kda) continue;
+        auto xml_path = WriteKdaScanGpuConfig(kda->heads(), kda->key_dim(),
+                                              kda->value_dim());
+        device_config["CONFIG_FILE"] = xml_path.string();
+        break;
+      }
     }
   }
 
