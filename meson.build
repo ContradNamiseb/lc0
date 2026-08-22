@@ -895,6 +895,28 @@ endif
   configure_file(output : 'trace_config.h',
                  configuration : trace_config)
 
+  ## ~~~~~~~~~~
+  ## OpenVINO
+  ## ~~~~~~~~~~
+  # Converts weights to the same in-memory ONNX graph the onnx backend uses
+  # (including the KDA recurrence's Scan op) and lets OpenVINO's own graph
+  # compiler place and fuse it, rather than hand-writing kernels the way
+  # SYCL/DirectML do -- there is no per-layer C++ dispatch to keep in step
+  # with sycl/layers.h here, only the InputsOutputs buffer pattern.
+  if get_option('openvino')
+    openvino_lib = cc.find_library('openvino', dirs: get_option('openvino_libdirs'),
+                                   required: false)
+    if openvino_lib.found()
+      deps += openvino_lib
+      includes += include_directories(get_option('openvino_include'), is_system: true)
+      files += 'src/neural/backends/openvino/network_openvino.cc'
+      has_backends = true
+    else
+      warning('openvino requested but libopenvino was not found in ' +
+              ','.join(get_option('openvino_libdirs')))
+    endif
+  endif
+
   ## ~~~~~~~~
   ## Profiler
   ## ~~~~~~~~
