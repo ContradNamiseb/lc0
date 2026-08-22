@@ -360,9 +360,14 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
     // `float` buffers -- under silent fp16 execution it was actually being
     // handed `half` data through a `float*`, i.e. reading every value at
     // half the correct stride, which is indistinguishable from garbage.
-    // Force f32 so the kernel's buffer layout assumption holds; the
-    // non-KDA ops are >98% of nodes but <2% of runtime (see the profiling
-    // note on ReplaceKdaScan), so losing their fp16 speedup here is noise.
+    // Force f32 so the kernel's buffer layout assumption holds. Re-profiled
+    // after KdaScanOp replaced TensorIterator: KdaScan is now only ~7% of
+    // total runtime (the ~200 small FullyConnected/Gemm ops elsewhere in
+    // the graph now dominate, likely per-op GPU dispatch overhead rather
+    // than any single op's compute cost -- see kda_scan_pass.h's comment),
+    // so losing fp16 on those ops costs more than this comment used to
+    // assume; has not been re-measured against leaving fp16 on for the
+    // non-KDA ops specifically.
     device_config[ov::hint::inference_precision.name()] = ov::element::f32;
 
     // The GPU plugin has no built-in fallback for an unrecognized op type
