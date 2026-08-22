@@ -901,10 +901,15 @@ endif
   if get_option('directml')
       has_backends = true
       message('Building DirectMLX backend')
-      files += 'src/neural/backends/directml/network_directml.cc'
+      files += [
+        'src/neural/backends/directml/network_directml.cc',
+        'src/neural/backends/directml/layers.cc',
+      ]
       deps += cc.find_library('directml', required: true)
       deps += cc.find_library('d3d12', required: true)
       deps += cc.find_library('dxgi', required: true)
+      deps += cc.find_library('d3dcompiler', required: true)
+      includes += include_directories('.')
       add_project_arguments('-DUSE_DIRECTML=1', language : 'cpp')
   endif
 
@@ -1045,6 +1050,27 @@ if get_option('gtest')
                'src/neural/memcache.cc', pb_files,
     include_directories: includes, link_with: lc0_lib, dependencies: [gtest, gmock]),
     args: '--gtest_output=xml:engine_test.xml', timeout: 90)
+
+  # Not linked with lc0_lib: the directml backend's files live in the lc0.exe
+  # target's own `files` list (like every other backend), not in
+  # common_files, so this test builds layers.cc itself instead. Compares
+  # KdaRecurrenceLayer's HLSL shader against an independent CPU reference --
+  # see test_kda_recurrence.cc for why that, not the SYCL kernel, is the
+  # thing being checked against.
+  if get_option('directml')
+    test('KdaRecurrence',
+      executable('kda_recurrence_test',
+        'src/neural/backends/directml/test_kda_recurrence.cc',
+        'src/neural/backends/directml/layers.cc', pb_files,
+        include_directories: [includes, include_directories('.')],
+        link_with: lc0_lib,
+        dependencies: [gtest,
+          cc.find_library('directml', required: true),
+          cc.find_library('d3d12', required: true),
+          cc.find_library('dxgi', required: true),
+          cc.find_library('d3dcompiler', required: true)],
+    ), args: '--gtest_output=xml:kda_recurrence.xml', timeout: 90)
+  endif
 endif
 
 
