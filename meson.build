@@ -912,7 +912,10 @@ endif
   # (including the KDA recurrence's Scan op) and lets OpenVINO's own graph
   # compiler place and fuse it, rather than hand-writing kernels the way
   # SYCL/DirectML do -- there is no per-layer C++ dispatch to keep in step
-  # with sycl/layers.h here, only the InputsOutputs buffer pattern.
+  # with sycl/layers.h here, only the InputsOutputs buffer pattern, with one
+  # exception: kda_scan_op/kda_scan_pass replace the TensorIterator OpenVINO's
+  # ONNX frontend builds for the KDA recurrence's Scan (>98% of inference
+  # time by profiling) with a hand-written fused op.
   if get_option('openvino')
     openvino_lib = cc.find_library('openvino', dirs: get_option('openvino_libdirs'),
                                    required: false)
@@ -920,6 +923,8 @@ endif
       deps += openvino_lib
       includes += include_directories(get_option('openvino_include'), is_system: true)
       files += 'src/neural/backends/openvino/network_openvino.cc'
+      files += 'src/neural/backends/openvino/kda_scan_op.cc'
+      files += 'src/neural/backends/openvino/kda_scan_pass.cc'
       has_backends = true
     else
       warning('openvino requested but libopenvino was not found in ' +

@@ -22,7 +22,10 @@
 // pre-allocated buffer. There is no sycl/layers.h equivalent here: OpenVINO
 // compiles and fuses the whole graph itself from the converted ONNX model,
 // so there is no per-layer C++ dispatch to split out the way SYCL's
-// FCLayer/SELayer/EncoderBlock classes do.
+// FCLayer/SELayer/EncoderBlock classes do -- with one exception, KdaScanOp
+// (kda_scan_op.h/.cc), a hand-written fused op that replaces the ONNX-Scan
+// -derived TensorIterator OpenVINO would otherwise use for the KDA
+// recurrence, which profiling showed was >98% of total inference time.
 
 #include <algorithm>
 #include <cassert>
@@ -34,7 +37,9 @@
 #include <string_view>
 #include <vector>
 
+#include <openvino/core/op_extension.hpp>
 #include <openvino/openvino.hpp>
+#include <openvino/pass/manager.hpp>
 
 #include "neural/factory.h"
 #include "neural/loader.h"
@@ -45,6 +50,8 @@
 #include "utils/logging.h"
 
 #include "neural/backends/openvino/inputs_outputs.h"
+#include "neural/backends/openvino/kda_scan_op.h"
+#include "neural/backends/openvino/kda_scan_pass.h"
 
 namespace lczero {
 namespace openvino_backend {
@@ -261,6 +268,13 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
     throw Exception(
         "OpenVINO: converted ONNX graph is missing a policy or value "
         "output -- ConvertWeightsToOnnx's naming must have changed.");
+  }
+
+  core_.add_extension(ov::OpExtension<KdaScanOp>());
+  {
+    ov::pass::Manager manager;
+    manager.register_pass<ReplaceKdaScan>();
+    manager.run_passes(model);
   }
 
   ov::AnyMap device_config;
