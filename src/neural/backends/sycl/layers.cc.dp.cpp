@@ -3259,12 +3259,12 @@ void EncoderBlock<DataType>::EvalKda(int N, DataType* in_out_tensor,
         const float val = static_cast<float>(mixed[offset + channel]);
         sum_squares += val * val;
       }
-      const float factor_f =
+      const float factor =
           1.0f / sycl::sqrt(sum_squares / value_depth + norm_epsilon);
-      const DataType factor = static_cast<DataType>(factor_f);
       for (int channel = 0; channel < value_depth; ++channel) {
-        mixed[offset + channel] =
-            mixed[offset + channel] * factor * norm_gammas[channel];
+        const float value = static_cast<float>(mixed[offset + channel]) *
+                            factor * static_cast<float>(norm_gammas[channel]);
+        mixed[offset + channel] = static_cast<DataType>(value);
       }
     });
   }

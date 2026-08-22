@@ -2201,9 +2201,21 @@ void kdaRecurrenceValueParallel(
   sycl::range<2> local_range(1, value_dim);
 
   sycl_queue.submit([&](sycl::handler& cgh) {
-    sycl::local_accessor<T, 1> p_q(sycl::range<1>(key_dim), cgh);
-    sycl::local_accessor<T, 1> p_k(sycl::range<1>(key_dim), cgh);
-    sycl::local_accessor<T, 1> p_decay(sycl::range<1>(key_dim), cgh);
+    // Local staging and the recurrent state stay float regardless of T: this
+    // is a 64-step sequential scan with no barrier that ever re-normalizes
+    // it, so precision loss compounds across the whole board. It is also a
+    // scalar (non-vectorized) accumulation loop, and this iGPU's fp16 ALU
+    // throughput advantage only shows up for packed/vectorized math -- doing
+    // scalar half arithmetic here previously made FP16 *slower* than FP32
+    // (217 vs 241 NPS measured), not faster, because every op paid a
+    // half<->float promotion with no compensating throughput win. T is kept
+    // only at the global-memory boundary (q_ptr/k_ptr/v_ptr loads and the
+    // final `mixed` store), which is where FP16 actually pays off: half the
+    // bytes moved for a kernel that is bandwidth-bound at 64 sequential
+    // small reads per head.
+    sycl::local_accessor<float, 1> p_q(sycl::range<1>(key_dim), cgh);
+    sycl::local_accessor<float, 1> p_k(sycl::range<1>(key_dim), cgh);
+    sycl::local_accessor<float, 1> p_decay(sycl::range<1>(key_dim), cgh);
 
     cgh.parallel_for(
         sycl::nd_range<2>(global_range, local_range),
@@ -2216,15 +2228,14 @@ void kdaRecurrenceValueParallel(
           const int direction_index = head / (heads / direction_count);
           const int direction = directions[direction_index];
 
-          const float scale_f = 1.0f / sycl::sqrt(static_cast<float>(key_dim));
-          const T scale = static_cast<T>(scale_f);
+          const float scale = 1.0f / sycl::sqrt(static_cast<float>(key_dim));
           const float decay_scale = sycl::exp(static_cast<float>(a_log[head]));
           const int key_depth = heads * key_dim;
           const int value_depth = heads * value_dim;
 
-          T state[32];
+          float state[32];
           for (int i = 0; i < key_dim && i < 32; ++i) {
-            state[i] = static_cast<T>(0.0f);
+            state[i] = 0.0f;
           }
 
           for (int token = 0; token < 64; ++token) {
@@ -2265,10 +2276,12 @@ void kdaRecurrenceValueParallel(
             const int raw_decay_offset = token_idx * key_depth + head * key_dim;
             const int value_offset = token_idx * value_depth + head * value_dim;
 
-            // Strided write into local memory
+            // Strided write into local memory. The single load here is the
+            // only place T's storage width matters; everything downstream
+            // that reads p_q/p_k/p_decay works in float.
             for (int i = local_id; i < key_dim; i += value_dim) {
-              p_q[i] = q_ptr[i];
-              p_k[i] = k_ptr[i];
+              p_q[i] = static_cast<float>(q_ptr[i]);
+              p_k[i] = static_cast<float>(k_ptr[i]);
 
               const float decay_input =
                   static_cast<float>(raw_decay[raw_decay_offset + i]) +
@@ -2278,7 +2291,7 @@ void kdaRecurrenceValueParallel(
                   sycl::log1p(sycl::exp(-sycl::fabs(decay_input)));
               const float log_decay =
                   sycl::fmax(-decay_scale * softplus, log_decay_floor);
-              p_decay[i] = static_cast<T>(sycl::exp(log_decay));
+              p_decay[i] = sycl::exp(log_decay);
             }
 
             item.barrier(sycl::access::fence_space::local_space);
@@ -2286,40 +2299,46 @@ void kdaRecurrenceValueParallel(
             float q_norm_sq = 0.0f;
             float k_norm_sq = 0.0f;
             for (int key = 0; key < key_dim; ++key) {
-              const float q_val = static_cast<float>(p_q[key]);
-              const float k_val = static_cast<float>(p_k[key]);
-              q_norm_sq += q_val * q_val;
-              k_norm_sq += k_val * k_val;
+              q_norm_sq += p_q[key] * p_q[key];
+              k_norm_sq += p_k[key] * p_k[key];
             }
-            const T q_norm = static_cast<T>(
-                1.0f / sycl::sqrt(q_norm_sq > 1.0e-12f ? q_norm_sq : 1.0e-12f));
-            const T k_norm = static_cast<T>(
-                1.0f / sycl::sqrt(k_norm_sq > 1.0e-12f ? k_norm_sq : 1.0e-12f));
+            const float q_norm =
+                1.0f / sycl::sqrt(q_norm_sq > 1.0e-12f ? q_norm_sq : 1.0e-12f);
+            const float k_norm =
+                1.0f / sycl::sqrt(k_norm_sq > 1.0e-12f ? k_norm_sq : 1.0e-12f);
 
             for (int key = 0; key < key_dim; ++key) {
-              state[key] = state[key] * p_decay[key];
+              state[key] *= p_decay[key];
             }
 
             const float beta_value =
                 static_cast<float>(beta[token_idx * heads + head]);
-            const T update_rate =
-                static_cast<T>(1.0f / (1.0f + sycl::exp(-beta_value)));
+            const float update_rate = 1.0f / (1.0f + sycl::exp(-beta_value));
 
-            T prediction = static_cast<T>(0.0f);
+            float prediction = 0.0f;
             for (int key = 0; key < key_dim; ++key) {
               prediction += p_k[key] * k_norm * state[key];
             }
 
-            const T delta = update_rate * (v_ptr[local_id] - prediction);
+            const float delta =
+                update_rate *
+                (static_cast<float>(v_ptr[local_id]) - prediction);
 
-            T output = static_cast<T>(0.0f);
+            float output = 0.0f;
             for (int key = 0; key < key_dim; ++key) {
               state[key] += p_k[key] * k_norm * delta;
               output += p_q[key] * q_norm * scale * state[key];
             }
 
-            mixed[value_offset + local_id] = output;
+            mixed[value_offset + local_id] = static_cast<T>(output);
 
+            // p_q/p_k/p_decay are read by every work-item above (the
+            // q_norm_sq/k_norm_sq/prediction/output loops over key_dim), but
+            // only written by the first key_dim work-items at the top of the
+            // next iteration. Without this barrier, a writer thread can loop
+            // back and overwrite them before a slower reader thread has
+            // finished consuming this token's values -- nothing upstream
+            // guarantees the work-items in this group stay in lockstep.
             item.barrier(sycl::access::fence_space::local_space);
           }
         });
@@ -2384,7 +2403,11 @@ void applyKdaLocalDepthwiseConv(int N, int emb_size, const T* input,
         const int file = token % 8;
         const int batch_base = (token / 64) * 64;
 
-        T sum = (conv_b != nullptr) ? conv_b[c] : static_cast<T>(0.0f);
+        // Accumulated in float even for T=half: only 9 taps, so this isn't
+        // the FP16 bandwidth win (that's the T loads/store below), and
+        // there's no reason to pay a conversion on every multiply-add when
+        // one cast at the end does the same job.
+        float sum = (conv_b != nullptr) ? static_cast<float>(conv_b[c]) : 0.0f;
         // 3x3 neighbourhood with same (zero) padding.
         for (int kr = 0; kr < 3; ++kr) {
           const int nr = rank + kr - 1;  // neighbour rank
@@ -2393,17 +2416,19 @@ void applyKdaLocalDepthwiseConv(int N, int emb_size, const T* input,
             const int nf = file + kf - 1;  // neighbour file
             if (nf < 0 || nf > 7) continue;
             const int neighbour_token = batch_base + nr * 8 + nf;
-            sum += conv_w[c * 9 + kr * 3 + kf] * input[neighbour_token * emb_size + c];
+            sum += static_cast<float>(conv_w[c * 9 + kr * 3 + kf]) *
+                   static_cast<float>(input[neighbour_token * emb_size + c]);
           }
         }
-        scratch[token * emb_size + c] = sum;
+        scratch[token * emb_size + c] = static_cast<T>(sum);
       });
 
   // Add convolution output to original input (residual connection).
   sycl_queue.parallel_for(
       sycl::range<1>(tokens * emb_size), [=](sycl::id<1> idx) {
         const int i = static_cast<int>(idx[0]);
-        output[i] = input[i] + scratch[i];
+        output[i] = static_cast<T>(static_cast<float>(input[i]) +
+                                   static_cast<float>(scratch[i]));
       });
 }
 
