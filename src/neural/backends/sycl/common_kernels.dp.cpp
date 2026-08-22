@@ -2433,11 +2433,13 @@ void applyKdaLocalDepthwiseConv(int N, int emb_size, const T* input,
         const int token = static_cast<int>(idx[0]);
         const int c = static_cast<int>(idx[1]);
 
-        // Board coordinates: token = rank * 8 + file.
-        const int rank = token / 8;
-        const int file = token % 8;
-        // Batch index; the local 8x8 grid starts at batch * 64.
+        // Board coordinates: square = rank * 8 + file, where square is the
+        // *intra-batch* index (0-63) -- token itself spans all N*64 tokens,
+        // so token/8 and token%8 only give the right rank/file for batch 0.
         const int batch_base = (token / 64) * 64;
+        const int square = token - batch_base;
+        const int rank = square / 8;
+        const int file = square % 8;
 
         float sum = 0.0f;
         // 3x3 neighbourhood with same (zero) padding.
