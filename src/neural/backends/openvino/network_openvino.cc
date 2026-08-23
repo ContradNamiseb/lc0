@@ -33,6 +33,7 @@
 #include <filesystem>
 #include <fstream>
 #include <list>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -97,7 +98,7 @@ struct CachedOutputPorts {
 class OpenVinoNetwork : public Network {
  public:
   OpenVinoNetwork(const WeightsFile& weights, const OptionsDict& options);
-  ~OpenVinoNetwork() override = default;
+  ~OpenVinoNetwork() override { if (profile_) DumpProfile(); }
 
   const NetworkCapabilities& GetCapabilities() const override {
     return capabilities_;
@@ -112,6 +113,38 @@ class OpenVinoNetwork : public Network {
   bool IsCpu() const override { return is_cpu_; }
 
   const CachedOutputPorts& ports() const { return ports_; }
+  bool profile() const { return profile_; }
+
+  // Folds one inference's per-op counters into the running totals. Called
+  // with the InferRequest still intact, straight after infer().
+  void AccumulateProfile(const ov::InferRequest& request) {
+    // Not every primitive produces a profiling event -- the GPU plugin
+    // throws CL_PROFILING_INFO_NOT_AVAILABLE for at least the custom-layer
+    // KdaScanOp kernel, and it takes the whole request's counters down with
+    // it. Losing some samples is fine for a diagnostic; killing the search
+    // thread is not, so swallow it and report the drop count at the end.
+    std::vector<ov::ProfilingInfo> infos;
+    try {
+      infos = request.get_profiling_info();
+    } catch (const std::exception&) {
+      std::lock_guard<std::mutex> lock(profile_mutex_);
+      profile_failures_++;
+      return;
+    }
+
+    std::lock_guard<std::mutex> lock(profile_mutex_);
+    for (const auto& info : infos) {
+      if (info.status != ov::ProfilingInfo::Status::EXECUTED) continue;
+      auto& entry = profile_by_type_[info.exec_type];
+      entry.us += info.real_time.count();
+      entry.count++;
+      auto& node = profile_by_node_[info.node_name];
+      node.us += info.real_time.count();
+      node.count++;
+      node.exec_type = info.exec_type;
+    }
+    profile_infers_++;
+  }
   int min_batch() const { return min_batch_; }
   bool is_ir_model() const { return is_ir_model_; }
 
@@ -156,6 +189,23 @@ class OpenVinoNetwork : public Network {
 
   std::mutex io_mutex_;
   std::list<std::unique_ptr<InputsOutputs>> free_inputs_outputs_;
+
+  // Per-op profiling, off unless the `profile` backend option is set.
+  // Aggregated across every inference and dumped once at teardown -- a
+  // per-call dump would be unreadable at hundreds of batches a second, and
+  // the whole point is to find which kernels dominate in aggregate.
+  struct ProfileEntry {
+    uint64_t us = 0;
+    uint64_t count = 0;
+    std::string exec_type;
+  };
+  bool profile_ = false;
+  std::mutex profile_mutex_;
+  std::map<std::string, ProfileEntry> profile_by_type_;
+  std::map<std::string, ProfileEntry> profile_by_node_;
+  uint64_t profile_infers_ = 0;
+  uint64_t profile_failures_ = 0;
+  void DumpProfile();
 };
 
 OpenVinoNetworkComputation::OpenVinoNetworkComputation(
@@ -250,6 +300,8 @@ void OpenVinoNetworkComputation::ComputeBlocking() {
   }
 
   io_->infer_request_.infer();
+
+  if (network_->profile()) network_->AccumulateProfile(io_->infer_request_);
 }
 
 float OpenVinoNetworkComputation::GetQVal(int sample) const {
@@ -432,6 +484,7 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
   // line, so `device=CPU,fp16=true` has to consume it and explain itself
   // rather than look like a typo.
   const bool want_fp16 = options.GetOrDefault<bool>("fp16", false);
+  profile_ = options.GetOrDefault<bool>("profile", false);
 
   ov::AnyMap device_config;
   if (device != "GPU" && want_fp16) {
@@ -480,8 +533,80 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
         (want_fp16 && !has_kda_scan) ? ov::element::f16 : ov::element::f32;
   }
 
+  if (profile_) device_config[ov::enable_profiling.name()] = true;
+
   compiled_model_ = core_.compile_model(model, device, device_config);
   CERR << "OpenVINO model compiled successfully on " << device << ".";
+}
+
+void OpenVinoNetwork::DumpProfile() {
+  std::lock_guard<std::mutex> lock(profile_mutex_);
+  if (profile_infers_ == 0) {
+    CERR << "OpenVINO profile: no usable counters were collected ("
+         << profile_failures_ << " inferences had none available).";
+    return;
+  }
+
+  uint64_t total_us = 0;
+  for (const auto& [type, entry] : profile_by_type_) {
+    (void)type;
+    total_us += entry.us;
+  }
+  if (total_us == 0) {
+    CERR << "OpenVINO profile: counters came back all-zero -- the plugin "
+            "may not support per-op profiling on this device.";
+    return;
+  }
+
+  // Sorted views. std::map gives name order, which is useless for finding
+  // the hot kernels.
+  auto by_time = [](const auto& a, const auto& b) {
+    return a.second.us > b.second.us;
+  };
+  std::vector<std::pair<std::string, ProfileEntry>> types(
+      profile_by_type_.begin(), profile_by_type_.end());
+  std::sort(types.begin(), types.end(), by_time);
+  std::vector<std::pair<std::string, ProfileEntry>> nodes(
+      profile_by_node_.begin(), profile_by_node_.end());
+  std::sort(nodes.begin(), nodes.end(), by_time);
+
+  const double infers = static_cast<double>(profile_infers_);
+  CERR << "";
+  if (profile_failures_ > 0) {
+    CERR << "OpenVINO profile: " << profile_failures_
+         << " inferences reported no counters and were skipped.";
+  }
+  CERR << "OpenVINO profile over " << profile_infers_ << " inferences ("
+       << (total_us / infers / 1000.0) << " ms of op time per inference):";
+  CERR << "";
+  CERR << "  by kernel implementation:";
+  for (size_t i = 0; i < types.size() && i < 15; ++i) {
+    const auto& [type, entry] = types[i];
+    CERR << "    " << (100.0 * entry.us / total_us) << "%  "
+         << (entry.us / infers / 1000.0) << " ms  " << entry.count / infers
+         << " ops  " << type;
+  }
+
+  // Reference kernels are the plugin's unoptimized fallbacks. They still
+  // run on the device -- this is not CPU fallback -- but a graph that
+  // spends most of its time here is being executed by the slow path and is
+  // usually better fixed by fusing ops away than by tuning anything.
+  uint64_t ref_us = 0;
+  for (const auto& [type, entry] : profile_by_type_) {
+    if (type.find("_ref") != std::string::npos) ref_us += entry.us;
+  }
+  CERR << "";
+  CERR << "  reference (unoptimized) kernels: " << (100.0 * ref_us / total_us)
+       << "% of op time";
+
+  CERR << "";
+  CERR << "  hottest individual ops:";
+  for (size_t i = 0; i < nodes.size() && i < 12; ++i) {
+    const auto& [name, entry] = nodes[i];
+    CERR << "    " << (entry.us / infers / 1000.0) << " ms  "
+         << entry.exec_type << "  " << name;
+  }
+  CERR << "";
 }
 
 std::unique_ptr<Network> MakeOpenVinoNetwork(
