@@ -112,6 +112,7 @@ class OpenVinoNetwork : public Network {
   bool IsCpu() const override { return is_cpu_; }
 
   const CachedOutputPorts& ports() const { return ports_; }
+  int min_batch() const { return min_batch_; }
   bool is_ir_model() const { return is_ir_model_; }
 
   // Mirrors sycl/network_sycl.cc.dp.cpp's GetInputsOutputs/
@@ -147,6 +148,11 @@ class OpenVinoNetwork : public Network {
   // needs the forced-f32 precision hint, for its own separate reason. See
   // the device_config block in the constructor.
   bool is_ir_model_ = false;
+  // Mirrors the cuda backend's min_batch: it never evaluates fewer
+  // than this many positions, padding the batch out instead. There
+  // it is about output variance on tiny batches; here it also keeps
+  // the GPU plugin off the degenerate small-batch path.
+  int min_batch_ = 1;
 
   std::mutex io_mutex_;
   std::list<std::unique_ptr<InputsOutputs>> free_inputs_outputs_;
@@ -187,6 +193,18 @@ void OpenVinoNetworkComputation::AddInput(InputPlanes&& input) {
 void OpenVinoNetworkComputation::ComputeBlocking() {
   if (batch_size_ == 0) return;
 
+  // Evaluate at least min_batch positions. Samples are independent,
+  // so the padding rows cannot affect the real ones; they are zeroed
+  // rather than left stale so the padding is at least well-defined,
+  // and only batch_size_ results are ever read back.
+  const int infer_batch = std::max(batch_size_, network_->min_batch());
+  if (infer_batch > batch_size_) {
+    std::memset(io_->input_val_mem_ + batch_size_ * (kInputPlanes * 64),
+                0,
+                static_cast<size_t>(infer_batch - batch_size_) *
+                    kInputPlanes * 64 * sizeof(float));
+  }
+
   if (network_->is_ir_model()) {
     // The zero-copy ROI view below hands the graph a tensor whose strides
     // still describe the full kMaxBatchSize backing buffer. The ONNX path
@@ -196,30 +214,42 @@ void OpenVinoNetworkComputation::ComputeBlocking() {
     // costs one memcpy of at most a few hundred KB per call and is also
     // what the Python verification of this IR actually exercised.
     ov::Tensor exact(io_->input_tensor_.get_element_type(),
-                     {static_cast<size_t>(batch_size_), kInputPlanes, 8, 8});
+                     {static_cast<size_t>(infer_batch), kInputPlanes, 8, 8});
     std::memcpy(exact.data<float>(), io_->input_val_mem_,
-                static_cast<size_t>(batch_size_) * kInputPlanes * 64 *
+                static_cast<size_t>(infer_batch) * kInputPlanes * 64 *
                     sizeof(float));
     io_->infer_request_.set_input_tensor(exact);
   } else {
     // Zero-copy dynamic-batch view over the pre-allocated input tensor.
     ov::Tensor batch_view(
         io_->input_tensor_, {0, 0, 0, 0},
-        {static_cast<size_t>(batch_size_), kInputPlanes, 8, 8});
+        {static_cast<size_t>(infer_batch), kInputPlanes, 8, 8});
     io_->infer_request_.set_input_tensor(batch_view);
   }
 
-  io_->infer_request_.infer();
-
+  // Bind our own host buffers as the output tensors BEFORE inferring, so
+  // the plugin writes results straight into memory we own. Reading back
+  // from whatever get_tensor() hands us is what crashed: on the GPU plugin
+  // that memory is not dependably host-readable, and no amount of bounds
+  // checking helps because the pointer itself is the problem.
   const auto& ports = network_->ports();
-  io_->op_policy_mem_ =
-      io_->infer_request_.get_tensor(ports.policy_port).data<const float>();
-  io_->op_value_mem_ =
-      io_->infer_request_.get_tensor(ports.value_port).data<const float>();
+  const size_t nb = static_cast<size_t>(infer_batch);
+  io_->infer_request_.set_tensor(
+      ports.policy_port,
+      ov::Tensor(ov::element::f32, {nb, InputsOutputs::kPolicyWidth},
+                 io_->policy_.data()));
+  io_->infer_request_.set_tensor(
+      ports.value_port,
+      ov::Tensor(ov::element::f32,
+                 {nb, has_wdl_ ? InputsOutputs::kValueWidth : size_t{1}},
+                 io_->value_.data()));
   if (has_mlh_) {
-    io_->op_moves_left_mem_ =
-        io_->infer_request_.get_tensor(ports.mlh_port).data<const float>();
+    io_->infer_request_.set_tensor(
+        ports.mlh_port,
+        ov::Tensor(ov::element::f32, {nb, 1}, io_->moves_left_.data()));
   }
+
+  io_->infer_request_.infer();
 }
 
 float OpenVinoNetworkComputation::GetQVal(int sample) const {
@@ -318,6 +348,8 @@ std::filesystem::path WriteKdaScanGpuConfig(int heads, int key_dim,
 OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
                                  const OptionsDict& options) {
   std::string device = options.GetOrDefault<std::string>("device", "GPU");
+  min_batch_ = std::min(options.GetOrDefault<int>("min_batch", 4),
+                        kMaxBatchSize);
   is_cpu_ = (device == "CPU");
 
   const auto& format = weights.format().network_format();
