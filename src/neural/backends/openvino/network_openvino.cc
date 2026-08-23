@@ -427,43 +427,57 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
     manager.run_passes(model);
   }
 
+  // Read unconditionally, not inside the GPU branch below: an unread
+  // backend option makes CheckAllOptionsRead() reject the whole command
+  // line, so `device=CPU,fp16=true` has to consume it and explain itself
+  // rather than look like a typo.
+  const bool want_fp16 = options.GetOrDefault<bool>("fp16", false);
+
   ov::AnyMap device_config;
+  if (device != "GPU" && want_fp16) {
+    CERR << "OpenVINO: ignoring fp16 -- it only applies to device=GPU.";
+  }
   if (device == "GPU") {
     device_config[ov::hint::performance_mode.name()] =
         ov::hint::PerformanceMode::LATENCY;
     device_config[ov::hint::execution_mode.name()] =
         ov::hint::ExecutionMode::PERFORMANCE;
 
-    // The GPU plugin defaults to running the whole graph in fp16
-    // (INFERENCE_PRECISION_HINT) regardless of the model's declared f32
-    // data type. Both model paths need this forced back to f32, for
-    // different reasons:
-    //   ONNX/KdaScanOp path: its OpenCL kernel reads/writes raw `float`
-    //     buffers, so under silent fp16 it was handed `half` data through
-    //     a `float*` -- every value read at half the correct stride, which
-    //     is indistinguishable from garbage.
-    //   IR path: the TF-imported graph's KDA recurrence is a chunked
-    //     Neumann-series matmul chain, and fp16 there diverges from the
-    //     reference backends well past any sane tolerance once a batch
-    //     holds more than one position.
-    device_config[ov::hint::inference_precision.name()] = ov::element::f32;
-
+    // KdaScanOp's GPU path is a hand-written OpenCL kernel that reads and
+    // writes raw `float`. It cannot run in fp16: under the GPU plugin's
+    // default half precision it is handed `half` data through a `float*`,
+    // reading every value at the wrong stride. So the presence of that op
+    // decides whether fp16 is even available.
+    bool has_kda_scan = false;
     if (!is_ir_model_) {
-      // The GPU plugin has no built-in fallback for an unrecognized op
-      // type the way the CPU plugin does (which is what makes
-      // KdaScanOp::evaluate() usable as a CPU reference at all) -- it
-      // needs an actual OpenCL kernel, wired through the
-      // legacy-but-still-supported GPU custom-layer mechanism. Only bother
-      // if this model actually has a KDA layer.
       for (const auto& node : model->get_ops()) {
         auto kda = ov::as_type_ptr<KdaScanOp>(node);
         if (!kda) continue;
+        has_kda_scan = true;
         auto xml_path = WriteKdaScanGpuConfig(kda->heads(), kda->key_dim(),
                                               kda->value_dim());
         device_config["CONFIG_FILE"] = xml_path.string();
         break;
       }
     }
+
+    if (want_fp16 && has_kda_scan) {
+      CERR << "OpenVINO: ignoring fp16 -- this net uses the KdaScanOp "
+              "custom GPU kernel, which is float-only. Convert the net to "
+              "an IR (see lc0-training tf/net_to_openvino_ir.py) to use "
+              "fp16 on a KDA net.";
+    }
+    // Note the GPU plugin's own default is fp16, so f32 is the value that
+    // has to be set explicitly here, not the other way round -- which is
+    // also why every net has to make a choice, not just the fp16 ones.
+    //
+    // fp16 costs roughly 1e-2 absolute on both value and policy versus the
+    // BLAS reference (measured on 791556 and on a KDA net via the IR path),
+    // for ~2.3x the throughput. That is ordinary half-precision rounding,
+    // not a correctness problem, but it is well outside the check backend's
+    // default tolerance -- verify fp16 runs with atol around 0.05.
+    device_config[ov::hint::inference_precision.name()] =
+        (want_fp16 && !has_kda_scan) ? ov::element::f16 : ov::element::f32;
   }
 
   compiled_model_ = core_.compile_model(model, device, device_config);
