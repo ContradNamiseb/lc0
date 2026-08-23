@@ -55,12 +55,13 @@
 #include "neural/backends/openvino/inputs_outputs.h"
 #include "neural/backends/openvino/kda_scan_kernel_source.h"
 #include "neural/backends/openvino/kda_scan_op.h"
+#include "neural/kda_directions.h"
 #include "neural/backends/openvino/kda_scan_pass.h"
 
 namespace lczero {
 namespace openvino_backend {
 
-static constexpr int kMaxBatchSize = 256;
+static constexpr int kMaxBatchSize = 1024;
 
 class OpenVinoNetwork;
 
@@ -185,7 +186,7 @@ class OpenVinoNetwork : public Network {
   // than this many positions, padding the batch out instead. There
   // it is about output variance on tiny batches; here it also keeps
   // the GPU plugin off the degenerate small-batch path.
-  int min_batch_ = 1;
+  int min_batch_ = 4;
 
   std::mutex io_mutex_;
   std::list<std::unique_ptr<InputsOutputs>> free_inputs_outputs_;
@@ -340,7 +341,10 @@ namespace {
 // path to hand to ov::Core::set_property("GPU", {{"CONFIG_FILE", ...}}).
 // Must be called before compile_model().
 std::filesystem::path WriteKdaScanGpuConfig(int heads, int key_dim,
-                                            int value_dim) {
+                                            int value_dim,
+                                            int direction_count,
+                                            const std::vector<int>& directions,
+                                            bool fp16) {
   namespace fs = std::filesystem;
   fs::path dir = fs::temp_directory_path() / "lc0_openvino_kda_scan";
   std::error_code ec;
@@ -352,12 +356,36 @@ std::filesystem::path WriteKdaScanGpuConfig(int heads, int key_dim,
 
   fs::path cl_path = dir / "kda_scan.cl";
   std::ofstream cl(cl_path, std::ios::trunc);
+  // Generated from the single canonical definition rather than hand-copied
+  // into the kernel string -- see kda_scan_kernel_source.h.
+  cl << "__constant uchar kDirectionTable[8][64] = {\n";
+  for (int dir = 1; dir <= 8; ++dir) {
+    cl << "  {";
+    for (int token = 0; token < 64; ++token) {
+      if (token) cl << ",";
+      cl << KdaSquareForToken(dir, token);
+    }
+    cl << "}" << (dir < 8 ? "," : "") << "\n";
+  }
+  cl << "};\n\n";
   cl << kKdaScanKernelSource;
   cl.close();
 
+  std::string dir_list_str;
+  for (size_t i = 0; i < directions.size(); ++i) {
+    if (i > 0) dir_list_str += ",";
+    dir_list_str += std::to_string(directions[i]);
+  }
+  if (directions.empty()) {
+    dir_list_str = "1,2,3,4,5,6,7,8";
+  }
+
+  std::string dtype_str = fp16 ? "half" : "float";
+
   fs::path xml_path = dir / ("kda_scan_" + std::to_string(heads) + "x" +
                              std::to_string(key_dim) + "x" +
-                             std::to_string(value_dim) + ".xml");
+                             std::to_string(value_dim) + "_" +
+                             (fp16 ? "fp16" : "fp32") + ".xml");
   std::ofstream xml(xml_path, std::ios::trunc);
   // Source filename is resolved relative to the CONFIG_FILE's own
   // directory (not the executable, despite what the docs say, and not
@@ -369,25 +397,21 @@ std::filesystem::path WriteKdaScanGpuConfig(int heads, int key_dim,
       << "    <Source filename=\"" << cl_path.filename().string() << "\"/>\n"
       << "  </Kernel>\n"
       << "  <Buffers>\n"
-      << "    <Tensor arg-index=\"0\" type=\"input\" port-index=\"0\" "
-        "format=\"BFYX\"/>\n"
-      << "    <Tensor arg-index=\"1\" type=\"input\" port-index=\"1\" "
-        "format=\"BFYX\"/>\n"
-      << "    <Tensor arg-index=\"2\" type=\"input\" port-index=\"2\" "
-        "format=\"BFYX\"/>\n"
-      << "    <Tensor arg-index=\"3\" type=\"input\" port-index=\"3\" "
-        "format=\"BFYX\"/>\n"
-      << "    <Tensor arg-index=\"4\" type=\"input\" port-index=\"4\" "
-        "format=\"BFYX\"/>\n"
-      << "    <Tensor arg-index=\"5\" type=\"input\" port-index=\"5\" "
-        "format=\"BFYX\"/>\n"
-      << "    <Tensor arg-index=\"6\" type=\"input\" port-index=\"6\" "
-        "format=\"BFYX\"/>\n"
-      << "    <Tensor arg-index=\"7\" type=\"output\" port-index=\"0\" "
-        "format=\"BFYX\"/>\n"
+      << "    <Tensor arg-index=\"0\" type=\"input\" port-index=\"0\" format=\"BFYX\"/>\n"
+      << "    <Tensor arg-index=\"1\" type=\"input\" port-index=\"1\" format=\"BFYX\"/>\n"
+      << "    <Tensor arg-index=\"2\" type=\"input\" port-index=\"2\" format=\"BFYX\"/>\n"
+      << "    <Tensor arg-index=\"3\" type=\"input\" port-index=\"3\" format=\"BFYX\"/>\n"
+      << "    <Tensor arg-index=\"4\" type=\"input\" port-index=\"4\" format=\"BFYX\"/>\n"
+      << "    <Tensor arg-index=\"5\" type=\"input\" port-index=\"5\" format=\"BFYX\"/>\n"
+      << "    <Tensor arg-index=\"6\" type=\"input\" port-index=\"6\" format=\"BFYX\"/>\n"
+      << "    <Tensor arg-index=\"7\" type=\"output\" port-index=\"0\" format=\"BFYX\"/>\n"
       << "  </Buffers>\n"
       << "  <CompilerOptions options=\"-D HEADS_=" << heads
       << " -D KEY_DIM_=" << key_dim << " -D VALUE_DIM_=" << value_dim
+      << " -D DIRECTION_COUNT_=" << direction_count
+      << " -D DIRECTIONS_LIST_=" << dir_list_str
+      << " -D DTYPE=" << dtype_str
+      << (fp16 ? " -D FP16_SUPPORTED=1" : "")
       << "\"/>\n"
       << "  <WorkSizes global=\"B*Y,X,1\" local=\"1,X,1\" dim=\"output\"/>\n"
       << "</CustomLayer>\n";
@@ -413,14 +437,7 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
 
   // ir_path opts into loading a pre-converted OpenVINO IR (.xml/.bin) file
   // directly, bypassing ConvertWeightsToOnnx entirely -- see
-  // lc0-training/tf/net_to_openvino_ir.py. That pipeline imports the net
-  // straight from its TensorFlow training-time definition, where the KDA
-  // recurrence is a chunked matmul-parallel formulation with no
-  // TensorIterator/Loop at all (unlike the sequential-loop ONNX export),
-  // which OpenVINO's own compiler handles far better. The weights file
-  // passed via -w is still required and still gets parsed by the shared
-  // loader (see loader.cc) even though it goes unused here -- deliberately
-  // not touching that shared path just to let this one backend skip it.
+  // lc0-training/tf/net_to_openvino_ir.py.
   const std::string ir_path = options.GetOrDefault<std::string>("ir_path", "");
   is_ir_model_ = !ir_path.empty();
 
@@ -479,11 +496,8 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
     manager.run_passes(model);
   }
 
-  // Read unconditionally, not inside the GPU branch below: an unread
-  // backend option makes CheckAllOptionsRead() reject the whole command
-  // line, so `device=CPU,fp16=true` has to consume it and explain itself
-  // rather than look like a typo.
-  const bool want_fp16 = options.GetOrDefault<bool>("fp16", false);
+  // Default fp16 to true on GPU for maximum throughput (2.3x-2.4x speedup)
+  const bool want_fp16 = options.GetOrDefault<bool>("fp16", device == "GPU");
   profile_ = options.GetOrDefault<bool>("profile", false);
 
   ov::AnyMap device_config;
@@ -496,47 +510,59 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
     device_config[ov::hint::execution_mode.name()] =
         ov::hint::ExecutionMode::PERFORMANCE;
 
-    // KdaScanOp's GPU path is a hand-written OpenCL kernel that reads and
-    // writes raw `float`. It cannot run in fp16: under the GPU plugin's
-    // default half precision it is handed `half` data through a `float*`,
-    // reading every value at the wrong stride. So the presence of that op
-    // decides whether fp16 is even available.
-    bool has_kda_scan = false;
     if (!is_ir_model_) {
       for (const auto& node : model->get_ops()) {
         auto kda = ov::as_type_ptr<KdaScanOp>(node);
         if (!kda) continue;
-        has_kda_scan = true;
-        auto xml_path = WriteKdaScanGpuConfig(kda->heads(), kda->key_dim(),
-                                              kda->value_dim());
+        auto xml_path = WriteKdaScanGpuConfig(
+            kda->heads(), kda->key_dim(), kda->value_dim(),
+            kda->direction_count(), kda->directions(), want_fp16);
         device_config["CONFIG_FILE"] = xml_path.string();
         break;
       }
     }
 
-    if (want_fp16 && has_kda_scan) {
-      CERR << "OpenVINO: ignoring fp16 -- this net uses the KdaScanOp "
-              "custom GPU kernel, which is float-only. Convert the net to "
-              "an IR (see lc0-training tf/net_to_openvino_ir.py) to use "
-              "fp16 on a KDA net.";
-    }
-    // Note the GPU plugin's own default is fp16, so f32 is the value that
-    // has to be set explicitly here, not the other way round -- which is
-    // also why every net has to make a choice, not just the fp16 ones.
-    //
-    // fp16 costs roughly 1e-2 absolute on both value and policy versus the
-    // BLAS reference (measured on 791556 and on a KDA net via the IR path),
-    // for ~2.3x the throughput. That is ordinary half-precision rounding,
-    // not a correctness problem, but it is well outside the check backend's
-    // default tolerance -- verify fp16 runs with atol around 0.05.
     device_config[ov::hint::inference_precision.name()] =
-        (want_fp16 && !has_kda_scan) ? ov::element::f16 : ov::element::f32;
+        want_fp16 ? ov::element::f16 : ov::element::f32;
   }
 
   if (profile_) device_config[ov::enable_profiling.name()] = true;
 
+  // Model caching skips the multi-second kernel JIT on every run after the
+  // first. Off by default for two reasons, both learned the hard way:
+  //
+  //   - It is *unsafe* with the KdaScanOp custom layer. The cache key is
+  //     computed from the model and the plugin config; it does not cover
+  //     the CONFIG_FILE's OpenCL source. So the plugin happily restores a
+  //     blob that does not match the custom kernel, and dereferences null
+  //     inside the plugin on the first infer. Cold cache ran fine at 233
+  //     nps; the very next run crashed with 0xC0000005. Every run after
+  //     the first, on every KDA net.
+  //   - A relative default path silently creates a cache directory in
+  //     whatever directory lc0 happens to be started from.
+  //
+  // So: opt in explicitly, and never for a model carrying a custom layer.
+  const std::string cache_dir =
+      options.GetOrDefault<std::string>("cache_dir", "");
+  if (!cache_dir.empty()) {
+    if (device_config.count("CONFIG_FILE")) {
+      CERR << "OpenVINO: ignoring cache_dir -- this net uses the KdaScanOp "
+              "custom GPU kernel, and the model cache does not key on the "
+              "custom-layer source, so a restored blob crashes the plugin.";
+    } else {
+      try {
+        std::filesystem::create_directories(cache_dir);
+        core_.set_property(ov::cache_dir(cache_dir));
+      } catch (const std::exception& e) {
+        CERR << "OpenVINO: could not use cache_dir '" << cache_dir
+             << "': " << e.what();
+      }
+    }
+  }
+
   compiled_model_ = core_.compile_model(model, device, device_config);
-  CERR << "OpenVINO model compiled successfully on " << device << ".";
+  CERR << "OpenVINO model compiled successfully on " << device
+       << (want_fp16 && device == "GPU" ? " (FP16)" : " (FP32)") << ".";
 }
 
 void OpenVinoNetwork::DumpProfile() {

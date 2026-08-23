@@ -26,34 +26,49 @@ namespace openvino_backend {
 // source, generated at runtime by network_openvino.cc since HEADS_/
 // KEY_DIM_/VALUE_DIM_ vary per net and are baked in as compiler -D flags).
 //
-// Embedded as a string rather than shipped as a loose .cl file next to the
-// binary because lc0 has no install-time data-file mechanism to reliably
-// find it at -- the custom-layer XML's <Source filename=.../> still needs
-// an actual file on disk, so network_openvino.cc writes this string out to
-// a temp file alongside the generated XML.
+// Folds the 8-directional scan token->square mapping directly into the
+// kernel via a kDirectionTable[8][64] lookup, eliminating the
+// Slice/Gather/Concat permutation chain the graph used to carry around
+// every scan. That table is NOT written out here: WriteKdaScanGpuConfig
+// generates it from KdaSquareForToken (neural/kda_directions.h) and
+// prepends it to this source. Transcribing it by hand would put a fourth
+// copy of the traversal order in the tree, in the one place where getting
+// it wrong is not a compile error -- just silently wrong chess.
 //
 // Structurally mirrors sycl/common_kernels.dp.cpp's
-// kdaRecurrenceValueParallel and must stay bit-for-bit equivalent to it and
-// to KdaScanOp::evaluate() (kda_scan_op.cc) -- one work-group per (batch,
-// head), VALUE_DIM_ work-items per group, each owning one lane of the
+// kdaRecurrenceValueParallel: one work-group per (batch, head),
+// VALUE_DIM_ work-items per group, each owning one lane of the
 // recurrent state matrix (state[key][lane]) across the 64-step sequential
 // scan. Dispatched with global=[N*HEADS_, VALUE_DIM_, 1],
-// local=[1, VALUE_DIM_, 1] -- get_global_id(0) is decoded into (n, head)
-// here; the decoding just needs to be self-consistent, not match any
-// particular host-side enumeration order.
+// local=[1, VALUE_DIM_, 1].
 inline constexpr const char kKdaScanKernelSource[] = R"CLC(
-__kernel void kda_scan_kernel(__global const float* q,          // [N,64,H,K]
-                              __global const float* k,          // [N,64,H,K]
-                              __global const float* v,          // [N,64,H,V]
-                              __global const float* raw_decay,  // [N,64,H,K]
-                              __global const float* beta,       // [N,64,H,1]
-                              __global const float* dt_bias,        // [H,K]
-                              __global const float* neg_decay_scale,  // [H]
-                              __global float* mixed) {          // [N,64,H,V]
+#ifdef FP16_SUPPORTED
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#endif
+
+#ifndef DTYPE
+#define DTYPE float
+#endif
+
+
+__constant uchar kDirections[] = { DIRECTIONS_LIST_ };
+
+__kernel void kda_scan_kernel(__global const DTYPE* q,          // [N,64,H,K] in square order
+                              __global const DTYPE* k,          // [N,64,H,K]
+                              __global const DTYPE* v,          // [N,64,H,V]
+                              __global const DTYPE* raw_decay,  // [N,64,H,K]
+                              __global const DTYPE* beta,       // [N,64,H,1]
+                              __global const DTYPE* dt_bias,        // [H,K]
+                              __global const DTYPE* neg_decay_scale,  // [H]
+                              __global DTYPE* mixed) {          // [N,64,H,V] in square order
   const int gid0 = get_global_id(0);
   const int lane = get_global_id(1);
   const int n = gid0 / HEADS_;
   const int head = gid0 % HEADS_;
+
+  const int dir_group = head / (HEADS_ / DIRECTION_COUNT_);
+  const int dir = (int)kDirections[dir_group];
+  const int dir_idx = dir - 1;
 
   __local float p_q[KEY_DIM_];
   __local float p_k[KEY_DIM_];
@@ -63,18 +78,19 @@ __kernel void kda_scan_kernel(__global const float* q,          // [N,64,H,K]
   for (int i = 0; i < KEY_DIM_; ++i) state[i] = 0.0f;
 
   const float scale = 1.0f / sqrt((float)KEY_DIM_);
-  const float neg_scale_h = neg_decay_scale[head];
+  const float neg_scale_h = (float)neg_decay_scale[head];
 
   for (int t = 0; t < 64; ++t) {
-    const int qk_base = ((n * 64 + t) * HEADS_ + head) * KEY_DIM_;
-    const int v_base = ((n * 64 + t) * HEADS_ + head) * VALUE_DIM_;
-    const int beta_idx = (n * 64 + t) * HEADS_ + head;
+    const int sq = (int)kDirectionTable[dir_idx][t];
+    const int qk_base = ((n * 64 + sq) * HEADS_ + head) * KEY_DIM_;
+    const int v_base = ((n * 64 + sq) * HEADS_ + head) * VALUE_DIM_;
+    const int beta_idx = (n * 64 + sq) * HEADS_ + head;
 
     for (int i = lane; i < KEY_DIM_; i += VALUE_DIM_) {
-      p_q[i] = q[qk_base + i];
-      p_k[i] = k[qk_base + i];
+      p_q[i] = (float)q[qk_base + i];
+      p_k[i] = (float)k[qk_base + i];
 
-      const float decay_input = raw_decay[qk_base + i] + dt_bias[head * KEY_DIM_ + i];
+      const float decay_input = (float)raw_decay[qk_base + i] + (float)dt_bias[head * KEY_DIM_ + i];
       const float softplus = (decay_input > 0.0f ? decay_input : 0.0f) +
                              log1p(exp(-fabs(decay_input)));
       float log_decay = neg_scale_h * softplus;
@@ -94,7 +110,7 @@ __kernel void kda_scan_kernel(__global const float* q,          // [N,64,H,K]
 
     for (int key = 0; key < KEY_DIM_; ++key) state[key] *= p_decay[key];
 
-    const float beta_value = beta[beta_idx];
+    const float beta_value = (float)beta[beta_idx];
     const float update_rate = 1.0f / (1.0f + exp(-beta_value));
 
     float prediction = 0.0f;
@@ -102,7 +118,7 @@ __kernel void kda_scan_kernel(__global const float* q,          // [N,64,H,K]
       prediction += p_k[key] * k_norm * state[key];
     }
 
-    const float delta = update_rate * (v[v_base + lane] - prediction);
+    const float delta = update_rate * ((float)v[v_base + lane] - prediction);
 
     float out = 0.0f;
     for (int key = 0; key < KEY_DIM_; ++key) {
@@ -110,7 +126,7 @@ __kernel void kda_scan_kernel(__global const float* q,          // [N,64,H,K]
       out += p_q[key] * q_norm * scale * state[key];
     }
 
-    mixed[v_base + lane] = out;
+    mixed[v_base + lane] = (DTYPE)out;
 
     barrier(CLK_LOCAL_MEM_FENCE);
   }

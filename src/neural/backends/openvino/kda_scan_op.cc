@@ -18,6 +18,8 @@
 
 #include "neural/backends/openvino/kda_scan_op.h"
 
+#include "neural/kda_directions.h"
+
 #include <algorithm>
 #include <cmath>
 #include <vector>
@@ -31,8 +33,12 @@ KdaScanOp::KdaScanOp(const ov::Output<ov::Node>& q,
                      const ov::Output<ov::Node>& raw_decay,
                      const ov::Output<ov::Node>& beta,
                      const ov::Output<ov::Node>& dt_bias,
-                     const ov::Output<ov::Node>& neg_decay_scale)
-    : Op({q, k, v, raw_decay, beta, dt_bias, neg_decay_scale}) {
+                     const ov::Output<ov::Node>& neg_decay_scale,
+                     int direction_count,
+                     std::vector<int> directions)
+    : Op({q, k, v, raw_decay, beta, dt_bias, neg_decay_scale}),
+      direction_count_(direction_count),
+      directions_(std::move(directions)) {
   constructor_validate_and_infer_types();
 }
 
@@ -63,7 +69,8 @@ std::shared_ptr<ov::Node> KdaScanOp::clone_with_new_inputs(
   return std::make_shared<KdaScanOp>(new_args.at(0), new_args.at(1),
                                      new_args.at(2), new_args.at(3),
                                      new_args.at(4), new_args.at(5),
-                                     new_args.at(6));
+                                     new_args.at(6), direction_count_,
+                                     directions_);
 }
 
 bool KdaScanOp::visit_attributes(ov::AttributeVisitor&) { return true; }
@@ -77,6 +84,7 @@ inline float Softplus(float x) {
   return (x > 0.0f ? x : 0.0f) + std::log1p(std::exp(-std::fabs(x)));
 }
 inline float Sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
+
 }  // namespace
 
 bool KdaScanOp::evaluate(ov::TensorVector& outputs,
@@ -109,13 +117,16 @@ bool KdaScanOp::evaluate(ov::TensorVector& outputs,
     for (int h = 0; h < heads; ++h) {
       std::fill(state.begin(), state.end(), 0.0f);
       const float neg_scale_h = neg_decay_scale[h];
+      const int dir_group = h / (heads / direction_count_);
+      const int dir = directions_[dir_group];
 
       for (int t = 0; t < 64; ++t) {
+        const int sq = KdaSquareForToken(dir, t);
         const size_t qk_base =
-            ((static_cast<size_t>(n) * 64 + t) * heads + h) * key_dim;
+            ((static_cast<size_t>(n) * 64 + sq) * heads + h) * key_dim;
         const size_t v_base =
-            ((static_cast<size_t>(n) * 64 + t) * heads + h) * value_dim;
-        const size_t beta_idx = (static_cast<size_t>(n) * 64 + t) * heads + h;
+            ((static_cast<size_t>(n) * 64 + sq) * heads + h) * value_dim;
+        const size_t beta_idx = (static_cast<size_t>(n) * 64 + sq) * heads + h;
 
         const float* q_t = q + qk_base;
         const float* k_t = k + qk_base;
@@ -132,8 +143,6 @@ bool KdaScanOp::evaluate(ov::TensorVector& outputs,
         const float k_norm =
             1.0f / std::sqrt(k_norm_sq > 1e-12f ? k_norm_sq : 1e-12f);
 
-        // decay[key] = exp(max(-neg_decay_scale? see below, floor))
-        // decayed_state[key,val] = state[key,val] * decay[key]
         for (int key = 0; key < key_dim; ++key) {
           const float decay_x = decay_t[key] + dt_bias[h * key_dim + key];
           const float log_decay_raw = neg_scale_h * Softplus(decay_x);
@@ -147,7 +156,6 @@ bool KdaScanOp::evaluate(ov::TensorVector& outputs,
 
         const float update_rate = Sigmoid(beta[beta_idx]);
 
-        // prediction[val] = sum_key k_normed[key] * decayed_state[key,val]
         std::vector<float> prediction(value_dim, 0.0f);
         for (int key = 0; key < key_dim; ++key) {
           const float k_normed = k_t[key] * k_norm;
@@ -162,9 +170,6 @@ bool KdaScanOp::evaluate(ov::TensorVector& outputs,
           delta[val] = update_rate * (v_t[val] - prediction[val]);
         }
 
-        // new_state[key,val] = decayed_state[key,val]
-        //                       + k_normed[key] * delta[val]
-        // out[val] = sum_key q_normed[key] * new_state[key,val]
         std::vector<float> out(value_dim, 0.0f);
         const float q_scale = q_norm * scale;
         for (int key = 0; key < key_dim; ++key) {

@@ -22,6 +22,10 @@
 #include <openvino/op/constant.hpp>
 #include <openvino/op/tensor_iterator.hpp>
 #include <openvino/pass/pattern/matcher.hpp>
+#include <openvino/op/concat.hpp>
+#include <openvino/op/gather.hpp>
+#include <openvino/op/slice.hpp>
+#include <openvino/op/strided_slice.hpp>
 #include <openvino/pass/pattern/op/wrap_type.hpp>
 
 #include "neural/backends/openvino/kda_scan_op.h"
@@ -72,6 +76,64 @@ std::shared_ptr<ov::op::v0::Constant> FindBodyConstantBySuffix(
                   "' body has no Constant ending in '" + suffix + "'.");
 }
 
+// Walks back from a KdaScanOp input to the unpermuted, square-major
+// tensor. The ONNX export builds each scan input as a Concat over the
+// per-direction groups, each of which is a Gather (the direction's
+// token->square permutation) over a Slice of the full tensor. The kernel
+// now applies that permutation itself from kDirectionTable, so the graph
+// copy has to be bypassed -- feeding it the Concat as well would permute
+// twice.
+//
+// Do not compare get_type_name() against a literal: it returns const char*,
+// so `==` compares pointers and is always false. That silently turned this
+// whole function into a no-op.
+ov::Output<ov::Node> TraceToUnpermutedInput(ov::Output<ov::Node> input) {
+  auto node = input.get_node_shared_ptr();
+  if (ov::is_type<ov::op::v0::Concat>(node) && node->get_input_size() > 0) {
+    node = node->input_value(0).get_node_shared_ptr();
+  }
+  if ((ov::is_type<ov::op::v8::Gather>(node) ||
+       ov::is_type<ov::op::v7::Gather>(node) ||
+       ov::is_type<ov::op::v1::Gather>(node)) &&
+      node->get_input_size() > 0) {
+    node = node->input_value(0).get_node_shared_ptr();
+  }
+  if ((ov::is_type<ov::op::v8::Slice>(node) ||
+       ov::is_type<ov::op::v1::StridedSlice>(node)) &&
+      node->get_input_size() > 0) {
+    return node->input_value(0);
+  }
+  throw Exception(
+      "OpenVINO KdaScan pass: could not trace '" +
+      input.get_node()->get_friendly_name() +
+      "' back to an unpermuted tensor (stopped at a " +
+      std::string(node->get_type_name()) +
+      "). The kernel permutes internally, so feeding it the graph's "
+      "permuted tensor would double-permute and silently produce wrong "
+      "results -- failing instead.");
+}
+
+// Finds the Concat that reassembles the per-direction scan outputs back
+// into square order. The kernel already writes square-major, so that
+// Concat is what the fused op must replace -- replacing ti->output(1)
+// instead would leave the inverse permutation in place on top of a result
+// that is already in square order.
+std::shared_ptr<ov::Node> FindDownstreamReorderedOutput(
+    const ov::Output<ov::Node>& ti_out) {
+  for (const auto& slice_in : ti_out.get_target_inputs()) {
+    auto slice_node = slice_in.get_node()->shared_from_this();
+    for (const auto& gather_in : slice_node->output(0).get_target_inputs()) {
+      auto gather_node = gather_in.get_node()->shared_from_this();
+      for (const auto& concat_in :
+           gather_node->output(0).get_target_inputs()) {
+        auto concat_node = concat_in.get_node()->shared_from_this();
+        if (ov::is_type<ov::op::v0::Concat>(concat_node)) return concat_node;
+      }
+    }
+  }
+  return nullptr;
+}
+
 }  // namespace
 
 ReplaceKdaScan::ReplaceKdaScan() {
@@ -86,11 +148,11 @@ ReplaceKdaScan::ReplaceKdaScan() {
     // suffix converter.cc gives every KDA Scan node's friendly name.
     if (!EndsWith(ti->get_friendly_name(), "/scan")) return false;
 
-    auto q = FindInputBySuffix(ti, "/scan/q");
-    auto k = FindInputBySuffix(ti, "/scan/k");
-    auto v = FindInputBySuffix(ti, "/scan/v");
-    auto decay = FindInputBySuffix(ti, "/scan/decay");
-    auto beta = FindInputBySuffix(ti, "/scan/beta");
+    auto q = TraceToUnpermutedInput(FindInputBySuffix(ti, "/scan/q"));
+    auto k = TraceToUnpermutedInput(FindInputBySuffix(ti, "/scan/k"));
+    auto v = TraceToUnpermutedInput(FindInputBySuffix(ti, "/scan/v"));
+    auto decay = TraceToUnpermutedInput(FindInputBySuffix(ti, "/scan/decay"));
+    auto beta = TraceToUnpermutedInput(FindInputBySuffix(ti, "/scan/beta"));
     auto dt_bias_c = FindBodyConstantBySuffix(ti, "/dt_bias");
     auto neg_decay_scale_c =
         FindBodyConstantBySuffix(ti, "/neg_decay_scale");
@@ -118,7 +180,17 @@ ReplaceKdaScan::ReplaceKdaScan() {
           "not compute it and this replacement would be silently wrong.");
     }
 
-    ti->output(1).replace(kda_scan->output(0));
+    auto mixed4 = FindDownstreamReorderedOutput(ti->output(1));
+    if (!mixed4) {
+      throw Exception(
+          "OpenVINO KdaScan pass: TensorIterator '" +
+          ti->get_friendly_name() +
+          "' has no downstream Slice->Gather->Concat reassembling the "
+          "per-direction outputs. Falling back to replacing the scan "
+          "output directly would leave the inverse permutation applied to "
+          "an already square-major result -- failing instead.");
+    }
+    mixed4->output(0).replace(kda_scan->output(0));
     ov::copy_runtime_info(ti, kda_scan);
     return true;
   };

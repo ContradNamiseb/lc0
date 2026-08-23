@@ -27,6 +27,8 @@
 
 #include "neural/onnx/converter.h"
 
+#include "neural/kda_directions.h"
+
 #include <climits>
 #include <cmath>
 #include <cstddef>
@@ -52,60 +54,6 @@
 namespace lczero {
 namespace {
 
-// Traversal order of the 64 squares for each KdaDirection value. Kept in
-// sync with the identical function of the same name in
-// src/neural/backends/blas/network_blas.cc (itself commented "Must match
-// KDA_TRAVERSALS in the trainer") -- duplicated rather than shared across a
-// translation-unit boundary since it's a small, stable, pure function and
-// the ONNX converter has no other dependency on the BLAS backend.
-int KdaSquareForToken(int direction, int token) {
-  switch (direction) {
-    case 1:
-      return token;
-    case 2:
-      return 63 - token;
-    case 3:
-      return (token % 8) * 8 + token / 8;
-    case 4: {
-      const int reverse = 63 - token;
-      return (reverse % 8) * 8 + reverse / 8;
-    }
-    case 5: {
-      static constexpr int kTable[64] = {
-          7,  6,  15, 5,  14, 23, 4,  13, 22, 31, 3,  12, 21, 30, 39, 2,
-          11, 20, 29, 38, 47, 1,  10, 19, 28, 37, 46, 55, 0,  9,  18, 27,
-          36, 45, 54, 63, 8,  17, 26, 35, 44, 53, 62, 16, 25, 34, 43, 52,
-          61, 24, 33, 42, 51, 60, 32, 41, 50, 59, 40, 49, 58, 48, 57, 56};
-      return kTable[token];
-    }
-    case 6: {
-      static constexpr int kTable[64] = {
-          56, 57, 48, 58, 49, 40, 59, 50, 41, 32, 60, 51, 42, 33, 24, 61,
-          52, 43, 34, 25, 16, 62, 53, 44, 35, 26, 17, 8,  63, 54, 45, 36,
-          27, 18, 9,  0,  55, 46, 37, 28, 19, 10, 1,  47, 38, 29, 20, 11,
-          2,  39, 30, 21, 12, 3,  31, 22, 13, 4,  23, 14, 5,  15, 6,  7};
-      return kTable[token];
-    }
-    case 7: {
-      static constexpr int kTable[64] = {
-          0,  1,  8,  2,  9,  16, 3,  10, 17, 24, 4,  11, 18, 25, 32, 5,
-          12, 19, 26, 33, 40, 6,  13, 20, 27, 34, 41, 48, 7,  14, 21, 28,
-          35, 42, 49, 56, 15, 22, 29, 36, 43, 50, 57, 23, 30, 37, 44, 51,
-          58, 31, 38, 45, 52, 59, 39, 46, 53, 60, 47, 54, 61, 55, 62, 63};
-      return kTable[token];
-    }
-    case 8: {
-      static constexpr int kTable[64] = {
-          63, 62, 55, 61, 54, 47, 60, 53, 46, 39, 59, 52, 45, 38, 31, 58,
-          51, 44, 37, 30, 23, 57, 50, 43, 36, 29, 22, 15, 56, 49, 42, 35,
-          28, 21, 14, 7,  48, 41, 34, 27, 20, 13, 6,  40, 33, 26, 19, 12,
-          5,  32, 25, 18, 11, 4,  24, 17, 10, 3,  16, 9,  2,  8,  1,  0};
-      return kTable[token];
-    }
-    default:
-      throw Exception("Unsupported KDA traversal direction.");
-  }
-}
 
 class Converter {
  public:

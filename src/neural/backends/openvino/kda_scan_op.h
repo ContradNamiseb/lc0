@@ -59,7 +59,9 @@ class KdaScanOp : public ov::op::Op {
             const ov::Output<ov::Node>& raw_decay,
             const ov::Output<ov::Node>& beta,
             const ov::Output<ov::Node>& dt_bias,
-            const ov::Output<ov::Node>& neg_decay_scale);
+            const ov::Output<ov::Node>& neg_decay_scale,
+            int direction_count = 8,
+            std::vector<int> directions = {1, 2, 3, 4, 5, 6, 7, 8});
 
   void validate_and_infer_types() override;
   std::shared_ptr<ov::Node> clone_with_new_inputs(
@@ -77,6 +79,8 @@ class KdaScanOp : public ov::op::Op {
   int heads() const { return heads_; }
   int key_dim() const { return key_dim_; }
   int value_dim() const { return value_dim_; }
+  int direction_count() const { return direction_count_; }
+  const std::vector<int>& directions() const { return directions_; }
 
   // Lower clamp on log_decay. Must match converter.cc's kLogDecayFloor.
   static constexpr float kLogDecayFloor = -10.0f;
@@ -85,6 +89,8 @@ class KdaScanOp : public ov::op::Op {
   int heads_ = -1;
   int key_dim_ = -1;
   int value_dim_ = -1;
+  int direction_count_ = 8;
+  std::vector<int> directions_{1, 2, 3, 4, 5, 6, 7, 8};
 };
 
 }  // namespace openvino_backend
