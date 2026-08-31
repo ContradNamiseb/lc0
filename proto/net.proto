@@ -144,6 +144,9 @@ message Weights {
     optional Layer local_conv_w = 28;
     optional Layer local_conv_b = 29;
     optional bool local_conv = 30 [default = false];
+    // SiLU on the q/k/v projections, as fla's KimiDeltaAttention always
+    // applies (via ShortConvolution activation, or a bare silu without it).
+    optional bool qkv_silu = 31 [default = false];
   }
 
   message EncoderLayer {
@@ -416,6 +419,14 @@ message NetworkFormat {
     KDA_DIRECTION_DIAG_REVERSE = 6;
     KDA_DIRECTION_ANTI_DIAG_FORWARD = 7;
     KDA_DIRECTION_ANTI_DIAG_REVERSE = 8;
+    // Boustrophedon ("serpentine") walks: every other rank/file is reversed,
+    // so consecutive tokens are always board adjacent. The plain
+    // RANK_FORWARD walk jumps 7 squares at each rank wrap, which the
+    // recurrence cannot represent -- it can only weight by recency.
+    KDA_DIRECTION_RANK_SERPENTINE = 9;
+    KDA_DIRECTION_RANK_SERPENTINE_REVERSE = 10;
+    KDA_DIRECTION_FILE_SERPENTINE = 11;
+    KDA_DIRECTION_FILE_SERPENTINE_REVERSE = 12;
   }
   repeated KdaDirection kda_directions = 11;
 }

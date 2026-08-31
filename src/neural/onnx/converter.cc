@@ -102,6 +102,27 @@ int KdaSquareForToken(int direction, int token) {
           5,  32, 25, 18, 11, 4,  24, 17, 10, 3,  16, 9,  2,  8,  1,  0};
       return kTable[token];
     }
+    // Boustrophedon ("serpentine") walks: every other rank/file is reversed,
+    // so consecutive tokens are always board adjacent, unlike cases 1-4 which
+    // jump 7 squares at each wrap. Closed form, no table needed.
+    case 9: {
+      const int rank = token / 8, file = token % 8;
+      return rank * 8 + (rank % 2 == 0 ? file : 7 - file);
+    }
+    case 10: {
+      const int reverse = 63 - token;
+      const int rank = reverse / 8, file = reverse % 8;
+      return rank * 8 + (rank % 2 == 0 ? file : 7 - file);
+    }
+    case 11: {
+      const int file = token / 8, rank = token % 8;
+      return (file % 2 == 0 ? rank : 7 - rank) * 8 + file;
+    }
+    case 12: {
+      const int reverse = 63 - token;
+      const int file = reverse / 8, rank = reverse % 8;
+      return (file % 2 == 0 ? rank : 7 - rank) * 8 + file;
+    }
     default:
       throw Exception("Unsupported KDA traversal direction.");
   }
@@ -767,6 +788,18 @@ std::string Converter::MakeKdaMixer(OnnxBuilder* builder,
   auto q = MakeProjection(kda.q_w, kda.q_b, key_depth, name + "/q");
   auto k = MakeProjection(kda.k_w, kda.k_b, key_depth, name + "/k");
   auto v = MakeProjection(kda.v_w, kda.v_b, value_depth, name + "/v");
+  if (kda.qkv_silu) {
+    // fla's KimiDeltaAttention always activates q/k/v (ShortConvolution's
+    // silu, or a bare silu without the conv). The builder has no Silu op, so
+    // spell it out: x * sigmoid(x).
+    auto silu = [&](const std::string& flow, const std::string& sname) {
+      return builder->Mul(sname, flow,
+                          builder->Sigmoid(sname + "/sigmoid", flow));
+    };
+    q = silu(q, name + "/q/silu");
+    k = silu(k, name + "/k/silu");
+    v = silu(v, name + "/v/silu");
+  }
   auto decay_hidden = MakeProjection(kda.decay_a_w, kda.decay_a_b, gate_rank,
                                      name + "/decay_a");
   auto raw_decay = builder->MatMul(

@@ -185,7 +185,8 @@ BaseWeights::KDA::KDA(const pblczero::Weights::KDA& kda)
       rms_norm_epsilon(kda.rms_norm_epsilon()),
       output_gate(kda.output_gate()),
       output_rms_norm(kda.output_rms_norm()),
-      local_conv(kda.local_conv()) {}
+      local_conv(kda.local_conv()),
+      qkv_silu(kda.qkv_silu()) {}
 
 BaseWeights::EncoderLayer::EncoderLayer(
     const pblczero::Weights::EncoderLayer& encoder)
