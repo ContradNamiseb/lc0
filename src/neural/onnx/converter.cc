@@ -123,6 +123,42 @@ int KdaSquareForToken(int direction, int token) {
       const int file = reverse / 8, rank = reverse % 8;
       return (file % 2 == 0 ? rank : 7 - rank) * 8 + file;
     }
+    // diag_serpentine
+    case 13: {
+      static constexpr int kTable[64] = {
+          7, 15, 6, 5, 14, 23, 31, 22, 13, 4, 3, 12, 21, 30, 39, 47, 38, 29,
+          20, 11, 2, 1, 10, 19, 28, 37, 46, 55, 63, 54, 45, 36, 27, 18, 9, 0,
+          8, 17, 26, 35, 44, 53, 62, 61, 52, 43, 34, 25, 16, 24, 33, 42, 51,
+          60, 59, 50, 41, 32, 40, 49, 58, 57, 48, 56};
+      return kTable[token];
+    }
+    // diag_serpentine_reverse
+    case 14: {
+      static constexpr int kTable[64] = {
+          56, 48, 57, 58, 49, 40, 32, 41, 50, 59, 60, 51, 42, 33, 24, 16, 25,
+          34, 43, 52, 61, 62, 53, 44, 35, 26, 17, 8, 0, 9, 18, 27, 36, 45, 54,
+          63, 55, 46, 37, 28, 19, 10, 1, 2, 11, 20, 29, 38, 47, 39, 30, 21,
+          12, 3, 4, 13, 22, 31, 23, 14, 5, 6, 15, 7};
+      return kTable[token];
+    }
+    // anti_diag_serpentine
+    case 15: {
+      static constexpr int kTable[64] = {
+          0, 8, 1, 2, 9, 16, 24, 17, 10, 3, 4, 11, 18, 25, 32, 40, 33, 26, 19,
+          12, 5, 6, 13, 20, 27, 34, 41, 48, 56, 49, 42, 35, 28, 21, 14, 7, 15,
+          22, 29, 36, 43, 50, 57, 58, 51, 44, 37, 30, 23, 31, 38, 45, 52, 59,
+          60, 53, 46, 39, 47, 54, 61, 62, 55, 63};
+      return kTable[token];
+    }
+    // anti_diag_serpentine_reverse
+    case 16: {
+      static constexpr int kTable[64] = {
+          63, 55, 62, 61, 54, 47, 39, 46, 53, 60, 59, 52, 45, 38, 31, 23, 30,
+          37, 44, 51, 58, 57, 50, 43, 36, 29, 22, 15, 7, 14, 21, 28, 35, 42,
+          49, 56, 48, 41, 34, 27, 20, 13, 6, 5, 12, 19, 26, 33, 40, 32, 25,
+          18, 11, 4, 3, 10, 17, 24, 16, 9, 2, 1, 8, 0};
+      return kTable[token];
+    }
     default:
       throw Exception("Unsupported KDA traversal direction.");
   }

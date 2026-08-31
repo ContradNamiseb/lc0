@@ -427,6 +427,12 @@ message NetworkFormat {
     KDA_DIRECTION_RANK_SERPENTINE_REVERSE = 10;
     KDA_DIRECTION_FILE_SERPENTINE = 11;
     KDA_DIRECTION_FILE_SERPENTINE_REVERSE = 12;
+    // The diagonals break 12 times per scan against the rank walk's 7,
+    // so they benefit from this more than the orthogonal walks do.
+    KDA_DIRECTION_DIAG_SERPENTINE = 13;
+    KDA_DIRECTION_DIAG_SERPENTINE_REVERSE = 14;
+    KDA_DIRECTION_ANTI_DIAG_SERPENTINE = 15;
+    KDA_DIRECTION_ANTI_DIAG_SERPENTINE_REVERSE = 16;
   }
   repeated KdaDirection kda_directions = 11;
 }
