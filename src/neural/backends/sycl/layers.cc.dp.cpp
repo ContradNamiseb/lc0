@@ -2492,7 +2492,7 @@ EncoderBlock<DataType>::EncoderBlock(
       throw Exception("KDA directions must evenly divide the encoder heads.");
     }
     for (int i = 0; i < kda_direction_count_; ++i) {
-      if (kda_directions[i] < 1 || kda_directions[i] > 8) {
+      if (kda_directions[i] < 1 || kda_directions[i] > 16) {
         throw Exception("Unsupported KDA traversal direction.");
       }
       kda_directions_[i] = kda_directions[i];

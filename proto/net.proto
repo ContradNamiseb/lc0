@@ -419,6 +419,20 @@ message NetworkFormat {
     KDA_DIRECTION_DIAG_REVERSE = 6;
     KDA_DIRECTION_ANTI_DIAG_FORWARD = 7;
     KDA_DIRECTION_ANTI_DIAG_REVERSE = 8;
+    // Boustrophedon ("serpentine") walks: every other rank/file is reversed,
+    // so consecutive tokens are always board adjacent. The plain
+    // RANK_FORWARD walk jumps 7 squares at each rank wrap, which the
+    // recurrence cannot represent -- it can only weight by recency.
+    KDA_DIRECTION_RANK_SERPENTINE = 9;
+    KDA_DIRECTION_RANK_SERPENTINE_REVERSE = 10;
+    KDA_DIRECTION_FILE_SERPENTINE = 11;
+    KDA_DIRECTION_FILE_SERPENTINE_REVERSE = 12;
+    // The diagonals break 12 times per scan against the rank walk's 7,
+    // so they benefit from this more than the orthogonal walks do.
+    KDA_DIRECTION_DIAG_SERPENTINE = 13;
+    KDA_DIRECTION_DIAG_SERPENTINE_REVERSE = 14;
+    KDA_DIRECTION_ANTI_DIAG_SERPENTINE = 15;
+    KDA_DIRECTION_ANTI_DIAG_SERPENTINE_REVERSE = 16;
   }
   repeated KdaDirection kda_directions = 11;
 }

@@ -1234,7 +1234,7 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
   kda_directions_.assign(nf.kda_directions().begin(),
                          nf.kda_directions().end());
   for (const int direction : kda_directions_) {
-    if (direction < 1 || direction > 8) {
+    if (direction < 1 || direction > 16) {
       throw Exception("Unsupported KDA traversal direction.");
     }
   }
