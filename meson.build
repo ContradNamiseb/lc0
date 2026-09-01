@@ -930,6 +930,8 @@ endif
       files += 'src/neural/backends/openvino/network_openvino.cc'
       files += 'src/neural/backends/openvino/kda_scan_op.cc'
       files += 'src/neural/backends/openvino/kda_scan_pass.cc'
+      files += 'src/neural/backends/openvino/se_residual_op.cc'
+      files += 'src/neural/backends/openvino/se_residual_pass.cc'
       has_backends = true
     else
       warning('openvino requested but libopenvino was not found in ' +
