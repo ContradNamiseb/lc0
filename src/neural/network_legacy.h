@@ -123,6 +123,7 @@ struct BaseWeights {
     bool output_gate;
     bool output_rms_norm;
     bool local_conv;
+    bool qkv_silu;
   };
 
   struct EncoderLayer {

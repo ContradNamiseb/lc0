@@ -375,6 +375,7 @@ class EncoderBlock {
   bool kda_output_gate_;
   bool kda_output_rms_norm_;
   bool kda_local_conv_;
+  bool kda_qkv_silu_;
   std::array<int, 16> kda_directions_{};
   int kda_direction_count_;
 

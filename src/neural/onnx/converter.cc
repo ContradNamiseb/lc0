@@ -715,6 +715,13 @@ std::string Converter::MakeKdaMixer(OnnxBuilder* builder,
   auto q = MakeProjection(kda.q_w, kda.q_b, key_depth, name + "/q");
   auto k = MakeProjection(kda.k_w, kda.k_b, key_depth, name + "/k");
   auto v = MakeProjection(kda.v_w, kda.v_b, value_depth, name + "/v");
+  if (kda.qkv_silu) {
+    // SiLU (= Swish) on the q/k/v projections, matching the trainer's
+    // qkv_silu (kda.py F.silu).
+    q = MakeActivation(builder, q, name + "/q/silu", ACTIVATION_SWISH);
+    k = MakeActivation(builder, k, name + "/k/silu", ACTIVATION_SWISH);
+    v = MakeActivation(builder, v, name + "/v/silu", ACTIVATION_SWISH);
+  }
   auto decay_hidden = MakeProjection(kda.decay_a_w, kda.decay_a_b, gate_rank,
                                      name + "/decay_a");
   auto raw_decay = builder->MatMul(

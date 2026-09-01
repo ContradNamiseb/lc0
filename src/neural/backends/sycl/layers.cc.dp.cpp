@@ -2451,6 +2451,7 @@ EncoderBlock<DataType>::EncoderBlock(
       kda_output_gate_(cpu_weights.kda.output_gate),
       kda_output_rms_norm_(cpu_weights.kda.output_rms_norm),
       kda_local_conv_(cpu_weights.kda.local_conv),
+      kda_qkv_silu_(cpu_weights.kda.qkv_silu),
       kda_direction_count_(static_cast<int>(kda_directions.size())),
       alpha_(alpha),
       has_smolgen_(!cpu_weights.is_kda && cpu_weights.mha.has_smolgen),
@@ -3109,6 +3110,10 @@ void EncoderBlock<DataType>::EvalKda(int N, DataType* in_out_tensor,
   DataType* k = q + max_tokens * key_depth;
   DataType* v = k + max_tokens * key_depth;
 
+  // The trainer's qkv_silu applies SiLU (= Swish) to the q/k/v projections.
+  const ActivationFunction qkv_act =
+      kda_qkv_silu_ ? ACTIVATION_SWISH : ACTIVATION_NONE;
+
   if (kda_qkv_w) {
     const int qkv_depth = 2 * key_depth + value_depth;
     cublasXgemm<DataType>(
@@ -3116,7 +3121,7 @@ void EncoderBlock<DataType>::EvalKda(int N, DataType* in_out_tensor,
         tokens, embedding_op_size_, 1.0f, kda_qkv_w, embedding_op_size_,
         proj_input, embedding_op_size_, 0.0f, q, qkv_depth, sycl_queue);
     if (kda_qkv_b) {
-      addBiasBatched(q, q, kda_qkv_b, 1, tokens, qkv_depth, ACTIVATION_NONE,
+      addBiasBatched(q, q, kda_qkv_b, 1, tokens, qkv_depth, qkv_act,
                      sycl_queue);
     }
   } else {
@@ -3133,15 +3138,15 @@ void EncoderBlock<DataType>::EvalKda(int N, DataType* in_out_tensor,
         tokens, embedding_op_size_, 1.0f, kda_v_w, embedding_op_size_,
         proj_input, embedding_op_size_, 0.0f, v, value_depth, sycl_queue);
     if (kda_q_b) {
-      addBiasBatched(q, q, kda_q_b, 1, tokens, key_depth, ACTIVATION_NONE,
+      addBiasBatched(q, q, kda_q_b, 1, tokens, key_depth, qkv_act,
                      sycl_queue);
     }
     if (kda_k_b) {
-      addBiasBatched(k, k, kda_k_b, 1, tokens, key_depth, ACTIVATION_NONE,
+      addBiasBatched(k, k, kda_k_b, 1, tokens, key_depth, qkv_act,
                      sycl_queue);
     }
     if (kda_v_b) {
-      addBiasBatched(v, v, kda_v_b, 1, tokens, value_depth, ACTIVATION_NONE,
+      addBiasBatched(v, v, kda_v_b, 1, tokens, value_depth, qkv_act,
                      sycl_queue);
     }
   }

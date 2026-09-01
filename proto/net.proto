@@ -144,6 +144,9 @@ message Weights {
     optional Layer local_conv_w = 28;
     optional Layer local_conv_b = 29;
     optional bool local_conv = 30 [default = false];
+    // SiLU (x*sigmoid(x)) applied to the q/k/v projections. Mirrors the
+    // trainer's qkv_silu (KdaConfig.qkv_silu, directml/kda.py F.silu).
+    optional bool qkv_silu = 31 [default = false];
   }
 
   message EncoderLayer {

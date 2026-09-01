@@ -358,15 +358,20 @@ void BlasComputation<use_eigen>::ForwardKdaMixer(
   std::vector<float> hidden(tokens * gate_rank);
   std::vector<float> mixed(tokens * value_depth);
 
+  // The trainer's qkv_silu applies SiLU (= Swish, x*sigmoid(x)) to the
+  // q/k/v projections. Matches kda.py F.silu when qkv_silu is set.
+  const ActivationFunction qkv_act =
+      kda.qkv_silu ? ACTIVATION_SWISH : ACTIVATION_NONE;
+
   FullyConnectedLayer<use_eigen>::Forward1D(
       tokens, embedding_size, key_depth, proj_input.data(), kda.q_w.data(),
-      bias(kda.q_b), ACTIVATION_NONE, q.data());
+      bias(kda.q_b), qkv_act, q.data());
   FullyConnectedLayer<use_eigen>::Forward1D(
       tokens, embedding_size, key_depth, proj_input.data(), kda.k_w.data(),
-      bias(kda.k_b), ACTIVATION_NONE, k.data());
+      bias(kda.k_b), qkv_act, k.data());
   FullyConnectedLayer<use_eigen>::Forward1D(
       tokens, embedding_size, value_depth, proj_input.data(), kda.v_w.data(),
-      bias(kda.v_b), ACTIVATION_NONE, v.data());
+      bias(kda.v_b), qkv_act, v.data());
 
   FullyConnectedLayer<use_eigen>::Forward1D(
       tokens, embedding_size, gate_rank, proj_input.data(),
