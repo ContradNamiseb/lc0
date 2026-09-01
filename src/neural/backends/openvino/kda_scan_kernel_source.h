@@ -26,8 +26,8 @@ namespace openvino_backend {
 // source, generated at runtime by network_openvino.cc since HEADS_/
 // KEY_DIM_/VALUE_DIM_ vary per net and are baked in as compiler -D flags).
 //
-// Folds the 8-directional scan token->square mapping directly into the
-// kernel via a kDirectionTable[8][64] lookup, eliminating the
+// Folds the directional scan token->square mapping directly into the
+// kernel via a kDirectionTable[16][64] lookup, eliminating the
 // Slice/Gather/Concat permutation chain the graph used to carry around
 // every scan. That table is NOT written out here: WriteKdaScanGpuConfig
 // generates it from KdaSquareForToken (neural/kda_directions.h) and

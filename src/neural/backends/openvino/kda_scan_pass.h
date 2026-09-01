@@ -18,6 +18,8 @@
 
 #pragma once
 
+#include <vector>
+
 #include <openvino/pass/matcher_pass.hpp>
 
 namespace lczero {
@@ -39,10 +41,19 @@ namespace openvino_backend {
 // frontend generated -- except for pulling the two per-head constants
 // (dt_bias, neg_decay_scale) out of the body, since the frontend folds
 // those in as internal Constants rather than external invariant inputs.
+//
+// The direction set comes from the net's own
+// format().network_format().kda_directions() -- the same source converter.cc,
+// network_blas.cc and network_sycl.cc.dp.cpp read. It cannot be defaulted:
+// the fused kernel applies the direction permutation internally (the graph
+// no longer carries it), so a net declaring a different set or count would
+// otherwise be evaluated with the wrong traversal order and silently produce
+// wrong output -- on the CPU evaluate() path too, since it reads the same
+// members.
 class ReplaceKdaScan : public ov::pass::MatcherPass {
  public:
   OPENVINO_RTTI("ReplaceKdaScan", "0");
-  ReplaceKdaScan();
+  ReplaceKdaScan(int direction_count, std::vector<int> directions);
 };
 
 }  // namespace openvino_backend

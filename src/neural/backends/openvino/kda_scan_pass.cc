@@ -136,10 +136,13 @@ std::shared_ptr<ov::Node> FindDownstreamReorderedOutput(
 
 }  // namespace
 
-ReplaceKdaScan::ReplaceKdaScan() {
+ReplaceKdaScan::ReplaceKdaScan(int direction_count,
+                               std::vector<int> directions) {
   auto pattern = ov::pass::pattern::wrap_type<ov::op::v0::TensorIterator>();
 
-  ov::matcher_pass_callback callback = [](ov::pass::pattern::Matcher& m) {
+  ov::matcher_pass_callback callback =
+      [direction_count,
+       directions = std::move(directions)](ov::pass::pattern::Matcher& m) {
     auto ti = ov::as_type_ptr<ov::op::v0::TensorIterator>(m.get_match_root());
     if (!ti) return false;
 
@@ -164,8 +167,9 @@ ReplaceKdaScan::ReplaceKdaScan() {
         ov::element::f32, neg_decay_scale_c->get_shape(),
         neg_decay_scale_c->get_vector<float>());
 
-    auto kda_scan = std::make_shared<KdaScanOp>(q, k, v, decay, beta,
-                                                dt_bias, neg_decay_scale);
+    auto kda_scan = std::make_shared<KdaScanOp>(
+        q, k, v, decay, beta, dt_bias, neg_decay_scale, direction_count,
+        directions);
     kda_scan->set_friendly_name(ti->get_friendly_name() + "/fused");
 
     // Output 0 of the original Scan/TensorIterator is the final recurrent

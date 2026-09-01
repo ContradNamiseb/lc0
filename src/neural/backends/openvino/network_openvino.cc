@@ -358,14 +358,17 @@ std::filesystem::path WriteKdaScanGpuConfig(int heads, int key_dim,
   std::ofstream cl(cl_path, std::ios::trunc);
   // Generated from the single canonical definition rather than hand-copied
   // into the kernel string -- see kda_scan_kernel_source.h.
-  cl << "__constant uchar kDirectionTable[8][64] = {\n";
-  for (int dir = 1; dir <= 8; ++dir) {
+  // All 16 directions, not just the net's own: the kernel indexes this
+  // by dir - 1 taken straight from DIRECTIONS_LIST_, so a serpentine net
+  // (directions 9-16) reads rows 8-15. 1 KiB of __constant either way.
+  cl << "__constant uchar kDirectionTable[16][64] = {\n";
+  for (int dir = 1; dir <= 16; ++dir) {
     cl << "  {";
     for (int token = 0; token < 64; ++token) {
       if (token) cl << ",";
       cl << KdaSquareForToken(dir, token);
     }
-    cl << "}" << (dir < 8 ? "," : "") << "\n";
+    cl << "}" << (dir < 16 ? "," : "") << "\n";
   }
   cl << "};\n\n";
   cl << kKdaScanKernelSource;
@@ -490,9 +493,32 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
   }
 
   core_.add_extension(ov::OpExtension<KdaScanOp>());
+  // The fused KdaScanOp applies the direction permutation inside the kernel
+  // (the exported graph used to carry it as explicit ops and no longer
+  // does), so it has to be told the net's actual direction set. Read it from
+  // the same place converter.cc:682, network_blas.cc and
+  // network_sycl.cc.dp.cpp:552 read it; defaulting to {1..8} would silently
+  // evaluate a net declaring any other set or count with the wrong traversal
+  // order. Empty is not a valid KDA net -- converter.cc throws on it too --
+  // but a non-KDA net legitimately has none, and there the pass simply never
+  // matches, so only validate when the field is actually populated.
+  const auto& net_format = weights.format().network_format();
+  const std::vector<int> kda_directions(net_format.kda_directions().begin(),
+                                        net_format.kda_directions().end());
+  const int kda_direction_count = static_cast<int>(kda_directions.size());
+  if (kda_direction_count > 0) {
+    const int heads = static_cast<int>(weights.weights().headcount());
+    if (heads > 0 && heads % kda_direction_count != 0) {
+      throw Exception(
+          "KDA directions must evenly divide the encoder heads (" +
+          std::to_string(heads) + " heads, " +
+          std::to_string(kda_direction_count) + " directions).");
+    }
+  }
+
   {
     ov::pass::Manager manager;
-    manager.register_pass<ReplaceKdaScan>();
+    manager.register_pass<ReplaceKdaScan>(kda_direction_count, kda_directions);
     manager.run_passes(model);
   }
 
