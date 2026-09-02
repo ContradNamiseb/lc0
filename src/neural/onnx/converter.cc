@@ -686,6 +686,15 @@ std::string Converter::MakeKdaMixer(OnnxBuilder* builder,
   if (direction_count <= 0 || heads % direction_count != 0) {
     throw Exception("KDA directions must evenly divide the encoder heads.");
   }
+  // Same range check BLAS and SYCL do at load: KdaSquareForToken clamps an
+  // out-of-range direction instead of failing, so without this a malformed
+  // net would convert silently to a traversal no backend computes.
+  for (int dir : directions) {
+    if (dir < 1 || dir > 16) {
+      throw Exception("KDA direction " + std::to_string(dir) +
+                      " is out of range [1, 16].");
+    }
+  }
   if (kda.output_rms_norm && kda.out_norm_gammas.empty()) {
     throw Exception(
         "KDA output RMS norm requested but out_norm_gammas is missing.");
@@ -823,9 +832,15 @@ std::string Converter::MakeKdaMixer(OnnxBuilder* builder,
     beta_parts.push_back(reorder(beta4, 1, gname + "/beta"));
   }
 
+  // Always a Concat, even with a single direction group: OpenVINO's
+  // ReplaceKdaScan pass finds the scan inputs by the "/scan/..." node-name
+  // suffix and the reassembled output by the "/mixed4" Concat, and both
+  // would vanish for direction_count == 1 if the single part were passed
+  // through directly. A one-input Concat is legal ONNX and a no-op
+  // numerically.
   auto join = [&](const std::vector<std::string>& parts,
                   const std::string& jname) {
-    return parts.size() == 1 ? parts[0] : builder->Concat(jname, parts, 2);
+    return builder->Concat(jname, parts, 2);
   };
   auto q_scan = join(q_parts, name + "/scan/q");
   auto k_scan = join(k_parts, name + "/scan/k");
@@ -959,9 +974,10 @@ std::string Converter::MakeKdaMixer(OnnxBuilder* builder,
         1);
   }
 
-  auto mixed4 = direction_count == 1
-                    ? group_outputs[0]
-                    : builder->Concat(name + "/mixed4", group_outputs, 2);
+  // Always a Concat for the same reason as the scan-input join above: the
+  // OpenVINO pass locates the node to replace by this Concat's existence,
+  // so a single direction group must not shortcut to group_outputs[0].
+  auto mixed4 = builder->Concat(name + "/mixed4", group_outputs, 2);
   auto mixed = builder->Reshape(
       name + "/mixed", mixed4,
       builder->AddInitializer(name + "/mixed/shape",
