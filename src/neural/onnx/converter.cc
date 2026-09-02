@@ -712,9 +712,38 @@ std::string Converter::MakeKdaMixer(OnnxBuilder* builder,
     return flow;
   };
 
-  auto q = MakeProjection(kda.q_w, kda.q_b, key_depth, name + "/q");
-  auto k = MakeProjection(kda.k_w, kda.k_b, key_depth, name + "/k");
-  auto v = MakeProjection(kda.v_w, kda.v_b, value_depth, name + "/v");
+  const int qkv_depth = 2 * key_depth + value_depth;
+  MultiHeadWeights::Vec qkv_w;
+  qkv_w.reserve(kda.q_w.size() + kda.k_w.size() + kda.v_w.size());
+  qkv_w.insert(qkv_w.end(), kda.q_w.begin(), kda.q_w.end());
+  qkv_w.insert(qkv_w.end(), kda.k_w.begin(), kda.k_w.end());
+  qkv_w.insert(qkv_w.end(), kda.v_w.begin(), kda.v_w.end());
+
+  auto qkv = builder->MatMul(
+      name + "/qkv/w", proj_input,
+      *GetWeghtsConverter(qkv_w, {embedding_size, qkv_depth}, {1, 0}));
+
+  const bool has_qkv_bias = !kda.q_b.empty() || !kda.k_b.empty() ||
+                            !kda.v_b.empty();
+  if (has_qkv_bias) {
+    if (kda.q_b.empty() || kda.k_b.empty() || kda.v_b.empty()) {
+      throw Exception("KDA q/k/v biases must either all be present or all be "
+                      "absent.");
+    }
+    MultiHeadWeights::Vec qkv_b;
+    qkv_b.reserve(kda.q_b.size() + kda.k_b.size() + kda.v_b.size());
+    qkv_b.insert(qkv_b.end(), kda.q_b.begin(), kda.q_b.end());
+    qkv_b.insert(qkv_b.end(), kda.k_b.begin(), kda.k_b.end());
+    qkv_b.insert(qkv_b.end(), kda.v_b.begin(), kda.v_b.end());
+    qkv = builder->Add(name + "/qkv/b", qkv,
+                       *GetWeghtsConverter(qkv_b, {qkv_depth}));
+  }
+
+  const auto qkv_parts = builder->Split(name + "/qkv/split", qkv, 1,
+                                        {key_depth, key_depth, value_depth});
+  auto q = qkv_parts[0];
+  auto k = qkv_parts[1];
+  auto v = qkv_parts[2];
   if (kda.qkv_silu) {
     // SiLU (= Swish) on the q/k/v projections, matching the trainer's
     // qkv_silu (kda.py F.silu).

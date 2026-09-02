@@ -49,6 +49,7 @@
 
 #include <openvino/core/op_extension.hpp>
 #include <openvino/openvino.hpp>
+#include <openvino/op/util/precision_sensitive_attribute.hpp>
 #include <openvino/pass/manager.hpp>
 
 #include "neural/factory.h"
@@ -544,17 +545,35 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
   const std::string ir_path = options.GetOrDefault<std::string>("ir_path", "");
   is_ir_model_ = !ir_path.empty();
 
+  // Head selection, same option names and defaults as network_cuda.cc:381 and
+  // network_sycl.cc.dp.cpp:427, so a multi-head net evaluates the same head
+  // whichever backend runs it. Read unconditionally (not just on the
+  // converter path) because OptionsDict rejects any option nothing read --
+  // hardcoding these was why `openvino-auto.policy_head` came back as
+  // "Unknown string option".
+  const std::string policy_head =
+      options.GetOrDefault<std::string>("policy_head", "vanilla");
+  const std::string value_head =
+      options.GetOrDefault<std::string>("value_head", "winner");
+
   std::shared_ptr<ov::Model> model;
   if (is_ir_model_) {
     CERR << "Loading pre-converted OpenVINO IR from: " << ir_path;
+    // The IR was baked with whichever heads net_to_openvino_ir.py exported;
+    // there is no conversion here to steer, so say so rather than silently
+    // evaluating a different head than asked for.
+    if (policy_head != "vanilla" || value_head != "winner") {
+      CERR << "Warning: policy_head/value_head are ignored with ir_path -- the "
+              "IR already has its heads baked in.";
+    }
     model = core_.read_model(ir_path);
   } else {
     WeightsToOnnxConverterOptions converter_options;
     converter_options.opset = 17;
     converter_options.data_type =
         WeightsToOnnxConverterOptions::DataType::kFloat32;
-    converter_options.policy_head = "vanilla";
-    converter_options.value_head = "winner";
+    converter_options.policy_head = policy_head;
+    converter_options.value_head = value_head;
 
     pblczero::Net onnx_net = ConvertWeightsToOnnx(weights, converter_options);
     std::string_view model_bytes = onnx_net.onnx_model().model();
@@ -666,6 +685,57 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
   const bool want_fp16 = options.GetOrDefault<bool>("fp16", device == "GPU");
   profile_ = options.GetOrDefault<bool>("profile", false);
 
+  // Does this net actually have KDA layers? (ReplaceKdaScan above has
+  // already turned any KDA TensorIterator into KdaScanOp nodes, so this is
+  // a direct check, not a guess from the net's metadata.) Used below to
+  // default kda_safe on automatically -- a non-KDA net has nothing for it
+  // to protect and pays no cost either way, since the marking loop is a
+  // no-op without a KdaScanOp to find.
+  bool has_kda = false;
+  for (const auto& node : model->get_ops()) {
+    if (ov::as_type_ptr<KdaScanOp>(node)) {
+      has_kda = true;
+      break;
+    }
+  }
+
+  // kda_safe: mixed precision. Keeps the KDA recurrence's tensors and the
+  // value head in fp32 inside an otherwise-fp16 graph, since those are where
+  // half rounding costs the most (measured ~1.6e-2 absolute value error at
+  // plain fp16), while the bulk of the FC/FFN work keeps fp16 speed. Comes on
+  // automatically for any net with KDA layers -- a KDA net should not need a
+  // manual flag to avoid its own worst fp16 error -- but can be forced off
+  // (raw fp16 throughput, ~6x faster, at the larger error) or on.
+  const bool kda_safe = options.GetOrDefault<bool>("kda_safe", has_kda) &&
+                        want_fp16 && device == "GPU";
+  if (kda_safe) {
+    int marked = 0;
+    for (const auto& node : model->get_ops()) {
+      if (!ov::as_type_ptr<KdaScanOp>(node)) continue;
+      // All 7 inputs, not just the 5 data tensors: the custom kernel is
+      // compiled with one DTYPE, so a mixed f16-constant/f32-data op would
+      // misread whichever side disagrees.
+      for (size_t i = 0; i < node->get_input_size(); ++i) {
+        ov::mark_as_precision_sensitive(node->input(i));
+        ++marked;
+      }
+    }
+    for (const auto& result : model->get_results()) {
+      const auto& names = result->input_value(0).get_names();
+      const bool is_value =
+          std::any_of(names.begin(), names.end(), [](const std::string& n) {
+            return n.find("value") != std::string::npos ||
+                   n.find("wdl") != std::string::npos;
+          });
+      if (is_value) {
+        ov::mark_as_precision_sensitive(result->input(0));
+        ++marked;
+      }
+    }
+    CERR << "OpenVINO: kda_safe marked " << marked
+         << " inputs precision-sensitive (KDA scan + value head stay fp32).";
+  }
+
   ov::AnyMap device_config;
   if (device != "GPU" && want_fp16) {
     CERR << "OpenVINO: ignoring fp16 -- it only applies to device=GPU.";
@@ -728,9 +798,12 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
         }
       }
       if (first_kda) {
+        // With kda_safe the scan's tensors stay f32, so the kernel must be
+        // compiled to read f32 -- half would misinterpret every buffer.
         config_fragments.push_back(WriteKdaScanGpuConfig(
             first_kda->heads(), first_kda->key_dim(), first_kda->value_dim(),
-            first_kda->direction_count(), first_kda->directions(), want_fp16));
+            first_kda->direction_count(), first_kda->directions(),
+            want_fp16 && !kda_safe));
       }
 
       std::shared_ptr<SEResidualOp> first_se;
