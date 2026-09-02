@@ -21,6 +21,7 @@
 
 #include <sycl/sycl.hpp>
 #include "sycl_common.h"
+#include "kernels.h"
 #include "neural/backends/shared/activation.h"
 
 #include "winograd_helper.h"
@@ -665,11 +666,12 @@ void OutputInputTransformKernel_fp16_shmem_board(
 #endif
 }
 
-template <typename T = sycl::half, bool use_se, ActivationFunction activation,
-          bool use_bias, bool use_skip>
-void OutputInputTransform(int N, int C, int se_K, T* output, const T* input,
-                          const T* skip, const T* bias, const T* w1,
-                          const T* b1, const T* w2, const T* b2, sycl::queue &sycl_queue) {
+template <bool use_se, ActivationFunction activation, bool use_bias,
+          bool use_skip>
+void OutputInputTransformFp16Impl(int N, int C, int se_K, sycl::half* output,
+                          const sycl::half* input,
+                          const sycl::half* skip, const sycl::half* bias, const sycl::half* w1,
+                          const sycl::half* b1, const sycl::half* w2, const sycl::half* b2, sycl::queue &sycl_queue) {
   // Each thread processes entire chess board.
   if (use_se == false) {
     sycl::range<3> grid_dim(1, N, DivUp(C, kOpInpTransformBlockSize));
@@ -911,35 +913,31 @@ template void OutputTransform<sycl::half, false, ACTIVATION_NONE, true, false, f
                                      const sycl::half* b1, const sycl::half* w2,
                                      const sycl::half* b2, sycl::queue &sycl_queue);
 
-template void OutputInputTransform<sycl::half, true, ACTIVATION_RELU, true, true>(
-    int N, int C, int se_K, sycl::half* output, const sycl::half* input, const sycl::half* skip,
-    const sycl::half* bias, const sycl::half* w1, const sycl::half* b1, const sycl::half* w2,
-    const sycl::half* b2, sycl::queue &sycl_queue);
+// Explicit specializations of the generic OutputInputTransform template for
+// sycl::half, dispatching to the fp16-specific implementation above. Declared
+// in kernels.h so every caller links these bodies instead of implicitly
+// instantiating the generic template (which previously existed as a second,
+// conflicting definition of the same template in this file -- ill-formed but
+// undiagnosed, and a trap for any future refactor).
+#define LCZ_OIT_FP16_SPECIALIZATION(SE, ACT, SKIP)                           \
+  template <>                                                                \
+  void OutputInputTransform<sycl::half, SE, ACT, true, SKIP>(                \
+      int N, int C, int se_K, sycl::half* output, const sycl::half* input,   \
+      const sycl::half* skip, const sycl::half* bias, const sycl::half* w1,  \
+      const sycl::half* b1, const sycl::half* w2, const sycl::half* b2,      \
+      sycl::queue &sycl_queue) {                                             \
+    OutputInputTransformFp16Impl<SE, ACT, true, SKIP>(                       \
+        N, C, se_K, output, input, skip, bias, w1, b1, w2, b2, sycl_queue);  \
+  }
 
-template void OutputInputTransform<sycl::half, false, ACTIVATION_RELU, true, true>(
-    int N, int C, int se_K, sycl::half* output, const sycl::half* input, const sycl::half* skip,
-    const sycl::half* bias, const sycl::half* w1, const sycl::half* b1, const sycl::half* w2,
-    const sycl::half* b2, sycl::queue &sycl_queue);
+LCZ_OIT_FP16_SPECIALIZATION(true, ACTIVATION_RELU, true)
+LCZ_OIT_FP16_SPECIALIZATION(false, ACTIVATION_RELU, true)
+LCZ_OIT_FP16_SPECIALIZATION(false, ACTIVATION_RELU, false)
+LCZ_OIT_FP16_SPECIALIZATION(true, ACTIVATION_MISH, true)
+LCZ_OIT_FP16_SPECIALIZATION(false, ACTIVATION_MISH, true)
+LCZ_OIT_FP16_SPECIALIZATION(false, ACTIVATION_MISH, false)
 
-template void OutputInputTransform<sycl::half, false, ACTIVATION_RELU, true, false>(
-    int N, int C, int se_K, sycl::half* output, const sycl::half* input, const sycl::half* skip,
-    const sycl::half* bias, const sycl::half* w1, const sycl::half* b1, const sycl::half* w2,
-    const sycl::half* b2, sycl::queue &sycl_queue);
-
-template void OutputInputTransform<sycl::half, true, ACTIVATION_MISH, true, true>(
-    int N, int C, int se_K, sycl::half* output, const sycl::half* input, const sycl::half* skip,
-    const sycl::half* bias, const sycl::half* w1, const sycl::half* b1, const sycl::half* w2,
-    const sycl::half* b2, sycl::queue &sycl_queue);
-
-template void OutputInputTransform<sycl::half, false, ACTIVATION_MISH, true, true>(
-    int N, int C, int se_K, sycl::half* output, const sycl::half* input, const sycl::half* skip,
-    const sycl::half* bias, const sycl::half* w1, const sycl::half* b1, const sycl::half* w2,
-    const sycl::half* b2, sycl::queue &sycl_queue);
-
-template void OutputInputTransform<sycl::half, false, ACTIVATION_MISH, true, false>(
-    int N, int C, int se_K, sycl::half* output, const sycl::half* input, const sycl::half* skip,
-    const sycl::half* bias, const sycl::half* w1, const sycl::half* b1, const sycl::half* w2,
-    const sycl::half* b2, sycl::queue &sycl_queue);
+#undef LCZ_OIT_FP16_SPECIALIZATION
 
 }  // namespace sycldnn_backend
 }  // namespace lczero

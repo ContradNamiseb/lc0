@@ -1000,7 +1000,14 @@ void SELayer<sycl::half>::Eval(int N, sycl::half* output,
 
 #ifdef USE_CUBLAS
 
-    sycl_queue_.submit([&](sycl::handler& cgh) {
+    // Submitted to the sycl_queue parameter, not the layer's sycl_queue_
+    // member: everything else in this function (the first gemm, the
+    // addVectors calls) runs on the caller's queue, and under
+    // multi_stream=true the two differ per thread. Mixing them here put the
+    // second gemm on a different in-order queue than the addVectors that
+    // produces its input and consumes its output, with no ordering between
+    // the queues.
+    sycl_queue.submit([&](sycl::handler& cgh) {
       cgh.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
         auto cudaStreamHandle =
             ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
@@ -2131,19 +2138,10 @@ void ResidualBlock<DataType>::Eval(int N, DataType* output,
   // for float (FP32), allowFusing is still computed for the channel-count
   // guard but the if-constexpr branch below will not dispatch SubGroup kernels,
   // falling through to the generic OutputInputTransform / OutputTransform path.
+  // The decision itself lives in sycl_common.h so sycl_test.cc exercises it.
   const bool fp16 = std::is_same<sycl::half, DataType>::value;
   bool allowFusing =
-      ((C <= kMaxResBlockFusingChannels) ||
-       (fp16 && (shared_mem_size_ >= kMaxResBlockFusingSeFp16AmpereSmem) &&
-        (C <= kMaxResBlockFusingSeKFp16Ampere))) &&
-      (se_k_ <= C);
-
-  if constexpr (std::is_same_v<DataType, sycl::half>) {
-    // SubGroup kernels launch with work-group size = C. Verify that the device
-    // can support this before enabling fusing to avoid crashes or silent
-    // errors.
-    allowFusing = allowFusing && (static_cast<size_t>(C) <= max_wg_size_);
-  }
+      AllowSubGroupFusing(C, se_k_, shared_mem_size_, max_wg_size_, fp16);
 
   if (act_ == ACTIVATION_RELU) {
     if (last_block_) {
@@ -2490,6 +2488,30 @@ EncoderBlock<DataType>::EncoderBlock(
     if (kda_direction_count_ <= 0 || kda_direction_count_ > 16 ||
         encoder_heads_ % kda_direction_count_ != 0) {
       throw Exception("KDA directions must evenly divide the encoder heads.");
+    }
+    // EvalKda() feeds these KDA-derived widths to addBiasBatched
+    // (vectorized over groups of 4 channels) and LayerNorm (over 16), which
+    // throw at *eval* time on non-divisible widths -- i.e. after a full
+    // successful-looking load. A valid proto can carry odd dims, so reject
+    // them here, where the message can name the offending dimension.
+    {
+      const int key_depth_ld = encoder_heads_ * kda_key_dim_;
+      const int value_depth_ld = encoder_heads_ * kda_value_dim_;
+      auto require_divisible = [](const char* what, int value, int divisor) {
+        if (value % divisor != 0) {
+          throw Exception(
+              std::string("KDA ") + what + " (" + std::to_string(value) +
+              ") must be a multiple of " + std::to_string(divisor) +
+              " for the SYCL backend's vectorized kernels.");
+        }
+      };
+      require_divisible("key_depth (heads * key_dim)", key_depth_ld, 4);
+      require_divisible("value_depth (heads * value_dim)", value_depth_ld, 4);
+      // gate_rank % 4 covers both the fused decay/gate bias width
+      // (2*gate_rank) and the unfused per-projection width (gate_rank).
+      require_divisible("gate_rank", kda_gate_rank_, 4);
+      require_divisible("encoder head count", encoder_heads_, 4);
+      require_divisible("embedding size", embedding_op_size_, 16);
     }
     for (int i = 0; i < kda_direction_count_; ++i) {
       if (kda_directions[i] < 1 || kda_directions[i] > 16) {
@@ -3123,6 +3145,14 @@ void EncoderBlock<DataType>::EvalKda(int N, DataType* in_out_tensor,
     if (kda_qkv_b) {
       addBiasBatched(q, q, kda_qkv_b, 1, tokens, qkv_depth, qkv_act,
                      sycl_queue);
+    } else if (qkv_act != ACTIVATION_NONE) {
+      // qkv_silu with no fused bias: the activation must still run -- the
+      // BLAS reference applies it regardless of bias presence, and folding
+      // it into addBiasBatched silently skipped it whenever the biases were
+      // absent. addVectors with a null second operand is exactly
+      // elementwise-activate here.
+      addVectors(q, q, static_cast<DataType*>(nullptr), tokens * qkv_depth,
+                 tokens * qkv_depth, 0, qkv_act, sycl_queue);
     }
   } else {
     cublasXgemm<DataType>(
@@ -3148,6 +3178,23 @@ void EncoderBlock<DataType>::EvalKda(int N, DataType* in_out_tensor,
     if (kda_v_b) {
       addBiasBatched(v, v, kda_v_b, 1, tokens, value_depth, qkv_act,
                      sycl_queue);
+    }
+    if (qkv_act != ACTIVATION_NONE) {
+      // See the fused-branch comment: apply the activation even where the
+      // matching bias is missing.
+      if (!kda_q_b) {
+        addVectors(q, q, static_cast<DataType*>(nullptr), tokens * key_depth,
+                   tokens * key_depth, 0, qkv_act, sycl_queue);
+      }
+      if (!kda_k_b) {
+        addVectors(k, k, static_cast<DataType*>(nullptr), tokens * key_depth,
+                   tokens * key_depth, 0, qkv_act, sycl_queue);
+      }
+      if (!kda_v_b) {
+        addVectors(v, v, static_cast<DataType*>(nullptr),
+                   tokens * value_depth, tokens * value_depth, 0, qkv_act,
+                   sycl_queue);
+      }
     }
   }
 
