@@ -31,3 +31,20 @@ kd-perf-plan-review.md
 setup_dumps.ps1
 replace.py
 _split_msg.txt
+
+# Local build/bench driver scripts and logs
+/*.cmd
+/*.bat
+/*.log
+bench_out.txt
+diff_layers.txt
+
+# Vendored binaries not for distribution
+third_party/directml/
+
+# Internal review/plan notes (not shipped)
+docs/kimi-*.md
+docs/qwen-*.md
+docs/openvino-*.md
+docs/*readiness*.md
+docs/search-threads-to-processes-plan.md
