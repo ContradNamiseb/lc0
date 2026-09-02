@@ -845,6 +845,40 @@ if get_option('build_backends')
       endif
   endif
 
+  ## ~~~~~~~~~~
+  ## OpenVINO
+  ## ~~~~~~~~~~
+  # Converts weights to the same in-memory ONNX graph the onnx backend uses
+  # (including the KDA recurrence's Scan op) and lets OpenVINO's own graph
+  # compiler place and fuse it, rather than hand-writing kernels the way
+  # SYCL/DirectML do -- there is no per-layer C++ dispatch to keep in step
+  # with sycl/layers.h here, only the InputsOutputs buffer pattern, with one
+  # exception: kda_scan_op/kda_scan_pass replace the TensorIterator OpenVINO's
+  # ONNX frontend builds for the KDA recurrence's Scan (>98% of inference
+  # time by profiling) with a hand-written fused op.
+  #
+  # Detected BEFORE the "no usable computation backends" check below: that
+  # check used to run first, so a lone -Dopenvino=true build failed with a
+  # misleading "no backends" error even when the library was found.
+  if get_option('openvino')
+    openvino_lib = cc.find_library('openvino', dirs: get_option('openvino_libdirs'),
+                                   required: false)
+    if openvino_lib.found()
+      deps += openvino_lib
+      includes += include_directories(get_option('openvino_include'), is_system: true)
+      files += 'src/neural/backends/openvino/network_openvino.cc'
+      files += 'src/neural/backends/openvino/kda_scan_op.cc'
+      files += 'src/neural/backends/openvino/kda_scan_pass.cc'
+      files += 'src/neural/backends/openvino/se_residual_op.cc'
+      files += 'src/neural/backends/openvino/se_residual_pass.cc'
+      has_backends = true
+    else
+      error('openvino requested but libopenvino was not found in ' +
+            ','.join(get_option('openvino_libdirs')) +
+            ' -- fix openvino_libdirs/openvino_include or drop -Dopenvino.')
+    endif
+  endif
+
 endif # if get_option('build_backends')
 
 if not has_backends and get_option('lc0') and get_option('build_backends')
@@ -910,34 +944,8 @@ endif
   configure_file(output : 'trace_config.h',
                  configuration : trace_config)
 
-  ## ~~~~~~~~~~
-  ## OpenVINO
-  ## ~~~~~~~~~~
-  # Converts weights to the same in-memory ONNX graph the onnx backend uses
-  # (including the KDA recurrence's Scan op) and lets OpenVINO's own graph
-  # compiler place and fuse it, rather than hand-writing kernels the way
-  # SYCL/DirectML do -- there is no per-layer C++ dispatch to keep in step
-  # with sycl/layers.h here, only the InputsOutputs buffer pattern, with one
-  # exception: kda_scan_op/kda_scan_pass replace the TensorIterator OpenVINO's
-  # ONNX frontend builds for the KDA recurrence's Scan (>98% of inference
-  # time by profiling) with a hand-written fused op.
-  if get_option('openvino')
-    openvino_lib = cc.find_library('openvino', dirs: get_option('openvino_libdirs'),
-                                   required: false)
-    if openvino_lib.found()
-      deps += openvino_lib
-      includes += include_directories(get_option('openvino_include'), is_system: true)
-      files += 'src/neural/backends/openvino/network_openvino.cc'
-      files += 'src/neural/backends/openvino/kda_scan_op.cc'
-      files += 'src/neural/backends/openvino/kda_scan_pass.cc'
-      files += 'src/neural/backends/openvino/se_residual_op.cc'
-      files += 'src/neural/backends/openvino/se_residual_pass.cc'
-      has_backends = true
-    else
-      warning('openvino requested but libopenvino was not found in ' +
-              ','.join(get_option('openvino_libdirs')))
-    endif
-  endif
+  # (The OpenVINO backend detection lives above, before the "no usable
+  # computation backends" check -- see the comment there.)
 
   ## ~~~~~~~~
   ## Profiler
@@ -1048,6 +1056,16 @@ if get_option('gtest')
     include_directories: includes, link_with: lc0_lib,
     dependencies: [gtest]
   ), args: '--gtest_output=xml:encoder.xml', timeout: 90)
+
+  # KDA parity: runs a synthetic KDA-hybrid net through the blas reference
+  # and the sycl kernels and asserts the outputs agree. Links the full
+  # backend set ('files', like the lc0 executable) rather than lc0_lib so
+  # both backends are registered; the sycl half skips gracefully when no
+  # SYCL device is available.
+  test('KdaParity',
+    executable('kda_parity_test', 'src/neural/kda_parity_test.cc', files,
+    include_directories: includes, dependencies: [deps, gtest]
+  ), args: '--gtest_output=xml:kda_parity.xml', timeout: 600)
 
   test('EngineTest',
     executable('engine_test', 'src/engine_test.cc', 'src/engine.cc',

@@ -1,0 +1,81 @@
+name: OpenVINO Backend Build
+
+on:
+  workflow_call:
+    inputs:
+      os:
+        required: true
+        type: string
+      artifact_name:
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ${{ inputs.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Update submodules
+        run: |
+          git submodule sync --recursive
+          git submodule update --init --recursive
+      - name: Install Build Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build curl binutils python3-pip
+          pip3 install meson==1.3.2
+          meson --version
+      - name: Install OpenVINO runtime
+        run: |
+          # OpenVINO from Intel's apt repo. libopenvino-dev ships the headers
+          # and the libopenvino.so the meson 'openvino' option links against;
+          # the runtime plugins (openvino-intel-cpu) make CPU device builds
+          # usable, and ocl-icd + the ICD cover GPU device strings.
+          sudo wget -qO /etc/apt/trusted.gpg.d/intel-oneapi.asc https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+          echo "deb https://apt.repos.intel.com/oneapi all main" | sudo tee /etc/apt/sources.list.d/oneAPI.list
+          sudo apt-get update
+          sudo apt-get install -y libopenvino-dev openvino-intel-cpu ocl-icd-opencl-dev
+          # Locate the installed layout and export it for the meson options.
+          OV_ROOT=$(dirname "$(find /usr -name 'libopenvino.so' | head -1)")
+          OV_INCLUDE=$(find /usr -path '*openvino*' -name 'openvino.hpp' | head -1 | xargs dirname | xargs dirname)
+          echo "OV_LIBDIR=$OV_ROOT" >> $GITHUB_ENV
+          echo "OV_INCLUDE=$OV_INCLUDE" >> $GITHUB_ENV
+      - name: Configure Meson and Build OpenVINO
+        run: |
+          meson setup --buildtype release build \
+            -Dopenvino=true \
+            -Dopenvino_libdirs="$OV_LIBDIR" \
+            -Dopenvino_include="$OV_INCLUDE" \
+            -Dgtest=false \
+            -Dnative_arch=false \
+            --clearcache
+          ninja -C build -v
+      - name: Upload Meson Log on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4.4.3
+        with:
+          name: build-logs-${{ inputs.artifact_name }}
+          path: build
+      - name: Download Network
+        if: success()
+        run: |
+          cd build
+          curl -L https://training.lczero.org/get_network?sha=195b450999e874d07aea2c09fd0db5eff9d4441ec1ad5a60a140fe8ea94c4f3a -o T79.pb.gz
+          touch -t 201801010000.00 T79.pb.gz
+      - name: Smoke test (non-KDA net on OpenVINO CPU device)
+        if: success()
+        run: |
+          cd build
+          # The CI runner has no Intel GPU; device=CPU exercises the ONNX
+          # conversion + graph compilation path end to end.
+          ./lc0 backend=openvino,device=CPU,weights=T79.pb.gz --benchmark
+      - name: Upload a Build Artifact
+        if: success()
+        uses: actions/upload-artifact@v4.4.3
+        with:
+          name: lc0-${{ inputs.artifact_name }}
+          path: |
+            build/lc0
+            build/T79.pb.gz
