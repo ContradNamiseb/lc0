@@ -60,6 +60,7 @@
 
 #ifdef _WIN32
 #include <process.h>
+#include <windows.h>
 #else
 #include <unistd.h>
 #endif
@@ -410,16 +411,36 @@ namespace {
 // below), which is why all of this shares one directory rather than each
 // op getting its own.
 //
+// Base directory for the staged custom-layer files: the directory the lc0
+// binary itself lives in. Engine setups keep per-backend folders (e.g.
+// lc0-Engine/openvino/lc0.exe), and the cache files belong next to the
+// binary they serve rather than in the system temp dir. Falls back to the
+// system temp dir when the exe's own path can't be determined.
+std::filesystem::path CustomLayerBaseDir() {
+#ifdef _WIN32
+  wchar_t buf[MAX_PATH];
+  const DWORD len = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+  if (len > 0 && len < MAX_PATH) {
+    return std::filesystem::path(buf).parent_path();
+  }
+#else
+  std::error_code ec;
+  const auto exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+  if (!ec) return exe.parent_path();
+#endif
+  return std::filesystem::temp_directory_path();
+}
+
 // Every network instance gets its OWN directory, named with the pid and a
-// process-local sequence number. A shared fixed path (<temp>/lc0_openvino_
-// kda_scan/) was tried first and is wrong twice over: two lc0 processes
-// (a cutechess match, parallel self-play workers) truncate and rewrite the
-// same kda_scan.cl while the other process's compile_model() is reading it
-// -- and with different nets, one process can JIT the other's
-// HEADS_/KEY_DIM_/VALUE_DIM_ defines and silently compute wrong output;
-// and on a shared /tmp another local user can pre-create the directory and
-// own the kernel source lc0 loads onto the GPU. ~OpenVinoNetwork removes
-// the directory again.
+// process-local sequence number, under CustomLayerBaseDir(). A shared fixed
+// path (<temp>/lc0_openvino_kda_scan/) was tried first and is wrong twice
+// over: two lc0 processes (a cutechess match, parallel self-play workers)
+// truncate and rewrite the same kda_scan.cl while the other process's
+// compile_model() is reading it -- and with different nets, one process can
+// JIT the other's HEADS_/KEY_DIM_/VALUE_DIM_ defines and silently compute
+// wrong output; and a world-writable shared directory lets another local
+// user supply the kernel source lc0 loads onto the GPU. The per-process
+// unique name avoids both. ~OpenVinoNetwork removes the directory again.
 std::filesystem::path MakeCustomLayerConfigDir() {
   namespace fs = std::filesystem;
   static std::atomic<unsigned long long> sequence{0};
@@ -431,14 +452,18 @@ std::filesystem::path MakeCustomLayerConfigDir() {
        << getpid()
 #endif
        << "_" << sequence++;
-  fs::path dir = fs::temp_directory_path() / name.str();
-  std::error_code ec;
-  fs::create_directories(dir, ec);
-  if (ec) {
-    throw Exception("OpenVINO: could not create temp dir for GPU "
-                    "custom-layer kernel configs: " + ec.message());
+  // Next to the binary first; fall back to the system temp dir when that
+  // directory isn't writable (e.g. a read-only install location).
+  for (const fs::path& base :
+       {CustomLayerBaseDir(), fs::temp_directory_path()}) {
+    fs::path dir = base / name.str();
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (!ec) return dir;
   }
-  return dir;
+  throw Exception("OpenVINO: could not create a directory for the GPU "
+                  "custom-layer kernel configs (tried next to the binary "
+                  "and the system temp dir).");
 }
 
 // Writes the merged CONFIG_FILE from however many <CustomLayer> fragments
@@ -586,7 +611,7 @@ std::string WriteSEResidualGpuConfig(const std::filesystem::path& dir,
               ? " -D MISH_ACTIVATION=1"
               : "")
       << "\"/>\n"
-      << "  <WorkSizes global=\"B*1,F,1\" local=\"1,F,1\" dim=\"output\"/>\n"
+      << "  <WorkSizes global=\"B*1,64,1\" local=\"1,64,1\" dim=\"output\"/>\n"
       << "</CustomLayer>\n";
   return xml.str();
 }
@@ -696,27 +721,26 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
   {
     ov::pass::Manager manager;
     manager.register_pass<ReplaceKdaScan>(kda_direction_count, kda_directions);
-    // ReplaceSqueezeExcite is deliberately NOT registered: measured slower
-    // than the native ops it replaces. On 791556.pb.gz (15 SE residual
-    // blocks), device=GPU, MinibatchSize=32 with min_batch=32 so every
-    // inference uses one batch shape, over 60s searches: unfused 873/828
-    // nps vs fused 719/708 nps, i.e. ~16% slower. The premise (SE is ~14%
-    // of op time as many small dispatch-bound ops, so fusing it should
-    // win) capped the possible gain at ~14% to begin with, and this
-    // kernel -- one work-item per (batch, channel), 64 squares serial, two
-    // barriers, and only SE_FILTERS_ of CHANNELS_ lanes active during FC1
-    // -- does not beat OpenVINO's own kernels even for the ops it removes.
+    // ReplaceSqueezeExcite is deliberately NOT registered: it cannot beat
+    // the native ops it replaces, for a structural reason. The custom
+    // SimpleGPU layer only supports planar formats (custom_primitive.cpp's
+    // add_layout_to_jit handles bfyx/byxf/yxfb/fyxb only), while the
+    // surrounding convolutions run in blocked os_iyx_osv32 -- so the plugin
+    // inserts two reorder_data ops per fused block (~30 reorders,
+    // ~300us/block at batch 32 on 791556, iGPU). That boundary tax alone
+    // already exceeds the entire native SE chain it replaces (AvgPool + 2
+    // FCs + eltwise tail ~= 284us/block from the same profile), so even an
+    // infinitely fast kernel would lose. Measured end-to-end (backendbench,
+    // batch 32, fp16): native ~575-705 nps vs fused ~495.
     //
-    // Also worth knowing before re-enabling: custom SimpleGPU layers are
-    // JIT-compiled lazily per (kernel source x tensor shape) and a cold
-    // compile costs seconds. The graph uses a dynamic batch dim, so a real
-    // search hits many shapes and stalls repeatedly until the driver's
-    // on-disk cache warms. Pinning to one shape (as measured above) hides
-    // it; anything re-enabling this op needs batch-shape bucketing, not
-    // just a faster kernel.
-    //
-    // Left reachable rather than deleted so the measurement can be redone
-    // without resurrecting the code, but off by default and GPU-only.
+    // The kernel itself (se_residual_kernel_source.h) was still rewritten
+    // from the original one-lane-per-channel version -- which put all bulk
+    // accesses 64 floats apart across lanes (~64x wasted transactions) and
+    // measured ~16% slower end-to-end -- to a coalesced one-work-group-per-
+    // sample / one-lane-per-pixel layout that sits at rough kernel parity
+    // with the native SE chain. Kept reachable rather than deleted so the
+    // measurement can be redone (e.g. if OpenVINO ever lets custom layers
+    // consume blocked formats), but off by default and GPU-only.
     // GPU-only because the fallback path cannot carry it: SEResidualOp,
     // like KdaScanOp, only implements evaluate() for f32
     // (se_residual_op.cc:64), so on CPU -- or anywhere else the custom
@@ -852,15 +876,20 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
         }
       }
       if (first_se) {
-        // One work-item per output channel (se_residual_kernel_source.h),
-        // and Intel Gen9-Gen12 iGPUs cap a work-group at 256 work-items --
-        // a wider net cannot launch this kernel at all.
-        if (first_se->channels() > 256) {
+        // The kernel's local arrays scale with CHANNELS_ (avg/gamma/beta
+        // plus 8 subgroup-partial slots per channel); Intel iGPUs provide
+        // 64 KiB of local memory per work-group. Refuse nets that don't
+        // fit rather than failing inside the kernel compiler.
+        const size_t local_bytes =
+            (8 + 3) * static_cast<size_t>(first_se->channels()) * 4 +
+            static_cast<size_t>(first_se->se_filters()) * 4;
+        if (local_bytes > 64 * 1024) {
           throw Exception(
               "OpenVINO: se_fusion cannot run this net (" +
               std::to_string(first_se->channels()) +
-              " channels exceeds the 256 work-item limit of Intel iGPUs); "
-              "disable se_fusion.");
+              " channels needs " + std::to_string(local_bytes) +
+              " bytes of local memory, over the 64 KiB limit); disable "
+              "se_fusion.");
         }
         config_fragments.push_back(WriteSEResidualGpuConfig(
             ensure_dir(), first_se->channels(), first_se->se_filters(),

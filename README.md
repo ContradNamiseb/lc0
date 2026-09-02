@@ -181,11 +181,11 @@ Backend options (`--backend-opts`):
 - `min_batch`: positions are padded up to at least this many per evaluation (default 4).
 - `bucket_batches`: with a fused custom layer (KDA nets), round batch sizes up to powers of two so the per-shape kernel JIT cost is paid once in warmup instead of mid-search (default `true`).
 - `warmup`: run one inference per batch bucket at startup so kernels are built before the first search (default `true` on GPU).
-- `cache_dir`: OpenVINO model cache directory. Ignored for nets with a fused custom layer (KDA), where the cache does not key on the kernel source.
+- `cache_dir`: OpenVINO model cache directory. Ignored for nets with a fused custom layer (KDA), where the cache does not key on the kernel source. The GPU custom-layer staging files (`kda_scan.cl` etc.) are written to a per-process `lc0_openvino_<pid>_*` directory next to the lc0 binary and removed on exit.
 - `ir_path`: load a pre-converted OpenVINO IR (.xml) instead of converting the weights in-process.
 - `policy_head`, `value_head`: which heads to use for multi-head nets (defaults `vanilla`/`winner`, as the onnx backend).
 - `profile`: dump per-op GPU timings at exit.
-- `se_fusion`: fuse squeeze-and-excitation blocks into a custom kernel. Measured slower than the native ops; left for experimentation only.
+- `se_fusion`: fuse squeeze-and-excitation blocks into a custom kernel. Measured slower than the native ops (the custom layer forces format-conversion reorders at every residual-block boundary, which cost more than the fusion saves); left for experimentation only.
 
 ### BLAS
 
