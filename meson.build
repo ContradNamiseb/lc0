@@ -1054,6 +1054,19 @@ if get_option('gtest')
                'src/neural/memcache.cc', pb_files,
     include_directories: includes, link_with: lc0_lib, dependencies: [gtest, gmock]),
     args: '--gtest_output=xml:engine_test.xml', timeout: 90)
+
+  if get_option('openvino') and openvino_lib.found()
+    # No link_with: lc0_lib -- on Windows lc0_lib is a DLL with no exported
+    # symbols, so no import library exists to link against. The test only
+    # needs kda_scan_op.cc (self-contained: openvino + kda_directions.h).
+    test('OpenVinoKdaScan',
+      executable('openvino_kda_test',
+        'src/neural/backends/openvino/openvino_kda_test.cc',
+        'src/neural/backends/openvino/kda_scan_op.cc',
+      include_directories: includes,
+      dependencies: [gtest, openvino_lib]
+    ), args: '--gtest_output=xml:openvino_kda.xml', timeout: 90)
+  endif
 endif
 
 

@@ -82,6 +82,10 @@ __kernel void kda_scan_kernel(__global const DTYPE* q,          // [N,64,H,K] in
 
   for (int t = 0; t < 64; ++t) {
     const int sq = (int)kDirectionTable[dir_idx][t];
+    // int indexing is safe: the largest index is bounded by
+    // N*64*HEADS_*KEY_DIM_ <= 1024*64*heads*key_dim (~2^27 at heads=32,
+    // key_dim=64), far under INT_MAX. kMaxBatchSize caps N at 1024 in
+    // network_openvino.cc.
     const int qk_base = ((n * 64 + sq) * HEADS_ + head) * KEY_DIM_;
     const int v_base = ((n * 64 + sq) * HEADS_ + head) * VALUE_DIM_;
     const int beta_idx = (n * 64 + sq) * HEADS_ + head;

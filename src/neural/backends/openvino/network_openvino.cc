@@ -33,6 +33,7 @@
 // ReplaceKdaScan).
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cassert>
 #include <cstring>
@@ -48,8 +49,20 @@
 #include <vector>
 
 #include <openvino/core/op_extension.hpp>
+#include <openvino/core/version.hpp>
 #include <openvino/openvino.hpp>
 #include <openvino/pass/manager.hpp>
+
+#if defined(OPENVINO_VERSION_MAJOR) && OPENVINO_VERSION_MAJOR < 2023
+#error \
+    "The openvino backend requires OpenVINO 2023.0 or newer (uses ov::hint::execution_mode and friends)."
+#endif
+
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 #include "neural/factory.h"
 #include "neural/loader.h"
@@ -109,7 +122,16 @@ struct CachedOutputPorts {
 class OpenVinoNetwork : public Network {
  public:
   OpenVinoNetwork(const WeightsFile& weights, const OptionsDict& options);
-  ~OpenVinoNetwork() override { if (profile_) DumpProfile(); }
+  ~OpenVinoNetwork() override {
+    if (profile_) DumpProfile();
+    // The custom-layer kernels were JIT'd at compile_model()/warmup time, so
+    // the staged sources are dead weight once this network exists. Remove
+    // best-effort -- a lingering handle making removal fail is harmless.
+    if (!custom_layer_dir_.empty()) {
+      std::error_code ec;
+      std::filesystem::remove_all(custom_layer_dir_, ec);
+    }
+  }
 
   const NetworkCapabilities& GetCapabilities() const override {
     return capabilities_;
@@ -120,7 +142,10 @@ class OpenVinoNetwork : public Network {
         this, capabilities_.has_wdl(), capabilities_.has_mlh());
   }
 
-  int GetMiniBatchSize() const override { return kMaxBatchSize; }
+  // 1024 rows is the fixed max the buffers are allocated for and a
+  // reasonable batch for GPU latency. On CPU a batch anywhere near that
+  // size wrecks per-move latency, so keep a small onnx-cpu-style default.
+  int GetMiniBatchSize() const override { return is_cpu_ ? 16 : kMaxBatchSize; }
   bool IsCpu() const override { return is_cpu_; }
 
   const CachedOutputPorts& ports() const { return ports_; }
@@ -209,9 +234,9 @@ class OpenVinoNetwork : public Network {
   // True when this model came from a pre-converted IR file (ir_path) rather
   // than ConvertWeightsToOnnx. An IR-loaded graph never contains KdaScanOp
   // (nothing matches ReplaceKdaScan's TensorIterator pattern in the first
-  // place), so it skips the GPU custom-layer kernel setup -- but it still
-  // needs the forced-f32 precision hint, for its own separate reason. See
-  // the device_config block in the constructor.
+  // place), so it skips the GPU custom-layer kernel setup and the batch
+  // bucketing that setup triggers. Inference precision follows the same
+  // fp16 option as the ONNX path.
   bool is_ir_model_ = false;
   // Mirrors the cuda backend's min_batch: it never evaluates fewer
   // than this many positions, padding the batch out instead. There
@@ -221,6 +246,11 @@ class OpenVinoNetwork : public Network {
   // Ascending batch shapes the search is allowed to use, and which warmup
   // pre-compiles. Empty means "no bucketing" -- see BucketBatch().
   std::vector<int> batch_buckets_;
+
+  // Per-instance temp dir holding the staged GPU custom-layer kernel
+  // sources and merged CONFIG_FILE (see MakeCustomLayerConfigDir); removed
+  // by the destructor. Empty when the model needed no custom layers.
+  std::filesystem::path custom_layer_dir_;
 
   std::mutex io_mutex_;
   std::list<std::unique_ptr<InputsOutputs>> free_inputs_outputs_;
@@ -369,19 +399,39 @@ float OpenVinoNetworkComputation::GetMVal(int sample) const {
 
 namespace {
 
-// The shared temp directory both WriteKdaScanGpuConfig and
-// WriteSEResidualGpuConfig write their .cl sources into, and where the
-// single merged CONFIG_FILE ends up. OpenVINO's GPU plugin loads multiple
-// custom ops from one CONFIG_FILE as sibling <CustomLayer> elements with no
-// wrapper (confirmed against the plugin's own parser: it walks
-// document_element()/next_sibling(), not a single expected root) -- so
-// every <Source filename=.../> in that file must resolve from the same
-// directory as the merged xml itself (see the comment on WriteKdaScanGpuConfig
-// below), which is why all of this shares one directory rather than each op
-// getting its own.
-std::filesystem::path CustomLayerConfigDir() {
+// The directory both WriteKdaScanGpuConfig and WriteSEResidualGpuConfig
+// write their .cl sources into, and where the single merged CONFIG_FILE
+// ends up. OpenVINO's GPU plugin loads multiple custom ops from one
+// CONFIG_FILE as sibling <CustomLayer> elements with no wrapper (confirmed
+// against the plugin's own parser: it walks document_element()/
+// next_sibling(), not a single expected root) -- so every
+// <Source filename=.../> in that file must resolve from the same directory
+// as the merged xml itself (see the comment on WriteKdaScanGpuConfig
+// below), which is why all of this shares one directory rather than each
+// op getting its own.
+//
+// Every network instance gets its OWN directory, named with the pid and a
+// process-local sequence number. A shared fixed path (<temp>/lc0_openvino_
+// kda_scan/) was tried first and is wrong twice over: two lc0 processes
+// (a cutechess match, parallel self-play workers) truncate and rewrite the
+// same kda_scan.cl while the other process's compile_model() is reading it
+// -- and with different nets, one process can JIT the other's
+// HEADS_/KEY_DIM_/VALUE_DIM_ defines and silently compute wrong output;
+// and on a shared /tmp another local user can pre-create the directory and
+// own the kernel source lc0 loads onto the GPU. ~OpenVinoNetwork removes
+// the directory again.
+std::filesystem::path MakeCustomLayerConfigDir() {
   namespace fs = std::filesystem;
-  fs::path dir = fs::temp_directory_path() / "lc0_openvino_kda_scan";
+  static std::atomic<unsigned long long> sequence{0};
+  std::ostringstream name;
+  name << "lc0_openvino_"
+#ifdef _WIN32
+       << _getpid()
+#else
+       << getpid()
+#endif
+       << "_" << sequence++;
+  fs::path dir = fs::temp_directory_path() / name.str();
   std::error_code ec;
   fs::create_directories(dir, ec);
   if (ec) {
@@ -395,12 +445,17 @@ std::filesystem::path CustomLayerConfigDir() {
 // were generated (one KdaScanOp fragment, one SEResidualOp fragment, both,
 // or neither). Must be called before compile_model().
 std::filesystem::path WriteMergedGpuConfig(
+    const std::filesystem::path& dir,
     const std::vector<std::string>& fragments) {
   namespace fs = std::filesystem;
-  fs::path xml_path = CustomLayerConfigDir() / "lc0_custom_layers.xml";
+  fs::path xml_path = dir / "lc0_custom_layers.xml";
   std::ofstream xml(xml_path, std::ios::trunc);
   for (const auto& fragment : fragments) xml << fragment;
   xml.close();
+  if (!xml) {
+    throw Exception("OpenVINO: failed writing GPU custom-layer config to " +
+                    xml_path.string());
+  }
   return xml_path;
 }
 
@@ -409,12 +464,12 @@ std::filesystem::path WriteMergedGpuConfig(
 // different net shapes, so the kernel is JIT-compiled per model rather than
 // shipped pre-built), and returns its <CustomLayer> XML fragment for
 // WriteMergedGpuConfig to concatenate alongside any other custom op's.
-std::string WriteKdaScanGpuConfig(int heads, int key_dim, int value_dim,
+std::string WriteKdaScanGpuConfig(const std::filesystem::path& dir,
+                                  int heads, int key_dim, int value_dim,
                                   int direction_count,
                                   const std::vector<int>& directions,
                                   bool fp16) {
   namespace fs = std::filesystem;
-  fs::path dir = CustomLayerConfigDir();
 
   fs::path cl_path = dir / "kda_scan.cl";
   std::ofstream cl(cl_path, std::ios::trunc);
@@ -435,6 +490,10 @@ std::string WriteKdaScanGpuConfig(int heads, int key_dim, int value_dim,
   cl << "};\n\n";
   cl << kKdaScanKernelSource;
   cl.close();
+  if (!cl) {
+    throw Exception("OpenVINO: failed writing GPU kernel source to " +
+                    cl_path.string());
+  }
 
   std::string dir_list_str;
   for (size_t i = 0; i < directions.size(); ++i) {
@@ -442,7 +501,13 @@ std::string WriteKdaScanGpuConfig(int heads, int key_dim, int value_dim,
     dir_list_str += std::to_string(directions[i]);
   }
   if (directions.empty()) {
-    dir_list_str = "1,2,3,4,5,6,7,8";
+    // converter.cc throws on an empty direction set long before this runs,
+    // and the constructor validates what it does pass -- silently
+    // defaulting to {1..8} here would evaluate a net declaring any other
+    // set with the wrong traversal order. Fail instead.
+    throw Exception(
+        "OpenVINO: KdaScanOp has no direction set; converter.cc should "
+        "have rejected this net.");
   }
 
   std::string dtype_str = fp16 ? "half" : "float";
@@ -483,16 +548,20 @@ std::string WriteKdaScanGpuConfig(int heads, int key_dim, int value_dim,
 // se_filters are static per net (uniform across every residual block in an
 // lc0 resnet tower), so -- like KdaScanOp -- exactly one compiled kernel
 // covers every SEResidualOp instance in the model.
-std::string WriteSEResidualGpuConfig(int channels, int se_filters,
+std::string WriteSEResidualGpuConfig(const std::filesystem::path& dir,
+                                     int channels, int se_filters,
                                      SEResidualOp::Activation activation,
                                      bool fp16) {
   namespace fs = std::filesystem;
-  fs::path dir = CustomLayerConfigDir();
 
   fs::path cl_path = dir / "se_residual.cl";
   std::ofstream cl(cl_path, std::ios::trunc);
   cl << kSEResidualKernelSource;
   cl.close();
+  if (!cl) {
+    throw Exception("OpenVINO: failed writing GPU kernel source to " +
+                    cl_path.string());
+  }
 
   std::string dtype_str = fp16 ? "half" : "float";
 
@@ -527,8 +596,11 @@ std::string WriteSEResidualGpuConfig(int channels, int se_filters,
 OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
                                  const OptionsDict& options) {
   std::string device = options.GetOrDefault<std::string>("device", "GPU");
-  min_batch_ = std::min(options.GetOrDefault<int>("min_batch", 4),
-                        kMaxBatchSize);
+  // Clamp to [1, kMaxBatchSize]: a non-positive min_batch would make the
+  // batch-bucket ladder below loop forever (b *= 2 never leaves 0), hanging
+  // the constructor.
+  min_batch_ = std::clamp(options.GetOrDefault<int>("min_batch", 4), 1,
+                          kMaxBatchSize);
   is_cpu_ = (device == "CPU");
 
   const auto& format = weights.format().network_format();
@@ -537,6 +609,7 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
   capabilities_.moves_left = format.moves_left();
 
   CERR << "Initializing OpenVINO backend on device [" << device << "]...";
+  CERR << "OpenVINO runtime: " << ov::get_openvino_version().buildNumber;
 
   // ir_path opts into loading a pre-converted OpenVINO IR (.xml/.bin) file
   // directly, bypassing ConvertWeightsToOnnx entirely -- see
@@ -553,8 +626,10 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
     converter_options.opset = 17;
     converter_options.data_type =
         WeightsToOnnxConverterOptions::DataType::kFloat32;
-    converter_options.policy_head = "vanilla";
-    converter_options.value_head = "winner";
+    converter_options.policy_head =
+        options.GetOrDefault<std::string>("policy_head", "vanilla");
+    converter_options.value_head =
+        options.GetOrDefault<std::string>("value_head", "winner");
 
     pblczero::Net onnx_net = ConvertWeightsToOnnx(weights, converter_options);
     std::string_view model_bytes = onnx_net.onnx_model().model();
@@ -662,7 +737,23 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
     manager.run_passes(model);
   }
 
-  // Default fp16 to true on GPU for maximum throughput (2.3x-2.4x speedup)
+  // Whether the (post-pass) graph contains a fused KdaScanOp. Resolved once
+  // here: the GPU block below needs the first instance's geometry, and the
+  // non-GPU path needs mere presence to pin f32 (see the device_config
+  // else-if).
+  bool has_kda_scan = false;
+  for (const auto& node : model->get_ops()) {
+    if (ov::as_type_ptr<KdaScanOp>(node)) {
+      has_kda_scan = true;
+      break;
+    }
+  }
+
+  // Default fp16 to true on GPU for maximum throughput -- measured ~6.1x
+  // fp32 on a KDA net (1965 vs 321 nps) and ~2.3x on a CNN net. Accuracy
+  // cost is ~1.4e-3 absolute on post-softmax policy for KDA nets and up to
+  // ~1e-2 on CNN nets (value ~0 at display precision in both cases), so
+  // fp16=false remains available for strength-critical use.
   const bool want_fp16 = options.GetOrDefault<bool>("fp16", device == "GPU");
   profile_ = options.GetOrDefault<bool>("profile", false);
 
@@ -707,6 +798,14 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
       // format enforces, so check it instead of trusting it: a net mixing
       // block sizes would otherwise produce wrong math with nothing logged.
       std::vector<std::string> config_fragments;
+      // Lazily create this instance's private staging directory only if the
+      // model actually needs custom layers (see MakeCustomLayerConfigDir).
+      const auto ensure_dir = [this]() -> const std::filesystem::path& {
+        if (custom_layer_dir_.empty()) {
+          custom_layer_dir_ = MakeCustomLayerConfigDir();
+        }
+        return custom_layer_dir_;
+      };
       std::shared_ptr<KdaScanOp> first_kda;
       for (const auto& node : model->get_ops()) {
         auto kda = ov::as_type_ptr<KdaScanOp>(node);
@@ -729,8 +828,9 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
       }
       if (first_kda) {
         config_fragments.push_back(WriteKdaScanGpuConfig(
-            first_kda->heads(), first_kda->key_dim(), first_kda->value_dim(),
-            first_kda->direction_count(), first_kda->directions(), want_fp16));
+            ensure_dir(), first_kda->heads(), first_kda->key_dim(),
+            first_kda->value_dim(), first_kda->direction_count(),
+            first_kda->directions(), want_fp16));
       }
 
       std::shared_ptr<SEResidualOp> first_se;
@@ -752,13 +852,23 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
         }
       }
       if (first_se) {
+        // One work-item per output channel (se_residual_kernel_source.h),
+        // and Intel Gen9-Gen12 iGPUs cap a work-group at 256 work-items --
+        // a wider net cannot launch this kernel at all.
+        if (first_se->channels() > 256) {
+          throw Exception(
+              "OpenVINO: se_fusion cannot run this net (" +
+              std::to_string(first_se->channels()) +
+              " channels exceeds the 256 work-item limit of Intel iGPUs); "
+              "disable se_fusion.");
+        }
         config_fragments.push_back(WriteSEResidualGpuConfig(
-            first_se->channels(), first_se->se_filters(),
+            ensure_dir(), first_se->channels(), first_se->se_filters(),
             first_se->activation(), want_fp16));
       }
       if (!config_fragments.empty()) {
         device_config["CONFIG_FILE"] =
-            WriteMergedGpuConfig(config_fragments).string();
+            WriteMergedGpuConfig(ensure_dir(), config_fragments).string();
         // This model carries a per-shape-JIT'd custom layer, so confine the
         // search to a fixed ladder of batch shapes. Powers of two above
         // min_batch: few enough to warm in one startup pass, and since lc0's
@@ -776,6 +886,12 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
 
     device_config[ov::hint::inference_precision.name()] =
         want_fp16 ? ov::element::f16 : ov::element::f32;
+  } else if (has_kda_scan) {
+    // Non-GPU device with a fused KdaScanOp: its evaluate() only implements
+    // f32 (kda_scan_op.cc), and a CPU with AMX would otherwise pick bf16
+    // under the PERFORMANCE execution mode and fail to compile the op.
+    // Pin f32 so the CPU reference path is used for the whole graph.
+    device_config[ov::hint::inference_precision.name()] = ov::element::f32;
   }
 
   if (profile_) device_config[ov::enable_profiling.name()] = true;
@@ -847,39 +963,40 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
       const auto warm_start = std::chrono::steady_clock::now();
 
       for (const int shape : warm_shapes) {
-      const size_t nb = static_cast<size_t>(shape);
-      std::memset(io->input_val_mem_, 0,
-                  nb * kInputPlanes * 64 * sizeof(float));
-
-      // Bind exactly what ComputeBlocking binds, so warmup compiles the
-      // kernels the search will actually use rather than a variant of them.
-      if (is_ir_model_) {
-        ov::Tensor exact(io->input_tensor_.get_element_type(),
-                         {nb, kInputPlanes, 8, 8});
-        std::memcpy(exact.data<float>(), io->input_val_mem_,
+        const size_t nb = static_cast<size_t>(shape);
+        std::memset(io->input_val_mem_, 0,
                     nb * kInputPlanes * 64 * sizeof(float));
-        io->infer_request_.set_input_tensor(exact);
-      } else {
-        io->infer_request_.set_input_tensor(ov::Tensor(
-            io->input_tensor_, {0, 0, 0, 0}, {nb, kInputPlanes, 8, 8}));
-      }
-      io->infer_request_.set_tensor(
-          ports_.policy_port,
-          ov::Tensor(ov::element::f32, {nb, InputsOutputs::kPolicyWidth},
-                     io->policy_.data()));
-      io->infer_request_.set_tensor(
-          ports_.value_port,
-          ov::Tensor(ov::element::f32,
-                     {nb, capabilities_.has_wdl() ? InputsOutputs::kValueWidth
-                                                  : size_t{1}},
-                     io->value_.data()));
-      if (capabilities_.has_mlh()) {
-        io->infer_request_.set_tensor(
-            ports_.mlh_port,
-            ov::Tensor(ov::element::f32, {nb, 1}, io->moves_left_.data()));
-      }
 
-      io->infer_request_.infer();
+        // Bind exactly what ComputeBlocking binds, so warmup compiles the
+        // kernels the search will actually use rather than a variant of
+        // them.
+        if (is_ir_model_) {
+          ov::Tensor exact(io->input_tensor_.get_element_type(),
+                           {nb, kInputPlanes, 8, 8});
+          std::memcpy(exact.data<float>(), io->input_val_mem_,
+                      nb * kInputPlanes * 64 * sizeof(float));
+          io->infer_request_.set_input_tensor(exact);
+        } else {
+          io->infer_request_.set_input_tensor(ov::Tensor(
+              io->input_tensor_, {0, 0, 0, 0}, {nb, kInputPlanes, 8, 8}));
+        }
+        io->infer_request_.set_tensor(
+            ports_.policy_port,
+            ov::Tensor(ov::element::f32, {nb, InputsOutputs::kPolicyWidth},
+                       io->policy_.data()));
+        io->infer_request_.set_tensor(
+            ports_.value_port,
+            ov::Tensor(ov::element::f32,
+                       {nb, capabilities_.has_wdl() ? InputsOutputs::kValueWidth
+                                                    : size_t{1}},
+                       io->value_.data()));
+        if (capabilities_.has_mlh()) {
+          io->infer_request_.set_tensor(
+              ports_.mlh_port,
+              ov::Tensor(ov::element::f32, {nb, 1}, io->moves_left_.data()));
+        }
+
+        io->infer_request_.infer();
       }
 
       ReleaseInputsOutputs(std::move(io));
@@ -989,17 +1106,21 @@ std::unique_ptr<Network> MakeOpenVinoNetworkAuto(
   return MakeOpenVinoNetwork(weights, opts);
 }
 
-// Priority well below sycl (130-132), cudnn/dx12 (120), and cuda (102-104):
-// measured GPU throughput here is currently ~5-8x slower than SYCL on this
-// KDA-hybrid net (see docs/inference-backends-handoff.md), likely from
-// OpenVINO serializing the KDA recurrence's ONNX Scan op into per-token
-// dispatch, where SYCL runs it as one fused kernel. Still above blas/eigen
-// (49-50): GPU execution should beat a CPU BLAS fallback when nothing
-// faster is available. Do not raise this without re-measuring -- a wrong
+// Priority: above blas/eigen (49-50) so GPU execution beats a CPU BLAS
+// fallback when nothing faster is available, but below the onnx providers
+// (59-65), opencl (100), cuda (102-104), cudnn/dx12 (120) and sycl
+// (130-132), all of which measure faster on the same hardware. Note the
+// ordering: NetworkFactory sorts with LARGER priority winning
+// (factory.h Factory::operator<), so 45/46 here previously ranked BELOW
+// blas and auto-selection silently ran on CPU. The old justification --
+// "~5-8x slower than SYCL ... from serializing the KDA recurrence's ONNX
+// Scan op" -- predates the fused KdaScanOp and direction-table fold; the
+// KDA gap is now much smaller, and on CNN nets fp16 OpenVINO is ~2.3x
+// blas on this machine. Do not raise this without re-measuring -- a wrong
 // auto-selection would silently make search slower on any machine with
 // both this and sycl/cuda/dx12 available.
-REGISTER_NETWORK("openvino", MakeOpenVinoNetwork, 45)
-REGISTER_NETWORK("openvino-auto", MakeOpenVinoNetworkAuto, 46)
+REGISTER_NETWORK("openvino", MakeOpenVinoNetwork, 51)
+REGISTER_NETWORK("openvino-auto", MakeOpenVinoNetworkAuto, 52)
 
 }  // namespace openvino_backend
 }  // namespace lczero

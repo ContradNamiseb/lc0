@@ -39,7 +39,7 @@ Building should be easier now than it was in the past. Please report any problem
 
 Building lc0 requires the Meson build system and at least one backend library for evaluating the neural network, as well as a few libraries. If your system already has these libraries installed, they will be used; otherwise Meson will generate its own copy (a "subproject"), which in turn requires that git is installed (yes, separately from cloning the actual lc0 repository). Meson also requires python and Ninja.
 
-Backend support includes (in theory) any CBLAS-compatible library for CPU usage, but OpenBLAS or Intel's DNNL are the main ones. For GPUs, the following are supported: CUDA (with optional cuDNN), various flavors of onnxruntime, and Apple's Metal Performance Shaders. There is also experimental SYCL support for AMD and Intel GPUs.
+Backend support includes (in theory) any CBLAS-compatible library for CPU usage, but OpenBLAS or Intel's DNNL are the main ones. For GPUs, the following are supported: CUDA (with optional cuDNN), various flavors of onnxruntime, and Apple's Metal Performance Shaders. There is also experimental SYCL support for AMD and Intel GPUs, and an experimental OpenVINO backend for Intel CPUs, iGPUs and NPUs.
 
 Finally, lc0 requires a compiler supporting C++20. Minimal versions tested are g++ v10.0, clang v12.0 and Visual Studio 2019 version 16.11.
 
@@ -156,6 +156,36 @@ The first line is to initialize the build environment and is only needed once pe
 On windows you will have to build using `ninja`, this is provided by Visual Studio if you install the CMake component. We provide a `build-sycl.cmd` script that should build just fine for an Intel GPU. This script has not yet been tested with and AMD GPU, some editing will be required.
 
 You can also install the [oneAPI DPC++/C++ Compiler Runtime](https://www.intel.com/content/www/us/en/developer/articles/tool/compilers-redistributable-libraries-by-version.html) so you can run Lc0 without needing to initialize the build environment every time.
+
+### OpenVINO
+
+*Note* that OpenVINO support is experimental.
+
+The `openvino` backend runs the network through Intel's OpenVINO toolkit, which targets Intel CPUs, iGPUs and NPUs. It requires the OpenVINO runtime (2023.0 or newer), downloadable from <https://docs.openvino.ai/> or, on Debian/Ubuntu, installable from Intel's apt repository (`apt install openvino` after adding `https://apt.repos.intel.com/openvino`).
+
+To build, enable the `openvino` meson option and point the build at the runtime:
+
+```shell
+meson setup --buildtype release build \
+  -Dopenvino=true \
+  -Dopenvino_include=/opt/intel/openvino/runtime/include \
+  -Dopenvino_libdirs=/opt/intel/openvino/runtime/lib/intel64
+```
+
+(On Windows, `openvino_include`/`openvino_libdirs` point into the extracted OpenVINO archive, e.g. `.../runtime/include` and `.../runtime/lib/intel64/Release`.)
+
+Backend options (`--backend-opts`):
+
+- `device`: `GPU` (default) or `CPU`; `openvino-auto` picks GPU when present.
+- `fp16`: half-precision inference on GPU, default `true`. Roughly 6x faster than fp32 on KDA nets at ~1e-3 absolute policy error; set `false` for maximum accuracy.
+- `min_batch`: positions are padded up to at least this many per evaluation (default 4).
+- `bucket_batches`: with a fused custom layer (KDA nets), round batch sizes up to powers of two so the per-shape kernel JIT cost is paid once in warmup instead of mid-search (default `true`).
+- `warmup`: run one inference per batch bucket at startup so kernels are built before the first search (default `true` on GPU).
+- `cache_dir`: OpenVINO model cache directory. Ignored for nets with a fused custom layer (KDA), where the cache does not key on the kernel source.
+- `ir_path`: load a pre-converted OpenVINO IR (.xml) instead of converting the weights in-process.
+- `policy_head`, `value_head`: which heads to use for multi-head nets (defaults `vanilla`/`winner`, as the onnx backend).
+- `profile`: dump per-op GPU timings at exit.
+- `se_fusion`: fuse squeeze-and-excitation blocks into a custom kernel. Measured slower than the native ops; left for experimentation only.
 
 ### BLAS
 
