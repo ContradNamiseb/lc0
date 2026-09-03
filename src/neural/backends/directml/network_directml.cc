@@ -301,7 +301,14 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
     } else {
       const uint64_t d_model =
           !enc.mha.q_w.empty() ? enc.mha.q_w.size() / emb_size : emb_size;
-      need = 3 * d_model;
+      // 3*d_model per token for the q/k/v projections in the scratch arena
+      // PLUS 5*d_model for the split/merged head-transpose buffers EvalMha
+      // keeps in the buffer1 tensor slot (qt/kt/vt/ctx/merged); the tensor
+      // slot is sized >= scratch_bytes_, so folding both into this estimate
+      // covers both arenas. An underestimate here is not a failed
+      // allocation but an out-of-bounds UAV write and a removed device
+      // (DXGI_ERROR_DEVICE_REMOVED surfacing at the next DML call).
+      need = 8 * d_model;
     }
     scratch_elems = std::max(scratch_elems, need);
   }
@@ -589,7 +596,6 @@ void DirectMlNetwork<DataType>::forwardEval(
   ReportD3DErrors(
       io->command_list_->Reset(io->command_allocator_.Get(), nullptr),
       "Reset command list");
-  ctx_.descriptors().Reset();
   transient_arena_.ResetCursor();
 
   ID3D12GraphicsCommandList* list = io->command_list_.Get();
@@ -602,6 +608,13 @@ void DirectMlNetwork<DataType>::forwardEval(
   DmlPtr scratch(scratch_arena_.resource(), 0);
 
   DmlExecScope scope(ctx_, list, &transient_arena_);
+
+  // Two-phase: compile every layer's graphs for this batch size BEFORE any
+  // dispatch is recorded. On this driver, interleaving diverse-shape graph
+  // builds with bound dispatches poisons later CreateOperator calls (see
+  // docs/directml-handoff.md section 3); it also removes lazy-compile
+  // stalls from the search loop.
+  for (auto& layer : network_) layer->EnsureCompiled(batch, scope);
 
   DmlPtr flow = tensor_mem[0];
   DmlPtr spare1 = tensor_mem[1];
@@ -718,7 +731,6 @@ void DirectMlNetwork<DataType>::forwardEval(
   ReportD3DErrors(ctx_.queue()->Signal(io->fence_.Get(), io->fence_value_),
                   "Signal");
   ctx_.WaitForFence(io->fence_.Get(), io->fence_value_);
-
   if (wdl_) {
     // Value softmax done CPU-side, exactly like the CUDA/SYCL finishEval.
     float* v = const_cast<float*>(io->value_mapped_);

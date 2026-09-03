@@ -222,7 +222,8 @@ constexpr UINT kMaxRootConstants = 16;
 template <typename DataType>
 class GraphFactory {
  public:
-  explicit GraphFactory(DmlDeviceContext& ctx) : graph_(ctx.dml_device()) {}
+  explicit GraphFactory(DmlDeviceContext& ctx)
+      : graph_(ctx.dml_device()), ctx_(ctx) {}
 
   dml::Graph& graph() { return graph_; }
 
@@ -299,6 +300,11 @@ class GraphFactory {
     out.transient_bytes = props.TemporaryResourceSize;
     out.bindings = std::move(bindings_);
     out.output_bytes = std::move(output_bytes);
+    // Create the op's binding table NOW, in the build phase: this driver
+    // fails DML object creation with bogus errors once dispatches have
+    // been recorded (see docs/directml-handoff.md section 3), so every
+    // table must exist before the first RecordDispatch.
+    ctx_.GetOrCreateBindingTable(out.op.Get());
     return out;
   }
 
@@ -340,6 +346,7 @@ class GraphFactory {
   }
 
   dml::Graph graph_;
+  DmlDeviceContext& ctx_;
   std::vector<DmlBindingRef> bindings_;
   uint32_t next_input_ = 0;
 };
@@ -466,29 +473,41 @@ DmlHalf::operator float() const { return F16BitsToF32(bits); }
 
 // Implemented in network_directml.cc (device bring-up lives there, like the
 // CUDA backend's device discovery in network_cuda.cc).
+IDMLBindingTable* DmlDeviceContext::GetOrCreateBindingTable(
+    IDMLCompiledOperator* op) {
+  auto it = tables_.find(op);
+  if (it != tables_.end()) return it->second.Get();
+
+  // The table must cover the dispatchable's RequiredDescriptorCount, which
+  // includes DML-internal intermediates (e.g. the KDA projection graph
+  // needs 105). A smaller table than required fails E_INVALIDARG, and this
+  // driver reports some undersized-table failures with the misleading
+  // DXGI_ERROR_DEVICE_REMOVED code instead.
+  const uint32_t slots =
+      std::max<uint32_t>(op->GetBindingProperties().RequiredDescriptorCount,
+                         1u);
+  D3D12_CPU_DESCRIPTOR_HANDLE cpu = descriptors_.TakeCpu(slots);
+  DML_BINDING_TABLE_DESC table_desc = {};
+  table_desc.Dispatchable = op;
+  table_desc.CPUDescriptorHandle = cpu;
+  table_desc.GPUDescriptorHandle = descriptors_.CpuToGpu(cpu);
+  table_desc.SizeInDescriptors = slots;
+  ComPtr<IDMLBindingTable> table;
+  ReportDmlErrors(
+      dml_device_->CreateBindingTable(&table_desc, IID_PPV_ARGS(&table)),
+      "CreateBindingTable");
+  IDMLBindingTable* raw = table.Get();
+  tables_.emplace(op, std::move(table));
+  return raw;
+}
+
 void DmlDeviceContext::DispatchOperator(
     ID3D12GraphicsCommandList* list, IDMLCompiledOperator* op,
     const std::vector<DmlPtr>& inputs, const std::vector<DmlBindingRef>& meta,
     const std::vector<DmlPtr>& outputs,
     const std::vector<uint64_t>& output_bytes, DmlPtr transient,
     uint64_t transient_bytes) {
-  constexpr uint32_t kSlotsPerTable = 64;
-  D3D12_CPU_DESCRIPTOR_HANDLE cpu = descriptors_.TakeCpu(kSlotsPerTable);
-  DML_BINDING_TABLE_DESC table_desc = {};
-  table_desc.Dispatchable = op;
-  table_desc.CPUDescriptorHandle = cpu;
-  table_desc.GPUDescriptorHandle = descriptors_.CpuToGpu(cpu);
-  // SizeInDescriptors must cover RequiredDescriptorCount (the system
-  // DirectML 1.x runtime validates it; zero is rejected with E_INVALIDARG).
-  // SizeInDescriptors must cover the dispatchable's RequiredDescriptorCount
-  // (the system DirectML 1.x runtime validates it; zero is rejected).
-  table_desc.SizeInDescriptors =
-      std::max<uint32_t>(op->GetBindingProperties().RequiredDescriptorCount,
-                         1u);
-  ComPtr<IDMLBindingTable> table;
-  ReportDmlErrors(
-      dml_device_->CreateBindingTable(&table_desc, IID_PPV_ARGS(&table)),
-      "CreateBindingTable");
+  IDMLBindingTable* table = GetOrCreateBindingTable(op);  // created at build
 
   std::vector<DML_BUFFER_BINDING> buffer_bindings(inputs.size());
   std::vector<DML_BINDING_DESC> binding_descs(inputs.size());
@@ -523,7 +542,7 @@ void DmlDeviceContext::DispatchOperator(
 
   ID3D12DescriptorHeap* heap = descriptors_.heap();
   list->SetDescriptorHeaps(1, &heap);
-  recorder_->RecordDispatch(list, op, table.Get());
+  recorder_->RecordDispatch(list, op, table);
 
   // A global UAV barrier between dispatches: layers are strictly sequential
   // so this is correct, if conservative.
@@ -776,18 +795,22 @@ FCLayer<DataType>::FCLayer(BaseLayer<DataType>* ip, int C, int H, int W,
 }
 
 template <typename DataType>
+void FCLayer<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
+  if (compiled_.count(N)) return;
+  const int num_inputs = this->input_->GetC() * this->input_->GetH() *
+                         this->input_->GetW();
+  compiled_.emplace(N, BuildGemmLayerOp<DataType>(
+                           scope.ctx(), N, N, num_inputs, C, use_bias_, act_,
+                           weights_, biases_));
+}
+
+template <typename DataType>
 void FCLayer<DataType>::Eval(int N, DmlPtr output, DmlPtr input, DmlPtr input2,
                              DmlPtr scratch, size_t scratch_size,
                              DmlExecScope& scope) {
-  const int num_inputs = this->input_->GetC() * this->input_->GetH() *
-                         this->input_->GetW();
-  auto it = compiled_.find(N);
-  if (it == compiled_.end()) {
-    it = compiled_.emplace(N, BuildGemmLayerOp<DataType>(
-                                  scope.ctx(), N, N, num_inputs, C, use_bias_,
-                                  act_, weights_, biases_)).first;
-  }
-  DispatchOp<DataType>(scope, it->second, input, input2, scratch, {output});
+  if (!compiled_.count(N)) EnsureCompiled(N, scope);
+  DispatchOp<DataType>(scope, compiled_.find(N)->second, input, input2, scratch,
+                       {output});
 }
 
 template <typename DataType>
@@ -805,19 +828,23 @@ EmbeddingLayer<DataType>::EmbeddingLayer(BaseLayer<DataType>* ip, int C, int H,
 }
 
 template <typename DataType>
-void EmbeddingLayer<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
-                                    DmlPtr input2, DmlPtr scratch,
-                                    size_t scratch_size, DmlExecScope& scope) {
+void EmbeddingLayer<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
+  if (compiled_.count(N)) return;
   // Token-level GEMM: [N*64, K] -> [N*64, M], no H/W flattening.
   const int num_inputs = this->input_->GetC();
   const uint32_t tokens = N * 64;
-  auto it = compiled_.find(N);
-  if (it == compiled_.end()) {
-    it = compiled_.emplace(N, BuildGemmLayerOp<DataType>(
-                                  scope.ctx(), N, tokens, num_inputs, C,
-                                  use_bias_, act_, weights_, biases_)).first;
-  }
-  DispatchOp<DataType>(scope, it->second, input, input2, scratch, {output});
+  compiled_.emplace(N, BuildGemmLayerOp<DataType>(
+                           scope.ctx(), N, tokens, num_inputs, C, use_bias_,
+                           act_, weights_, biases_));
+}
+
+template <typename DataType>
+void EmbeddingLayer<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
+                                    DmlPtr input2, DmlPtr scratch,
+                                    size_t scratch_size, DmlExecScope& scope) {
+  if (!compiled_.count(N)) EnsureCompiled(N, scope);
+  DispatchOp<DataType>(scope, compiled_.find(N)->second, input, input2, scratch,
+                       {output});
 }
 
 template <typename DataType>
@@ -850,24 +877,25 @@ PolicyMapLayer<DataType>::PolicyMapLayer(BaseLayer<DataType>* ip, int usedSize,
 }
 
 template <typename DataType>
+void PolicyMapLayer<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
+  if (compiled_.count(N)) return;
+  GraphFactory<DataType> g(scope.ctx());
+  auto x = g.Input({1, 1, static_cast<uint32_t>(N),
+                    static_cast<uint32_t>(used_size_)});
+  auto indices = g.WeightU32(
+      indices_, {1, 1, 1, static_cast<uint32_t>(kNumOutputPolicy)});
+  dml::Expression y = dml::Gather(x, indices, 3, 1);
+  compiled_.emplace(
+      N, g.Compile({y}, {(uint64_t)N * kNumOutputPolicy * sizeof(DataType)}));
+}
+
+template <typename DataType>
 void PolicyMapLayer<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
                                      DmlPtr input2, DmlPtr scratch,
                                      size_t scratch_size, DmlExecScope& scope) {
-  auto it = compiled_.find(N);
-  if (it == compiled_.end()) {
-    CERR << "MAP building";
-    GraphFactory<DataType> g(scope.ctx());
-    auto x = g.Input({1, 1, static_cast<uint32_t>(N),
-                      static_cast<uint32_t>(used_size_)});
-    auto indices = g.WeightU32(
-        indices_, {1, 1, 1, static_cast<uint32_t>(kNumOutputPolicy)});
-    dml::Expression y = dml::Gather(x, indices, 3, 1);
-    it = compiled_.emplace(
-             N, g.Compile({y},
-                          {(uint64_t)N * kNumOutputPolicy * sizeof(DataType)}))
-             .first;
-  }
-  DispatchOp<DataType>(scope, it->second, input, input2, scratch, {output});
+  if (!compiled_.count(N)) EnsureCompiled(N, scope);
+  DispatchOp<DataType>(scope, compiled_.find(N)->second, input, input2, scratch,
+                       {output});
 }
 
 // ===========================================================================
@@ -950,6 +978,104 @@ AttentionBody<DataType>::AttentionBody(
         smolgen_global, smolgen_global_size, max_batch_size,
         activations.smolgen_activation, activations.ffn_activation,
         is_pe_dense_embedding_ ? 1e-3f : 1e-6f, kda_directions, ctx, fp16));
+  }
+}
+
+template <typename DataType>
+void AttentionBody<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
+  const uint32_t tokens = N * 64;
+  const int input_size = kNumInputPlanes;
+  const int body_input_c = is_pe_dense_embedding_
+                               ? input_size + embedding_dense_size_
+                               : input_size + kNumPosEncodingChannels;
+  if (is_pe_dense_embedding_) {
+    if (!pre_compiled_.count(N)) {
+      GraphFactory<DataType> g(scope.ctx());
+      auto x = g.Input({1, 1, static_cast<uint32_t>(N), 64 * 12});
+      auto w = g.Weight(ip_emb_pre_w_,
+                        {1, 1, static_cast<uint32_t>(64 * embedding_dense_size_),
+                         64 * 12});
+      auto b = g.WeightChannel(ip_emb_pre_b_, static_cast<uint32_t>(N),
+                               static_cast<uint32_t>(64 * embedding_dense_size_));
+      dml::Expression y = dml::Gemm(x, w, dml::NullOpt,
+                                    DML_MATRIX_TRANSFORM_NONE,
+                                    DML_MATRIX_TRANSFORM_TRANSPOSE) + b;
+      pre_compiled_.emplace(
+          N, g.Compile({y}, {(uint64_t)N * 64 * embedding_dense_size_ *
+                                 sizeof(DataType)}));
+    }
+    if (!compiled_.count(N)) {
+      GraphFactory<DataType> g(scope.ctx());
+      auto x = g.Input({1, 1, tokens, static_cast<uint32_t>(body_input_c)});
+      auto w = g.Weight(ip_emb_w_, {1, 1, static_cast<uint32_t>(embedding_op_size_),
+                                    static_cast<uint32_t>(body_input_c)});
+      auto b = g.WeightChannel(ip_emb_b_, tokens, static_cast<uint32_t>(embedding_op_size_));
+      auto ln_g = g.WeightChannel(ip_emb_ln_g_, tokens, static_cast<uint32_t>(embedding_op_size_));
+      auto ln_b = g.WeightChannel(ip_emb_ln_b_, tokens, static_cast<uint32_t>(embedding_op_size_));
+      dml::Expression emb =
+          dml::Gemm(x, w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                    DML_MATRIX_TRANSFORM_TRANSPOSE);
+      dml::Expression bias_b = b;
+      // LayerNorm with the previous gemm's bias fused: activation is the
+      // net's default (RELU/MISH), matching the SYCL embedding LN.
+      dml::Expression pre_ln = LayerNormExpr<DataType>(emb, &bias_b, nullptr, ln_g, ln_b, 1.0f, 1e-3f,
+          activations_.default_activation);
+      if (has_gating_) {
+        auto mult = g.WeightChannel(ip_mult_gate_, tokens, static_cast<uint32_t>(embedding_op_size_));
+        auto add = g.WeightChannel(ip_add_gate_, tokens, static_cast<uint32_t>(embedding_op_size_));
+        pre_ln = pre_ln * mult + add;
+      }
+      auto ffn1_w = g.Weight(
+          ip_emb_ffn_d1_w_,
+          {1, 1, static_cast<uint32_t>(embedding_ffn_dff_),
+           static_cast<uint32_t>(embedding_op_size_)});
+      auto ffn1_b = g.WeightChannel(ip_emb_ffn_d1_b_, tokens, static_cast<uint32_t>(embedding_ffn_dff_));
+      auto ffn2_w = g.Weight(
+          ip_emb_ffn_d2_w_,
+          {1, 1, static_cast<uint32_t>(embedding_op_size_),
+           static_cast<uint32_t>(embedding_ffn_dff_)});
+      auto ffn2_b = g.WeightChannel(ip_emb_ffn_d2_b_, tokens, static_cast<uint32_t>(embedding_op_size_));
+      auto ffn_ln_g = g.WeightChannel(ip_emb_ffn_ln_g_, tokens, static_cast<uint32_t>(embedding_op_size_));
+      auto ffn_ln_b = g.WeightChannel(ip_emb_ffn_ln_b_, tokens, static_cast<uint32_t>(embedding_op_size_));
+      dml::Expression ffn1 =
+          dml::Gemm(pre_ln, ffn1_w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                    DML_MATRIX_TRANSFORM_TRANSPOSE) + ffn1_b;
+      ffn1 = ActivationExpr<DataType>(activations_.ffn_activation, ffn1);
+      dml::Expression ffn2 =
+          dml::Gemm(ffn1, ffn2_w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                    DML_MATRIX_TRANSFORM_TRANSPOSE);
+      const float alpha =
+          static_cast<float>(pow(2.0 * encoder_weights_.size(), -0.25));
+      dml::Expression out = LayerNormExpr<DataType>(ffn2, &ffn2_b, &pre_ln, ffn_ln_g, ffn_ln_b, alpha, 1e-3f,
+          ACTIVATION_NONE);
+      compiled_.emplace(
+          N, g.Compile({out}, {(uint64_t)tokens * embedding_op_size_ *
+                                   sizeof(DataType)}));
+    }
+  } else {
+    if (!compiled_.count(N)) {
+      GraphFactory<DataType> g(scope.ctx());
+      auto x = g.Input({1, 1, tokens, static_cast<uint32_t>(body_input_c)});
+      auto w = g.Weight(ip_emb_w_, {1, 1, static_cast<uint32_t>(embedding_op_size_),
+                                    static_cast<uint32_t>(body_input_c)});
+      auto b = g.WeightChannel(ip_emb_b_, tokens, static_cast<uint32_t>(embedding_op_size_));
+      dml::Expression g0 =
+          dml::Gemm(x, w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                    DML_MATRIX_TRANSFORM_TRANSPOSE);
+      dml::Expression y = g0 + b;
+      y = ActivationExpr<DataType>(activations_.default_activation, y);
+      if (has_gating_) {
+        auto mult = g.WeightChannel(ip_mult_gate_, tokens, static_cast<uint32_t>(embedding_op_size_));
+        auto add = g.WeightChannel(ip_add_gate_, tokens, static_cast<uint32_t>(embedding_op_size_));
+        y = y * mult + add;
+      }
+      compiled_.emplace(
+          N, g.Compile({y}, {(uint64_t)tokens * embedding_op_size_ *
+                                 sizeof(DataType)}));
+    }
+  }
+  for (const auto& enc : encoder_weights_) {
+    enc->EnsureCompiled(N, scope);
   }
 }
 
@@ -1242,6 +1368,224 @@ void EncoderBlock<DataType>::Eval(int N, DmlPtr in_out_tensor, DmlPtr scratch,
   }
 }
 
+template <typename DataType>
+void EncoderBlock<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
+  // NOTE: these build blocks mirror the lazy fallback blocks inside
+  // EvalKda/EvalMha (which stay as dead-man's fuses). Keep them in sync.
+  if (is_kda_) {
+    const uint32_t tokens = N * 64;
+    const uint32_t max_tokens = max_batch_size_ * 64;
+    const uint32_t KD = encoder_heads_ * kda_key_dim_;
+    const uint32_t VD = encoder_heads_ * kda_value_dim_;
+    const uint32_t gr = kda_gate_rank_;
+    const uint32_t emb = embedding_op_size_;
+    const size_t elem = sizeof(DataType);
+    if (!kda_proj_compiled_.count(N)) {
+      GraphFactory<DataType> g(scope.ctx());
+      auto x = g.Input({1, 1, tokens, emb});
+      auto gemm_bias =
+          [&](const DmlPtr& w, const DmlPtr& b, uint32_t out_c,
+              ActivationFunction act) {
+            auto we = g.Weight(w, {1, 1, out_c, emb});
+            auto be = g.WeightChannel(b, tokens, out_c);
+            dml::Expression y =
+                dml::Gemm(x, we, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                          DML_MATRIX_TRANSFORM_TRANSPOSE) + be;
+            return ActivationExpr<DataType>(act, y);
+          };
+      ActivationFunction silu_or_none =
+          kda_qkv_silu_ ? ACTIVATION_SWISH : ACTIVATION_NONE;
+      dml::Expression qe = gemm_bias(kda_q_w_, kda_q_b_, KD, silu_or_none);
+      dml::Expression ke = gemm_bias(kda_k_w_, kda_k_b_, KD, silu_or_none);
+      dml::Expression ve = gemm_bias(kda_v_w_, kda_v_b_, VD, silu_or_none);
+      dml::Expression decay_hidden =
+          gemm_bias(kda_decay_a_w_, kda_decay_a_b_, gr, ACTIVATION_NONE);
+      dml::Expression raw_decay_e = [&] {
+        auto w = g.Weight(kda_decay_b_w_, {1, 1, KD, gr});
+        auto b = g.WeightChannel(kda_decay_b_b_, tokens, KD);
+        return dml::Gemm(decay_hidden, w, dml::NullOpt,
+                         DML_MATRIX_TRANSFORM_NONE,
+                         DML_MATRIX_TRANSFORM_TRANSPOSE) + b;
+      }();
+      std::vector<dml::Expression> outs{qe, ke, ve, raw_decay_e};
+      std::vector<uint64_t> out_bytes{
+          (uint64_t)tokens * KD * elem, (uint64_t)tokens * KD * elem,
+          (uint64_t)tokens * VD * elem, (uint64_t)tokens * KD * elem};
+      if (kda_output_gate_) {
+        dml::Expression gate_hidden_e =
+            gemm_bias(kda_gate_a_w_, kda_gate_a_b_, gr, ACTIVATION_NONE);
+        dml::Expression gate_e = [&] {
+          auto w = g.Weight(kda_gate_b_w_, {1, 1, VD, gr});
+          auto b = g.WeightChannel(kda_gate_b_b_, tokens, VD);
+          return dml::Gemm(gate_hidden_e, w, dml::NullOpt,
+                           DML_MATRIX_TRANSFORM_NONE,
+                           DML_MATRIX_TRANSFORM_TRANSPOSE) + b;
+        }();
+        outs.push_back(gate_e);
+        out_bytes.push_back((uint64_t)tokens * VD * elem);
+      }
+      dml::Expression beta_e =
+          gemm_bias(kda_beta_w_, kda_beta_b_, encoder_heads_, ACTIVATION_NONE);
+      outs.push_back(beta_e);
+      out_bytes.push_back((uint64_t)tokens * encoder_heads_ * elem);
+      kda_proj_compiled_.emplace(N, g.Compile(outs, out_bytes));
+    }
+    if (!kda_tail_compiled_.count(N)) {
+      GraphFactory<DataType> g(scope.ctx());
+      auto mixed_in = g.Input({1, 1, tokens, VD});
+      dml::Expression normed = mixed_in;
+      if (kda_output_rms_norm_) {
+        auto gammas = g.WeightChannel(kda_out_norm_gammas_, tokens, VD);
+        normed = RmsNormExpr<DataType>(normed, gammas, kda_rms_norm_epsilon_);
+      }
+      if (kda_output_gate_) {
+        // Gate applies after the RMS norm on purpose (they do not commute).
+        auto gate_in = g.Input2({1, 1, tokens, VD});
+        normed = normed * dml::ActivationSigmoid(gate_in);
+      }
+      auto dw = g.Weight(kda_dense_w_, {1, 1, emb, VD});
+      dml::Expression dense =
+          dml::Gemm(normed, dw, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                    DML_MATRIX_TRANSFORM_TRANSPOSE);
+      auto db = g.WeightChannel(kda_dense_b_, tokens, emb);
+      auto ln1g = g.WeightChannel(ln1_gammas_, tokens, emb);
+      auto ln1b = g.WeightChannel(ln1_betas_, tokens, emb);
+      auto x = g.Scratch({1, 1, tokens, emb});  // original input (skip)
+      dml::Expression bias_dense = db;
+      dml::Expression ln1 = LayerNormExpr<DataType>(
+          dense, &bias_dense, &x, ln1g, ln1b, alpha_, default_eps_,
+          ACTIVATION_NONE);
+      auto f1w = g.Weight(ffn_dense1_w_, {1, 1, (uint32_t)ffn_dense1_size_, emb});
+      auto f1b = g.WeightChannel(ffn_dense1_b_, tokens, (uint32_t)ffn_dense1_size_);
+      dml::Expression ffn1 =
+          dml::Gemm(ln1, f1w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                    DML_MATRIX_TRANSFORM_TRANSPOSE) + f1b;
+      ffn1 = ActivationExpr<DataType>(ffn_activation_, ffn1);
+      auto f2w = g.Weight(ffn_dense2_w_, {1, 1, emb, (uint32_t)ffn_dense1_size_});
+      auto f2b = g.WeightChannel(ffn_dense2_b_, tokens, emb);
+      dml::Expression ffn2 =
+          dml::Gemm(ffn1, f2w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                    DML_MATRIX_TRANSFORM_TRANSPOSE);
+      auto ln2g = g.WeightChannel(ln2_gammas_, tokens, emb);
+      auto ln2b = g.WeightChannel(ln2_betas_, tokens, emb);
+      dml::Expression bias_ffn2 = f2b;
+      dml::Expression ln2 = LayerNormExpr<DataType>(
+          ffn2, &bias_ffn2, &ln1, ln2g, ln2b, alpha_, default_eps_,
+          ACTIVATION_NONE);
+      kda_tail_compiled_.emplace(
+          N, g.Compile({ln2}, {(uint64_t)tokens * emb * elem}));
+    }
+    return;
+  }
+
+  // MHA block.
+  if (has_smolgen_) {
+    throw Exception(
+        "directml backend: smolgen in MHA encoder heads is not supported "
+        "(its strided GEMMs hit the same driver limitation as the old "
+        "head-split views; matches nothing the backend has been tested with).");
+  }
+  const uint32_t H = encoder_heads_;
+  const uint32_t d_model = mha_q_size_;
+  const uint32_t D = d_model / H;
+  const uint32_t tokens = N * 64;
+  const uint32_t B = (uint32_t)N * H;
+  const size_t elem = sizeof(DataType);
+  if (!mha_qkv_compiled_.count(N)) {
+    GraphFactory<DataType> g(scope.ctx());
+    auto x = g.Input({1, 1, tokens, d_model});
+    auto gemm_bias = [&](const DmlPtr& w, const DmlPtr& b, uint32_t out_c) {
+      auto we = g.Weight(w, {1, 1, out_c, (uint32_t)embedding_op_size_});
+      auto be = g.WeightChannel(b, tokens, out_c);
+      return dml::Gemm(x, we, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                       DML_MATRIX_TRANSFORM_TRANSPOSE) + be;
+    };
+    dml::Expression qe = gemm_bias(mha_q_w_, mha_q_b_, d_model);
+    dml::Expression ke = gemm_bias(mha_k_w_, mha_k_b_, d_model);
+    dml::Expression ve = gemm_bias(mha_v_w_, mha_v_b_, d_model);
+    mha_qkv_compiled_.emplace(
+        N, g.Compile({qe, ke, ve},
+                     {(uint64_t)tokens * d_model * elem,
+                      (uint64_t)tokens * d_model * elem,
+                      (uint64_t)tokens * d_model * elem}));
+  }
+  if (!mha_attn_compiled_.count(N)) {
+    GraphFactory<DataType> g(scope.ctx());
+    auto qt_in = g.Input({B, 1, 64, D});
+    auto kt_in = g.Input2({B, 1, 64, D});
+    auto vt_in = g.Scratch({B, 1, 64, D});
+    const float softmax_scale = 1.0f / std::sqrt(static_cast<float>(D));
+    dml::Expression logits = dml::Gemm(
+        qt_in, kt_in, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+        DML_MATRIX_TRANSFORM_TRANSPOSE, softmax_scale);
+    const uint32_t softmax_axes[] = {3};
+    const dml::Span<const uint32_t> softmax_axis(softmax_axes, 1);
+    const auto sm_sizes = logits.Impl()->GetOutputDesc().sizes;
+    const std::vector<uint32_t> sm_bcast{0, 0, 0, 1};
+    dml::Expression max_b = GraphFactory<DataType>::ReinterpretView(
+        dml::Reduce(logits, DML_REDUCE_FUNCTION_MAX, softmax_axis), sm_sizes,
+        sm_bcast);
+    dml::Expression shifted = logits - max_b;
+    dml::Expression exp_shifted = dml::Exp(shifted);
+    dml::Expression sum_b = GraphFactory<DataType>::ReinterpretView(
+        dml::Reduce(exp_shifted, DML_REDUCE_FUNCTION_SUM, softmax_axis),
+        sm_sizes, sm_bcast);
+    dml::Expression attn = exp_shifted * dml::Recip(sum_b);
+    dml::Expression context =
+        dml::Gemm(attn, vt_in, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                  DML_MATRIX_TRANSFORM_NONE);
+    mha_attn_compiled_.emplace(N, g.Compile({context},
+                                            {(uint64_t)B * 64 * D * elem}));
+  }
+  if (!mha_tail_compiled_.count(N)) {
+    GraphFactory<DataType> g(scope.ctx());
+    auto mg = g.Input({1, 1, tokens, d_model});
+    auto skip = g.Input2({1, 1, tokens, (uint32_t)embedding_op_size_});
+    auto dw = g.Weight(mha_dense_w_,
+                       {1, 1, (uint32_t)embedding_op_size_, d_model});
+    auto db = g.WeightChannel(mha_dense_b_, tokens,
+                              (uint32_t)embedding_op_size_);
+    dml::Expression dense =
+        dml::Gemm(mg, dw, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                  DML_MATRIX_TRANSFORM_TRANSPOSE);
+    auto ln1g = g.WeightChannel(ln1_gammas_, tokens,
+                                (uint32_t)embedding_op_size_);
+    auto ln1b = g.WeightChannel(ln1_betas_, tokens,
+                                (uint32_t)embedding_op_size_);
+    dml::Expression bias_dense = db;
+    dml::Expression ln1 = LayerNormExpr<DataType>(
+        dense, &bias_dense, &skip, ln1g, ln1b, alpha_, default_eps_,
+        ACTIVATION_NONE);
+    auto f1w = g.Weight(ffn_dense1_w_,
+                        {1, 1, (uint32_t)ffn_dense1_size_,
+                         (uint32_t)embedding_op_size_});
+    auto f1b = g.WeightChannel(ffn_dense1_b_, tokens,
+                               (uint32_t)ffn_dense1_size_);
+    dml::Expression ffn1 =
+        dml::Gemm(ln1, f1w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                  DML_MATRIX_TRANSFORM_TRANSPOSE) + f1b;
+    ffn1 = ActivationExpr<DataType>(ffn_activation_, ffn1);
+    auto f2w = g.Weight(ffn_dense2_w_,
+                        {1, 1, (uint32_t)embedding_op_size_,
+                         (uint32_t)ffn_dense1_size_});
+    auto f2b = g.WeightChannel(ffn_dense2_b_, tokens,
+                               (uint32_t)embedding_op_size_);
+    dml::Expression ffn2 =
+        dml::Gemm(ffn1, f2w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                  DML_MATRIX_TRANSFORM_TRANSPOSE);
+    auto ln2g = g.WeightChannel(ln2_gammas_, tokens,
+                                (uint32_t)embedding_op_size_);
+    auto ln2b = g.WeightChannel(ln2_betas_, tokens,
+                                (uint32_t)embedding_op_size_);
+    dml::Expression bias_ffn2 = f2b;
+    dml::Expression ln2 = LayerNormExpr<DataType>(
+        ffn2, &bias_ffn2, &ln1, ln2g, ln2b, alpha_, default_eps_,
+        ACTIVATION_NONE);
+    mha_tail_compiled_.emplace(
+        N, g.Compile({ln2}, {(uint64_t)tokens * embedding_op_size_ * elem}));
+  }
+}
+
 // MHA evaluation with dense [N*H,1]-batch attention (see mha_transpose.hlsl
 // for why the head interleave cannot stay a strided GEMM input on this
 // driver). Three DML graphs (qkv projections, attention, LN/FFN tail) with
@@ -1385,11 +1729,9 @@ void EncoderBlock<DataType>::EvalMha(int N, DmlPtr in_out_tensor,
                          {1, 1, (uint32_t)embedding_op_size_, d_model});
       auto db = g.WeightChannel(mha_dense_b_, tokens,
                                 (uint32_t)embedding_op_size_);
-      CERR << "MHA tail inputs done";
       dml::Expression dense =
           dml::Gemm(mg, dw, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
                     DML_MATRIX_TRANSFORM_TRANSPOSE);
-      CERR << "MHA tail dense done";
       auto ln1g = g.WeightChannel(ln1_gammas_, tokens,
                                   (uint32_t)embedding_op_size_);
       auto ln1b = g.WeightChannel(ln1_betas_, tokens,
@@ -1412,7 +1754,6 @@ void EncoderBlock<DataType>::EvalMha(int N, DmlPtr in_out_tensor,
                     DML_MATRIX_TRANSFORM_TRANSPOSE) +
           f1b;
       ffn1 = ActivationExpr<DataType>(ffn_activation_, ffn1);
-      CERR << "MHA tail ffn1 done";
       auto f2w = g.Weight(ffn_dense2_w_,
                           {1, 1, (uint32_t)embedding_op_size_,
                            (uint32_t)ffn_dense1_size_});
@@ -1421,7 +1762,6 @@ void EncoderBlock<DataType>::EvalMha(int N, DmlPtr in_out_tensor,
       dml::Expression ffn2 =
           dml::Gemm(ffn1, f2w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
                     DML_MATRIX_TRANSFORM_TRANSPOSE);
-      CERR << "MHA tail ffn2 done";
       auto ln2g = g.WeightChannel(ln2_gammas_, tokens,
                                   (uint32_t)embedding_op_size_);
       auto ln2b = g.WeightChannel(ln2_betas_, tokens,
@@ -1434,7 +1774,6 @@ void EncoderBlock<DataType>::EvalMha(int N, DmlPtr in_out_tensor,
                .emplace(N, g.Compile({ln2}, {(uint64_t)tokens *
                                              embedding_op_size_ * elem}))
                .first;
-      CERR << "MHABUILD tail compiled";
     }
     DispatchOp<DataType>(scope, it->second, merged, in_out_tensor, buffer2,
                          {in_out_tensor});
@@ -1654,6 +1993,68 @@ AttentionPolicyHead<DataType>::AttentionPolicyHead(
 }
 
 template <typename DataType>
+void AttentionPolicyHead<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
+  const uint32_t tokens = N * 64;
+  const size_t elem = sizeof(DataType);
+  if (!compiled_.count(N)) {
+    GraphFactory<DataType> g(scope.ctx());
+    const int input_c = this->input_->GetC();
+    auto x = g.Input({1, 1, tokens, (uint32_t)input_c});
+    auto w = g.Weight(ip_pol_w_,
+                      {1, 1, (uint32_t)embedding_op_size_, (uint32_t)input_c});
+    auto b = g.WeightChannel(ip_pol_b_, tokens, (uint32_t)embedding_op_size_);
+    dml::Expression y =
+        dml::Gemm(x, w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                  DML_MATRIX_TRANSFORM_TRANSPOSE) + b;
+    y = ActivationExpr<DataType>(act_, y);
+    compiled_.emplace(
+        N, g.Compile({y}, {(uint64_t)tokens * embedding_op_size_ * elem}));
+  }
+  if (!compiled_.count(-N - 1)) {
+    GraphFactory<DataType> g(scope.ctx());
+    auto x = g.Input({1, 1, tokens, (uint32_t)embedding_op_size_});
+    auto wqe =
+        g.Weight(ip2_pol_w_, {1, 1, (uint32_t)policy_d_model_,
+                              (uint32_t)embedding_op_size_});
+    auto qbe = g.WeightChannel(ip2_pol_b_, tokens, (uint32_t)policy_d_model_);
+    auto wke =
+        g.Weight(ip3_pol_w_, {1, 1, (uint32_t)policy_d_model_,
+                              (uint32_t)embedding_op_size_});
+    auto kbe = g.WeightChannel(ip3_pol_b_, tokens, (uint32_t)policy_d_model_);
+    dml::Expression wq_e =
+        dml::Gemm(x, wqe, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                  DML_MATRIX_TRANSFORM_TRANSPOSE) + qbe;
+    dml::Expression wk_e =
+        dml::Gemm(x, wke, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                  DML_MATRIX_TRANSFORM_TRANSPOSE) + kbe;
+    // scores[n] = wq[n] @ wk[n]^T / sqrt(d), i.e. scores[i,j] =
+    // Q_i.K_j, matching the CUDA backend (tf.matmul(queries, keys,
+    // transpose_b=True)) and the BLAS backend (whose Eigen col-major
+    // maps land the same Q_i.K_j in row-major (i,j); dot products
+    // commute, so K_j.Q_i there is the same value). Batch over N with
+    // strided views of the dense [T, d] buffers ([N,1,64,d] per batch).
+    dml::Expression logits = dml::Gemm(
+        GraphFactory<DataType>::ReinterpretView(wq_e, {(uint32_t)N, 1, 64,
+                                (uint32_t)policy_d_model_},
+                         {64u * policy_d_model_, policy_d_model_, policy_d_model_, 1u}),
+        GraphFactory<DataType>::ReinterpretView(wk_e, {(uint32_t)N, 1, 64,
+                                (uint32_t)policy_d_model_},
+                         {64u * policy_d_model_, policy_d_model_, policy_d_model_, 1u}),
+        dml::NullOpt, DML_MATRIX_TRANSFORM_NONE, DML_MATRIX_TRANSFORM_TRANSPOSE,
+        1.0f / std::sqrt((float)policy_d_model_));
+    compiled_.emplace(
+        -N - 1,
+        g.Compile({wq_e, wk_e, logits},
+                  {(uint64_t)tokens * policy_d_model_ * elem,
+                   (uint64_t)tokens * policy_d_model_ * elem,
+                   (uint64_t)N * 4096 * elem}));
+  }
+  for (const auto& enc : encoder_weights_) {
+    enc->EnsureCompiled(N, scope);
+  }
+}
+
+template <typename DataType>
 void AttentionPolicyHead<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
                                          DmlPtr input2, DmlPtr scratch,
                                          size_t scratch_size,
@@ -1667,21 +2068,6 @@ void AttentionPolicyHead<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
   DmlPtr embedding = input2;  // policy embedding + encoders run here
   {
     auto it = compiled_.find(N);
-    if (it == compiled_.end()) {
-      GraphFactory<DataType> g(scope.ctx());
-      const int input_c = this->input_->GetC();
-      auto x = g.Input({1, 1, tokens, (uint32_t)input_c});
-      auto w = g.Weight(ip_pol_w_,
-                        {1, 1, (uint32_t)embedding_op_size_, (uint32_t)input_c});
-      auto b = g.WeightChannel(ip_pol_b_, tokens, (uint32_t)embedding_op_size_);
-      dml::Expression y =
-          dml::Gemm(x, w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
-                    DML_MATRIX_TRANSFORM_TRANSPOSE) + b;
-      y = ActivationExpr<DataType>(act_, y);
-      it = compiled_.emplace(
-               N, g.Compile({y}, {(uint64_t)tokens * embedding_op_size_ * elem}))
-               .first;
-    }
     DispatchOp<DataType>(scope, it->second, input, buffer2, buffer2,
                          {embedding});
   }
@@ -1696,46 +2082,6 @@ void AttentionPolicyHead<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
 
   {
     auto it = compiled_.find(-N - 1);  // separate slot for the wqk/scores graph
-    if (it == compiled_.end()) {
-      GraphFactory<DataType> g(scope.ctx());
-      auto x = g.Input({1, 1, tokens, (uint32_t)embedding_op_size_});
-      auto wqe =
-          g.Weight(ip2_pol_w_, {1, 1, (uint32_t)policy_d_model_,
-                                (uint32_t)embedding_op_size_});
-      auto qbe = g.WeightChannel(ip2_pol_b_, tokens, (uint32_t)policy_d_model_);
-      auto wke =
-          g.Weight(ip3_pol_w_, {1, 1, (uint32_t)policy_d_model_,
-                                (uint32_t)embedding_op_size_});
-      auto kbe = g.WeightChannel(ip3_pol_b_, tokens, (uint32_t)policy_d_model_);
-      dml::Expression wq_e =
-          dml::Gemm(x, wqe, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
-                    DML_MATRIX_TRANSFORM_TRANSPOSE) + qbe;
-      dml::Expression wk_e =
-          dml::Gemm(x, wke, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
-                    DML_MATRIX_TRANSFORM_TRANSPOSE) + kbe;
-      // scores[n] = wq[n] @ wk[n]^T / sqrt(d), i.e. scores[i,j] =
-      // Q_i.K_j, matching the CUDA backend (tf.matmul(queries, keys,
-      // transpose_b=True)) and the BLAS backend (whose Eigen col-major
-      // maps land the same Q_i.K_j in row-major (i,j); dot products
-      // commute, so K_j.Q_i there is the same value). Batch over N with
-      // strided views of the dense [T, d] buffers ([N,1,64,d] per batch).
-      dml::Expression logits = dml::Gemm(
-          GraphFactory<DataType>::ReinterpretView(wq_e, {(uint32_t)N, 1, 64,
-                                  (uint32_t)policy_d_model_},
-                           {64u * policy_d_model_, policy_d_model_, policy_d_model_, 1u}),
-          GraphFactory<DataType>::ReinterpretView(wk_e, {(uint32_t)N, 1, 64,
-                                  (uint32_t)policy_d_model_},
-                           {64u * policy_d_model_, policy_d_model_, policy_d_model_, 1u}),
-          dml::NullOpt, DML_MATRIX_TRANSFORM_NONE, DML_MATRIX_TRANSFORM_TRANSPOSE,
-          1.0f / std::sqrt((float)policy_d_model_));
-      it = compiled_.emplace(
-          -N - 1,
-          g.Compile({wq_e, wk_e, logits},
-                    {(uint64_t)tokens * policy_d_model_ * elem,
-                     (uint64_t)tokens * policy_d_model_ * elem,
-                     (uint64_t)N * 4096 * elem}))
-          .first;
-    }
     DispatchOp<DataType>(scope, it->second, embedding, buffer1, buffer2,
                          {wq, wk, scores});
   }
@@ -1781,13 +2127,11 @@ ValueHead<DataType>::ValueHead(BaseLayer<DataType>* ip,
 }
 
 template <typename DataType>
-void ValueHead<DataType>::Eval(int N, DmlPtr output, DmlPtr input, DmlPtr input2,
-                               DmlPtr scratch, size_t scratch_size,
-                               DmlExecScope& scope) {
-  const uint32_t tokens = N * 64;
-  const size_t elem = sizeof(DataType);
-  auto it = compiled_.find(N);
-  if (it == compiled_.end()) {
+void ValueHead<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
+  if (compiled_.count(N)) return;
+  {
+    const uint32_t tokens = N * 64;
+    const size_t elem = sizeof(DataType);
     GraphFactory<DataType> g(scope.ctx());
     auto x = g.Input({1, 1, tokens, (uint32_t)this->input_->GetC()});
     auto w0 = g.Weight(ip_val_w_,
@@ -1817,10 +2161,18 @@ void ValueHead<DataType>::Eval(int N, DmlPtr output, DmlPtr input, DmlPtr input2
         dml::Gemm(hidden, w2, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
                   DML_MATRIX_TRANSFORM_TRANSPOSE) + b2;
     if (!wdl_) y = dml::ActivationTanh(y);
-    it = compiled_.emplace(
-        N, g.Compile({y}, {(uint64_t)N * (wdl_ ? 3 : 1) * elem})).first;
+    compiled_.emplace(
+        N, g.Compile({y}, {(uint64_t)N * (wdl_ ? 3 : 1) * elem}));
   }
-  DispatchOp<DataType>(scope, it->second, input, input2, scratch, {output});
+}
+
+template <typename DataType>
+void ValueHead<DataType>::Eval(int N, DmlPtr output, DmlPtr input, DmlPtr input2,
+                               DmlPtr scratch, size_t scratch_size,
+                               DmlExecScope& scope) {
+  if (!compiled_.count(N)) EnsureCompiled(N, scope);
+  DispatchOp<DataType>(scope, compiled_.find(N)->second, input, input2, scratch,
+                       {output});
 }
 
 // ===========================================================================

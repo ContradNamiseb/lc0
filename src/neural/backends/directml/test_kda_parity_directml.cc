@@ -291,6 +291,7 @@ pblczero::Net MakeNoEncoderNet() {
   return file;
 }
 
+
 InputPlanes EncodeStartPos() {
   ChessBoard board;
   PositionHistory history;
@@ -375,6 +376,69 @@ void CompareBackends(const pblczero::Net& net) {
       << "policy diverges between directml and blas (worst move "
       << worst_move << ", diff " << worst << ")";
 }
+
+// KDA + moves-left head, no MHA encoder: covers the MLH path
+// against the BLAS reference.
+pblczero::Net MakeKdaMlhNet() {
+  const NetDims d;
+  const int input_size = kInputPlanes + 64;
+  const int mlh = 4;
+  std::mt19937 rng(55);
+  pblczero::Net file;
+  auto* weights = file.mutable_weights();
+  auto* nf = file.mutable_format()->mutable_network_format();
+  using NF = pblczero::NetworkFormat;
+  nf->set_input(NF::INPUT_CLASSICAL_112_PLANE);
+  nf->set_network(NF::NETWORK_KDA_HYBRID_WITH_MULTIHEADFORMAT);
+  nf->set_policy(NF::POLICY_ATTENTION);
+  nf->set_value(NF::VALUE_WDL);
+  nf->set_moves_left(NF::MOVES_LEFT_V1);
+  nf->set_input_embedding(NF::INPUT_EMBEDDING_NONE);
+  nf->set_default_activation(NF::DEFAULT_ACTIVATION_RELU);
+  nf->set_ffn_activation(NF::ACTIVATION_DEFAULT);
+  nf->set_smolgen_activation(NF::ACTIVATION_DEFAULT);
+  for (int dir : {1, 2, 3, 4}) nf->add_kda_directions(static_cast<NF::KdaDirection>(dir));
+  FillLayer(weights->mutable_ip_emb_w(), RandomVec(rng, d.embedding * input_size, 0.05f));
+  FillLayer(weights->mutable_ip_emb_b(), RandomVec(rng, d.embedding, 0.05f));
+  weights->set_headcount(d.heads);
+  FillKdaEncoder(&file, rng, d);
+  FillPolicyAndValueHeads(&file, rng, d, true, mlh);
+  return file;
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnKdaMlhNet) { CompareBackends(MakeKdaMlhNet()); }
+
+// MHA + moves-left head, no KDA encoder: covers the MHA encoder and
+// MLH paths together against the BLAS reference.
+pblczero::Net MakeMhaMlhNet() {
+  const NetDims d;
+  const int input_size = kInputPlanes + 64;
+  const int mlh = 4;
+  std::mt19937 rng(66);
+  pblczero::Net file;
+  auto* weights = file.mutable_weights();
+  auto* nf = file.mutable_format()->mutable_network_format();
+  using NF = pblczero::NetworkFormat;
+  nf->set_input(NF::INPUT_CLASSICAL_112_PLANE);
+  nf->set_network(NF::NETWORK_KDA_HYBRID_WITH_MULTIHEADFORMAT);
+  nf->set_policy(NF::POLICY_ATTENTION);
+  nf->set_value(NF::VALUE_WDL);
+  nf->set_moves_left(NF::MOVES_LEFT_V1);
+  nf->set_input_embedding(NF::INPUT_EMBEDDING_NONE);
+  nf->set_default_activation(NF::DEFAULT_ACTIVATION_RELU);
+  nf->set_ffn_activation(NF::ACTIVATION_DEFAULT);
+  nf->set_smolgen_activation(NF::ACTIVATION_DEFAULT);
+  nf->add_kda_directions(static_cast<NF::KdaDirection>(1));
+  FillLayer(weights->mutable_ip_emb_w(), RandomVec(rng, d.embedding * input_size, 0.05f));
+  FillLayer(weights->mutable_ip_emb_b(), RandomVec(rng, d.embedding, 0.05f));
+  weights->set_headcount(d.heads);
+  FillMhaEncoder(&file, rng, d);
+  FillPolicyAndValueHeads(&file, rng, d, true, mlh);
+  return file;
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnMhaMlhNet) { CompareBackends(MakeMhaMlhNet()); }
+
 
 TEST(DirectMlKdaParity, MatchesBlasOnKdaHybridNet) {
   CompareBackends(MakeKdaHybridNet());

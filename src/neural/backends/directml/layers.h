@@ -164,6 +164,15 @@ class BaseLayer {
                     DmlPtr scratch, size_t scratch_size,
                     DmlExecScope& scope) = 0;
 
+  // Compiles this layer's per-batch-size graphs WITHOUT recording GPU work.
+  // forwardEval runs this over the whole network before the first Eval:
+  // on this driver, interleaving diverse-shape graph builds with bound
+  // dispatches poisons later CreateOperator calls (see
+  // docs/directml-handoff.md section 3), so all compilation must finish
+  // before dispatching begins. Eval falls back to this when it finds no
+  // compiled op, so nothing breaks if a call site skips the pre-pass.
+  virtual void EnsureCompiled(int N, DmlExecScope& scope) {}
+
  protected:
   BaseLayer* input_;
   int C;  // Output tensor dimensions.
@@ -181,6 +190,7 @@ class FCLayer : public BaseLayer<DataType> {
           const std::vector<float>& biases, DmlWeightUploader& uploader);
   void Eval(int N, DmlPtr output, DmlPtr input, DmlPtr input2, DmlPtr scratch,
             size_t scratch_size, DmlExecScope& scope) override;
+  void EnsureCompiled(int N, DmlExecScope& scope) override;
 
  private:
   const bool use_bias_;
@@ -203,6 +213,7 @@ class EmbeddingLayer : public BaseLayer<DataType> {
                  DmlWeightUploader& uploader);
   void Eval(int N, DmlPtr output, DmlPtr input, DmlPtr input2, DmlPtr scratch,
             size_t scratch_size, DmlExecScope& scope) override;
+  void EnsureCompiled(int N, DmlExecScope& scope) override;
 
  private:
   const bool use_bias_;
@@ -222,6 +233,7 @@ class PolicyMapLayer : public BaseLayer<DataType> {
                  const short* cpuWeight, DmlWeightUploader& uploader);
   void Eval(int N, DmlPtr output, DmlPtr input, DmlPtr input2, DmlPtr scratch,
             size_t scratch_size, DmlExecScope& scope) override;
+  void EnsureCompiled(int N, DmlExecScope& scope) override;
 
  private:
   int used_size_;
@@ -248,6 +260,7 @@ class AttentionBody : public BaseLayer<DataType> {
                 DmlDeviceContext& ctx, bool fp16);
   void Eval(int N, DmlPtr output, DmlPtr input, DmlPtr input2, DmlPtr scratch,
             size_t scratch_size, DmlExecScope& scope) override;
+  void EnsureCompiled(int N, DmlExecScope& scope) override;
 
  private:
   DmlPtr ip_emb_w_, ip_emb_b_;
@@ -301,6 +314,10 @@ class EncoderBlock {
   // the SYCL EncoderBlock::Eval; scratch/buffer1/buffer2 are scratch.
   void Eval(int N, DmlPtr in_out_tensor, DmlPtr scratch, DmlPtr buffer1,
             DmlPtr buffer2, DmlExecScope& scope);
+
+  // Two-phase compile support: builds this block's per-N graphs without
+  // recording (see BaseLayer::EnsureCompiled).
+  void EnsureCompiled(int N, DmlExecScope& scope);
 
  private:
   void EvalKda(int N, DmlPtr in_out_tensor, DmlPtr scratch, DmlPtr buffer1,
@@ -380,6 +397,7 @@ class AttentionPolicyHead : public BaseLayer<DataType> {
                       const std::vector<int>& kda_directions);
   void Eval(int N, DmlPtr output, DmlPtr input, DmlPtr input2, DmlPtr scratch,
             size_t scratch_size, DmlExecScope& scope) override;
+  void EnsureCompiled(int N, DmlExecScope& scope) override;
 
   // Output layout is [N, 64*64 + 8*24] (the attention policy map's input).
  private:
@@ -412,6 +430,7 @@ class ValueHead : public BaseLayer<DataType> {
             DmlWeightUploader& uploader, bool wdl, ActivationFunction act);
   void Eval(int N, DmlPtr output, DmlPtr input, DmlPtr input2, DmlPtr scratch,
             size_t scratch_size, DmlExecScope& scope) override;
+  void EnsureCompiled(int N, DmlExecScope& scope) override;
 
  private:
   DmlPtr ip_val_w_, ip_val_b_, ip1_val_w_, ip1_val_b_, ip2_val_w_, ip2_val_b_;

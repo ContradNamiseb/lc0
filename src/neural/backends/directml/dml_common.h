@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <mutex>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -221,7 +222,9 @@ class DmlDescriptorPool {
     return h;
   }
 
-  void Reset() { cursor_ = 0; }
+  // NOTE: no Reset() -- binding tables are cached per compiled operator
+  // (see DmlDeviceContext::tables_), so their descriptor slots stay
+  // permanently reserved.
 
   ID3D12DescriptorHeap* heap() const { return heap_.Get(); }
 
@@ -265,6 +268,16 @@ class DmlDeviceContext {
   void Init(const OptionsDict& options);
 
   ID3D12Device* device() const { return device_.Get(); }
+
+  // Cached binding table for a compiled operator. This driver degrades
+  // under repeated CreateBindingTable calls (mis-floating
+  // DXGI_ERROR_DEVICE_REMOVED / E_INVALIDARG after ~6-8 creations; see
+  // docs/directml-handoff.md section 3), so each compiled operator gets
+  // exactly one table, created on first dispatch and rebound afterwards.
+  // Safe because batches are fence-serialized: a table's descriptors are
+  // rewritten (CPU-side, immediate) only after the previous batch's GPU
+  // work has completed.
+  IDMLBindingTable* GetOrCreateBindingTable(IDMLCompiledOperator* op);
   IDMLDevice* dml_device() const { return dml_device_.Get(); }
   IDMLCommandRecorder* recorder() const { return recorder_.Get(); }
   ID3D12CommandQueue* queue() const { return queue_.Get(); }
@@ -308,6 +321,9 @@ class DmlDeviceContext {
   ComPtr<ID3D12CommandAllocator> upload_allocator_;
   ComPtr<ID3D12GraphicsCommandList> upload_list_;
   DmlDescriptorPool descriptors_;
+  std::unordered_map<IDMLCompiledOperator*,
+                     Microsoft::WRL::ComPtr<IDMLBindingTable>>
+      tables_;
   friend class DmlUploadScope;
 };
 
