@@ -291,10 +291,11 @@ TEST(KdaRecurrence, MatchesCpuReferenceAtProductionShape) {
   params.log_decay_floor = kLogDecayFloor;
   params.fp16 = false;
 
-  layer.Record(command_list.Get(), params, /*qkv=*/nullptr, q_buf.Get(),
-              k_buf.Get(), v_buf.Get(), raw_decay_buf.Get(),
-              dt_bias_buf.Get(), a_log_buf.Get(), beta_buf.Get(),
-              mixed_buf.Get());
+  layer.Record(command_list.Get(), params, /*qkv=*/DmlPtr(),
+               DmlPtr(q_buf.Get(), 0), DmlPtr(k_buf.Get(), 0),
+               DmlPtr(v_buf.Get(), 0), DmlPtr(raw_decay_buf.Get(), 0),
+               DmlPtr(dt_bias_buf.Get(), 0), DmlPtr(a_log_buf.Get(), 0),
+               DmlPtr(beta_buf.Get(), 0), DmlPtr(mixed_buf.Get(), 0));
 
   D3D12_RESOURCE_BARRIER barrier = {};
   barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;

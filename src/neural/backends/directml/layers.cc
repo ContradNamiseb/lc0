@@ -18,18 +18,533 @@
 
 #include "neural/backends/directml/layers.h"
 
+// <span>/<version> first: DirectMLX.h only includes <span> when
+// __cpp_lib_span is already visible, and falls back to a detail::span that
+// leaves later std::span uses broken under this toolchain.
+#include <span>
+#include <version>
+#include <DirectMLX.h>
 #include <d3dcompiler.h>
 
 #include <cassert>
+#include <cmath>
 #include <cstring>
+#include <numeric>
 
+#include "neural/backends/directml/attention_preprocess_shader_source.h"
 #include "neural/backends/directml/kda_recurrence_shader_source.h"
+#include "neural/backends/directml/mha_transpose_shader_source.h"
+#include "neural/backends/directml/policy_finalize_shader_source.h"
+#include "neural/tables/attention_policy_map.h"
 #include "utils/exception.h"
+#include "utils/logging.h"
 
 #pragma comment(lib, "d3dcompiler.lib")
 
 namespace lczero {
 namespace directml_backend {
+
+// ===========================================================================
+// Host fp16 conversion (round-to-nearest-even bit tricks, the standard
+// half-float algorithm; same idea as FP32toFP16 in cuda/inputs_outputs.h).
+// ===========================================================================
+namespace {
+
+inline uint16_t F32toF16Bits(float value) {
+  uint32_t f;
+  std::memcpy(&f, &value, sizeof(f));
+  const uint32_t sign = (f >> 16) & 0x8000u;
+  int32_t exp = static_cast<int32_t>((f >> 23) & 0xffu) - 127 + 15;
+  uint32_t mant = (f >> 13) & 0x3ffu;
+  if (((f >> 23) & 0xffu) == 0xffu) {  // Inf/NaN
+    return static_cast<uint16_t>(sign | 0x7c00u | (mant ? 0x200u : 0u));
+  }
+  if (exp >= 0x1f) {
+    return static_cast<uint16_t>(sign | 0x7c00u);  // overflow -> Inf
+  }
+  if (exp <= 0) {  // subnormal or zero
+    if (exp < -10) return static_cast<uint16_t>(sign);
+    mant |= 0x400u;
+    const uint32_t shift = static_cast<uint32_t>(1 - exp);
+    const uint32_t half = static_cast<uint32_t>(mant >> shift);
+    const uint32_t rem = mant & ((1u << shift) - 1);
+    const uint32_t mid = 1u << (shift - 1);
+    uint32_t sub = half + ((rem > mid || (rem == mid && (half & 1u))) ? 1u : 0u);
+    return static_cast<uint16_t>(sign | sub);
+  }
+  // Round mantissa to nearest even.
+  const uint32_t rem = f & 0x1fffu;
+  mant += (rem > 0x1000u || (rem == 0x1000u && (mant & 1u))) ? 1u : 0u;
+  if (mant > 0x3ffu) {
+    mant = 0;
+    ++exp;
+    if (exp >= 0x1f) return static_cast<uint16_t>(sign | 0x7c00u);
+  }
+  return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) | mant);
+}
+
+inline float F16BitsToF32(uint16_t h) {
+  uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+  uint32_t exp = (h >> 10) & 0x1fu;
+  uint32_t mant = h & 0x3ffu;
+  uint32_t f;
+  if (exp == 0) {
+    if (mant == 0) {
+      f = sign;
+    } else {  // subnormal
+      exp = 127 - 15 + 1;
+      while ((mant & 0x400u) == 0) {
+        mant <<= 1;
+        --exp;
+      }
+      mant &= 0x3ffu;
+      f = sign | (exp << 23) | (mant << 13);
+    }
+  } else if (exp == 0x1f) {
+    f = sign | 0x7f800000u | (mant << 13);
+  } else {
+    f = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+  }
+  float out;
+  std::memcpy(&out, &f, sizeof(out));
+  return out;
+}
+
+// ===========================================================================
+// Shader compilation (runtime FXC, once per PSO at load) and a generic
+// root-signature layout: [root constants][SRVs][UAVs]. The KDA recurrence
+// keeps its bespoke 10-parameter layout from the original stub.
+// ===========================================================================
+
+ComPtr<ID3DBlob> CompileHlsl(const char* source, size_t source_len,
+                             const char* filename, const char* entry_point,
+                             bool fp16) {
+  D3D_SHADER_MACRO macros[] = {
+      {"INPUT_TYPE", fp16 ? "half" : "float"},
+      {nullptr, nullptr},
+  };
+  UINT flags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
+#ifndef NDEBUG
+  flags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+#endif
+  // FXC caps at shader model 5.1 where `half` is min16float; genuine 16-bit
+  // storage would need DXC (cs_6_2 + -enable-16bit-types), same caveat as
+  // kda_recurrence.hlsl.
+  ComPtr<ID3DBlob> shader, errors;
+  HRESULT hr = D3DCompile(source, source_len, filename, macros,
+                          nullptr /* no shader #includes */, entry_point,
+                          "cs_5_1", flags, 0, &shader, &errors);
+  if (FAILED(hr)) {
+    std::string message = "Failed to compile ";
+    message += filename;
+    message += ": ";
+    if (errors) {
+      message.append(static_cast<const char*>(errors->GetBufferPointer()),
+                     errors->GetBufferSize());
+    } else {
+      message += "HRESULT 0x" + std::to_string(static_cast<uint32_t>(hr));
+    }
+    throw Exception(message);
+  }
+  return shader;
+}
+
+// Root signature: parameter 0 = num_32bit_constants root constants,
+// then srv_count root SRVs (t0..), then uav_count root UAVs (u0..).
+ComPtr<ID3D12RootSignature> CreateShaderRootSignature(ID3D12Device* device,
+                                                      UINT num_32bit_constants,
+                                                      UINT srv_count,
+                                                      UINT uav_count) {
+  std::vector<D3D12_ROOT_PARAMETER> params(!!num_32bit_constants + srv_count +
+                                           uav_count);
+  UINT next = 0;
+  if (num_32bit_constants) {
+    params[next].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[next].Constants.ShaderRegister = 0;
+    params[next].Constants.RegisterSpace = 0;
+    params[next].Constants.Num32BitValues = num_32bit_constants;
+    params[next].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    ++next;
+  }
+  for (UINT i = 0; i < srv_count; ++i, ++next) {
+    params[next].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[next].Descriptor.ShaderRegister = i;
+    params[next].Descriptor.RegisterSpace = 0;
+    params[next].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  }
+  for (UINT i = 0; i < uav_count; ++i, ++next) {
+    params[next].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    params[next].Descriptor.ShaderRegister = i;
+    params[next].Descriptor.RegisterSpace = 0;
+    params[next].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  }
+  D3D12_ROOT_SIGNATURE_DESC desc = {};
+  desc.NumParameters = static_cast<UINT>(params.size());
+  desc.pParameters = params.data();
+  ComPtr<ID3DBlob> signature, errors;
+  ReportD3DErrors(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1,
+                                               &signature, &errors),
+                  "SerializeRootSignature");
+  ComPtr<ID3D12RootSignature> root;
+  ReportD3DErrors(device->CreateRootSignature(0, signature->GetBufferPointer(),
+                                              signature->GetBufferSize(),
+                                              IID_PPV_ARGS(&root)),
+                  "CreateRootSignature");
+  return root;
+}
+
+ComPtr<ID3D12PipelineState> CreateComputePso(ID3D12Device* device,
+                                             ID3D12RootSignature* root,
+                                             ID3DBlob* shader) {
+  D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
+  desc.pRootSignature = root;
+  desc.CS = {shader->GetBufferPointer(), shader->GetBufferSize()};
+  ComPtr<ID3D12PipelineState> pso;
+  ReportD3DErrors(device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pso)),
+                  "CreateComputePipelineState");
+  return pso;
+}
+
+// A persistently-mapped upload buffer for one shader's root constants --
+// recorded once per dispatch with CopyBufferRegion + a constant-buffer root
+// view would be the alternative; root constants set directly on the command
+// list are simpler and avoid the extra copy, so this is only used where the
+// constant payload exceeds what SetComputeRoot32BitConstants conveniently
+// expresses (nothing today -- kept for symmetry with inputs_outputs.h).
+constexpr UINT kMaxRootConstants = 16;
+
+// ===========================================================================
+// GraphFactory: wraps dml::Graph construction so every layer records its
+// graph inputs (weights and activations) in one ordered list and compiles a
+// DmlCompiledOp. The DirectML equivalent of writing a CUDA kernel launcher:
+// shapes are baked per batch size, exactly like a CUDA graph per batch size.
+// ===========================================================================
+template <typename DataType>
+class GraphFactory {
+ public:
+  explicit GraphFactory(DmlDeviceContext& ctx) : graph_(ctx.dml_device()) {}
+
+  dml::Graph& graph() { return graph_; }
+
+  using Sizes = std::vector<uint32_t>;
+
+  dml::Expression Weight(const DmlPtr& w, Sizes sizes) {
+    return AddTensor(w, DmlBindingRef::Kind::kWeight, std::move(sizes), {});
+  }
+  // UINT32 weight tensor (policy-map gather indices): same binding
+  // mechanics, different element type.
+  dml::Expression WeightU32(const DmlPtr& w, Sizes sizes) {
+    const uint64_t bytes = std::accumulate(
+        sizes.begin(), sizes.end(), uint64_t{4},
+        [](uint64_t a, uint32_t b) { return a * b; });
+    dml::TensorDesc desc(DML_TENSOR_DATA_TYPE_UINT32, sizes);
+    dml::Expression e = dml::InputTensor(graph_, next_input_++, desc);
+    bindings_.push_back({DmlBindingRef::Kind::kWeight, w, bytes});
+    return e;
+  }
+  // Strided weight view (e.g. zero-stride batch broadcast of the shared
+  // smolgen table); strides are in elements.
+  dml::Expression WeightStrided(const DmlPtr& w, Sizes sizes, Sizes strides) {
+    return AddTensor(w, DmlBindingRef::Kind::kWeight, std::move(sizes),
+                     std::move(strides));
+  }
+  // Per-channel weight broadcast to [1, 1, rows, C] via a zero row stride:
+  // DirectML's base elementwise operators take no broadcast shapes -- the
+  // idiom (same one the ONNX Runtime DML EP uses) is matching shapes with
+  // stride-0 replication.
+  dml::Expression WeightChannel(const DmlPtr& w, uint32_t rows, uint32_t C) {
+    return WeightStrided(w, {1, 1, rows, C}, {0, 0, 0, 1});
+  }
+  dml::Expression Input(Sizes sizes, Sizes strides = {}) {
+    return AddTensor({}, DmlBindingRef::Kind::kInput, std::move(sizes),
+                     std::move(strides));
+  }
+  dml::Expression Input2(Sizes sizes, Sizes strides = {}) {
+    return AddTensor({}, DmlBindingRef::Kind::kInput2, std::move(sizes),
+                     std::move(strides));
+  }
+  dml::Expression Scratch(Sizes sizes, Sizes strides = {}) {
+    return AddTensor({}, DmlBindingRef::Kind::kScratch, std::move(sizes),
+                     std::move(strides));
+  }
+
+  // Strided dense-memory view of an intermediate expression (the
+  // no-transpose-operator workaround for the policy scores GEMM, whose
+  // [N,1] batch compiles: [N,H>1]-batched strided GEMMs do not -- see
+  // mha_transpose.hlsl). An empty stride list means a dense reshape
+  // (NullOpt) -- passing an engaged-but-empty stride array leaves
+  // DimensionCount=4 with a garbage/empty stride pointer, which is
+  // undefined behavior.
+  static dml::Expression ReinterpretView(dml::Expression e, Sizes sizes,
+                                         Sizes strides = {}) {
+    dml::TensorDimensions dims(sizes.begin(), sizes.end());
+    if (strides.empty()) {
+      return dml::Reinterpret(e, e.Impl()->GetOutputDesc().dataType, dims,
+                              dml::NullOpt);
+    }
+    dml::TensorStrides ts(strides.begin(), strides.end());
+    return dml::Reinterpret(e, e.Impl()->GetOutputDesc().dataType, dims, ts);
+  }
+
+  DmlCompiledOp Compile(std::vector<dml::Expression> outputs,
+                        std::vector<uint64_t> output_bytes) {
+    DmlCompiledOp out;
+    out.op = graph_.Compile(DML_EXECUTION_FLAG_NONE, outputs);
+    DML_BINDING_PROPERTIES props = out.op->GetBindingProperties();
+    if (props.PersistentResourceSize != 0) {
+      throw Exception(
+          "directml backend: unexpectedly received a persistent-resource "
+          "operator (no DML_TENSOR_FLAG_OWNED_BY_DML tensors exist here)");
+    }
+    out.transient_bytes = props.TemporaryResourceSize;
+    out.bindings = std::move(bindings_);
+    out.output_bytes = std::move(output_bytes);
+    return out;
+  }
+
+ private:
+  dml::TensorDesc MakeDesc(const Sizes& sizes, const Sizes& strides) {
+    const uint64_t elements = std::accumulate(
+        sizes.begin(), sizes.end(), uint64_t{1},
+        [](uint64_t a, uint32_t b) { return a * b; });
+    if (strides.empty()) {
+      return dml::TensorDesc(DmlTensorType<DataType>(), sizes);
+    }
+    uint64_t span = 1;
+    for (size_t i = 0; i < sizes.size(); ++i) {
+      span += (uint64_t(sizes[i]) - 1) * strides[i];
+    }
+    dml::TensorDesc desc;
+    desc.dataType = DmlTensorType<DataType>();
+    desc.flags = DML_TENSOR_FLAG_NONE;
+    desc.sizes.assign(sizes.begin(), sizes.end());
+    desc.strides.emplace(strides.begin(), strides.end());
+    desc.totalTensorSizeInBytes = span * sizeof(DataType);
+    desc.guaranteedBaseOffsetAlignment = 0;
+    return desc;
+  }
+
+  dml::Expression AddTensor(const DmlPtr& w, DmlBindingRef::Kind kind,
+                            Sizes sizes, Sizes strides) {
+    const uint64_t bytes = [&] {
+      uint64_t span = 1;
+      for (size_t i = 0; i < sizes.size(); ++i) {
+        span += (uint64_t(sizes[i]) - 1) * (strides.empty() ? sizes[i] : strides[i]);
+      }
+      return span * sizeof(DataType);
+    }();
+    dml::Expression e =
+        dml::InputTensor(graph_, next_input_++, MakeDesc(sizes, strides));
+    bindings_.push_back({kind, w, bytes});
+    return e;
+  }
+
+  dml::Graph graph_;
+  std::vector<DmlBindingRef> bindings_;
+  uint32_t next_input_ = 0;
+};
+
+// Activation as a dml expression. Mish has no single DirectML op and is
+// composed exactly as the CUDA/SYCL activate() defines it:
+// x * tanh(softplus(x)). Swish likewise: x * sigmoid(x). RELU_2 is
+// relu(x)^2.
+template <typename DataType>
+dml::Expression ActivationExpr(ActivationFunction act, dml::Expression x) {
+  switch (act) {
+    case ACTIVATION_NONE:
+    case ACTIVATION_DEFAULT:
+      return x;
+    case ACTIVATION_RELU:
+      return dml::ActivationRelu(x);
+    case ACTIVATION_MISH:
+      return x * dml::ActivationTanh(dml::ActivationSoftplus(x));
+    case ACTIVATION_TANH:
+      return dml::ActivationTanh(x);
+    case ACTIVATION_SIGMOID:
+      return dml::ActivationSigmoid(x);
+    case ACTIVATION_SWISH:
+      return x * dml::ActivationSigmoid(x);
+    case ACTIVATION_RELU_2:
+      return dml::ActivationRelu(x) * dml::ActivationRelu(x);
+    default:
+      throw Exception(
+          "directml backend: activation not supported in graphs");
+  }
+}
+
+// Layer normalization, mirroring the SYCL layer_norm_kernel exactly:
+//   t = act(input + bias) * alpha + skip
+//   y = gamma * (t - mean) / sqrt(variance + eps) + beta
+// where mean/variance are over the last (channel) dimension and bias/skip
+// may be absent (the bias is the previous gemm's, fused here as in the CUDA
+// backend's LayerNorm kernel). All tensors are [1, 1, T, C] except the
+// per-channel ones which are [1, 1, 1, C].
+template <typename DataType>
+dml::Expression LayerNormExpr(dml::Expression input,
+                              dml::Expression* bias, dml::Expression* skip,
+                              dml::Expression& gammas, dml::Expression& betas,
+                              float alpha, float eps,
+                              ActivationFunction act) {
+  dml::Expression t = input;
+  if (bias) t = t + *bias;
+  t = ActivationExpr<DataType>(act, t);
+  if (alpha != 1.0f) t = t * alpha;
+  if (skip) t = t + *skip;
+
+  const uint32_t ln_axes[] = {3};
+  dml::Expression mean =
+      dml::Reduce(t, DML_REDUCE_FUNCTION_AVERAGE,
+                  dml::Span<const uint32_t>(ln_axes, 1));
+  const auto sizes = t.Impl()->GetOutputDesc().sizes;
+  dml::Expression mean_b =
+      GraphFactory<DataType>::ReinterpretView(mean, sizes, {0, 0, 1, 0});
+  dml::Expression centered = t - mean_b;
+  dml::Expression var =
+      dml::Reduce(centered * centered, DML_REDUCE_FUNCTION_AVERAGE,
+                  dml::Span<const uint32_t>(ln_axes, 1));
+  dml::Expression inv_b = GraphFactory<DataType>::ReinterpretView(
+      dml::Recip(dml::Sqrt(var + eps)), sizes, {0, 0, 1, 0});
+  return centered * inv_b * gammas + betas;
+}
+
+// KDA output RMS norm: mixed * gammas / sqrt(mean(mixed^2) + eps), the
+// applyKdaOutputGate-preceding norm from sycl EvalKda (which normalizes
+// before gating on purpose -- they do not commute).
+template <typename DataType>
+dml::Expression RmsNormExpr(dml::Expression mixed, dml::Expression& gammas,
+                            float eps) {
+  const uint32_t rms_axes[] = {3};
+  dml::Expression mean_sq =
+      dml::Reduce(mixed * mixed, DML_REDUCE_FUNCTION_AVERAGE,
+                  dml::Span<const uint32_t>(rms_axes, 1));
+  const auto sizes = mixed.Impl()->GetOutputDesc().sizes;
+  dml::Expression inv_b = GraphFactory<DataType>::ReinterpretView(
+      dml::Recip(dml::Sqrt(mean_sq + eps)), sizes, {0, 0, 1, 0});
+  return mixed * inv_b * gammas;
+}
+
+// Dispatches a compiled op with the layer's activation pointers substituted
+// into the recorded binding order. Mirrors calling a CUDA kernel launcher
+// with (output, input, input2, scratch).
+template <typename DataType>
+void DispatchOp(DmlExecScope& scope, DmlCompiledOp& op, DmlPtr input,
+                DmlPtr input2, DmlPtr scratch,
+                std::vector<DmlPtr> outputs) {
+  std::vector<DmlPtr> ptrs;
+  ptrs.reserve(op.bindings.size());
+  for (const auto& b : op.bindings) {
+    switch (b.kind) {
+      case DmlBindingRef::Kind::kWeight:
+        ptrs.push_back(b.weight);
+        break;
+      case DmlBindingRef::Kind::kInput:
+        ptrs.push_back(input);
+        break;
+      case DmlBindingRef::Kind::kInput2:
+        ptrs.push_back(input2);
+        break;
+      case DmlBindingRef::Kind::kScratch:
+        ptrs.push_back(scratch);
+        break;
+    }
+  }
+  DmlPtr transient;
+  if (op.transient_bytes) transient = scope.TakeTransient(op.transient_bytes);
+  scope.ctx().DispatchOperator(scope.list(), op.op.Get(), ptrs, op.bindings,
+                               outputs, op.output_bytes, transient,
+                               op.transient_bytes);
+}
+
+}  // namespace
+
+// ===========================================================================
+// DmlDeviceContext / DmlHalf / DmlWeightUploader plumbing
+// ===========================================================================
+
+DmlHalf::DmlHalf(float f) : bits(F32toF16Bits(f)) {}
+DmlHalf::operator float() const { return F16BitsToF32(bits); }
+
+// Implemented in network_directml.cc (device bring-up lives there, like the
+// CUDA backend's device discovery in network_cuda.cc).
+void DmlDeviceContext::DispatchOperator(
+    ID3D12GraphicsCommandList* list, IDMLCompiledOperator* op,
+    const std::vector<DmlPtr>& inputs, const std::vector<DmlBindingRef>& meta,
+    const std::vector<DmlPtr>& outputs,
+    const std::vector<uint64_t>& output_bytes, DmlPtr transient,
+    uint64_t transient_bytes) {
+  constexpr uint32_t kSlotsPerTable = 64;
+  D3D12_CPU_DESCRIPTOR_HANDLE cpu = descriptors_.TakeCpu(kSlotsPerTable);
+  DML_BINDING_TABLE_DESC table_desc = {};
+  table_desc.Dispatchable = op;
+  table_desc.CPUDescriptorHandle = cpu;
+  table_desc.GPUDescriptorHandle = descriptors_.CpuToGpu(cpu);
+  // SizeInDescriptors must cover RequiredDescriptorCount (the system
+  // DirectML 1.x runtime validates it; zero is rejected with E_INVALIDARG).
+  // SizeInDescriptors must cover the dispatchable's RequiredDescriptorCount
+  // (the system DirectML 1.x runtime validates it; zero is rejected).
+  table_desc.SizeInDescriptors =
+      std::max<uint32_t>(op->GetBindingProperties().RequiredDescriptorCount,
+                         1u);
+  ComPtr<IDMLBindingTable> table;
+  ReportDmlErrors(
+      dml_device_->CreateBindingTable(&table_desc, IID_PPV_ARGS(&table)),
+      "CreateBindingTable");
+
+  std::vector<DML_BUFFER_BINDING> buffer_bindings(inputs.size());
+  std::vector<DML_BINDING_DESC> binding_descs(inputs.size());
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    buffer_bindings[i].Buffer = inputs[i].res;
+    buffer_bindings[i].Offset = inputs[i].offset;
+    buffer_bindings[i].SizeInBytes = meta[i].bytes;
+    binding_descs[i].Type = DML_BINDING_TYPE_BUFFER;
+    binding_descs[i].Desc = &buffer_bindings[i];
+  }
+  if (!binding_descs.empty()) {
+    table->BindInputs(static_cast<UINT>(binding_descs.size()),
+                      binding_descs.data());
+  }
+
+  if (transient_bytes) {
+    DML_BUFFER_BINDING tb{transient.res, transient.offset, transient_bytes};
+    DML_BINDING_DESC td{DML_BINDING_TYPE_BUFFER, &tb};
+    table->BindTemporaryResource(&td);
+  }
+
+  std::vector<DML_BUFFER_BINDING> out_bindings(outputs.size());
+  std::vector<DML_BINDING_DESC> out_descs(outputs.size());
+  for (size_t i = 0; i < outputs.size(); ++i) {
+    out_bindings[i].Buffer = outputs[i].res;
+    out_bindings[i].Offset = outputs[i].offset;
+    out_bindings[i].SizeInBytes = output_bytes[i];
+    out_descs[i].Type = DML_BINDING_TYPE_BUFFER;
+    out_descs[i].Desc = &out_bindings[i];
+  }
+  table->BindOutputs(static_cast<UINT>(out_descs.size()), out_descs.data());
+
+  ID3D12DescriptorHeap* heap = descriptors_.heap();
+  list->SetDescriptorHeaps(1, &heap);
+  recorder_->RecordDispatch(list, op, table.Get());
+
+  // A global UAV barrier between dispatches: layers are strictly sequential
+  // so this is correct, if conservative.
+  D3D12_RESOURCE_BARRIER barrier = {};
+  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+  barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+  list->ResourceBarrier(1, &barrier);
+}
+
+void DmlDeviceContext::WaitForFence(ID3D12Fence* fence, uint64_t value) {
+  if (fence->GetCompletedValue() >= value) return;
+  ReportD3DErrors(fence->SetEventOnCompletion(value, fence_event_),
+                  "SetEventOnCompletion");
+  WaitForSingleObject(fence_event_, INFINITE);
+}
+
+// ===========================================================================
+// KdaRecurrenceLayer -- unchanged from the original stub, except Record()
+// now takes byte offsets (DmlPtr) so it can bind sub-allocations of the
+// shared arenas.
+// ===========================================================================
 
 namespace {
 
@@ -37,7 +552,7 @@ namespace {
 // field-for-field: same order, same types, no gaps. Root constants are
 // copied as raw 32-bit words, so any mismatch here silently scrambles the
 // shader's inputs rather than failing to compile.
-struct ShaderConstants {
+struct KdaShaderConstants {
   uint32_t N;
   uint32_t heads;
   uint32_t key_dim;
@@ -48,58 +563,41 @@ struct ShaderConstants {
   float log_decay_floor;
   int32_t directions[16];
 };
-static_assert(sizeof(ShaderConstants) == 96,
-              "ShaderConstants must match the HLSL cbuffer's 96-byte layout "
-              "(24 x 32-bit words) -- see kda_recurrence.hlsl");
-static_assert(sizeof(ShaderConstants) % 4 == 0, "must be a whole number of 32-bit words");
+static_assert(sizeof(KdaShaderConstants) == 96,
+              "KdaShaderConstants must match the HLSL cbuffer's 96-byte "
+              "layout (24 x 32-bit words) -- see kda_recurrence.hlsl");
 
-constexpr UINT kNum32BitConstants = sizeof(ShaderConstants) / 4;
+constexpr UINT kKdaNum32BitConstants = sizeof(KdaShaderConstants) / 4;
+constexpr UINT kKdaRootParamConstants = 0;
+constexpr UINT kKdaRootParamSrvBase = 1;
+constexpr UINT kKdaRootParamUav = 9;
 
-// Root parameter indices, fixed by construction order in the root
-// signature built below -- Record() must agree with these.
-constexpr UINT kRootParamConstants = 0;
-constexpr UINT kRootParamSrvBase = 1;  // qkv, q, k, v, raw_decay, dt_bias, a_log, beta
-constexpr UINT kRootParamUav = 9;      // mixed
+struct PreprocessConstants {
+  uint32_t mode;
+  uint32_t input_size;
+  uint32_t encoding_size;
+  uint32_t total_channels;
+  uint32_t enc_batch_stride;
+  uint32_t pad0;
+  uint32_t pad1;
+  uint32_t pad2;
+};
+static_assert(sizeof(PreprocessConstants) % 4 == 0);
 
-ComPtr<ID3DBlob> CompileShader(bool fp16) {
-  D3D_SHADER_MACRO macros[] = {
-      {"INPUT_TYPE", fp16 ? "half" : "float"},
-      {nullptr, nullptr},
-  };
+struct PolicyFinalizeConstants {
+  uint32_t key_width;
+  uint32_t pad0;
+  uint32_t pad1;
+  uint32_t pad2;
+};
 
-  UINT compile_flags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
-#ifndef NDEBUG
-  compile_flags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
-#endif
-  // NOTE: D3DCompile is the legacy FXC compiler, capped at shader model
-  // 5.1, where `half` is only a min-precision hint (min16float) -- the
-  // driver is free to still execute it at 32-bit. Genuine always-16-bit
-  // storage needs DXC with target cs_6_2+ and -enable-16bit-types, which
-  // this backend does not yet use. fp16=true here is therefore a real but
-  // unverified-magnitude bandwidth optimization, not a guaranteed one --
-  // unlike the SYCL kernel's T=sycl::half, which is a true 16-bit type.
-
-  ComPtr<ID3DBlob> shader_blob;
-  ComPtr<ID3DBlob> error_blob;
-  HRESULT hr = D3DCompile(
-      kKdaRecurrenceShaderSource, sizeof(kKdaRecurrenceShaderSource) - 1,
-      "kda_recurrence.hlsl", macros, D3D_COMPILE_STANDARD_FILE_INCLUDE,
-      "KdaRecurrence", "cs_5_1", compile_flags, 0, &shader_blob, &error_blob);
-
-  if (FAILED(hr)) {
-    std::string message = "Failed to compile kda_recurrence.hlsl (fp16=";
-    message += fp16 ? "true" : "false";
-    message += "): ";
-    if (error_blob) {
-      message.append(static_cast<const char*>(error_blob->GetBufferPointer()),
-                     error_blob->GetBufferSize());
-    } else {
-      message += "HRESULT 0x" + std::to_string(static_cast<uint32_t>(hr));
-    }
-    throw Exception(message);
-  }
-  return shader_blob;
-}
+struct TransposeConstants {
+  uint32_t mode;
+  uint32_t batch_size;
+  uint32_t heads;
+  uint32_t head_dim;
+};
+static_assert(sizeof(TransposeConstants) % 4 == 0);
 
 }  // namespace
 
@@ -107,35 +605,35 @@ KdaRecurrenceLayer::KdaRecurrenceLayer(ID3D12Device* device, bool fp16)
     : device_(device), fp16_(fp16) {
   D3D12_ROOT_PARAMETER params[10] = {};
 
-  params[kRootParamConstants].ParameterType =
+  params[kKdaRootParamConstants].ParameterType =
       D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-  params[kRootParamConstants].Constants.ShaderRegister = 0;
-  params[kRootParamConstants].Constants.RegisterSpace = 0;
-  params[kRootParamConstants].Constants.Num32BitValues = kNum32BitConstants;
-  params[kRootParamConstants].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  params[kKdaRootParamConstants].Constants.ShaderRegister = 0;
+  params[kKdaRootParamConstants].Constants.RegisterSpace = 0;
+  params[kKdaRootParamConstants].Constants.Num32BitValues =
+      kKdaNum32BitConstants;
+  params[kKdaRootParamConstants].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
   for (UINT i = 0; i < 8; ++i) {
-    auto& p = params[kRootParamSrvBase + i];
+    auto& p = params[kKdaRootParamSrvBase + i];
     p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     p.Descriptor.ShaderRegister = i;
     p.Descriptor.RegisterSpace = 0;
     p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
   }
 
-  params[kRootParamUav].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-  params[kRootParamUav].Descriptor.ShaderRegister = 0;
-  params[kRootParamUav].Descriptor.RegisterSpace = 0;
-  params[kRootParamUav].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  params[kKdaRootParamUav].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  params[kKdaRootParamUav].Descriptor.ShaderRegister = 0;
+  params[kKdaRootParamUav].Descriptor.RegisterSpace = 0;
+  params[kKdaRootParamUav].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
   D3D12_ROOT_SIGNATURE_DESC root_desc = {};
   root_desc.NumParameters = 10;
   root_desc.pParameters = params;
-  root_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
 
   ComPtr<ID3DBlob> signature_blob;
   ComPtr<ID3DBlob> error_blob;
-  HRESULT hr = D3D12SerializeRootSignature(
-      &root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &signature_blob, &error_blob);
+  HRESULT hr = D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1,
+                                           &signature_blob, &error_blob);
   if (FAILED(hr)) {
     std::string message = "Failed to serialize KdaRecurrence root signature: ";
     if (error_blob) {
@@ -144,37 +642,30 @@ KdaRecurrenceLayer::KdaRecurrenceLayer(ID3D12Device* device, bool fp16)
     }
     throw Exception(message);
   }
+  ReportD3DErrors(device_->CreateRootSignature(0, signature_blob->GetBufferPointer(),
+                                               signature_blob->GetBufferSize(),
+                                               IID_PPV_ARGS(&root_signature_)),
+                  "CreateRootSignature (kda)");
 
-  hr = device_->CreateRootSignature(0, signature_blob->GetBufferPointer(),
-                                    signature_blob->GetBufferSize(),
-                                    IID_PPV_ARGS(&root_signature_));
-  if (FAILED(hr)) throw Exception("Failed to create KdaRecurrence root signature");
-
-  ComPtr<ID3DBlob> shader_blob = CompileShader(fp16);
-
-  D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc = {};
-  pso_desc.pRootSignature = root_signature_.Get();
-  pso_desc.CS = {shader_blob->GetBufferPointer(), shader_blob->GetBufferSize()};
-
-  hr = device_->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&pso_));
-  if (FAILED(hr)) throw Exception("Failed to create KdaRecurrence PSO");
+  ComPtr<ID3DBlob> shader_blob = CompileHlsl(
+      kKdaRecurrenceShaderSource, sizeof(kKdaRecurrenceShaderSource) - 1,
+      "kda_recurrence.hlsl", "KdaRecurrence", fp16_);
+  pso_ = CreateComputePso(device_.Get(), root_signature_.Get(),
+                         shader_blob.Get());
 }
 
 void KdaRecurrenceLayer::Record(ID3D12GraphicsCommandList* command_list,
-                                const Params& params, ID3D12Resource* qkv,
-                                ID3D12Resource* q, ID3D12Resource* k,
-                                ID3D12Resource* v, ID3D12Resource* raw_decay,
-                                ID3D12Resource* dt_bias, ID3D12Resource* a_log,
-                                ID3D12Resource* beta,
-                                ID3D12Resource* mixed_out) {
+                                const Params& params, DmlPtr qkv, DmlPtr q,
+                                DmlPtr k, DmlPtr v, DmlPtr raw_decay,
+                                DmlPtr dt_bias, DmlPtr a_log, DmlPtr beta,
+                                DmlPtr mixed_out) {
   const bool fused = params.use_fused_qkv;
-  assert(fused ? (qkv != nullptr) : (q != nullptr && k != nullptr && v != nullptr));
+  assert(fused ? !!qkv : (!!q && !!k && !!v));
   assert(params.key_dim <= 32 && params.value_dim <= 32 &&
-        "KdaRecurrenceLayer's shader is compiled for BLOCK_SIZE=32; a "
-        "larger key_dim/value_dim needs a second shader variant, the same "
-        "way dx/shaders/SE.hlsl has one per channel count.");
+         "KdaRecurrenceLayer's shader is compiled for BLOCK_SIZE=32; a "
+         "larger key_dim/value_dim needs a second shader variant.");
 
-  ShaderConstants constants{};
+  KdaShaderConstants constants{};
   constants.N = params.batch_size;
   constants.heads = params.heads;
   constants.key_dim = params.key_dim;
@@ -184,45 +675,1171 @@ void KdaRecurrenceLayer::Record(ID3D12GraphicsCommandList* command_list,
   constants.qkv_stride = params.qkv_stride;
   constants.log_decay_floor = params.log_decay_floor;
   std::memcpy(constants.directions, params.directions.data(),
-             sizeof(constants.directions));
+              sizeof(constants.directions));
+
+  // Root SRV/UAV bind by GPU virtual address; arena sub-allocations add
+  // their byte offset to the resource base.
+  const DmlPtr q_slot = fused ? qkv : q;
+  const DmlPtr k_slot = fused ? qkv : k;
+  const DmlPtr v_slot = fused ? qkv : v;
+  DmlPtr slots[8] = {q_slot, q_slot, k_slot, v_slot,
+                     raw_decay, dt_bias, a_log, beta};
 
   command_list->SetComputeRootSignature(root_signature_.Get());
   command_list->SetPipelineState(pso_.Get());
+  command_list->SetComputeRoot32BitConstants(kKdaRootParamConstants,
+                                             kKdaNum32BitConstants, &constants,
+                                             0);
+  for (UINT i = 0; i < 8; ++i) {
+    command_list->SetComputeRootShaderResourceView(
+        kKdaRootParamSrvBase + i, slots[i].GpuVA());
+  }
+  command_list->SetComputeRootUnorderedAccessView(kKdaRootParamUav,
+                                                  mixed_out.GpuVA());
 
-  command_list->SetComputeRoot32BitConstants(
-      kRootParamConstants, kNum32BitConstants, &constants, 0);
-
-  // Structured-buffer root SRVs bind by raw GPU virtual address, and the
-  // root signature always declares all four of qkv/q/k/v regardless of
-  // which mode is active -- the unused three in either mode still need
-  // *some* valid VA bound (a null one would fault), so the used buffer(s)
-  // fill in for the unused slots rather than leaving them null.
-  ID3D12Resource* const q_slot = fused ? qkv : q;
-  ID3D12Resource* const k_slot = fused ? qkv : k;
-  ID3D12Resource* const v_slot = fused ? qkv : v;
-  command_list->SetComputeRootShaderResourceView(
-      kRootParamSrvBase + 0, q_slot->GetGPUVirtualAddress());
-  command_list->SetComputeRootShaderResourceView(
-      kRootParamSrvBase + 1, q_slot->GetGPUVirtualAddress());
-  command_list->SetComputeRootShaderResourceView(
-      kRootParamSrvBase + 2, k_slot->GetGPUVirtualAddress());
-  command_list->SetComputeRootShaderResourceView(
-      kRootParamSrvBase + 3, v_slot->GetGPUVirtualAddress());
-  command_list->SetComputeRootShaderResourceView(
-      kRootParamSrvBase + 4, raw_decay->GetGPUVirtualAddress());
-  command_list->SetComputeRootShaderResourceView(
-      kRootParamSrvBase + 5, dt_bias->GetGPUVirtualAddress());
-  command_list->SetComputeRootShaderResourceView(
-      kRootParamSrvBase + 6, a_log->GetGPUVirtualAddress());
-  command_list->SetComputeRootShaderResourceView(
-      kRootParamSrvBase + 7, beta->GetGPUVirtualAddress());
-  command_list->SetComputeRootUnorderedAccessView(
-      kRootParamUav, mixed_out->GetGPUVirtualAddress());
-
-  // One thread group per (batch, head); BLOCK_SIZE=32 threads each.
   const UINT group_count = params.batch_size * params.heads;
   command_list->Dispatch(group_count, 1, 1);
+
+  D3D12_RESOURCE_BARRIER barrier = {};
+  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+  command_list->ResourceBarrier(1, &barrier);
 }
+
+MhaTransposeLayer::MhaTransposeLayer(ID3D12Device* device, bool fp16)
+    : device_(device), fp16_(fp16) {
+  ComPtr<ID3DBlob> shader =
+      CompileHlsl(kMhaTransposeShaderSource,
+                  sizeof(kMhaTransposeShaderSource) - 1,
+                  "mha_transpose.hlsl", "MhaTranspose", fp16_);
+  root_signature_ = CreateShaderRootSignature(
+      device_.Get(), sizeof(TransposeConstants) / 4, 1, 1);
+  pso_ = CreateComputePso(device_.Get(), root_signature_.Get(), shader.Get());
+}
+
+void MhaTransposeLayer::Record(ID3D12GraphicsCommandList* command_list,
+                               const Params& params, DmlPtr input,
+                               DmlPtr output) {
+  TransposeConstants constants{};
+  constants.mode = params.mode;
+  constants.batch_size = params.batch_size;
+  constants.heads = params.heads;
+  constants.head_dim = params.head_dim;
+
+  command_list->SetComputeRootSignature(root_signature_.Get());
+  command_list->SetPipelineState(pso_.Get());
+  command_list->SetComputeRoot32BitConstants(0, sizeof(TransposeConstants) / 4,
+                                             &constants, 0);
+  command_list->SetComputeRootShaderResourceView(1, input.GpuVA());
+  command_list->SetComputeRootUnorderedAccessView(2, output.GpuVA());
+  const uint64_t total =
+      (uint64_t)params.batch_size * params.heads * 64 * params.head_dim;
+  command_list->Dispatch(static_cast<UINT>((total + 63) / 64), 1, 1);
+
+  D3D12_RESOURCE_BARRIER barrier = {};
+  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+  command_list->ResourceBarrier(1, &barrier);
+}
+
+// ===========================================================================
+// FCLayer / EmbeddingLayer / PolicyMapLayer
+// ===========================================================================
+
+template <typename DataType>
+static DmlCompiledOp BuildGemmLayerOp(
+    DmlDeviceContext& ctx, uint32_t N, uint32_t tokens, uint32_t num_inputs,
+    uint32_t num_outputs, bool use_bias, ActivationFunction act,
+    const DmlPtr& weights, const DmlPtr& biases) {
+  GraphFactory<DataType> g(ctx);
+  auto x = g.Input({1, 1, tokens, num_inputs});
+  auto w = g.Weight(weights, {1, 1, num_outputs, num_inputs});
+  dml::Expression y = dml::Gemm(x, w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                                DML_MATRIX_TRANSFORM_TRANSPOSE);
+  if (use_bias) {
+    auto b = g.WeightChannel(biases, tokens, num_outputs);
+    y = y + b;
+  }
+  y = ActivationExpr<DataType>(act, y);
+  return g.Compile({y}, {(uint64_t)tokens * num_outputs * sizeof(DataType)});
+}
+
+template <typename DataType>
+FCLayer<DataType>::FCLayer(BaseLayer<DataType>* ip, int C, int H, int W,
+                           bool bias, ActivationFunction activation,
+                           const std::vector<float>& weights,
+                           const std::vector<float>& biases,
+                           DmlWeightUploader& uploader)
+    : BaseLayer<DataType>(C, H, W, ip),
+      use_bias_(bias),
+      act_(activation) {
+  weights_ = uploader.Add(weights);
+  if (use_bias_) biases_ = uploader.Add(biases);
+}
+
+template <typename DataType>
+void FCLayer<DataType>::Eval(int N, DmlPtr output, DmlPtr input, DmlPtr input2,
+                             DmlPtr scratch, size_t scratch_size,
+                             DmlExecScope& scope) {
+  const int num_inputs = this->input_->GetC() * this->input_->GetH() *
+                         this->input_->GetW();
+  auto it = compiled_.find(N);
+  if (it == compiled_.end()) {
+    it = compiled_.emplace(N, BuildGemmLayerOp<DataType>(
+                                  scope.ctx(), N, N, num_inputs, C, use_bias_,
+                                  act_, weights_, biases_)).first;
+  }
+  DispatchOp<DataType>(scope, it->second, input, input2, scratch, {output});
+}
+
+template <typename DataType>
+EmbeddingLayer<DataType>::EmbeddingLayer(BaseLayer<DataType>* ip, int C, int H,
+                                         int W, bool bias,
+                                         ActivationFunction activation,
+                                         const std::vector<float>& weights,
+                                         const std::vector<float>& biases,
+                                         DmlWeightUploader& uploader)
+    : BaseLayer<DataType>(C, H, W, ip),
+      use_bias_(bias),
+      act_(activation) {
+  weights_ = uploader.Add(weights);
+  if (use_bias_) biases_ = uploader.Add(biases);
+}
+
+template <typename DataType>
+void EmbeddingLayer<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
+                                    DmlPtr input2, DmlPtr scratch,
+                                    size_t scratch_size, DmlExecScope& scope) {
+  // Token-level GEMM: [N*64, K] -> [N*64, M], no H/W flattening.
+  const int num_inputs = this->input_->GetC();
+  const uint32_t tokens = N * 64;
+  auto it = compiled_.find(N);
+  if (it == compiled_.end()) {
+    it = compiled_.emplace(N, BuildGemmLayerOp<DataType>(
+                                  scope.ctx(), N, tokens, num_inputs, C,
+                                  use_bias_, act_, weights_, biases_)).first;
+  }
+  DispatchOp<DataType>(scope, it->second, input, input2, scratch, {output});
+}
+
+template <typename DataType>
+PolicyMapLayer<DataType>::PolicyMapLayer(BaseLayer<DataType>* ip, int usedSize,
+                                         bool attention, const short* cpuWeight,
+                                         DmlWeightUploader& uploader)
+    : BaseLayer<DataType>(kNumOutputPolicy, 1, 1, ip), used_size_(usedSize) {
+  // The CUDA/BLAS PolicyMap is a scatter: policy[map[i]] = attn[i] for each
+  // attention row i in [0, usedSize). DirectML Gather is the inverse
+  // direction (out[j] = in[idx[j]]), so build the inverse table: for each
+  // policy index j, the attention row i with map[i] == j. The table is
+  // indexed by attention row (length usedSize == 4288), NOT by policy
+  // index -- reading only the first 1858 entries drops the promotion
+  // region entirely.
+  indices_host_.assign(kNumOutputPolicy, 0);
+  int covered = 0;
+  for (int i = 0; i < usedSize; ++i) {
+    const int j = cpuWeight[i];
+    if (j >= 0 && j < kNumOutputPolicy) {
+      indices_host_[static_cast<size_t>(j)] = static_cast<uint32_t>(i);
+      ++covered;
+    }
+  }
+  if (covered != kNumOutputPolicy) {
+    CERR << "directml PolicyMap: inverse map covers " << covered << "/"
+         << kNumOutputPolicy << " policy indices (map may be incomplete).";
+  }
+  indices_ = uploader.AddRaw(indices_host_.data(),
+                             indices_host_.size() * sizeof(uint32_t));
+}
+
+template <typename DataType>
+void PolicyMapLayer<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
+                                     DmlPtr input2, DmlPtr scratch,
+                                     size_t scratch_size, DmlExecScope& scope) {
+  auto it = compiled_.find(N);
+  if (it == compiled_.end()) {
+    CERR << "MAP building";
+    GraphFactory<DataType> g(scope.ctx());
+    auto x = g.Input({1, 1, static_cast<uint32_t>(N),
+                      static_cast<uint32_t>(used_size_)});
+    auto indices = g.WeightU32(
+        indices_, {1, 1, 1, static_cast<uint32_t>(kNumOutputPolicy)});
+    dml::Expression y = dml::Gather(x, indices, 3, 1);
+    it = compiled_.emplace(
+             N, g.Compile({y},
+                          {(uint64_t)N * kNumOutputPolicy * sizeof(DataType)}))
+             .first;
+  }
+  DispatchOp<DataType>(scope, it->second, input, input2, scratch, {output});
+}
+
+// ===========================================================================
+// AttentionBody
+// ===========================================================================
+
+template <typename DataType>
+AttentionBody<DataType>::AttentionBody(
+    const MultiHeadWeights& weights, DmlWeightUploader& uploader,
+    Activations activations, int num_res_blocks, int input_c,
+    int max_batch_size, bool is_pe_dense_embedding,
+    const std::vector<int>& kda_directions, DmlDeviceContext& ctx, bool fp16)
+    : BaseLayer<DataType>(static_cast<int>(weights.ip_emb_b.size()), 8, 8,
+                          nullptr),
+      embedding_op_size_(static_cast<int>(weights.ip_emb_b.size())),
+      input_c_(input_c),
+      is_pe_dense_embedding_(is_pe_dense_embedding),
+      has_gating_(!weights.ip_mult_gate.empty() && !weights.ip_add_gate.empty()),
+      activations_(activations),
+      num_resi_blocks_(num_res_blocks) {
+  if (num_resi_blocks_ > 0) {
+    throw Exception(
+        "The directml backend does not support attention nets with residual "
+        "conv blocks yet (embedding -> encoder stacks only).");
+  }
+
+  ip_emb_w_ = uploader.Add(weights.ip_emb_w);
+  ip_emb_b_ = uploader.Add(weights.ip_emb_b);
+
+  if (is_pe_dense_embedding_) {
+    ip_emb_pre_w_ = uploader.Add(weights.ip_emb_preproc_w);
+    ip_emb_pre_b_ = uploader.Add(weights.ip_emb_preproc_b);
+    ip_emb_ln_g_ = uploader.Add(weights.ip_emb_ln_gammas);
+    ip_emb_ln_b_ = uploader.Add(weights.ip_emb_ln_betas);
+    ip_emb_ffn_d1_w_ = uploader.Add(weights.ip_emb_ffn.dense1_w);
+    ip_emb_ffn_d1_b_ = uploader.Add(weights.ip_emb_ffn.dense1_b);
+    ip_emb_ffn_d2_w_ = uploader.Add(weights.ip_emb_ffn.dense2_w);
+    ip_emb_ffn_d2_b_ = uploader.Add(weights.ip_emb_ffn.dense2_b);
+    ip_emb_ffn_ln_g_ = uploader.Add(weights.ip_emb_ffn_ln_gammas);
+    ip_emb_ffn_ln_b_ = uploader.Add(weights.ip_emb_ffn_ln_betas);
+    embedding_dense_size_ =
+        static_cast<int>(weights.ip_emb_preproc_b.size()) / 64;
+    embedding_ffn_size_ = static_cast<int>(weights.ip_emb_ffn.dense2_b.size());
+    embedding_ffn_dff_ = static_cast<int>(weights.ip_emb_ffn.dense1_b.size());
+  } else {
+    pos_encoding_host_.assign(&kPosEncoding[0][0],
+                              &kPosEncoding[0][0] + 64 * kNumPosEncodingChannels);
+    pos_encoding_ = uploader.Add(pos_encoding_host_);
+    embedding_dense_size_ = 0;
+  }
+
+  if (has_gating_) {
+    ip_mult_gate_ = uploader.Add(weights.ip_mult_gate);
+    ip_add_gate_ = uploader.Add(weights.ip_add_gate);
+  }
+
+  // The preprocess compute shader: one PSO, compiled once.
+  ComPtr<ID3DBlob> shader =
+      CompileHlsl(kAttentionPreprocessShaderSource,
+                  sizeof(kAttentionPreprocessShaderSource) - 1,
+                  "attention_preprocess.hlsl", "AttentionPreprocess", fp16);
+  preprocess_root_signature_ =
+      CreateShaderRootSignature(ctx.device(), sizeof(PreprocessConstants) / 4,
+                                2, 1);
+  preprocess_pso_ =
+      CreateComputePso(ctx.device(), preprocess_root_signature_.Get(),
+                       shader.Get());
+
+  const int num_encoders = static_cast<int>(weights.encoder.size());
+  const float alpha = static_cast<float>(pow(2.0 * num_encoders, -0.25));
+  DmlPtr smolgen_global;
+  int smolgen_global_size = 0;
+  if (weights.has_smolgen) {
+    smolgen_global = uploader.Add(weights.smolgen_w);
+    smolgen_global_size = 64 * 64;
+  }
+  for (const auto& enc : weights.encoder) {
+    encoder_weights_.emplace_back(new EncoderBlock<DataType>(
+        enc, uploader, weights.encoder_head_count, embedding_op_size_, alpha,
+        smolgen_global, smolgen_global_size, max_batch_size,
+        activations.smolgen_activation, activations.ffn_activation,
+        is_pe_dense_embedding_ ? 1e-3f : 1e-6f, kda_directions, ctx, fp16));
+  }
+}
+
+template <typename DataType>
+void AttentionBody<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
+                                   DmlPtr input2, DmlPtr scratch,
+                                   size_t scratch_size, DmlExecScope& scope) {
+  ID3D12GraphicsCommandList* list = scope.list();
+  DmlPtr buffer1 = input2;
+  DmlPtr buffer2 = input2 + AlignUp(scratch_size / 2);
+  const uint32_t tokens = N * 64;
+  const int input_size = kNumInputPlanes;
+
+  auto record_preprocess = [&](uint32_t mode, uint32_t encoding_size,
+                               uint32_t total_channels,
+                               uint32_t enc_batch_stride, DmlPtr in,
+                               DmlPtr encoding, DmlPtr out) {
+    PreprocessConstants constants{};
+    constants.mode = mode;
+    constants.input_size = input_size;
+    constants.encoding_size = encoding_size;
+    constants.total_channels = total_channels;
+    constants.enc_batch_stride = enc_batch_stride;
+    list->SetComputeRootSignature(preprocess_root_signature_.Get());
+    list->SetPipelineState(preprocess_pso_.Get());
+    list->SetComputeRoot32BitConstants(0, sizeof(PreprocessConstants) / 4,
+                                       &constants, 0);
+    list->SetComputeRootShaderResourceView(1, in.GpuVA());
+    list->SetComputeRootShaderResourceView(2, encoding.GpuVA());
+    list->SetComputeRootUnorderedAccessView(3, out.GpuVA());
+    const UINT groups =
+        mode == 2 ? static_cast<UINT>(N * 64) : static_cast<UINT>(N * 64);
+    list->Dispatch(groups, 1, 1);
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    list->ResourceBarrier(1, &barrier);
+  };
+
+  const int body_input_c = is_pe_dense_embedding_
+                               ? input_size + embedding_dense_size_
+                               : input_size + kNumPosEncodingChannels;
+
+  if (!is_pe_dense_embedding_) {
+    record_preprocess(0, kNumPosEncodingChannels,
+                      input_size + kNumPosEncodingChannels, 0, input,
+                      pos_encoding_, scratch);
+
+    auto it = compiled_.find(N);
+    if (it == compiled_.end()) {
+      GraphFactory<DataType> g(scope.ctx());
+      auto x = g.Input({1, 1, tokens, static_cast<uint32_t>(body_input_c)});
+      auto w = g.Weight(ip_emb_w_, {1, 1, static_cast<uint32_t>(embedding_op_size_),
+                                    static_cast<uint32_t>(body_input_c)});
+      auto b = g.WeightChannel(ip_emb_b_, tokens, static_cast<uint32_t>(embedding_op_size_));
+      dml::Expression g0 =
+          dml::Gemm(x, w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                    DML_MATRIX_TRANSFORM_TRANSPOSE);
+      dml::Expression y = g0 + b;
+      y = ActivationExpr<DataType>(activations_.default_activation, y);
+      if (has_gating_) {
+        auto mult = g.WeightChannel(ip_mult_gate_, tokens, static_cast<uint32_t>(embedding_op_size_));
+        auto add = g.WeightChannel(ip_add_gate_, tokens, static_cast<uint32_t>(embedding_op_size_));
+        y = y * mult + add;
+      }
+      it = compiled_.emplace(
+               N, g.Compile({y}, {(uint64_t)tokens * embedding_op_size_ *
+                                      sizeof(DataType)}))
+               .first;
+    }
+    DispatchOp<DataType>(scope, it->second, scratch, buffer2, buffer2,
+                         {output});
+  } else {
+    // PE_DENSE: pos_info slice gemm, concat, embedding gemm + LN, gating,
+    // embedding FFN, LN -- one graph per N, with the preprocess kernels in
+    // between (the concat kernel needs the gemm output).
+    DmlPtr pos_info = scratch;  // [N, 64*12]
+    DmlPtr pre_out = buffer1;   // [N, 64*dense]
+    DmlPtr nhwc = scratch;      // reused: [N, 64, 112+dense]
+    record_preprocess(2, 12, 768, 0, input, pos_encoding_, pos_info);
+
+    {
+      auto it = pre_compiled_.find(N);
+      if (it == pre_compiled_.end()) {
+        GraphFactory<DataType> g(scope.ctx());
+        auto x = g.Input({1, 1, static_cast<uint32_t>(N), 64 * 12});
+        auto w = g.Weight(ip_emb_pre_w_,
+                          {1, 1, static_cast<uint32_t>(64 * embedding_dense_size_),
+                           64 * 12});
+        auto b = g.WeightChannel(ip_emb_pre_b_, static_cast<uint32_t>(N),
+                         static_cast<uint32_t>(64 * embedding_dense_size_));
+        dml::Expression y = dml::Gemm(x, w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                                      DML_MATRIX_TRANSFORM_TRANSPOSE) + b;
+        it = pre_compiled_.emplace(
+                 N, g.Compile({y}, {(uint64_t)N * 64 * embedding_dense_size_ *
+                                        sizeof(DataType)}))
+                 .first;
+      }
+      DispatchOp<DataType>(scope, it->second, pos_info, buffer2, buffer2,
+                           {pre_out});
+    }
+
+    record_preprocess(1, static_cast<uint32_t>(embedding_dense_size_),
+                      static_cast<uint32_t>(body_input_c),
+                      static_cast<uint32_t>(64 * embedding_dense_size_), input,
+                      pre_out, nhwc);
+
+    {
+      auto it = compiled_.find(N);
+      if (it == compiled_.end()) {
+        GraphFactory<DataType> g(scope.ctx());
+        auto x = g.Input({1, 1, tokens, static_cast<uint32_t>(body_input_c)});
+        auto w = g.Weight(ip_emb_w_, {1, 1, static_cast<uint32_t>(embedding_op_size_),
+                                      static_cast<uint32_t>(body_input_c)});
+        auto b = g.WeightChannel(ip_emb_b_, tokens, static_cast<uint32_t>(embedding_op_size_));
+        auto ln_g = g.WeightChannel(ip_emb_ln_g_, tokens, static_cast<uint32_t>(embedding_op_size_));
+        auto ln_b = g.WeightChannel(ip_emb_ln_b_, tokens, static_cast<uint32_t>(embedding_op_size_));
+        dml::Expression emb =
+            dml::Gemm(x, w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                      DML_MATRIX_TRANSFORM_TRANSPOSE);
+        dml::Expression bias_b = b;
+        // LayerNorm with the previous gemm's bias fused: activation is the
+        // net's default (RELU/MISH), matching the SYCL embedding LN.
+        dml::Expression pre_ln = LayerNormExpr<DataType>(emb, &bias_b, nullptr, ln_g, ln_b, 1.0f, 1e-3f,
+            activations_.default_activation);
+        if (has_gating_) {
+          auto mult = g.WeightChannel(ip_mult_gate_, tokens, static_cast<uint32_t>(embedding_op_size_));
+          auto add = g.WeightChannel(ip_add_gate_, tokens, static_cast<uint32_t>(embedding_op_size_));
+          pre_ln = pre_ln * mult + add;
+        }
+        auto ffn1_w = g.Weight(
+            ip_emb_ffn_d1_w_,
+            {1, 1, static_cast<uint32_t>(embedding_ffn_dff_),
+             static_cast<uint32_t>(embedding_op_size_)});
+        auto ffn1_b = g.WeightChannel(ip_emb_ffn_d1_b_, tokens, static_cast<uint32_t>(embedding_ffn_dff_));
+        auto ffn2_w = g.Weight(
+            ip_emb_ffn_d2_w_,
+            {1, 1, static_cast<uint32_t>(embedding_op_size_),
+             static_cast<uint32_t>(embedding_ffn_dff_)});
+        auto ffn2_b = g.WeightChannel(ip_emb_ffn_d2_b_, tokens, static_cast<uint32_t>(embedding_op_size_));
+        auto ffn_ln_g = g.WeightChannel(ip_emb_ffn_ln_g_, tokens, static_cast<uint32_t>(embedding_op_size_));
+        auto ffn_ln_b = g.WeightChannel(ip_emb_ffn_ln_b_, tokens, static_cast<uint32_t>(embedding_op_size_));
+        dml::Expression ffn1 =
+            dml::Gemm(pre_ln, ffn1_w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                      DML_MATRIX_TRANSFORM_TRANSPOSE) + ffn1_b;
+        ffn1 = ActivationExpr<DataType>(activations_.ffn_activation, ffn1);
+        dml::Expression ffn2 =
+            dml::Gemm(ffn1, ffn2_w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                      DML_MATRIX_TRANSFORM_TRANSPOSE);
+        const float alpha =
+            static_cast<float>(pow(2.0 * encoder_weights_.size(), -0.25));
+        dml::Expression out = LayerNormExpr<DataType>(ffn2, &ffn2_b, &pre_ln, ffn_ln_g, ffn_ln_b, alpha, 1e-3f,
+            ACTIVATION_NONE);
+        it = compiled_.emplace(
+            N, g.Compile({out}, {(uint64_t)tokens * embedding_op_size_ *
+                                     sizeof(DataType)})).first;
+      }
+      DispatchOp<DataType>(scope, it->second, nhwc, buffer2, buffer2,
+                           {output});
+    }
+  }
+
+  for (const auto& enc : encoder_weights_) {
+    enc->Eval(N, output, scratch, buffer1, buffer2, scope);
+  }
+}
+
+// ===========================================================================
+// EncoderBlock (MHA + KDA)
+// ===========================================================================
+
+template <typename DataType>
+EncoderBlock<DataType>::EncoderBlock(
+    const MultiHeadWeights::EncoderLayer& cpu_weights,
+    DmlWeightUploader& uploader, int heads, int size, float alpha,
+    DmlPtr smolgen_global, int smolgen_global_size, int max_batch_size,
+    ActivationFunction smolgen_act, ActivationFunction ffn_act,
+    float default_eps, const std::vector<int>& kda_directions,
+    DmlDeviceContext& ctx, bool fp16)
+    : embedding_op_size_(size),
+      encoder_heads_(heads),
+      alpha_(alpha),
+      default_eps_(default_eps),
+      has_smolgen_(cpu_weights.mha.has_smolgen && !cpu_weights.is_kda),
+      smolgen_activation_(smolgen_act),
+      ffn_activation_(ffn_act),
+      max_batch_size_(max_batch_size),
+      ctx_(ctx),
+      fp16_(fp16) {
+  const auto& mha = cpu_weights.mha;
+  const auto& ffn = cpu_weights.ffn;
+  const auto& kda = cpu_weights.kda;
+  is_kda_ = cpu_weights.is_kda;
+
+  ffn_dense1_size_ = static_cast<int>(ffn.dense1_w.size()) / size;
+  mha_q_size_ = size > 0 && !mha.q_w.empty()
+                    ? static_cast<int>(mha.q_w.size()) / size
+                    : 0;
+
+  mha_q_w_ = uploader.Add(mha.q_w);
+  mha_q_b_ = uploader.Add(mha.q_b);
+  mha_k_w_ = uploader.Add(mha.k_w);
+  mha_k_b_ = uploader.Add(mha.k_b);
+  mha_v_w_ = uploader.Add(mha.v_w);
+  mha_v_b_ = uploader.Add(mha.v_b);
+  mha_dense_w_ = uploader.Add(mha.dense_w);
+  mha_dense_b_ = uploader.Add(mha.dense_b);
+  ln1_gammas_ = uploader.Add(cpu_weights.ln1_gammas);
+  ln1_betas_ = uploader.Add(cpu_weights.ln1_betas);
+  ffn_dense1_w_ = uploader.Add(ffn.dense1_w);
+  ffn_dense1_b_ = uploader.Add(ffn.dense1_b);
+  ffn_dense2_w_ = uploader.Add(ffn.dense2_w);
+  ffn_dense2_b_ = uploader.Add(ffn.dense2_b);
+  ln2_gammas_ = uploader.Add(cpu_weights.ln2_gammas);
+  ln2_betas_ = uploader.Add(cpu_weights.ln2_betas);
+
+  if (has_smolgen_) {
+    const auto& smol = mha.smolgen;
+    smol_compress_ = uploader.Add(smol.compress);
+    smol_dense1_w_ = uploader.Add(smol.dense1_w);
+    smol_dense1_b_ = uploader.Add(smol.dense1_b);
+    smol_dense2_w_ = uploader.Add(smol.dense2_w);
+    smol_dense2_b_ = uploader.Add(smol.dense2_b);
+    smol_ln1_gammas_ = uploader.Add(smol.ln1_gammas);
+    smol_ln1_betas_ = uploader.Add(smol.ln1_betas);
+    smol_ln2_gammas_ = uploader.Add(smol.ln2_gammas);
+    smol_ln2_betas_ = uploader.Add(smol.ln2_betas);
+    smolgen_global_ = smolgen_global;
+    smolgen_global_size_ = smolgen_global_size;
+    smol_compress_size_ = static_cast<int>(smol.compress.size()) / size;
+    smol_dense_1_size_ = static_cast<int>(smol.dense1_b.size());
+    smol_dense_2_size_ = static_cast<int>(smol.dense2_b.size());
+  }
+
+  if (is_kda_) {
+    kda_q_w_ = uploader.Add(kda.q_w);
+    kda_q_b_ = uploader.Add(kda.q_b);
+    kda_k_w_ = uploader.Add(kda.k_w);
+    kda_k_b_ = uploader.Add(kda.k_b);
+    kda_v_w_ = uploader.Add(kda.v_w);
+    kda_v_b_ = uploader.Add(kda.v_b);
+    kda_decay_a_w_ = uploader.Add(kda.decay_a_w);
+    kda_decay_a_b_ = uploader.Add(kda.decay_a_b);
+    kda_decay_b_w_ = uploader.Add(kda.decay_b_w);
+    kda_decay_b_b_ = uploader.Add(kda.decay_b_b);
+    kda_beta_w_ = uploader.Add(kda.beta_w);
+    kda_beta_b_ = uploader.Add(kda.beta_b);
+    kda_a_log_ = uploader.Add(kda.a_log);
+    kda_dt_bias_ = uploader.Add(kda.dt_bias);
+    kda_gate_a_w_ = uploader.Add(kda.gate_a_w);
+    kda_gate_a_b_ = uploader.Add(kda.gate_a_b);
+    kda_gate_b_w_ = uploader.Add(kda.gate_b_w);
+    kda_gate_b_b_ = uploader.Add(kda.gate_b_b);
+    kda_out_norm_gammas_ = uploader.Add(kda.out_norm_gammas);
+    kda_dense_w_ = uploader.Add(kda.dense_w);
+    kda_dense_b_ = uploader.Add(kda.dense_b);
+    kda_local_conv_w_ = uploader.Add(kda.local_conv_w);
+    kda_local_conv_b_ = uploader.Add(kda.local_conv_b);
+
+    kda_key_dim_ = kda.key_dim;
+    kda_value_dim_ = kda.value_dim;
+    kda_gate_rank_ = kda.gate_rank;
+    kda_rms_norm_epsilon_ = kda.rms_norm_epsilon;
+    kda_output_gate_ = kda.output_gate;
+    kda_output_rms_norm_ = kda.output_rms_norm;
+    kda_local_conv_ = kda.local_conv;
+    kda_qkv_silu_ = kda.qkv_silu;
+    kda_direction_count_ = std::min<int>(16, (int)kda_directions.size());
+    for (int i = 0; i < 16; ++i) {
+      kda_directions_[i] = i < kda_direction_count_
+                               ? kda_directions[i]
+                               : kda_directions_[std::max(0, i - 1)];
+    }
+    kda_recurrence_ = std::make_unique<KdaRecurrenceLayer>(ctx.device(), fp16);
+  } else {
+    // MHA head transpose (see mha_transpose.hlsl). Smolgen nets throw at
+    // Eval time: their strided smolgen GEMMs share the same driver
+    // limitation and are out of scope for now.
+    mha_transpose_ = std::make_unique<MhaTransposeLayer>(ctx.device(), fp16);
+  }
+}
+
+template <typename DataType>
+void EncoderBlock<DataType>::Eval(int N, DmlPtr in_out_tensor, DmlPtr scratch,
+                                  DmlPtr buffer1, DmlPtr buffer2,
+                                  DmlExecScope& scope) {
+  if (is_kda_) {
+    EvalKda(N, in_out_tensor, scratch, buffer1, buffer2, scope);
+  } else {
+    EvalMha(N, in_out_tensor, scratch, buffer1, buffer2, scope);
+  }
+}
+
+// MHA evaluation with dense [N*H,1]-batch attention (see mha_transpose.hlsl
+// for why the head interleave cannot stay a strided GEMM input on this
+// driver). Three DML graphs (qkv projections, attention, LN/FFN tail) with
+// two HLSL transposes between them:
+//
+//   in_out [T,H*D] --qkv--> scratch q/k/v --split--> buffer1 qt/kt/vt [B,64,D]
+//     --attn--> buffer1 ctx [B,64,D] --merge--> buffer1 merged [T,H*D]
+//     --tail--> in_out (with the block-input skip, like the SYCL block).
+//
+// B = N*H. S below = max_tokens*d_model*elem; buffer1 holds qt/kt/vt/ctx/
+// merged (5*S). Scratch holds q/k/v (3*d_model/token, already covered by the
+// scratch-size estimate's MHA branch).
+template <typename DataType>
+void EncoderBlock<DataType>::EvalMha(int N, DmlPtr in_out_tensor,
+                                     DmlPtr scratch, DmlPtr buffer1,
+                                     DmlPtr buffer2, DmlExecScope& scope) {
+  if (has_smolgen_) {
+    throw Exception(
+        "directml backend: smolgen in MHA encoder heads is not supported "
+        "(its strided GEMMs hit the same driver limitation as the old "
+        "head-split views; matches nothing the backend has been tested with).");
+  }
+  const uint32_t H = encoder_heads_;
+  const uint32_t d_model = mha_q_size_;
+  if (H == 0 || d_model == 0 || d_model % H != 0) {
+    throw Exception(
+        "directml backend: malformed MHA head geometry in this net.");
+  }
+  const uint32_t D = d_model / H;
+  const uint32_t tokens = N * 64;
+  const uint32_t B = (uint32_t)N * H;
+  const size_t elem = sizeof(DataType);
+  const float softmax_scale = 1.0f / std::sqrt(static_cast<float>(D));
+
+  const uint64_t max_tokens = (uint64_t)max_batch_size_ * 64;
+  const uint64_t S = max_tokens * d_model * elem;
+  DmlPtr q = scratch;
+  DmlPtr k = q + S;
+  DmlPtr v = k + S;
+  DmlPtr qt = buffer1;
+  DmlPtr kt = buffer1 + S;
+  DmlPtr vt = buffer1 + 2 * S;
+  DmlPtr ctxb = buffer1 + 3 * S;
+  DmlPtr merged = buffer1 + 4 * S;
+
+  // 1. QKV projections, dense [T, H*D] into scratch.
+  {
+    auto it = mha_qkv_compiled_.find(N);
+    if (it == mha_qkv_compiled_.end()) {
+      GraphFactory<DataType> g(scope.ctx());
+      auto x = g.Input({1, 1, tokens, d_model});
+      auto gemm_bias = [&](const DmlPtr& w, const DmlPtr& b, uint32_t out_c) {
+        auto we = g.Weight(w, {1, 1, out_c, (uint32_t)embedding_op_size_});
+        auto be = g.WeightChannel(b, tokens, out_c);
+        return dml::Gemm(x, we, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                         DML_MATRIX_TRANSFORM_TRANSPOSE) +
+               be;
+      };
+      dml::Expression qe =
+          gemm_bias(mha_q_w_, mha_q_b_, d_model);
+      dml::Expression ke =
+          gemm_bias(mha_k_w_, mha_k_b_, d_model);
+      dml::Expression ve =
+          gemm_bias(mha_v_w_, mha_v_b_, d_model);
+      it = mha_qkv_compiled_
+               .emplace(N, g.Compile({qe, ke, ve},
+                                     {(uint64_t)tokens * d_model * elem,
+                                      (uint64_t)tokens * d_model * elem,
+                                      (uint64_t)tokens * d_model * elem}))
+               .first;
+    }
+    DispatchOp<DataType>(scope, it->second, in_out_tensor, buffer1, buffer2,
+                         {q, k, v});
+  }
+
+  // 2. Head-split transpose (HLSL): [T,H*D] -> [B,64,D] dense each.
+  {
+    MhaTransposeLayer::Params params{};
+    params.batch_size = N;
+    params.heads = H;
+    params.head_dim = D;
+    params.mode = 0;
+    mha_transpose_->Record(scope.list(), params, q, qt);
+    mha_transpose_->Record(scope.list(), params, k, kt);
+    mha_transpose_->Record(scope.list(), params, v, vt);
+  }
+
+  // 3. Attention over dense [B,1,64,D]: scores, softmax, context.
+  {
+    auto it = mha_attn_compiled_.find(N);
+    if (it == mha_attn_compiled_.end()) {
+      GraphFactory<DataType> g(scope.ctx());
+      auto qt_in = g.Input({B, 1, 64, D});
+      auto kt_in = g.Input2({B, 1, 64, D});
+      auto vt_in = g.Scratch({B, 1, 64, D});
+      dml::Expression logits = dml::Gemm(
+          qt_in, kt_in, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+          DML_MATRIX_TRANSFORM_TRANSPOSE, softmax_scale);
+      const uint32_t softmax_axes[] = {3};
+      const dml::Span<const uint32_t> softmax_axis(softmax_axes, 1);
+      const auto sm_sizes = logits.Impl()->GetOutputDesc().sizes;
+      const std::vector<uint32_t> sm_bcast{0, 0, 0, 1};
+      dml::Expression max_b = GraphFactory<DataType>::ReinterpretView(
+          dml::Reduce(logits, DML_REDUCE_FUNCTION_MAX, softmax_axis), sm_sizes,
+          sm_bcast);
+      dml::Expression shifted = logits - max_b;
+      dml::Expression exp_shifted = dml::Exp(shifted);
+      dml::Expression sum_b = GraphFactory<DataType>::ReinterpretView(
+          dml::Reduce(exp_shifted, DML_REDUCE_FUNCTION_SUM, softmax_axis),
+          sm_sizes, sm_bcast);
+      dml::Expression attn = exp_shifted * dml::Recip(sum_b);
+      dml::Expression context =
+          dml::Gemm(attn, vt_in, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                    DML_MATRIX_TRANSFORM_NONE);
+      it = mha_attn_compiled_
+               .emplace(N, g.Compile({context},
+                                     {(uint64_t)B * 64 * D * elem}))
+               .first;
+    }
+    DispatchOp<DataType>(scope, it->second, qt, kt, vt, {ctxb});
+  }
+
+  // 4. Merge back to token-major [T, H*D].
+  {
+    MhaTransposeLayer::Params params{};
+    params.batch_size = N;
+    params.heads = H;
+    params.head_dim = D;
+    params.mode = 1;
+    mha_transpose_->Record(scope.list(), params, ctxb, merged);
+  }
+
+  // 5. Dense projection + LN1 + FFN + LN2 (all [1,1]-batch, as before).
+  {
+    auto it = mha_tail_compiled_.find(N);
+    if (it == mha_tail_compiled_.end()) {
+      GraphFactory<DataType> g(scope.ctx());
+      auto mg = g.Input({1, 1, tokens, d_model});
+      auto skip = g.Input2({1, 1, tokens, (uint32_t)embedding_op_size_});
+      auto dw = g.Weight(mha_dense_w_,
+                         {1, 1, (uint32_t)embedding_op_size_, d_model});
+      auto db = g.WeightChannel(mha_dense_b_, tokens,
+                                (uint32_t)embedding_op_size_);
+      CERR << "MHA tail inputs done";
+      dml::Expression dense =
+          dml::Gemm(mg, dw, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                    DML_MATRIX_TRANSFORM_TRANSPOSE);
+      CERR << "MHA tail dense done";
+      auto ln1g = g.WeightChannel(ln1_gammas_, tokens,
+                                  (uint32_t)embedding_op_size_);
+      auto ln1b = g.WeightChannel(ln1_betas_, tokens,
+                                  (uint32_t)embedding_op_size_);
+      dml::Expression bias_dense = db;
+      dml::Expression ln1 = LayerNormExpr<DataType>(
+          dense, &bias_dense, &skip, ln1g, ln1b, alpha_, default_eps_,
+          ACTIVATION_NONE);
+      // NOTE: biases here MUST be WeightChannel (strided matching-sizes),
+      // not dense size-1 [1,1,1,C]: this runtime rejects size-1 broadcast
+      // in elementwise Add (E_INVALIDARG at CreateOperator). The original
+      // MHA code used dense size-1 f1b/f2b and could never compile.
+      auto f1w = g.Weight(ffn_dense1_w_,
+                          {1, 1, (uint32_t)ffn_dense1_size_,
+                           (uint32_t)embedding_op_size_});
+      auto f1b = g.WeightChannel(ffn_dense1_b_, tokens,
+                                 (uint32_t)ffn_dense1_size_);
+      dml::Expression ffn1 =
+          dml::Gemm(ln1, f1w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                    DML_MATRIX_TRANSFORM_TRANSPOSE) +
+          f1b;
+      ffn1 = ActivationExpr<DataType>(ffn_activation_, ffn1);
+      CERR << "MHA tail ffn1 done";
+      auto f2w = g.Weight(ffn_dense2_w_,
+                          {1, 1, (uint32_t)embedding_op_size_,
+                           (uint32_t)ffn_dense1_size_});
+      auto f2b = g.WeightChannel(ffn_dense2_b_, tokens,
+                                 (uint32_t)embedding_op_size_);
+      dml::Expression ffn2 =
+          dml::Gemm(ffn1, f2w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                    DML_MATRIX_TRANSFORM_TRANSPOSE);
+      CERR << "MHA tail ffn2 done";
+      auto ln2g = g.WeightChannel(ln2_gammas_, tokens,
+                                  (uint32_t)embedding_op_size_);
+      auto ln2b = g.WeightChannel(ln2_betas_, tokens,
+                                  (uint32_t)embedding_op_size_);
+      dml::Expression bias_ffn2 = f2b;
+      dml::Expression ln2 = LayerNormExpr<DataType>(
+          ffn2, &bias_ffn2, &ln1, ln2g, ln2b, alpha_, default_eps_,
+          ACTIVATION_NONE);
+      it = mha_tail_compiled_
+               .emplace(N, g.Compile({ln2}, {(uint64_t)tokens *
+                                             embedding_op_size_ * elem}))
+               .first;
+      CERR << "MHABUILD tail compiled";
+    }
+    DispatchOp<DataType>(scope, it->second, merged, in_out_tensor, buffer2,
+                         {in_out_tensor});
+  }
+}
+
+template <typename DataType>
+void EncoderBlock<DataType>::EvalKda(int N, DmlPtr in_out_tensor,
+                                     DmlPtr scratch, DmlPtr buffer1,
+                                     DmlPtr buffer2, DmlExecScope& scope) {
+  constexpr float kKdaLogDecayFloor = -10.0f;
+  const uint32_t tokens = N * 64;
+  const uint32_t max_tokens = max_batch_size_ * 64;
+  const uint32_t KD = encoder_heads_ * kda_key_dim_;
+  const uint32_t VD = encoder_heads_ * kda_value_dim_;
+  const uint32_t gr = kda_gate_rank_;
+  const uint32_t emb = embedding_op_size_;
+  const size_t elem = sizeof(DataType);
+
+  // Scratch layout mirrors sycl EvalKda's, in bytes.
+  DmlPtr q = scratch;
+  DmlPtr k = q + max_tokens * KD * elem;
+  DmlPtr v = k + max_tokens * KD * elem;
+  DmlPtr gate_hidden = scratch + max_tokens * (2 * KD + VD) * elem;
+  DmlPtr proj_input = scratch + max_tokens * (2 * KD + VD + gr) * elem;
+  DmlPtr raw_decay = buffer2;
+  DmlPtr gate = buffer2 + max_tokens * KD * elem;
+  DmlPtr beta = buffer1 + max_tokens * VD * elem;
+  DmlPtr mixed = buffer1;
+
+  DmlPtr proj_in = in_out_tensor;
+  if (kda_local_conv_) {
+    proj_in = proj_input;
+    // TODO(directml): depthwise 3x3 conv via a grouped DML convolution over
+    // a strided NCHW view; every net this backend has been exercised with
+    // has local_conv=false, so this errors clearly rather than guessing.
+    throw Exception(
+        "directml backend: kda local_conv is not implemented yet");
+  }
+
+  {
+    auto it = kda_proj_compiled_.find(N);
+    if (it == kda_proj_compiled_.end()) {
+      GraphFactory<DataType> g(scope.ctx());
+      auto x = g.Input({1, 1, tokens, emb});
+      auto gemm_bias =
+          [&](const DmlPtr& w, const DmlPtr& b, uint32_t out_c,
+              ActivationFunction act) {
+            auto we = g.Weight(w, {1, 1, out_c, emb});
+            auto be = g.WeightChannel(b, tokens, out_c);
+            dml::Expression y =
+                dml::Gemm(x, we, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                          DML_MATRIX_TRANSFORM_TRANSPOSE) + be;
+            return ActivationExpr<DataType>(act, y);
+          };
+      ActivationFunction silu_or_none =
+          kda_qkv_silu_ ? ACTIVATION_SWISH : ACTIVATION_NONE;
+      dml::Expression qe = gemm_bias(kda_q_w_, kda_q_b_, KD, silu_or_none);
+      dml::Expression ke = gemm_bias(kda_k_w_, kda_k_b_, KD, silu_or_none);
+      dml::Expression ve = gemm_bias(kda_v_w_, kda_v_b_, VD, silu_or_none);
+      dml::Expression decay_hidden =
+          gemm_bias(kda_decay_a_w_, kda_decay_a_b_, gr, ACTIVATION_NONE);
+      dml::Expression raw_decay_e = [&] {
+        auto w = g.Weight(kda_decay_b_w_, {1, 1, KD, gr});
+        auto b = g.WeightChannel(kda_decay_b_b_, tokens, KD);
+        return dml::Gemm(decay_hidden, w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                         DML_MATRIX_TRANSFORM_TRANSPOSE) + b;
+      }();
+      std::vector<dml::Expression> outs{qe, ke, ve, raw_decay_e};
+      std::vector<uint64_t> out_bytes{
+          (uint64_t)tokens * KD * elem, (uint64_t)tokens * KD * elem,
+          (uint64_t)tokens * VD * elem, (uint64_t)tokens * KD * elem};
+      if (kda_output_gate_) {
+        dml::Expression gate_hidden_e =
+            gemm_bias(kda_gate_a_w_, kda_gate_a_b_, gr, ACTIVATION_NONE);
+        dml::Expression gate_e = [&] {
+          auto w = g.Weight(kda_gate_b_w_, {1, 1, VD, gr});
+          auto b = g.WeightChannel(kda_gate_b_b_, tokens, VD);
+          return dml::Gemm(gate_hidden_e, w, dml::NullOpt,
+                           DML_MATRIX_TRANSFORM_NONE,
+                           DML_MATRIX_TRANSFORM_TRANSPOSE) + b;
+        }();
+        outs.push_back(gate_e);
+        out_bytes.push_back((uint64_t)tokens * VD * elem);
+      }
+      dml::Expression beta_e =
+          gemm_bias(kda_beta_w_, kda_beta_b_, encoder_heads_,
+                    ACTIVATION_NONE);
+      outs.push_back(beta_e);
+      out_bytes.push_back((uint64_t)tokens * encoder_heads_ * elem);
+      it = kda_proj_compiled_.emplace(N, g.Compile(outs, out_bytes)).first;
+    }
+    // The proj graph's outputs land in scratch regions; the recurrence
+    // consumes them next. Output buffers: q, k, v, raw_decay, [gate], beta.
+    std::vector<DmlPtr> outs{q, k, v, raw_decay};
+    if (kda_output_gate_) outs.push_back(gate);
+    outs.push_back(beta);
+    DispatchOp<DataType>(scope, it->second, proj_in, buffer1, buffer2, outs);
+  }
+
+  {
+    KdaRecurrenceLayer::Params params{};
+    params.batch_size = N;
+    params.heads = encoder_heads_;
+    params.key_dim = kda_key_dim_;
+    params.value_dim = kda_value_dim_;
+    params.direction_count = kda_direction_count_;
+    params.directions = kda_directions_;
+    params.use_fused_qkv = false;
+    params.qkv_stride = 2 * KD + VD;
+    params.log_decay_floor = kKdaLogDecayFloor;
+    params.fp16 = fp16_;
+    kda_recurrence_->Record(scope.list(), params, DmlPtr(), q, k, v,
+                            raw_decay, kda_dt_bias_, kda_a_log_, beta, mixed);
+  }
+
+  {
+    auto it = kda_tail_compiled_.find(N);
+    if (it == kda_tail_compiled_.end()) {
+      GraphFactory<DataType> g(scope.ctx());
+      auto mixed_in = g.Input({1, 1, tokens, VD});
+      dml::Expression normed = mixed_in;
+      if (kda_output_rms_norm_) {
+        auto gammas = g.WeightChannel(kda_out_norm_gammas_, tokens, VD);
+        normed = RmsNormExpr<DataType>(normed, gammas, kda_rms_norm_epsilon_);
+      }
+      if (kda_output_gate_) {
+        // Gate applies after the RMS norm on purpose (they do not commute).
+        auto gate_in = g.Input2({1, 1, tokens, VD});
+        normed = normed * dml::ActivationSigmoid(gate_in);
+      }
+      auto dw = g.Weight(kda_dense_w_, {1, 1, emb, VD});
+      dml::Expression dense =
+          dml::Gemm(normed, dw, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                    DML_MATRIX_TRANSFORM_TRANSPOSE);
+      auto db = g.WeightChannel(kda_dense_b_, tokens, emb);
+      auto ln1g = g.WeightChannel(ln1_gammas_, tokens, emb);
+      auto ln1b = g.WeightChannel(ln1_betas_, tokens, emb);
+      auto x = g.Scratch({1, 1, tokens, emb});  // original input (skip)
+      dml::Expression bias_dense = db;
+      dml::Expression ln1 = LayerNormExpr<DataType>(dense, &bias_dense, &x, ln1g, ln1b, alpha_, default_eps_,
+          ACTIVATION_NONE);
+      auto f1w = g.Weight(ffn_dense1_w_, {1, 1, (uint32_t)ffn_dense1_size_, emb});
+      auto f1b = g.WeightChannel(ffn_dense1_b_, tokens, (uint32_t)ffn_dense1_size_);
+      dml::Expression ffn1 =
+          dml::Gemm(ln1, f1w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                    DML_MATRIX_TRANSFORM_TRANSPOSE) + f1b;
+      ffn1 = ActivationExpr<DataType>(ffn_activation_, ffn1);
+      auto f2w = g.Weight(ffn_dense2_w_, {1, 1, emb, (uint32_t)ffn_dense1_size_});
+      auto f2b = g.WeightChannel(ffn_dense2_b_, tokens, emb);
+      dml::Expression ffn2 =
+          dml::Gemm(ffn1, f2w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                    DML_MATRIX_TRANSFORM_TRANSPOSE);
+      auto ln2g = g.WeightChannel(ln2_gammas_, tokens, emb);
+      auto ln2b = g.WeightChannel(ln2_betas_, tokens, emb);
+      dml::Expression bias_ffn2 = f2b;
+      dml::Expression ln2 = LayerNormExpr<DataType>(ffn2, &bias_ffn2, &ln1, ln2g, ln2b, alpha_, default_eps_,
+          ACTIVATION_NONE);
+      it = kda_tail_compiled_.emplace(
+               N, g.Compile({ln2}, {(uint64_t)tokens * emb * sizeof(DataType)}))
+               .first;
+    }
+    DispatchOp<DataType>(scope, it->second, mixed, gate, in_out_tensor,
+                         {in_out_tensor});
+  }
+}
+
+// ===========================================================================
+// AttentionPolicyHead
+// ===========================================================================
+
+template <typename DataType>
+AttentionPolicyHead<DataType>::AttentionPolicyHead(
+    BaseLayer<DataType>* ip, const MultiHeadWeights::PolicyHead& weights,
+    DmlWeightUploader& uploader, bool attention_body, ActivationFunction act,
+    int max_batch_size, DmlDeviceContext& ctx, bool fp16,
+    const std::vector<int>& kda_directions)
+    : BaseLayer<DataType>(64 * 64 + 8 * 24, 1, 1, ip),
+      embedding_op_size_(static_cast<int>(weights.ip_pol_b.size())),
+      policy_d_model_(static_cast<int>(weights.ip2_pol_b.size())),
+      attention_body_(attention_body),
+      // Old networks without attention body (e.g. T79) use hardcoded SELU
+      // activations -- same as the SYCL head.
+      act_(attention_body ? act : ACTIVATION_SELU) {
+  ip_pol_w_ = uploader.Add(weights.ip_pol_w);
+  ip_pol_b_ = uploader.Add(weights.ip_pol_b);
+  ip2_pol_w_ = uploader.Add(weights.ip2_pol_w);
+  ip2_pol_b_ = uploader.Add(weights.ip2_pol_b);
+  ip3_pol_w_ = uploader.Add(weights.ip3_pol_w);
+  ip3_pol_b_ = uploader.Add(weights.ip3_pol_b);
+  ip4_pol_w_ = uploader.Add(weights.ip4_pol_w);
+  encoder_heads_ = weights.pol_encoder_head_count;
+
+  ComPtr<ID3DBlob> shader =
+      CompileHlsl(kPolicyFinalizeShaderSource,
+                  sizeof(kPolicyFinalizeShaderSource) - 1,
+                  "policy_finalize.hlsl", "PolicyFinalize", fp16);
+  finalize_root_signature_ = CreateShaderRootSignature(
+      ctx.device(), sizeof(PolicyFinalizeConstants) / 4, 3, 1);
+  finalize_pso_ = CreateComputePso(ctx.device(), finalize_root_signature_.Get(),
+                                   shader.Get());
+
+  // Alpha 1.0 and eps 1e-6 for the policy encoders, matching the SYCL head
+  // (which notes they may change); smolgen is not implemented in policy
+  // encoder heads there either.
+  for (const auto& enc : weights.pol_encoder) {
+    if (enc.mha.has_smolgen) {
+      throw Exception(
+          "directml backend: smolgen in policy-encoder heads is not "
+          "supported (matches the SYCL backend).");
+    }
+    encoder_weights_.emplace_back(new EncoderBlock<DataType>(
+        enc, uploader, encoder_heads_, embedding_op_size_, 1.0f, DmlPtr(), 0,
+        max_batch_size, ACTIVATION_SWISH, act_, 1e-6f, kda_directions, ctx,
+        fp16));
+  }
+}
+
+template <typename DataType>
+void AttentionPolicyHead<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
+                                         DmlPtr input2, DmlPtr scratch,
+                                         size_t scratch_size,
+                                         DmlExecScope& scope) {
+  ID3D12GraphicsCommandList* list = scope.list();
+  const uint32_t tokens = N * 64;
+  const size_t elem = sizeof(DataType);
+  DmlPtr buffer1 = output + AlignUp(scratch_size / 2);
+  DmlPtr buffer2 = input2 + AlignUp(scratch_size / 2);
+
+  DmlPtr embedding = input2;  // policy embedding + encoders run here
+  {
+    auto it = compiled_.find(N);
+    if (it == compiled_.end()) {
+      GraphFactory<DataType> g(scope.ctx());
+      const int input_c = this->input_->GetC();
+      auto x = g.Input({1, 1, tokens, (uint32_t)input_c});
+      auto w = g.Weight(ip_pol_w_,
+                        {1, 1, (uint32_t)embedding_op_size_, (uint32_t)input_c});
+      auto b = g.WeightChannel(ip_pol_b_, tokens, (uint32_t)embedding_op_size_);
+      dml::Expression y =
+          dml::Gemm(x, w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                    DML_MATRIX_TRANSFORM_TRANSPOSE) + b;
+      y = ActivationExpr<DataType>(act_, y);
+      it = compiled_.emplace(
+               N, g.Compile({y}, {(uint64_t)tokens * embedding_op_size_ * elem}))
+               .first;
+    }
+    DispatchOp<DataType>(scope, it->second, input, buffer2, buffer2,
+                         {embedding});
+  }
+
+  for (const auto& enc : encoder_weights_) {
+    enc->Eval(N, embedding, scratch, buffer1, buffer2, scope);
+  }
+
+  DmlPtr wq = scratch;
+  DmlPtr wk = scratch + (uint64_t)tokens * policy_d_model_ * elem;
+  DmlPtr scores = scratch + 2 * (uint64_t)tokens * policy_d_model_ * elem;
+
+  {
+    auto it = compiled_.find(-N - 1);  // separate slot for the wqk/scores graph
+    if (it == compiled_.end()) {
+      GraphFactory<DataType> g(scope.ctx());
+      auto x = g.Input({1, 1, tokens, (uint32_t)embedding_op_size_});
+      auto wqe =
+          g.Weight(ip2_pol_w_, {1, 1, (uint32_t)policy_d_model_,
+                                (uint32_t)embedding_op_size_});
+      auto qbe = g.WeightChannel(ip2_pol_b_, tokens, (uint32_t)policy_d_model_);
+      auto wke =
+          g.Weight(ip3_pol_w_, {1, 1, (uint32_t)policy_d_model_,
+                                (uint32_t)embedding_op_size_});
+      auto kbe = g.WeightChannel(ip3_pol_b_, tokens, (uint32_t)policy_d_model_);
+      dml::Expression wq_e =
+          dml::Gemm(x, wqe, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                    DML_MATRIX_TRANSFORM_TRANSPOSE) + qbe;
+      dml::Expression wk_e =
+          dml::Gemm(x, wke, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                    DML_MATRIX_TRANSFORM_TRANSPOSE) + kbe;
+      // scores[n] = wq[n] @ wk[n]^T / sqrt(d), i.e. scores[i,j] =
+      // Q_i.K_j, matching the CUDA backend (tf.matmul(queries, keys,
+      // transpose_b=True)) and the BLAS backend (whose Eigen col-major
+      // maps land the same Q_i.K_j in row-major (i,j); dot products
+      // commute, so K_j.Q_i there is the same value). Batch over N with
+      // strided views of the dense [T, d] buffers ([N,1,64,d] per batch).
+      dml::Expression logits = dml::Gemm(
+          GraphFactory<DataType>::ReinterpretView(wq_e, {(uint32_t)N, 1, 64,
+                                  (uint32_t)policy_d_model_},
+                           {64u * policy_d_model_, policy_d_model_, policy_d_model_, 1u}),
+          GraphFactory<DataType>::ReinterpretView(wk_e, {(uint32_t)N, 1, 64,
+                                  (uint32_t)policy_d_model_},
+                           {64u * policy_d_model_, policy_d_model_, policy_d_model_, 1u}),
+          dml::NullOpt, DML_MATRIX_TRANSFORM_NONE, DML_MATRIX_TRANSFORM_TRANSPOSE,
+          1.0f / std::sqrt((float)policy_d_model_));
+      it = compiled_.emplace(
+          -N - 1,
+          g.Compile({wq_e, wk_e, logits},
+                    {(uint64_t)tokens * policy_d_model_ * elem,
+                     (uint64_t)tokens * policy_d_model_ * elem,
+                     (uint64_t)N * 4096 * elem}))
+          .first;
+    }
+    DispatchOp<DataType>(scope, it->second, embedding, buffer1, buffer2,
+                         {wq, wk, scores});
+  }
+
+  {
+    PolicyFinalizeConstants constants{};
+    constants.key_width = policy_d_model_;
+    list->SetComputeRootSignature(finalize_root_signature_.Get());
+    list->SetPipelineState(finalize_pso_.Get());
+    list->SetComputeRoot32BitConstants(0, sizeof(PolicyFinalizeConstants) / 4,
+                                       &constants, 0);
+    list->SetComputeRootShaderResourceView(1, scores.GpuVA());
+    list->SetComputeRootShaderResourceView(2, wk.GpuVA());
+    list->SetComputeRootShaderResourceView(3, ip4_pol_w_.GpuVA());
+    list->SetComputeRootUnorderedAccessView(4, output.GpuVA());
+    list->Dispatch(N, 1, 1);
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    list->ResourceBarrier(1, &barrier);
+  }
+}
+
+// ===========================================================================
+// ValueHead
+// ===========================================================================
+
+template <typename DataType>
+ValueHead<DataType>::ValueHead(BaseLayer<DataType>* ip,
+                               const MultiHeadWeights::ValueHead& weights,
+                               DmlWeightUploader& uploader, bool wdl,
+                               ActivationFunction act)
+    : BaseLayer<DataType>(wdl ? 3 : 1, 1, 1, ip),
+      value_hidden_size_(static_cast<int>(weights.ip1_val_b.size())),
+      wdl_(wdl),
+      act_(act) {
+  embedding_size_ = static_cast<int>(weights.ip_val_b.size());
+  ip_val_w_ = uploader.Add(weights.ip_val_w);
+  ip_val_b_ = uploader.Add(weights.ip_val_b);
+  ip1_val_w_ = uploader.Add(weights.ip1_val_w);
+  ip1_val_b_ = uploader.Add(weights.ip1_val_b);
+  ip2_val_w_ = uploader.Add(weights.ip2_val_w);
+  ip2_val_b_ = uploader.Add(weights.ip2_val_b);
+}
+
+template <typename DataType>
+void ValueHead<DataType>::Eval(int N, DmlPtr output, DmlPtr input, DmlPtr input2,
+                               DmlPtr scratch, size_t scratch_size,
+                               DmlExecScope& scope) {
+  const uint32_t tokens = N * 64;
+  const size_t elem = sizeof(DataType);
+  auto it = compiled_.find(N);
+  if (it == compiled_.end()) {
+    GraphFactory<DataType> g(scope.ctx());
+    auto x = g.Input({1, 1, tokens, (uint32_t)this->input_->GetC()});
+    auto w0 = g.Weight(ip_val_w_,
+                       {1, 1, (uint32_t)embedding_size_,
+                        (uint32_t)this->input_->GetC()});
+    auto b0 = g.WeightChannel(ip_val_b_, tokens, (uint32_t)embedding_size_);
+    dml::Expression emb =
+        dml::Gemm(x, w0, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                  DML_MATRIX_TRANSFORM_TRANSPOSE) + b0;
+    emb = ActivationExpr<DataType>(act_, emb);
+    // Flatten [N, embedding*64] for the hidden gemm.
+    dml::Expression flat =
+        GraphFactory<DataType>::ReinterpretView(emb, {1, 1, (uint32_t)N,
+                               (uint32_t)(64 * embedding_size_)});
+    auto w1 = g.Weight(ip1_val_w_,
+                       {1, 1, (uint32_t)value_hidden_size_,
+                        (uint32_t)(64 * embedding_size_)});
+    auto b1 = g.WeightChannel(ip1_val_b_, (uint32_t)N, (uint32_t)value_hidden_size_);
+    dml::Expression hidden =
+        dml::Gemm(flat, w1, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                  DML_MATRIX_TRANSFORM_TRANSPOSE) + b1;
+    hidden = ActivationExpr<DataType>(act_, hidden);
+    auto w2 = g.Weight(ip2_val_w_,
+                       {1, 1, wdl_ ? 3u : 1u, (uint32_t)value_hidden_size_});
+    auto b2 = g.WeightChannel(ip2_val_b_, (uint32_t)N, wdl_ ? 3u : 1u);
+    dml::Expression y =
+        dml::Gemm(hidden, w2, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                  DML_MATRIX_TRANSFORM_TRANSPOSE) + b2;
+    if (!wdl_) y = dml::ActivationTanh(y);
+    it = compiled_.emplace(
+        N, g.Compile({y}, {(uint64_t)N * (wdl_ ? 3 : 1) * elem})).first;
+  }
+  DispatchOp<DataType>(scope, it->second, input, input2, scratch, {output});
+}
+
+// ===========================================================================
+// Explicit template instantiations (cuda/layers.cc convention).
+// ===========================================================================
+template class FCLayer<float>;
+template class FCLayer<DmlHalf>;
+template class EmbeddingLayer<float>;
+template class EmbeddingLayer<DmlHalf>;
+template class PolicyMapLayer<float>;
+template class PolicyMapLayer<DmlHalf>;
+template class AttentionBody<float>;
+template class AttentionBody<DmlHalf>;
+template class EncoderBlock<float>;
+template class EncoderBlock<DmlHalf>;
+template class AttentionPolicyHead<float>;
+template class AttentionPolicyHead<DmlHalf>;
+template class ValueHead<float>;
+template class ValueHead<DmlHalf>;
 
 }  // namespace directml_backend
 }  // namespace lczero
