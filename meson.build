@@ -642,6 +642,32 @@ if get_option('build_backends')
   endif
 
   ## ~~~~~~~~~~
+  ## DirectML
+  ## ~~~~~~~~~~
+  # Native DirectMLX operator graph, hand-built the same way the SYCL backend
+  # hand-writes kernels: network_directml.cc only orchestrates, layers.cc
+  # holds one Build() per layer type mirroring sycl/layers.h's Eval() split,
+  # and inputs_outputs.h owns the D3D12 upload/default/readback buffers the
+  # same way sycl/inputs_outputs.h owns its USM allocations.
+  if host_machine.system() == 'windows' and get_option('directml')
+    dml_d3d12_lib = cc.find_library('d3d12', required: false)
+    dml_dxgi_lib = cc.find_library('dxgi', required: false)
+    dml_lib = cc.find_library('directml', required: false)
+    if dml_d3d12_lib.found() and dml_dxgi_lib.found() and dml_lib.found()
+      deps += [dml_d3d12_lib, dml_dxgi_lib, dml_lib]
+      includes += include_directories('third_party/directml')
+      files += [
+        'src/neural/backends/directml/network_directml.cc',
+        'src/neural/backends/directml/layers.cc',
+      ]
+      has_backends = true
+    else
+      warning('directml requested but d3d12/dxgi/DirectML.lib were not all found; ' +
+              'needs the Windows 10/11 SDK (DirectML.h/.lib ship in it since 10.0.18362).')
+    endif
+  endif
+
+  ## ~~~~~~~~~~
   ## ONNX
   ## ~~~~~~~~~~
   onnxruntime = cc.find_library('onnxruntime', dirs: get_option('onnx_libdir'),
