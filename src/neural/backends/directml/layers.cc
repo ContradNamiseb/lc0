@@ -32,6 +32,7 @@
 #include <numeric>
 
 #include "neural/backends/directml/attention_preprocess_shader_source.h"
+#include "neural/backends/directml/kda_local_conv_shader_source.h"
 #include "neural/backends/directml/kda_recurrence_shader_source.h"
 #include "neural/backends/directml/mha_transpose_shader_source.h"
 #include "neural/backends/directml/policy_finalize_shader_source.h"
@@ -809,6 +810,48 @@ void SmolgenBiasLayer::Record(ID3D12GraphicsCommandList* command_list,
   command_list->ResourceBarrier(1, &barrier);
 }
 
+struct KdaLocalConvConstants {
+  uint32_t tokens;
+  uint32_t emb;
+  uint32_t pad0;
+  uint32_t pad1;
+};
+
+KdaLocalConvLayer::KdaLocalConvLayer(ID3D12Device* device, bool fp16)
+    : device_(device), fp16_(fp16) {
+  ComPtr<ID3DBlob> shader =
+      CompileHlsl(kKdaLocalConvShaderSource,
+                  sizeof(kKdaLocalConvShaderSource) - 1, "kda_local_conv.hlsl",
+                  "KdaLocalConv", fp16_);
+  root_signature_ = CreateShaderRootSignature(
+      device_.Get(), sizeof(KdaLocalConvConstants) / 4, 3, 1);
+  pso_ = CreateComputePso(device_.Get(), root_signature_.Get(), shader.Get());
+}
+
+void KdaLocalConvLayer::Record(ID3D12GraphicsCommandList* command_list,
+                               const Params& params, DmlPtr input,
+                               DmlPtr weights, DmlPtr bias, DmlPtr output) {
+  KdaLocalConvConstants constants{};
+  constants.tokens = params.tokens;
+  constants.emb = params.emb;
+
+  command_list->SetComputeRootSignature(root_signature_.Get());
+  command_list->SetPipelineState(pso_.Get());
+  command_list->SetComputeRoot32BitConstants(0,
+                                             sizeof(KdaLocalConvConstants) / 4,
+                                             &constants, 0);
+  command_list->SetComputeRootShaderResourceView(1, input.GpuVA());
+  command_list->SetComputeRootShaderResourceView(2, weights.GpuVA());
+  command_list->SetComputeRootShaderResourceView(3, bias.GpuVA());
+  command_list->SetComputeRootUnorderedAccessView(4, output.GpuVA());
+  const uint64_t total = (uint64_t)params.tokens * params.emb;
+  command_list->Dispatch(static_cast<UINT>((total + 63) / 64), 1, 1);
+
+  D3D12_RESOURCE_BARRIER barrier = {};
+  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+  command_list->ResourceBarrier(1, &barrier);
+}
+
 // ===========================================================================
 // FCLayer / EmbeddingLayer / PolicyMapLayer
 // ===========================================================================
@@ -1404,6 +1447,10 @@ EncoderBlock<DataType>::EncoderBlock(
                                : kda_directions_[std::max(0, i - 1)];
     }
     kda_recurrence_ = std::make_unique<KdaRecurrenceLayer>(ctx.device(), fp16);
+    if (kda_local_conv_) {
+      kda_local_conv_layer_ =
+          std::make_unique<KdaLocalConvLayer>(ctx.device(), fp16);
+    }
   } else {
     // MHA head transpose (see mha_transpose.hlsl).
     mha_transpose_ = std::make_unique<MhaTransposeLayer>(ctx.device(), fp16);
@@ -1944,22 +1991,26 @@ void EncoderBlock<DataType>::EvalKda(int N, DmlPtr in_out_tensor,
   DmlPtr v = k + max_tokens * KD * elem;
   DmlPtr gate_hidden = scratch + max_tokens * (2 * KD + VD) * elem;
   DmlPtr proj_input = scratch + max_tokens * (2 * KD + VD + gr) * elem;
+  DmlPtr proj_in = in_out_tensor;
   DmlPtr raw_decay = buffer2;
   DmlPtr gate = buffer2 + max_tokens * KD * elem;
   DmlPtr beta = buffer1 + max_tokens * VD * elem;
   DmlPtr mixed = buffer1;
 
-  DmlPtr proj_in = in_out_tensor;
-  if (kda_local_conv_) {
-    proj_in = proj_input;
-    // TODO(directml): depthwise 3x3 conv via a grouped DML convolution over
-    // a strided NCHW view; every net this backend has been exercised with
-    // has local_conv=false, so this errors clearly rather than guessing.
-    throw Exception(
-        "directml backend: kda local_conv is not implemented yet");
-  }
 
   {
+    if (kda_local_conv_) {
+      // 3x3 depthwise board conv + residual as an HLSL kernel (see
+      // shaders/kda_local_conv.hlsl); the projection graph consumes
+      // proj_input.
+      KdaLocalConvLayer::Params params{};
+      params.tokens = tokens;
+      params.emb = emb;
+      kda_local_conv_layer_->Record(scope.list(), params, in_out_tensor,
+                              kda_local_conv_w_, kda_local_conv_b_,
+                              proj_input);
+      proj_in = proj_input;
+    }
     auto it = kda_proj_compiled_.find(N);
     if (it == kda_proj_compiled_.end()) {
       GraphFactory<DataType> g(scope.ctx());

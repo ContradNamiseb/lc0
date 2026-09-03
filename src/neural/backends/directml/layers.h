@@ -385,6 +385,7 @@ class EncoderBlock {
   // MHA blocks; see mha_transpose.hlsl for why a shader is needed).
   std::unique_ptr<class MhaTransposeLayer> mha_transpose_;
   std::unique_ptr<class SmolgenBiasLayer> smolgen_bias_;
+  std::unique_ptr<class KdaLocalConvLayer> kda_local_conv_layer_;
 };
 
 // Attention policy head: ip_pol embedding, optional encoder stack, wq/wk
@@ -462,6 +463,28 @@ class MhaTransposeLayer {
 
   void Record(ID3D12GraphicsCommandList* command_list, const Params& params,
               DmlPtr input, DmlPtr output);
+
+ private:
+  ComPtr<ID3D12Device> device_;
+  ComPtr<ID3D12RootSignature> root_signature_;
+  ComPtr<ID3D12PipelineState> pso_;
+  bool fp16_;
+};
+
+// KDA local 3x3 depthwise board conv + residual
+// (shaders/kda_local_conv.hlsl) -- see SmolgenBiasLayer for the
+// build-once/record-only contract.
+class KdaLocalConvLayer {
+ public:
+  struct Params {
+    uint32_t tokens;  // N * 64
+    uint32_t emb;     // embedding width
+  };
+
+  KdaLocalConvLayer(ID3D12Device* device, bool fp16);
+
+  void Record(ID3D12GraphicsCommandList* command_list, const Params& params,
+              DmlPtr input, DmlPtr weights, DmlPtr bias, DmlPtr output);
 
  private:
   ComPtr<ID3D12Device> device_;

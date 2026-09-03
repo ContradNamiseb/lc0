@@ -129,9 +129,11 @@ void DmlDeviceContext::Init(const OptionsDict& options) {
   fence_event_ = CreateEvent(nullptr, FALSE, FALSE, nullptr);
   if (!fence_event_) throw Exception("Failed to create fence event");
 
-  // 8192 slots x 64 per binding table = 128 concurrent dispatch bindings,
-  // far beyond any batch this backend records.
-  descriptors_.Create(device_.Get(), 8192);
+  // Descriptor slots are permanently reserved per cached binding table
+  // (one per compiled operator, one per ladder batch size). A big net --
+  // 10 encoders, 6 graphs each, 8 ladder sizes, ~10 descriptors per table
+  // -- needs tens of thousands; 64K slots (~4-8MB heap) covers it.
+  descriptors_.Create(device_.Get(), 65536);
 
   // One-shot command list for weight upload at load.
   ReportD3DErrors(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
