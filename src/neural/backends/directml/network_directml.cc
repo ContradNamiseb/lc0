@@ -50,6 +50,7 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <chrono>
 
 #include <span>
 #include <version>
@@ -386,7 +387,6 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
 
   FlushWeights(uploader);
 
-
   // Zero the activation arenas once at load, mirroring the SYCL backend's
   // memset of tensor_mem_[i]: padding rows and any region a graph doesn't
   // fully overwrite then read back as zeros instead of undefined memory.
@@ -437,6 +437,21 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
                     "Signal (clear)");
     ctx_.WaitForFence(ctx_.fence(), fence_value);
   }
+
+
+  // Pre-compile every layer for a ladder of batch sizes NOW, at load: this
+  // driver fails all DML operator creation with bogus errors once
+  // dispatches have been recorded (docs/directml-handoff.md section 3), so
+  // nothing may be compiled after the first batch runs. forwardEval rounds
+  // each batch UP to the ladder.
+  for (int b : {min_batch_size_, 8, 16, 32, 64, 128, 256, max_batch_size_}) {
+    if (b < min_batch_size_ || b > max_batch_size_) continue;
+    DmlExecScope pre(ctx_, ctx_.upload_list(), &transient_arena_);
+    for (auto& layer : network_) layer->EnsureCompiled(b, pre);
+  }
+
+
+
 
   // Pre-allocate one InputsOutputs (the first allocation is slow, like the
   // CUDA backend's note about first cudaMalloc).
@@ -521,6 +536,13 @@ template <typename DataType>
 void DirectMlNetwork<DataType>::forwardEval(
     InputsOutputs* io, int batch, const std::vector<InputPlanes>& planes) {
   batch = std::max(batch, min_batch_size_);
+  // Round UP to the pre-compiled ladder: only these sizes have graphs (see
+  // the pre-compile at load -- post-dispatch compilation fails on this
+  // driver). The layers are row/batch independent, so extra padding rows
+  // are harmless; buffers are sized for max_batch.
+  for (int b : {min_batch_size_, 8, 16, 32, 64, 128, 256, max_batch_size_}) {
+    if (b >= batch) { batch = std::clamp(b, min_batch_size_, max_batch_size_); break; }
+  }
   std::lock_guard<std::mutex> guard(eval_lock_);
 
   // Expand packed planes to full NCHW float planes on the host -- the CUDA

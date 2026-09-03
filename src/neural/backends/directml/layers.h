@@ -372,6 +372,8 @@ class EncoderBlock {
   // with the recurrence shader in between.
   std::unordered_map<int, DmlCompiledOp> mha_qkv_compiled_;
   std::unordered_map<int, DmlCompiledOp> mha_mlp_compiled_;
+  std::unordered_map<int, DmlCompiledOp> mha_mlp2_compiled_;
+  std::unordered_map<int, DmlCompiledOp> mha_mlp3_compiled_;
   std::unordered_map<int, DmlCompiledOp> mha_attn_compiled_;
   std::unordered_map<int, DmlCompiledOp> mha_tail_compiled_;
   std::unordered_map<int, DmlCompiledOp> kda_proj_compiled_;

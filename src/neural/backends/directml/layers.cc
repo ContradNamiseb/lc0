@@ -1154,7 +1154,12 @@ void AttentionBody<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
     list->SetComputeRoot32BitConstants(0, sizeof(PreprocessConstants) / 4,
                                        &constants, 0);
     list->SetComputeRootShaderResourceView(1, in.GpuVA());
-    list->SetComputeRootShaderResourceView(2, encoding.GpuVA());
+    // Mode 2 never reads the encoding SRV; bind a valid address anyway (a
+    // null DmlPtr's GpuVA() would dereference null -- PE_DENSE nets have no
+    // positional-encoding table uploaded).
+    const DmlPtr encoding_slot =
+        encoding ? encoding : in;
+    list->SetComputeRootShaderResourceView(2, encoding_slot.GpuVA());
     list->SetComputeRootUnorderedAccessView(3, out.GpuVA());
     const UINT groups =
         mode == 2 ? static_cast<UINT>(N * 64) : static_cast<UINT>(N * 64);
@@ -1560,60 +1565,95 @@ void EncoderBlock<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
     auto kt_in = g.Input2({B, 1, 64, D});
     auto vt_in = g.Scratch({B, 1, 64, D});
     if (has_smolgen_) {
-      // Smolgen MLP: compress -> dense1 -> LN -> dense2 -> LN, all dense
-      // GEMMs over the block input; output d2 [N, H*gen] feeds the
-      // SmolgenBiasLayer kernel (the bias matmul itself runs as HLSL --
-      // the DML-graph form needs a 5-D broadcast GEMM operand this driver
-      // rejects).
+      // Smolgen MLP in three stage graphs with no mid-graph reshapes (this
+      // driver fails CompileGraph on reshape-carrying graphs): M1 compress
+      // GEMM; M2 dense1+LN (input reinterpreted [N*64,hid] -> [N,64*hid],
+      // legal because input descs are memory-only); M3 dense2+LN. The
+      // SmolgenBiasLayer kernel then makes the [N,H,64,64] bias.
       const uint32_t gen = smol_dense_2_size_ / H;
-      auto x_in = g.Extra({1, 1, tokens, d_model});
-      auto compress =
-          g.Weight(smol_compress_,
-                   {1, 1, (uint32_t)smol_compress_size_, d_model});
-      dml::Expression compressed =
-          dml::Gemm(x_in, compress, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+      {
+      GraphFactory<DataType> g1(scope.ctx());
+      auto x1 = g1.Extra({1, 1, tokens, d_model});
+      auto compress1 =
+          g1.Weight(smol_compress_,
+                    {1, 1, (uint32_t)smol_compress_size_, d_model});
+      dml::Expression comp1 =
+          dml::Gemm(x1, compress1, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
                     DML_MATRIX_TRANSFORM_TRANSPOSE);
-      compressed = GraphFactory<DataType>::ReinterpretView(
-          compressed, {1, 1, (uint32_t)N,
-                       (uint32_t)(64 * smol_compress_size_)});
-      auto d1w = g.Weight(smol_dense1_w_,
-                          {1, 1, (uint32_t)smol_dense_1_size_,
-                           (uint32_t)(64 * smol_compress_size_)});
-      auto d1b = g.WeightChannel(smol_dense1_b_, (uint32_t)N,
-                                 (uint32_t)smol_dense_1_size_);
-      auto sln1g = g.WeightChannel(smol_ln1_gammas_, (uint32_t)N,
-                                   (uint32_t)smol_dense_1_size_);
-      auto sln1b = g.WeightChannel(smol_ln1_betas_, (uint32_t)N,
-                                   (uint32_t)smol_dense_1_size_);
-      dml::Expression dense1 =
-          dml::Gemm(compressed, d1w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
-                    DML_MATRIX_TRANSFORM_TRANSPOSE);
-      dml::Expression bias1 = d1b;
-      dense1 = LayerNormExpr<DataType>(dense1, &bias1, nullptr, sln1g,
-                                       sln1b, 1.0f, 1e-3f,
-                                       smolgen_activation_);
-      auto d2w = g.Weight(smol_dense2_w_,
-                          {1, 1, (uint32_t)smol_dense_2_size_,
-                           (uint32_t)smol_dense_1_size_});
-      auto d2b = g.WeightChannel(smol_dense2_b_, (uint32_t)N,
-                                 (uint32_t)smol_dense_2_size_);
-      auto sln2g = g.WeightChannel(smol_ln2_gammas_, (uint32_t)N,
-                                   (uint32_t)smol_dense_2_size_);
-      auto sln2b = g.WeightChannel(smol_ln2_betas_, (uint32_t)N,
-                                   (uint32_t)smol_dense_2_size_);
-      dml::Expression dense2 =
-          dml::Gemm(dense1, d2w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
-                    DML_MATRIX_TRANSFORM_TRANSPOSE);
-      dml::Expression bias2 = d2b;
-      dense2 = LayerNormExpr<DataType>(dense2, &bias2, nullptr, sln2g,
-                                       sln2b, 1.0f, 1e-3f,
-                                       smolgen_activation_);
-      // Output dense2 as [1,1,N*H,gen] (memory-identical to [N, H*gen]),
-      // the flat layout the SmolgenBiasLayer kernel indexes.
-      dense2 = GraphFactory<DataType>::ReinterpretView(
-          dense2, {1, 1, (uint32_t)(N * H), gen});
       mha_mlp_compiled_.emplace(
-          N, g.Compile({dense2}, {(uint64_t)N * H * gen * sizeof(DataType)}));
+          N, g1.Compile({comp1},
+                        {(uint64_t)N * 64 * smol_compress_size_ *
+                         sizeof(DataType)}));
+      }
+      {
+      GraphFactory<DataType> g2(scope.ctx());
+      auto comp2 = g2.Input({1, 1, (uint32_t)N,
+                             (uint32_t)(64 * smol_compress_size_)});
+      auto d1w = g2.Weight(smol_dense1_w_,
+                           {1, 1, (uint32_t)smol_dense_1_size_,
+                            (uint32_t)(64 * smol_compress_size_)});
+      auto d1 = dml::Gemm(comp2, d1w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                          DML_MATRIX_TRANSFORM_TRANSPOSE);
+      auto d1b = g2.WeightChannel(smol_dense1_b_, (uint32_t)N,
+                                  (uint32_t)smol_dense_1_size_);
+      auto sln1g = g2.WeightChannel(smol_ln1_gammas_, (uint32_t)N,
+                                    (uint32_t)smol_dense_1_size_);
+      auto sln1b = g2.WeightChannel(smol_ln1_betas_, (uint32_t)N,
+                                    (uint32_t)smol_dense_1_size_);
+      auto dense1 = d1 + d1b;
+      const uint32_t ln_axes1[] = {3};
+      const dml::Span<const uint32_t> ln_axis1(ln_axes1, 1);
+      const auto sz1 = dense1.Impl()->GetOutputDesc().sizes;
+      auto mean1 = GraphFactory<DataType>::ReinterpretView(
+          dml::Reduce(dense1, DML_REDUCE_FUNCTION_AVERAGE, ln_axis1), sz1,
+          {0, 0, 1, 0});
+      auto centered1 = dense1 - mean1;
+      auto var1 = GraphFactory<DataType>::ReinterpretView(
+          dml::Reduce(centered1 * centered1, DML_REDUCE_FUNCTION_AVERAGE,
+                      ln_axis1),
+          sz1, {0, 0, 1, 0});
+      auto inv1 = GraphFactory<DataType>::ReinterpretView(
+          dml::Recip(dml::Sqrt(var1 + 1e-3f)), sz1, {0, 0, 1, 0});
+      auto out1 = centered1 * inv1 * sln1g + sln1b;
+      out1 = ActivationExpr<DataType>(smolgen_activation_, out1);
+      mha_mlp2_compiled_.emplace(
+          N, g2.Compile({out1},
+                        {(uint64_t)N * smol_dense_1_size_ * sizeof(DataType)}));
+      }
+      {
+      GraphFactory<DataType> g3(scope.ctx());
+      auto d1_in = g3.Input({1, 1, (uint32_t)N,
+                             (uint32_t)smol_dense_1_size_});
+      auto d2w = g3.Weight(smol_dense2_w_,
+                           {1, 1, (uint32_t)smol_dense_2_size_,
+                            (uint32_t)smol_dense_1_size_});
+      auto d2 = dml::Gemm(d1_in, d2w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                          DML_MATRIX_TRANSFORM_TRANSPOSE);
+      auto d2b = g3.WeightChannel(smol_dense2_b_, (uint32_t)N,
+                                  (uint32_t)smol_dense_2_size_);
+      auto sln2g = g3.WeightChannel(smol_ln2_gammas_, (uint32_t)N,
+                                    (uint32_t)smol_dense_2_size_);
+      auto sln2b = g3.WeightChannel(smol_ln2_betas_, (uint32_t)N,
+                                    (uint32_t)smol_dense_2_size_);
+      auto dense2 = d2 + d2b;
+      const uint32_t ln_axes2[] = {3};
+      const dml::Span<const uint32_t> ln_axis2(ln_axes2, 1);
+      const auto sz2 = dense2.Impl()->GetOutputDesc().sizes;
+      auto mean2 = GraphFactory<DataType>::ReinterpretView(
+          dml::Reduce(dense2, DML_REDUCE_FUNCTION_AVERAGE, ln_axis2), sz2,
+          {0, 0, 1, 0});
+      auto centered2 = dense2 - mean2;
+      auto var2 = GraphFactory<DataType>::ReinterpretView(
+          dml::Reduce(centered2 * centered2, DML_REDUCE_FUNCTION_AVERAGE,
+                      ln_axis2),
+          sz2, {0, 0, 1, 0});
+      auto inv2 = GraphFactory<DataType>::ReinterpretView(
+          dml::Recip(dml::Sqrt(var2 + 1e-3f)), sz2, {0, 0, 1, 0});
+      auto out2 = centered2 * inv2 * sln2g + sln2b;
+      mha_mlp3_compiled_.emplace(
+          N, g3.Compile({out2},
+                        {(uint64_t)N * smol_dense_2_size_ * sizeof(DataType)}));
+      }
     }
     const float softmax_scale = 1.0f / std::sqrt(static_cast<float>(D));
     dml::Expression logits = dml::Gemm(
@@ -1781,20 +1821,29 @@ void EncoderBlock<DataType>::EvalMha(int N, DmlPtr in_out_tensor,
     }
     DmlPtr bias;
     if (has_smolgen_) {
-      // Smolgen MLP (dense graphs) then the bias HLSL kernel: d2 [N,H*gen]
-      // and bias [N,H,64,64] are per-batch, so they come from the transient
-      // arena at the real batch size.
-      auto mlp_it = mha_mlp_compiled_.find(N);
-      if (mlp_it == mha_mlp_compiled_.end()) {
+      // Smolgen MLP stage graphs (compress / dense1+LN / dense2+LN), then
+      // the bias HLSL kernel: all intermediates are per-batch, so they come
+      // from the transient arena at the real batch size.
+      auto m1 = mha_mlp_compiled_.find(N);
+      auto m2 = mha_mlp2_compiled_.find(N);
+      auto m3 = mha_mlp3_compiled_.find(N);
+      if (m1 == mha_mlp_compiled_.end() || m2 == mha_mlp2_compiled_.end() ||
+          m3 == mha_mlp3_compiled_.end()) {
         throw Exception(
-            "directml backend: smolgen MLP graph was not compiled; "
+            "directml backend: smolgen MLP graphs were not compiled; "
             "EnsureCompiled must run before Eval.");
       }
       const uint32_t gen = smol_dense_2_size_ / H;
-      auto d2 = scope.TakeTransient((uint64_t)N * H * smol_dense_2_size_ * elem);
+      auto compressed =
+          scope.TakeTransient((uint64_t)N * 64 * smol_compress_size_ * elem);
+      auto d1 = scope.TakeTransient((uint64_t)N * smol_dense_1_size_ * elem);
+      auto d2 = scope.TakeTransient((uint64_t)N * smol_dense_2_size_ * elem);
       bias = scope.TakeTransient((uint64_t)N * H * smolgen_global_size_ * elem);
-      DispatchOp<DataType>(scope, mlp_it->second, in_out_tensor, DmlPtr(),
-                           DmlPtr(), {d2});
+      DispatchOp<DataType>(scope, m1->second, in_out_tensor, DmlPtr(),
+                           DmlPtr(), {compressed});
+      DispatchOp<DataType>(scope, m2->second, compressed, DmlPtr(), DmlPtr(),
+                           {d1});
+      DispatchOp<DataType>(scope, m3->second, d1, DmlPtr(), DmlPtr(), {d2});
       SmolgenBiasLayer::Params sp{};
       sp.batch = N;
       sp.heads = H;

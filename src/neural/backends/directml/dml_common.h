@@ -339,11 +339,20 @@ class DmlExecScope {
   ID3D12GraphicsCommandList* list() const { return list_; }
   DmlDeviceContext& ctx() const { return ctx_; }
 
-  // Bump-allocates transient (DirectML-internal scratch) memory for one
-  // dispatch. Reset per batch by the network.
+  // Transient (DirectML-internal scratch) for one dispatch. Every dispatch
+  // gets the SAME base region: consecutive dispatches are separated by a
+  // global UAV barrier (DispatchOperator), so the region may be legally
+  // reused, and DirectML graphs' transient requirements here reach ~100MB
+  // -- bump-allocating per dispatch exhausts the arena within one batch.
   DmlPtr TakeTransient(uint64_t bytes) {
-    DmlPtr p = transient_arena_->Allocate(bytes);
-    return p;
+    if (bytes > transient_arena_->size()) {
+      throw Exception(
+          "directml backend: transient arena smaller (" +
+          std::to_string(transient_arena_->size()) +
+          " bytes) than a dispatch requires (" + std::to_string(bytes) +
+          " bytes)");
+    }
+    return DmlPtr(transient_arena_->resource(), 0);
   }
 
  private:

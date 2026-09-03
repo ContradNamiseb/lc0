@@ -36,7 +36,11 @@ void SmolgenBias(uint3 tid : SV_GroupThreadID, uint3 gtid : SV_GroupID) {
   const uint h = (flat / 4096u) % heads;
   const uint n = flat / (4096u * heads);
 
-  const uint trow = (h * 4096u + i) * gen;
+  // The smolgen weight table is ONE SHARED [4096, gen] matrix (the SYCL
+  // backend's smol_global gemm passes the same A for every (n, h) batch
+  // entry) -- head specificity comes from d2's per-head columns, not from
+  // the table.
+  const uint trow = i * gen;
   const uint drow = n * heads * gen + h * gen;
   float s = 0.0f;
   for (uint g = 0; g < gen; ++g) {

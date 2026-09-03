@@ -440,6 +440,61 @@ pblczero::Net MakeMhaMlhNet() {
 TEST(DirectMlKdaParity, MatchesBlasOnMhaMlhNet) { CompareBackends(MakeMhaMlhNet()); }
 
 
+
+// PE_DENSE input-embedding net (no encoders): the real trained nets use
+// INPUT_EMBEDDING_PE_DENSE, a body branch the earlier synthetic nets never
+// exercised.
+pblczero::Net MakePeDenseNet() {
+  const NetDims d;
+  const int dense_size = 32;
+  std::mt19937 rng(88);
+  pblczero::Net file;
+  auto* weights = file.mutable_weights();
+  auto* nf = file.mutable_format()->mutable_network_format();
+  using NF = pblczero::NetworkFormat;
+  nf->set_input(NF::INPUT_CLASSICAL_112_PLANE);
+  nf->set_network(NF::NETWORK_KDA_HYBRID_WITH_MULTIHEADFORMAT);
+  nf->set_policy(NF::POLICY_ATTENTION);
+  nf->set_value(NF::VALUE_WDL);
+  nf->set_moves_left(NF::MOVES_LEFT_NONE);
+  nf->set_input_embedding(NF::INPUT_EMBEDDING_PE_DENSE);
+  nf->set_default_activation(NF::DEFAULT_ACTIVATION_RELU);
+  nf->set_ffn_activation(NF::ACTIVATION_DEFAULT);
+  nf->set_smolgen_activation(NF::ACTIVATION_DEFAULT);
+  nf->add_kda_directions(static_cast<NF::KdaDirection>(1));
+
+  FillLayer(weights->mutable_ip_emb_w(),
+            RandomVec(rng, d.embedding * (kInputPlanes + dense_size), 0.05f));
+  FillLayer(weights->mutable_ip_emb_b(), RandomVec(rng, d.embedding, 0.05f));
+  // PE_DENSE preprocess: dense gemm over the flattened 12-channel slice.
+  FillLayer(weights->mutable_ip_emb_preproc_w(),
+            RandomVec(rng, 64 * dense_size * 64 * 12, 0.05f));
+  FillLayer(weights->mutable_ip_emb_preproc_b(),
+            RandomVec(rng, 64 * dense_size, 0.05f));
+  FillLayer(weights->mutable_ip_emb_ln_gammas(),
+            RandomVec(rng, d.embedding, 0.1f));
+  FillLayer(weights->mutable_ip_emb_ln_betas(),
+            RandomVec(rng, d.embedding, 0.05f));
+  auto* ffn = weights->mutable_ip_emb_ffn();
+  FillLayer(ffn->mutable_dense1_w(),
+            RandomVec(rng, d.embedding * d.embedding, 0.1f));
+  FillLayer(ffn->mutable_dense1_b(), RandomVec(rng, d.embedding, 0.05f));
+  FillLayer(ffn->mutable_dense2_w(),
+            RandomVec(rng, d.embedding * d.embedding, 0.1f));
+  FillLayer(ffn->mutable_dense2_b(), RandomVec(rng, d.embedding, 0.05f));
+  FillLayer(weights->mutable_ip_emb_ffn_ln_gammas(),
+            RandomVec(rng, d.embedding, 0.1f));
+  FillLayer(weights->mutable_ip_emb_ffn_ln_betas(),
+            RandomVec(rng, d.embedding, 0.05f));
+  weights->set_headcount(d.heads);
+  FillPolicyAndValueHeads(&file, rng, d, false, 0);
+  return file;
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnPeDenseNet) {
+  CompareBackends(MakePeDenseNet());
+}
+
 TEST(DirectMlKdaParity, MatchesBlasOnKdaHybridNet) {
   CompareBackends(MakeKdaHybridNet());
 }
