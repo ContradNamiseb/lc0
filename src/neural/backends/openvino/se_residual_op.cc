@@ -19,6 +19,7 @@
 #include "neural/backends/openvino/se_residual_op.h"
 
 #include <cmath>
+#include <cstdint>
 #include <vector>
 
 namespace lczero {
@@ -59,7 +60,17 @@ std::shared_ptr<ov::Node> SEResidualOp::clone_with_new_inputs(
                                         activation_);
 }
 
-bool SEResidualOp::visit_attributes(ov::AttributeVisitor&) { return true; }
+// Same rationale as KdaScanOp::visit_attributes: activation_ is the op's
+// only genuine runtime attribute, and leaving it unvisited would silently
+// restore kRelu on a serialize/deserialize round trip. Visited through an
+// int32_t temporary because ov::AttributeVisitor has no adapter for enum
+// class members.
+bool SEResidualOp::visit_attributes(ov::AttributeVisitor& visitor) {
+  std::int32_t activation = static_cast<std::int32_t>(activation_);
+  visitor.on_attribute("activation", activation);
+  activation_ = static_cast<Activation>(activation);
+  return true;
+}
 
 bool SEResidualOp::has_evaluate() const {
   return get_input_element_type(0) == ov::element::f32;

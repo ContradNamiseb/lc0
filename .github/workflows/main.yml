@@ -18,6 +18,7 @@ jobs:
       blas: ${{ steps.filter.outputs.blas }}
       cuda: ${{ steps.filter.outputs.cuda }}
       onnx: ${{ steps.filter.outputs.onnx }}
+      openvino: ${{ steps.filter.outputs.openvino }}
       common_files: ${{ steps.filter.outputs.common_files }}
     steps:
       - uses: actions/checkout@v4
@@ -40,6 +41,8 @@ jobs:
               - 'src/neural/backends/cuda/**'
             onnx:
               - 'src/neural/onnx/**'
+            openvino:
+              - 'src/neural/backends/openvino/**'
             common_files:
               # Engine files
               - 'src/engine.cc'
@@ -124,6 +127,15 @@ jobs:
     with:
       os: ubuntu-24.04
       artifact_name: sycl-ubuntu-24.04
+
+  # --- OpenVINO (independent of the SYCL/CUDA chain) ---
+  openvino-build:
+    needs: build
+    if: ${{ needs.build.outputs.common_files == 'true' || needs.build.outputs.openvino == 'true' }}
+    uses: ./.github/workflows/openvino.yml
+    with:
+      os: ubuntu-22.04
+      artifact_name: openvino-ubuntu-22.04
 
   # --- Step 2: CUDA (Waits for SYCL completion) ---
   cuda-build:

@@ -10,28 +10,27 @@
 #include <cuda_runtime.h>
 
 class cuBlasContextManager {
- private:
-  cublasHandle_t handle;
-
-  cuBlasContextManager() {
-    cublasCreate(&handle);
-  }
-
-  ~cuBlasContextManager() {
-    cublasDestroy(handle);
-  }
-
  public:
   cuBlasContextManager(const cuBlasContextManager&) = delete;
   cuBlasContextManager& operator=(const cuBlasContextManager&) = delete;
 
+  // One handle per THREAD, not per process: every call site does
+  // cublasSetStream(handle, ...) on the returned handle immediately before
+  // its own gemm, so a single shared handle was a data race whenever two
+  // forwardEval threads ran cublas calls concurrently (multi_stream=true).
+  // The handle is created on first use in the thread and destroyed at
+  // thread exit.
   static cublasHandle_t getcuBlasHandle_t() {
-    static cuBlasContextManager instance;
-    return instance.handle;
+    thread_local cublasHandle_t handle = [] {
+      cublasHandle_t h;
+      cublasCreate(&h);
+      return h;
+    }();
+    return handle;
   }
 
   static void destroycuBlasHandle_t() {
-    // Managed automatically by function-local static destructor.
+    // Handles are thread_local and destroyed automatically at thread exit.
   }
 };
 
@@ -41,28 +40,22 @@ class cuBlasContextManager {
 #include "hipblas/hipblas.h"
 
 class hipBlasContextManager {
- private:
-  hipblasHandle_t handle;
-
-  hipBlasContextManager() {
-    hipblasCreate(&handle);
-  }
-
-  ~hipBlasContextManager() {
-    hipblasDestroy(handle);
-  }
-
  public:
   hipBlasContextManager(const hipBlasContextManager&) = delete;
   hipBlasContextManager& operator=(const hipBlasContextManager&) = delete;
 
+  // One handle per THREAD -- same rationale as the cuBLAS manager above.
   static hipblasHandle_t gethipBlasHandle_t() {
-    static hipBlasContextManager instance;
-    return instance.handle;
+    thread_local hipblasHandle_t handle = [] {
+      hipblasHandle_t h;
+      hipblasCreate(&h);
+      return h;
+    }();
+    return handle;
   }
 
   static void destroyhipBlasHandle_t() {
-    // Managed automatically by function-local static destructor.
+    // Handles are thread_local and destroyed automatically at thread exit.
   }
 };
 

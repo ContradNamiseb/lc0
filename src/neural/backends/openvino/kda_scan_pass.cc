@@ -42,15 +42,30 @@ bool EndsWith(const std::string& s, const std::string& suffix) {
 }
 
 // Finds the external data input of `ti` whose source node's friendly name
-// ends with `suffix` (e.g. "/scan/q"). Throws if not found -- a miss here
-// means converter.cc's naming and this pass have drifted apart, which must
-// fail loudly rather than silently fall back to TensorIterator.
+// ends with `suffix`. Throws if not found -- a miss here means converter.cc's
+// naming and this pass have drifted apart, which must fail loudly rather
+// than silently fall back to TensorIterator.
+//
+// `fallback_suffix` covers one frontend variance: for a single-direction net
+// the pre-scan Concat (named "/scan/q") has exactly one input, and a frontend
+// is free to fold that away -- leaving the direction Gather, named
+// "/dir0/q", as the TensorIterator input. converter.cc now always emits the
+// Concat, so the primary suffix is what current exports produce; the
+// fallback keeps older single-direction exports loadable.
 ov::Output<ov::Node> FindInputBySuffix(
     const std::shared_ptr<ov::op::v0::TensorIterator>& ti,
-    const std::string& suffix) {
+    const std::string& suffix, const std::string& fallback_suffix = "") {
   for (size_t i = 0; i < ti->get_input_size(); ++i) {
     auto src = ti->input_value(i);
     if (EndsWith(src.get_node()->get_friendly_name(), suffix)) return src;
+  }
+  if (!fallback_suffix.empty()) {
+    for (size_t i = 0; i < ti->get_input_size(); ++i) {
+      auto src = ti->input_value(i);
+      if (EndsWith(src.get_node()->get_friendly_name(), fallback_suffix)) {
+        return src;
+      }
+    }
   }
   throw Exception(
       "OpenVINO KdaScan pass: TensorIterator '" + ti->get_friendly_name() +
@@ -113,13 +128,20 @@ ov::Output<ov::Node> TraceToUnpermutedInput(ov::Output<ov::Node> input) {
       "results -- failing instead.");
 }
 
-// Finds the Concat that reassembles the per-direction scan outputs back
-// into square order. The kernel already writes square-major, so that
-// Concat is what the fused op must replace -- replacing ti->output(1)
-// instead would leave the inverse permutation in place on top of a result
-// that is already in square order.
+// Finds the node that reassembles the per-direction scan outputs back into
+// square order. The kernel already writes square-major, so that reassembly
+// is what the fused op must replace -- replacing ti->output(1) instead
+// would leave the inverse permutation in place on top of a result that is
+// already in square order.
+//
+// The reassembly is the Slice->Gather->Concat chain for multi-direction
+// nets. With one direction the trailing Concat has a single input and may
+// be folded away by the frontend (converter.cc emits it either way), in
+// which case the Gather itself -- the inverse permutation -- is the last
+// node to bypass, and returning it is correct: replacing its output puts
+// the square-major result exactly where the Gather's output used to be.
 std::shared_ptr<ov::Node> FindDownstreamReorderedOutput(
-    const ov::Output<ov::Node>& ti_out) {
+    const ov::Output<ov::Node>& ti_out, int direction_count) {
   for (const auto& slice_in : ti_out.get_target_inputs()) {
     auto slice_node = slice_in.get_node()->shared_from_this();
     for (const auto& gather_in : slice_node->output(0).get_target_inputs()) {
@@ -128,6 +150,21 @@ std::shared_ptr<ov::Node> FindDownstreamReorderedOutput(
            gather_node->output(0).get_target_inputs()) {
         auto concat_node = concat_in.get_node()->shared_from_this();
         if (ov::is_type<ov::op::v0::Concat>(concat_node)) return concat_node;
+      }
+      // No downstream Concat. Only legitimate for a single direction, where
+      // the reassembly Concat is trivially foldable; for more directions the
+      // Concat is load-bearing and its absence means the graph changed.
+      if (direction_count == 1 &&
+          ov::is_type<ov::op::v8::Gather>(gather_node)) {
+        return gather_node;
+      }
+      if (direction_count == 1 &&
+          ov::is_type<ov::op::v7::Gather>(gather_node)) {
+        return gather_node;
+      }
+      if (direction_count == 1 &&
+          ov::is_type<ov::op::v1::Gather>(gather_node)) {
+        return gather_node;
       }
     }
   }
@@ -151,11 +188,16 @@ ReplaceKdaScan::ReplaceKdaScan(int direction_count,
     // suffix converter.cc gives every KDA Scan node's friendly name.
     if (!EndsWith(ti->get_friendly_name(), "/scan")) return false;
 
-    auto q = TraceToUnpermutedInput(FindInputBySuffix(ti, "/scan/q"));
-    auto k = TraceToUnpermutedInput(FindInputBySuffix(ti, "/scan/k"));
-    auto v = TraceToUnpermutedInput(FindInputBySuffix(ti, "/scan/v"));
-    auto decay = TraceToUnpermutedInput(FindInputBySuffix(ti, "/scan/decay"));
-    auto beta = TraceToUnpermutedInput(FindInputBySuffix(ti, "/scan/beta"));
+    auto q = TraceToUnpermutedInput(FindInputBySuffix(
+        ti, "/scan/q", direction_count == 1 ? "/dir0/q" : ""));
+    auto k = TraceToUnpermutedInput(FindInputBySuffix(
+        ti, "/scan/k", direction_count == 1 ? "/dir0/k" : ""));
+    auto v = TraceToUnpermutedInput(FindInputBySuffix(
+        ti, "/scan/v", direction_count == 1 ? "/dir0/v" : ""));
+    auto decay = TraceToUnpermutedInput(FindInputBySuffix(
+        ti, "/scan/decay", direction_count == 1 ? "/dir0/decay" : ""));
+    auto beta = TraceToUnpermutedInput(FindInputBySuffix(
+        ti, "/scan/beta", direction_count == 1 ? "/dir0/beta" : ""));
     auto dt_bias_c = FindBodyConstantBySuffix(ti, "/dt_bias");
     auto neg_decay_scale_c =
         FindBodyConstantBySuffix(ti, "/neg_decay_scale");
@@ -184,7 +226,7 @@ ReplaceKdaScan::ReplaceKdaScan(int direction_count,
           "not compute it and this replacement would be silently wrong.");
     }
 
-    auto mixed4 = FindDownstreamReorderedOutput(ti->output(1));
+    auto mixed4 = FindDownstreamReorderedOutput(ti->output(1), direction_count);
     if (!mixed4) {
       throw Exception(
           "OpenVINO KdaScan pass: TensorIterator '" +

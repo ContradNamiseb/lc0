@@ -61,9 +61,28 @@ SyclDeviceCache InitDeviceCache(const sycl::queue& q) {
       sg_sizes.end()) {
     cache.sub_group_size = SYCL_SUB_GROUP_SIZE;
   } else if (!sg_sizes.empty()) {
-    cache.sub_group_size = sg_sizes.back();
+    // The kernels request [[intel::reqd_sub_group_size(SYCL_SUB_GROUP_SIZE)]]
+    // at compile time, so a device that does not expose that size cannot run
+    // them at all -- silently reporting a different size in the cache (the
+    // old fallback) only moved the failure to the first kernel launch with a
+    // confusing backend error. Fail here instead, naming the rebuild flag.
+    throw Exception(
+        "SYCL backend: this build requires sub-group size " +
+        std::to_string(SYCL_SUB_GROUP_SIZE) + ", but device '" +
+        device.get_info<sycl::info::device::name>() +
+        "' only supports {" +
+        [&] {
+          std::string s;
+          for (auto sz : sg_sizes) {
+            if (!s.empty()) s += ", ";
+            s += std::to_string(sz);
+          }
+          return s;
+        }() +
+        "}. Rebuild with the matching -Dsycl= flavor (l0 for Intel, cuda for "
+        "NVIDIA, hip for AMD) or adjust SYCL_SUB_GROUP_SIZE.");
   } else {
-    cache.sub_group_size = 32; // Default
+    cache.sub_group_size = 32;  // Default
   }
 
   cache.max_work_group_size =
@@ -155,6 +174,18 @@ static size_t getMaxAttentionBodySize(const MultiHeadWeights& weights, int N) {
     encoder_dff = std::max(encoder_dff, encoder.ffn.dense1_b.size());
     assert(embedding_op_size == encoder.ffn.dense2_b.size());
     if (encoder.is_kda) continue;
+
+    // Same 0/0 class as getMaxAttentionHeadSize: an MHA encoder without the
+    // embedding layer it indexes against is a malformed net, and the assert
+    // that would have flagged it is compiled out in release. Garbage
+    // d_model inflates scratch_size_ the same way the head-side bug hung
+    // conv-policy nets. A valid net always has ip_emb_b whenever it has
+    // encoder layers at all.
+    if (embedding_op_size == 0) {
+      throw Exception(
+          "SYCL: net has non-KDA encoder layers but no embedding layer "
+          "(ip_emb_b is empty) -- malformed network.");
+    }
 
     const size_t d_model = encoder.mha.q_w.size() / embedding_op_size;
     assert(d_model * embedding_op_size == encoder.mha.q_w.size());
@@ -387,15 +418,14 @@ class SyclNetwork : public Network {
     }
 
     // Res block fusing option (fused winograd kernels).
-    // Auto-enable for FP16 when filters are a multiple of 32, matching the
-    // CUDA backend behaviour. The user can override via res_block_fusing=.
-    if (kNumFilters % 32 == 0 && std::is_same<sycl::half, DataType>::value) {
-      use_res_block_winograd_fuse_opt_ = true;
-    } else {
-      use_res_block_winograd_fuse_opt_ = false;
-    }
+    // Default OFF, matching upstream: the sub-group fused kernels are newly
+    // written and not yet strength/regression tested against the standard
+    // path, and silently re-routing every fp16 %32-filter user onto them is
+    // not a change to bury in a release. Opt in with res_block_fusing=true.
     if (options.Exists<bool>("res_block_fusing")) {
       use_res_block_winograd_fuse_opt_ = options.Get<bool>("res_block_fusing");
+    } else {
+      use_res_block_winograd_fuse_opt_ = false;
     }
 
     // 0. Check for SE.
@@ -980,11 +1010,9 @@ class SyclNetwork : public Network {
 
 
     // Copy policy output from device memory to host memory.
-#ifndef USE_INTEL
     auto event =
         io_sycl_queue_.memcpy(io->op_policy_mem_, io->op_policy_mem_gpu_,
                               sizeof(float) * kNumOutputPolicy * batchSize);
-#endif
 
     if (!multi_stream_) {
       // ReportCUDAErrors(
@@ -992,11 +1020,7 @@ class SyclNetwork : public Network {
       // The next thread can start using the GPU now.
     }
 
-#ifndef USE_INTEL
     event.wait_and_throw();
-#else
-    io_sycl_queue_.wait_and_throw();
-#endif
 
     if (wdl_) {
       // Value softmax done cpu side.

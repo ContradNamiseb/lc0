@@ -58,6 +58,28 @@ void CublasError(int status, const char* file, const int& line);
 #define ReportCUBLASErrors(status) CublasError(status, __FILE__, __LINE__)
 #endif
 
+// The allowFusing decision for the SubGroup fused SE+output+input transform
+// kernels. Shared between ResidualBlockLayer's dispatch (layers.cc.dp.cpp)
+// and sycl_test.cc so the test exercises the real decision rather than a
+// copy with its own constants, which had already drifted from production.
+inline bool AllowSubGroupFusing(int C, int se_k, size_t shared_mem_size,
+                                size_t max_wg_size, bool is_fp16) {
+  bool allow_fusing =
+      ((C <= kMaxResBlockFusingChannels) ||
+       (is_fp16 && (shared_mem_size >= kMaxResBlockFusingSeFp16AmpereSmem) &&
+        (C <= kMaxResBlockFusingSeKFp16Ampere))) &&
+      (se_k <= C);
+
+  // The SubGroup kernels launch with work-group size = C. Verify that the
+  // device can support this before enabling fusing to avoid crashes or
+  // silent errors.
+  if (is_fp16) {
+    allow_fusing = allow_fusing && (static_cast<size_t>(C) <= max_wg_size);
+  }
+
+  return allow_fusing;
+}
+
 inline int DivUp(int a, int b) { return (a + b - 1) / b; }
 
 struct SyclDeviceCache {

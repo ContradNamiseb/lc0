@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cassert>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -47,8 +48,16 @@
 #include <string_view>
 #include <vector>
 
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
 #include <openvino/core/op_extension.hpp>
+#include <openvino/core/version.hpp>
 #include <openvino/openvino.hpp>
+#include <openvino/op/util/precision_sensitive_attribute.hpp>
 #include <openvino/pass/manager.hpp>
 
 #include "neural/factory.h"
@@ -120,7 +129,16 @@ class OpenVinoNetwork : public Network {
         this, capabilities_.has_wdl(), capabilities_.has_mlh());
   }
 
-  int GetMiniBatchSize() const override { return kMaxBatchSize; }
+  int GetMiniBatchSize() const override {
+    // The batch the search gathers before evaluating when the user leaves
+    // MinibatchSize at 0 (wrapper.cc surfaces this as recommended_batch_size).
+    // 256 is the Network base-class default; returning kMaxBatchSize (1024)
+    // here padded most default-config inferences up to 1024 rows of real GPU
+    // work and quadrupled max_out_of_order on a backend whose per-inference
+    // latency is already its weak spot. Custom-layer JIT shapes are handled
+    // by BucketBatch()/batch_buckets_, not by a large suggested minibatch.
+    return 256;
+  }
   bool IsCpu() const override { return is_cpu_; }
 
   const CachedOutputPorts& ports() const { return ports_; }
@@ -207,11 +225,13 @@ class OpenVinoNetwork : public Network {
   NetworkCapabilities capabilities_;
   bool is_cpu_ = false;
   // True when this model came from a pre-converted IR file (ir_path) rather
-  // than ConvertWeightsToOnnx. An IR-loaded graph never contains KdaScanOp
-  // (nothing matches ReplaceKdaScan's TensorIterator pattern in the first
-  // place), so it skips the GPU custom-layer kernel setup -- but it still
-  // needs the forced-f32 precision hint, for its own separate reason. See
-  // the device_config block in the constructor.
+  // than ConvertWeightsToOnnx. An IR-loaded graph normally contains no
+  // KdaScanOp (nothing matches ReplaceKdaScan's TensorIterator pattern --
+  // and the constructor now rejects one that does, since the GPU
+  // custom-layer config is converter-path-only), so it skips the GPU
+  // custom-layer kernel setup -- but it still needs the forced-f32 precision
+  // hint, for its own separate reason. See the device_config block in the
+  // constructor.
   bool is_ir_model_ = false;
   // Mirrors the cuda backend's min_batch: it never evaluates fewer
   // than this many positions, padding the batch out instead. There
@@ -369,7 +389,16 @@ float OpenVinoNetworkComputation::GetMVal(int sample) const {
 
 namespace {
 
-// The shared temp directory both WriteKdaScanGpuConfig and
+// Portable pid for the per-process config directory below.
+std::uint32_t ProcessId() {
+#if defined(_WIN32)
+  return static_cast<std::uint32_t>(::_getpid());
+#else
+  return static_cast<std::uint32_t>(::getpid());
+#endif
+}
+
+// The per-process temp directory both WriteKdaScanGpuConfig and
 // WriteSEResidualGpuConfig write their .cl sources into, and where the
 // single merged CONFIG_FILE ends up. OpenVINO's GPU plugin loads multiple
 // custom ops from one CONFIG_FILE as sibling <CustomLayer> elements with no
@@ -379,9 +408,18 @@ namespace {
 // directory as the merged xml itself (see the comment on WriteKdaScanGpuConfig
 // below), which is why all of this shares one directory rather than each op
 // getting its own.
+//
+// The directory is keyed on the process id: the merged XML embeds this net's
+// KDA/SE geometry as -D defines and is rewritten (truncating whatever is
+// there) on every backend load, so a fixed shared path would let two
+// concurrent lc0 processes converting different nets -- match play,
+// selfplay workers, lc0 plus a benchmark -- race on one file, and the loser
+// would compile the winner's geometry with nothing logged. The .cl sources
+// are net-independent, so only the XML needs this protection.
 std::filesystem::path CustomLayerConfigDir() {
   namespace fs = std::filesystem;
-  fs::path dir = fs::temp_directory_path() / "lc0_openvino_kda_scan";
+  fs::path dir = fs::temp_directory_path() /
+                 ("lc0_openvino_" + std::to_string(ProcessId()));
   std::error_code ec;
   fs::create_directories(dir, ec);
   if (ec) {
@@ -399,6 +437,10 @@ std::filesystem::path WriteMergedGpuConfig(
   namespace fs = std::filesystem;
   fs::path xml_path = CustomLayerConfigDir() / "lc0_custom_layers.xml";
   std::ofstream xml(xml_path, std::ios::trunc);
+  if (!xml) {
+    throw Exception("OpenVINO: could not write custom-layer config to '" +
+                    xml_path.string() + "'.");
+  }
   for (const auto& fragment : fragments) xml << fragment;
   xml.close();
   return xml_path;
@@ -414,10 +456,26 @@ std::string WriteKdaScanGpuConfig(int heads, int key_dim, int value_dim,
                                   const std::vector<int>& directions,
                                   bool fp16) {
   namespace fs = std::filesystem;
+  // The kernel launches with a work-group VALUE_DIM_ wide (WorkSizes
+  // local="1,X,1" below), which must fit CL_KERNEL_WORK_GROUP_SIZE --
+  // commonly 256 on Intel iGPUs. Exceeding it fails at first execution with
+  // a raw OpenCL error deep inside the plugin, so reject a net that cannot
+  // fit at config time, where a clear message is possible.
+  constexpr int kMaxWorkgroupWidth = 256;
+  if (value_dim > kMaxWorkgroupWidth) {
+    throw Exception(
+        "OpenVINO: KDA value_dim " + std::to_string(value_dim) +
+        " exceeds the " + std::to_string(kMaxWorkgroupWidth) +
+        "-wide work-group this GPU kernel launches with.");
+  }
   fs::path dir = CustomLayerConfigDir();
 
   fs::path cl_path = dir / "kda_scan.cl";
   std::ofstream cl(cl_path, std::ios::trunc);
+  if (!cl) {
+    throw Exception("OpenVINO: could not write KDA kernel source to '" +
+                    cl_path.string() + "'.");
+  }
   // Generated from the single canonical definition rather than hand-copied
   // into the kernel string -- see kda_scan_kernel_source.h.
   // All 16 directions, not just the net's own: the kernel indexes this
@@ -487,10 +545,23 @@ std::string WriteSEResidualGpuConfig(int channels, int se_filters,
                                      SEResidualOp::Activation activation,
                                      bool fp16) {
   namespace fs = std::filesystem;
+  // Same work-group-width limit as the KDA kernel (local="1,F,1" with
+  // F = channels).
+  constexpr int kMaxWorkgroupWidth = 256;
+  if (channels > kMaxWorkgroupWidth) {
+    throw Exception(
+        "OpenVINO: SE residual channel count " + std::to_string(channels) +
+        " exceeds the " + std::to_string(kMaxWorkgroupWidth) +
+        "-wide work-group this GPU kernel launches with.");
+  }
   fs::path dir = CustomLayerConfigDir();
 
   fs::path cl_path = dir / "se_residual.cl";
   std::ofstream cl(cl_path, std::ios::trunc);
+  if (!cl) {
+    throw Exception("OpenVINO: could not write SE kernel source to '" +
+                    cl_path.string() + "'.");
+  }
   cl << kSEResidualKernelSource;
   cl.close();
 
@@ -527,16 +598,35 @@ std::string WriteSEResidualGpuConfig(int channels, int se_filters,
 OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
                                  const OptionsDict& options) {
   std::string device = options.GetOrDefault<std::string>("device", "GPU");
-  min_batch_ = std::min(options.GetOrDefault<int>("min_batch", 4),
-                        kMaxBatchSize);
-  is_cpu_ = (device == "CPU");
+  // Accept the whole OpenVINO device-name grammar for GPU and CPU ("GPU",
+  // "GPU.1" on multi-GPU, "CPU"), not exact equality: every GPU-specific
+  // setting below (LATENCY hints, inference_precision, the custom-layer
+  // CONFIG_FILE) was originally keyed on device == "GPU", so device=GPU.1
+  // silently dropped all of it and failed to compile KDA nets with an
+  // opaque plugin error. Composite devices (AUTO, MULTI:..., HETERO:...)
+  // remain unsupported for custom-layer nets -- see the check after the
+  // graph passes -- because the config mechanism targets one concrete
+  // plugin.
+  const bool is_gpu_device = device.rfind("GPU", 0) == 0;
+  const bool is_cpu_device = device.rfind("CPU", 0) == 0;
+  const int requested_min_batch = options.GetOrDefault<int>("min_batch", 4);
+  if (requested_min_batch < 1 || requested_min_batch > kMaxBatchSize) {
+    CERR << "OpenVINO: clamping min_batch=" << requested_min_batch
+         << " to [1, " << kMaxBatchSize << "].";
+  }
+  // Both bounds matter: above kMaxBatchSize overflows the buffers, and <= 0
+  // used to hang the constructor -- the bucket ladder below steps batches
+  // up by doubling until they reach kMaxBatchSize, which 0 never does.
+  min_batch_ = std::clamp(requested_min_batch, 1, kMaxBatchSize);
+  is_cpu_ = is_cpu_device;
 
   const auto& format = weights.format().network_format();
   capabilities_.input_format = format.input();
   capabilities_.output_format = format.output();
   capabilities_.moves_left = format.moves_left();
 
-  CERR << "Initializing OpenVINO backend on device [" << device << "]...";
+  CERR << "Initializing OpenVINO backend on device [" << device
+       << "], runtime " << ov::get_openvino_version().buildNumber << "...";
 
   // ir_path opts into loading a pre-converted OpenVINO IR (.xml/.bin) file
   // directly, bypassing ConvertWeightsToOnnx entirely -- see
@@ -544,17 +634,35 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
   const std::string ir_path = options.GetOrDefault<std::string>("ir_path", "");
   is_ir_model_ = !ir_path.empty();
 
+  // Head selection, same option names and defaults as network_cuda.cc:381 and
+  // network_sycl.cc.dp.cpp:427, so a multi-head net evaluates the same head
+  // whichever backend runs it. Read unconditionally (not just on the
+  // converter path) because OptionsDict rejects any option nothing read --
+  // hardcoding these was why `openvino-auto.policy_head` came back as
+  // "Unknown string option".
+  const std::string policy_head =
+      options.GetOrDefault<std::string>("policy_head", "vanilla");
+  const std::string value_head =
+      options.GetOrDefault<std::string>("value_head", "winner");
+
   std::shared_ptr<ov::Model> model;
   if (is_ir_model_) {
     CERR << "Loading pre-converted OpenVINO IR from: " << ir_path;
+    // The IR was baked with whichever heads net_to_openvino_ir.py exported;
+    // there is no conversion here to steer, so say so rather than silently
+    // evaluating a different head than asked for.
+    if (policy_head != "vanilla" || value_head != "winner") {
+      CERR << "Warning: policy_head/value_head are ignored with ir_path -- the "
+              "IR already has its heads baked in.";
+    }
     model = core_.read_model(ir_path);
   } else {
     WeightsToOnnxConverterOptions converter_options;
     converter_options.opset = 17;
     converter_options.data_type =
         WeightsToOnnxConverterOptions::DataType::kFloat32;
-    converter_options.policy_head = "vanilla";
-    converter_options.value_head = "winner";
+    converter_options.policy_head = policy_head;
+    converter_options.value_head = value_head;
 
     pblczero::Net onnx_net = ConvertWeightsToOnnx(weights, converter_options);
     std::string_view model_bytes = onnx_net.onnx_model().model();
@@ -616,6 +724,18 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
           std::to_string(heads) + " heads, " +
           std::to_string(kda_direction_count) + " directions).");
     }
+    // Same check BLAS (network_blas.cc) and SYCL (layers.cc.dp.cpp) do at
+    // load. Here it also protects the GPU kernel: it indexes
+    // kDirectionTable[dir - 1] straight from DIRECTIONS_LIST_, and that
+    // table has exactly 16 rows -- an out-of-range direction from a
+    // malformed net would be an out-of-bounds __constant read rather than
+    // an error.
+    for (int dir : kda_directions) {
+      if (dir < 1 || dir > 16) {
+        throw Exception("KDA direction " + std::to_string(dir) +
+                        " is out of range [1, 16].");
+      }
+    }
   }
 
   {
@@ -650,7 +770,7 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
     // matched out of an ONNX-imported TensorIterator, which an f16 IR does
     // not contain (see the is_ir_model_ note above).
     if (options.GetOrDefault<bool>("se_fusion", false)) {
-      if (device == "GPU") {
+      if (is_gpu_device) {
         manager.register_pass<ReplaceSqueezeExcite>();
         CERR << "OpenVINO: SE residual fusion enabled -- measured ~16% "
                 "SLOWER than the native ops on 791556; see the comment in "
@@ -663,14 +783,94 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
   }
 
   // Default fp16 to true on GPU for maximum throughput (2.3x-2.4x speedup)
-  const bool want_fp16 = options.GetOrDefault<bool>("fp16", device == "GPU");
+  const bool want_fp16 = options.GetOrDefault<bool>("fp16", is_gpu_device);
   profile_ = options.GetOrDefault<bool>("profile", false);
 
-  ov::AnyMap device_config;
-  if (device != "GPU" && want_fp16) {
-    CERR << "OpenVINO: ignoring fp16 -- it only applies to device=GPU.";
+  // Does this net actually have KDA layers? (ReplaceKdaScan above has
+  // already turned any KDA TensorIterator into KdaScanOp nodes, so this is
+  // a direct check, not a guess from the net's metadata.) Used below to
+  // default kda_safe on automatically -- a non-KDA net has nothing for it
+  // to protect and pays no cost either way, since the marking loop is a
+  // no-op without a KdaScanOp to find.
+  bool has_kda = false;
+  for (const auto& node : model->get_ops()) {
+    if (ov::as_type_ptr<KdaScanOp>(node)) {
+      has_kda = true;
+      break;
+    }
   }
-  if (device == "GPU") {
+
+  // A graph that still carries a KdaScanOp needs either the GPU custom-layer
+  // config (generated only for converter-path models, on one concrete GPU
+  // plugin) or the CPU evaluate() fallback. Two load configurations can
+  // reach here with neither available -- say so plainly instead of letting
+  // compile_model() fail with an opaque plugin error:
+  //   - ir_path + KDA on GPU: the pass does run on IR-loaded models (IR
+  //     preserves layer names, so a KDA IR converted from the same ONNX can
+  //     still match), but the CONFIG_FILE generation below is deliberately
+  //     converter-path-only.
+  //   - a composite device (AUTO, MULTI:..., HETERO:...): the custom-layer
+  //     config mechanism targets one concrete plugin, and which plugin
+  //     executes the op is decided at runtime.
+  if (has_kda) {
+    if (is_ir_model_ && is_gpu_device) {
+      throw Exception(
+          "OpenVINO: ir_path models containing KDA layers are not supported "
+          "on GPU -- the custom KdaScan kernel config is only generated on "
+          "the net-to-ONNX conversion path. Load the net without ir_path, or "
+          "use device=CPU (the KdaScanOp CPU path handles it).");
+    }
+    if (!is_gpu_device && !is_cpu_device) {
+      throw Exception(
+          "OpenVINO: device='" + device +
+          "' cannot run this net's fused KDA layers -- the custom-layer "
+          "config targets one concrete plugin. Use an explicit GPU (e.g. "
+          "'GPU' or 'GPU.1') or CPU.");
+    }
+  }
+
+  // kda_safe: mixed precision. Keeps the KDA recurrence's tensors and the
+  // value head in fp32 inside an otherwise-fp16 graph, since those are where
+  // half rounding costs the most (measured ~1.6e-2 absolute value error at
+  // plain fp16), while the bulk of the FC/FFN work keeps fp16 speed. Comes on
+  // automatically for any net with KDA layers -- a KDA net should not need a
+  // manual flag to avoid its own worst fp16 error -- but can be forced off
+  // (raw fp16 throughput, ~6x faster, at the larger error) or on.
+  const bool kda_safe = options.GetOrDefault<bool>("kda_safe", has_kda) &&
+                        want_fp16 && is_gpu_device;
+  if (kda_safe) {
+    int marked = 0;
+    for (const auto& node : model->get_ops()) {
+      if (!ov::as_type_ptr<KdaScanOp>(node)) continue;
+      // All 7 inputs, not just the 5 data tensors: the custom kernel is
+      // compiled with one DTYPE, so a mixed f16-constant/f32-data op would
+      // misread whichever side disagrees.
+      for (size_t i = 0; i < node->get_input_size(); ++i) {
+        ov::mark_as_precision_sensitive(node->input(i));
+        ++marked;
+      }
+    }
+    for (const auto& result : model->get_results()) {
+      const auto& names = result->input_value(0).get_names();
+      const bool is_value =
+          std::any_of(names.begin(), names.end(), [](const std::string& n) {
+            return n.find("value") != std::string::npos ||
+                   n.find("wdl") != std::string::npos;
+          });
+      if (is_value) {
+        ov::mark_as_precision_sensitive(result->input(0));
+        ++marked;
+      }
+    }
+    CERR << "OpenVINO: kda_safe marked " << marked
+         << " inputs precision-sensitive (KDA scan + value head stay fp32).";
+  }
+
+  ov::AnyMap device_config;
+  if (!is_gpu_device && want_fp16) {
+    CERR << "OpenVINO: ignoring fp16 -- it only applies to GPU devices.";
+  }
+  if (is_gpu_device) {
     device_config[ov::hint::performance_mode.name()] =
         ov::hint::PerformanceMode::LATENCY;
     device_config[ov::hint::execution_mode.name()] =
@@ -728,9 +928,12 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
         }
       }
       if (first_kda) {
+        // With kda_safe the scan's tensors stay f32, so the kernel must be
+        // compiled to read f32 -- half would misinterpret every buffer.
         config_fragments.push_back(WriteKdaScanGpuConfig(
             first_kda->heads(), first_kda->key_dim(), first_kda->value_dim(),
-            first_kda->direction_count(), first_kda->directions(), want_fp16));
+            first_kda->direction_count(), first_kda->directions(),
+            want_fp16 && !kda_safe));
       }
 
       std::shared_ptr<SEResidualOp> first_se;
@@ -816,7 +1019,7 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
 
   compiled_model_ = core_.compile_model(model, device, device_config);
   CERR << "OpenVINO model compiled successfully on " << device
-       << (want_fp16 && device == "GPU" ? " (FP16)" : " (FP32)") << ".";
+       << (want_fp16 && is_gpu_device ? " (FP16)" : " (FP32)") << ".";
 
   // compile_model() does not actually build the device kernels: the GPU
   // plugin JITs them lazily on first execution, through the Intel graphics
@@ -836,7 +1039,7 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
   // across a whole varying-batch search), so warming one shape warms them
   // all. That is NOT true of custom SimpleGPU layers, which are
   // specialized per concrete shape -- see the ReplaceSqueezeExcite note.
-  if (options.GetOrDefault<bool>("warmup", device == "GPU")) {
+  if (options.GetOrDefault<bool>("warmup", is_gpu_device)) {
     try {
       auto io = GetInputsOutputs();
       // With a custom layer every bucket is a separate JIT, so warm them

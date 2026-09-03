@@ -19,9 +19,11 @@
 #include "neural/backends/openvino/kda_scan_op.h"
 
 #include "neural/kda_directions.h"
+#include "utils/exception.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <vector>
 
 namespace lczero {
@@ -39,6 +41,17 @@ KdaScanOp::KdaScanOp(const ov::Output<ov::Node>& q,
     : Op({q, k, v, raw_decay, beta, dt_bias, neg_decay_scale}),
       direction_count_(direction_count),
       directions_(std::move(directions)) {
+  // The GPU kernel indexes its 16-row direction table with dir - 1 taken
+  // straight from this list, so an out-of-range direction from a malformed
+  // or foreign graph is an out-of-bounds read there rather than an error.
+  // The backend validates the net's own directions at load; this guards the
+  // op itself (e.g. against a future serialize/deserialize path).
+  for (int dir : directions_) {
+    if (dir < 1 || dir > 16) {
+      throw Exception("KdaScanOp: direction " + std::to_string(dir) +
+                      " is out of range [1, 16].");
+    }
+  }
   constructor_validate_and_infer_types();
 }
 
@@ -73,7 +86,21 @@ std::shared_ptr<ov::Node> KdaScanOp::clone_with_new_inputs(
                                      directions_);
 }
 
-bool KdaScanOp::visit_attributes(ov::AttributeVisitor&) { return true; }
+// Visit every runtime attribute. Nothing in-tree serializes a KdaScanOp
+// today, but an unvisited attribute is silently restored to its default on
+// any serialize/deserialize round trip (model export, XML debugging), which
+// would reset directions_ to {1..8} -- i.e. silently wrong traversal order
+// for a serpentine net. ov::AttributeVisitor has adapters for int32_t (not
+// plain int), so the values go through temporaries.
+bool KdaScanOp::visit_attributes(ov::AttributeVisitor& visitor) {
+  std::int32_t direction_count = direction_count_;
+  visitor.on_attribute("direction_count", direction_count);
+  direction_count_ = direction_count;
+  std::vector<std::int32_t> dirs(directions_.begin(), directions_.end());
+  visitor.on_attribute("directions", dirs);
+  directions_.assign(dirs.begin(), dirs.end());
+  return true;
+}
 
 bool KdaScanOp::has_evaluate() const {
   return get_input_element_type(0) == ov::element::f32;
@@ -112,6 +139,11 @@ bool KdaScanOp::evaluate(ov::TensorVector& outputs,
 
   const float scale = 1.0f / std::sqrt(static_cast<float>(key_dim));
   std::vector<float> state(static_cast<size_t>(key_dim) * value_dim);
+  // Reused across every token step -- these used to be constructed inside
+  // the t-loop, costing three heap allocations per (batch, head) per token.
+  std::vector<float> prediction(value_dim);
+  std::vector<float> delta(value_dim);
+  std::vector<float> out(value_dim);
 
   for (int n = 0; n < N; ++n) {
     for (int h = 0; h < heads; ++h) {
@@ -156,7 +188,7 @@ bool KdaScanOp::evaluate(ov::TensorVector& outputs,
 
         const float update_rate = Sigmoid(beta[beta_idx]);
 
-        std::vector<float> prediction(value_dim, 0.0f);
+        std::fill(prediction.begin(), prediction.end(), 0.0f);
         for (int key = 0; key < key_dim; ++key) {
           const float k_normed = k_t[key] * k_norm;
           const float* row = &state[static_cast<size_t>(key) * value_dim];
@@ -165,12 +197,11 @@ bool KdaScanOp::evaluate(ov::TensorVector& outputs,
           }
         }
 
-        std::vector<float> delta(value_dim);
         for (int val = 0; val < value_dim; ++val) {
           delta[val] = update_rate * (v_t[val] - prediction[val]);
         }
 
-        std::vector<float> out(value_dim, 0.0f);
+        std::fill(out.begin(), out.end(), 0.0f);
         const float q_scale = q_norm * scale;
         for (int key = 0; key < key_dim; ++key) {
           const float k_normed = k_t[key] * k_norm;

@@ -48,14 +48,13 @@ struct InputsOutputs {
     // Separate device memory copy for policy output.
     // It's faster to write to device memory and then copy to host memory
     // than having the kernel write directly to it (for discrete GPUs).
-    // For Intel iGPUs, shared memory is faster since it avoids the extra copy.
-#ifdef USE_INTEL
-    op_policy_mem_gpu_ = malloc_shared<float>(maxBatchSize * kNumOutputPolicy, q_ct1);
-    op_policy_mem_ = op_policy_mem_gpu_;
-#else
+    // (An experiment writing straight into shared memory on Intel iGPUs via
+    // a USE_INTEL define lived here; nothing ever defined USE_INTEL, so the
+    // always-copy path below is what every build has actually run. Reintroduce
+    // properly, keyed on a real backend option, if the iGPU trade-off is ever
+    // re-measured.)
     op_policy_mem_ = malloc_host<float>(maxBatchSize * kNumOutputPolicy, q_ct1);
     op_policy_mem_gpu_ = malloc_device<float>(maxBatchSize * kNumOutputPolicy, q_ct1);
-#endif
     op_value_mem_shared_ = malloc_host<float>(maxBatchSize * (wdl ? 3 : 1), q_ct1);
 
     if (moves_left) {
@@ -83,9 +82,7 @@ struct InputsOutputs {
     if (op_moves_left_mem_shared_ != nullptr)
       sycl::free(op_moves_left_mem_shared_, q_ct1);
     sycl::free(op_policy_mem_gpu_, q_ct1);
-#ifndef USE_INTEL
     sycl::free(op_policy_mem_, q_ct1);
-#endif
 
     if (multi_stream_) {
       for (auto mem : tensor_mem_) {

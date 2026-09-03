@@ -686,6 +686,15 @@ std::string Converter::MakeKdaMixer(OnnxBuilder* builder,
   if (direction_count <= 0 || heads % direction_count != 0) {
     throw Exception("KDA directions must evenly divide the encoder heads.");
   }
+  // Same range check BLAS and SYCL do at load: KdaSquareForToken clamps an
+  // out-of-range direction instead of failing, so without this a malformed
+  // net would convert silently to a traversal no backend computes.
+  for (int dir : directions) {
+    if (dir < 1 || dir > 16) {
+      throw Exception("KDA direction " + std::to_string(dir) +
+                      " is out of range [1, 16].");
+    }
+  }
   if (kda.output_rms_norm && kda.out_norm_gammas.empty()) {
     throw Exception(
         "KDA output RMS norm requested but out_norm_gammas is missing.");
@@ -712,9 +721,38 @@ std::string Converter::MakeKdaMixer(OnnxBuilder* builder,
     return flow;
   };
 
-  auto q = MakeProjection(kda.q_w, kda.q_b, key_depth, name + "/q");
-  auto k = MakeProjection(kda.k_w, kda.k_b, key_depth, name + "/k");
-  auto v = MakeProjection(kda.v_w, kda.v_b, value_depth, name + "/v");
+  const int qkv_depth = 2 * key_depth + value_depth;
+  MultiHeadWeights::Vec qkv_w;
+  qkv_w.reserve(kda.q_w.size() + kda.k_w.size() + kda.v_w.size());
+  qkv_w.insert(qkv_w.end(), kda.q_w.begin(), kda.q_w.end());
+  qkv_w.insert(qkv_w.end(), kda.k_w.begin(), kda.k_w.end());
+  qkv_w.insert(qkv_w.end(), kda.v_w.begin(), kda.v_w.end());
+
+  auto qkv = builder->MatMul(
+      name + "/qkv/w", proj_input,
+      *GetWeghtsConverter(qkv_w, {embedding_size, qkv_depth}, {1, 0}));
+
+  const bool has_qkv_bias = !kda.q_b.empty() || !kda.k_b.empty() ||
+                            !kda.v_b.empty();
+  if (has_qkv_bias) {
+    if (kda.q_b.empty() || kda.k_b.empty() || kda.v_b.empty()) {
+      throw Exception("KDA q/k/v biases must either all be present or all be "
+                      "absent.");
+    }
+    MultiHeadWeights::Vec qkv_b;
+    qkv_b.reserve(kda.q_b.size() + kda.k_b.size() + kda.v_b.size());
+    qkv_b.insert(qkv_b.end(), kda.q_b.begin(), kda.q_b.end());
+    qkv_b.insert(qkv_b.end(), kda.k_b.begin(), kda.k_b.end());
+    qkv_b.insert(qkv_b.end(), kda.v_b.begin(), kda.v_b.end());
+    qkv = builder->Add(name + "/qkv/b", qkv,
+                       *GetWeghtsConverter(qkv_b, {qkv_depth}));
+  }
+
+  const auto qkv_parts = builder->Split(name + "/qkv/split", qkv, 1,
+                                        {key_depth, key_depth, value_depth});
+  auto q = qkv_parts[0];
+  auto k = qkv_parts[1];
+  auto v = qkv_parts[2];
   if (kda.qkv_silu) {
     // SiLU (= Swish) on the q/k/v projections, matching the trainer's
     // qkv_silu (kda.py F.silu).
@@ -794,9 +832,15 @@ std::string Converter::MakeKdaMixer(OnnxBuilder* builder,
     beta_parts.push_back(reorder(beta4, 1, gname + "/beta"));
   }
 
+  // Always a Concat, even with a single direction group: OpenVINO's
+  // ReplaceKdaScan pass finds the scan inputs by the "/scan/..." node-name
+  // suffix and the reassembled output by the "/mixed4" Concat, and both
+  // would vanish for direction_count == 1 if the single part were passed
+  // through directly. A one-input Concat is legal ONNX and a no-op
+  // numerically.
   auto join = [&](const std::vector<std::string>& parts,
                   const std::string& jname) {
-    return parts.size() == 1 ? parts[0] : builder->Concat(jname, parts, 2);
+    return builder->Concat(jname, parts, 2);
   };
   auto q_scan = join(q_parts, name + "/scan/q");
   auto k_scan = join(k_parts, name + "/scan/k");
@@ -930,9 +974,10 @@ std::string Converter::MakeKdaMixer(OnnxBuilder* builder,
         1);
   }
 
-  auto mixed4 = direction_count == 1
-                    ? group_outputs[0]
-                    : builder->Concat(name + "/mixed4", group_outputs, 2);
+  // Always a Concat for the same reason as the scan-input join above: the
+  // OpenVINO pass locates the node to replace by this Concat's existence,
+  // so a single direction group must not shortcut to group_outputs[0].
+  auto mixed4 = builder->Concat(name + "/mixed4", group_outputs, 2);
   auto mixed = builder->Reshape(
       name + "/mixed", mixed4,
       builder->AddInitializer(name + "/mixed/shape",

@@ -141,6 +141,50 @@ void OutputInputTransform(int N, int C, int se_K, T* output, const T* input,
                           const T* skip, const T* bias, const T* w1,
                           const T* b1, const T* w2, const T* b2, sycl::queue &sycl_queue);
 
+// The sycl::half instantiations have an fp16-specific implementation with
+// its own kernels (fp16_kernels.dp.cpp). Declaring the specializations here
+// -- and defining them only there -- means every TU calling
+// OutputInputTransform<sycl::half, ...> links the specialized bodies
+// instead of implicitly instantiating the generic (float-shaped) template.
+// Without these declarations the fp16 file had to re-define the whole
+// template, which was two conflicting definitions of one template entity.
+template <>
+void OutputInputTransform<sycl::half, true, ACTIVATION_RELU, true, true>(
+    int N, int C, int se_K, sycl::half* output, const sycl::half* input,
+    const sycl::half* skip, const sycl::half* bias, const sycl::half* w1,
+    const sycl::half* b1, const sycl::half* w2, const sycl::half* b2,
+    sycl::queue &sycl_queue);
+template <>
+void OutputInputTransform<sycl::half, false, ACTIVATION_RELU, true, true>(
+    int N, int C, int se_K, sycl::half* output, const sycl::half* input,
+    const sycl::half* skip, const sycl::half* bias, const sycl::half* w1,
+    const sycl::half* b1, const sycl::half* w2, const sycl::half* b2,
+    sycl::queue &sycl_queue);
+template <>
+void OutputInputTransform<sycl::half, false, ACTIVATION_RELU, true, false>(
+    int N, int C, int se_K, sycl::half* output, const sycl::half* input,
+    const sycl::half* skip, const sycl::half* bias, const sycl::half* w1,
+    const sycl::half* b1, const sycl::half* w2, const sycl::half* b2,
+    sycl::queue &sycl_queue);
+template <>
+void OutputInputTransform<sycl::half, true, ACTIVATION_MISH, true, true>(
+    int N, int C, int se_K, sycl::half* output, const sycl::half* input,
+    const sycl::half* skip, const sycl::half* bias, const sycl::half* w1,
+    const sycl::half* b1, const sycl::half* w2, const sycl::half* b2,
+    sycl::queue &sycl_queue);
+template <>
+void OutputInputTransform<sycl::half, false, ACTIVATION_MISH, true, true>(
+    int N, int C, int se_K, sycl::half* output, const sycl::half* input,
+    const sycl::half* skip, const sycl::half* bias, const sycl::half* w1,
+    const sycl::half* b1, const sycl::half* w2, const sycl::half* b2,
+    sycl::queue &sycl_queue);
+template <>
+void OutputInputTransform<sycl::half, false, ACTIVATION_MISH, true, false>(
+    int N, int C, int se_K, sycl::half* output, const sycl::half* input,
+    const sycl::half* skip, const sycl::half* bias, const sycl::half* w1,
+    const sycl::half* b1, const sycl::half* w2, const sycl::half* b2,
+    sycl::queue &sycl_queue);
+
 /**
  * @brief Softmax activation kernel over feature channels.
  */

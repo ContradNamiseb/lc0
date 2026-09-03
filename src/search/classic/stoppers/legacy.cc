@@ -92,8 +92,13 @@ class LegacyTimeManager : public TimeManager {
         spend_saved_time_(params.GetOrDefault<float>("immediate-use", 1.0f)),
         first_move_bonus_(params.GetOrDefault<float>("first-move-bonus", 1.8f)),
         book_ply_bonus_(params.GetOrDefault<float>("book-ply-bonus", 0.25f)),
+        // Default 0 (disabled): this adjusts every move's time by up to the
+        // configured percentage based on instantaneous-vs-average NPS, a
+        // playing-strength-affecting behavior change that shipped
+        // accidentally-on and has no strength testing behind it. Opt in
+        // explicitly with e.g. nps-time-scaling=15.
         nps_time_scaling_(
-            params.GetOrDefault<float>("nps-time-scaling", 15.0f)) {}
+            params.GetOrDefault<float>("nps-time-scaling", 0.0f)) {}
   std::unique_ptr<SearchStopper> GetStopper(const GoParams& params,
                                             const Position& position,
                                             size_t /*total_memory*/,
@@ -173,33 +178,36 @@ std::unique_ptr<SearchStopper> LegacyTimeManager::GetStopper(
   // us to safely conserve move time. Conversely, when NPS drops below average,
   // the search is encountering complex lines or node resolution bottlenecks and
   // requires additional thinking time for accurate evaluation.
-  if (total_time_ms_ > 0 && last_nps_ > 0.0f) {
-    const float nps = last_nps_;
-    const float totalNodes = static_cast<float>(total_nodes_);
-    const float totalTime = static_cast<float>(total_time_ms_);
-
-    double alpha = 2.0 / (nps + 1.0);
-    float average_nps =
-        alpha * nps + (1.0f - alpha) * (totalNodes * 1e3f / totalTime);
-    if (average_nps > 0.0f) {
-      float nps_ratio = nps / average_nps;
+  // Off unless nps-time-scaling is set (see the constructor comment), and
+  // computed in double: total_nodes_ passes 2^24 routinely, where a float
+  // cast would lose node counts wholesale.
+  if (nps_time_scaling_ > 0.0f && total_time_ms_ > 0 && last_nps_ > 0.0f) {
+    const double nps = last_nps_;
+    const double alpha = 2.0 / (nps + 1.0);
+    const double average_nps =
+        alpha * nps +
+        (1.0 - alpha) *
+            (static_cast<double>(total_nodes_) * 1e3 / total_time_ms_);
+    if (average_nps > 0.0) {
+      const double nps_ratio = nps / average_nps;
       // Scale move time inversely proportional to search NPS ratio, clamped by
       // configured percentage.
-      float max_scale = nps_time_scaling_ / 100.0f;
-      float min_factor = std::max(0.0f, 1.0f - max_scale);
-      float max_factor = 1.0f + max_scale;
-      float nps_factor = std::clamp(1.0f / nps_ratio, min_factor, max_factor);
+      const double max_scale = nps_time_scaling_ / 100.0;
+      const double min_factor = std::max(0.0, 1.0 - max_scale);
+      const double max_factor = 1.0 + max_scale;
+      const double nps_factor =
+          std::clamp(1.0 / nps_ratio, min_factor, max_factor);
 
-      float old_time = this_move_time;
+      const double old_time = this_move_time;
       this_move_time *= nps_factor;
 
-      if (std::abs(nps_factor - 1.0f) < 0.001f) {
+      if (std::abs(nps_factor - 1.0) < 0.001) {
         LOGFILE << "NPS time adjustment: Current NPS (" << nps
                 << ") vs average NPS (" << average_nps
                 << ") [ratio: " << nps_ratio
                 << "]. Move time unchanged (scaled by factor " << nps_factor
                 << ", move time: " << this_move_time << "ms).";
-      } else if (nps_factor < 1.0f) {
+      } else if (nps_factor < 1.0) {
         LOGFILE << "NPS time adjustment: Current NPS (" << nps
                 << ") is higher than average NPS (" << average_nps
                 << ") [ratio: " << nps_ratio << ", factor: " << nps_factor
@@ -216,9 +224,11 @@ std::unique_ptr<SearchStopper> LegacyTimeManager::GetStopper(
       }
     }
   } else {
-    LOGFILE << "NPS time adjustment: No previous search NPS history available "
-               "yet. Move time unchanged ("
-            << this_move_time << "ms).";
+    LOGFILE << "NPS time adjustment: inactive ("
+            << (nps_time_scaling_ <= 0.0f
+                    ? "disabled; set nps-time-scaling to enable"
+                    : "no previous search NPS history yet")
+            << "). Move time unchanged (" << this_move_time << "ms).";
   }
 
   // Only extend thinking time with slowmover if smart pruning can potentially
