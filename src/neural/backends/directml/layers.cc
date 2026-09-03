@@ -35,6 +35,7 @@
 #include "neural/backends/directml/kda_recurrence_shader_source.h"
 #include "neural/backends/directml/mha_transpose_shader_source.h"
 #include "neural/backends/directml/policy_finalize_shader_source.h"
+#include "neural/backends/directml/smolgen_bias_shader_source.h"
 #include "neural/tables/attention_policy_map.h"
 #include "utils/exception.h"
 #include "utils/logging.h"
@@ -268,6 +269,10 @@ class GraphFactory {
     return AddTensor({}, DmlBindingRef::Kind::kScratch, std::move(sizes),
                      std::move(strides));
   }
+  dml::Expression Extra(Sizes sizes, Sizes strides = {}) {
+    return AddTensor({}, DmlBindingRef::Kind::kExtra, std::move(sizes),
+                     std::move(strides));
+  }
 
   // Strided dense-memory view of an intermediate expression (the
   // no-transpose-operator workaround for the policy scores GEMM, whose
@@ -435,8 +440,8 @@ dml::Expression RmsNormExpr(dml::Expression mixed, dml::Expression& gammas,
 // with (output, input, input2, scratch).
 template <typename DataType>
 void DispatchOp(DmlExecScope& scope, DmlCompiledOp& op, DmlPtr input,
-                DmlPtr input2, DmlPtr scratch,
-                std::vector<DmlPtr> outputs) {
+                DmlPtr input2, DmlPtr scratch, std::vector<DmlPtr> outputs,
+                DmlPtr extra = {}) {
   std::vector<DmlPtr> ptrs;
   ptrs.reserve(op.bindings.size());
   for (const auto& b : op.bindings) {
@@ -452,6 +457,9 @@ void DispatchOp(DmlExecScope& scope, DmlCompiledOp& op, DmlPtr input,
         break;
       case DmlBindingRef::Kind::kScratch:
         ptrs.push_back(scratch);
+        break;
+      case DmlBindingRef::Kind::kExtra:
+        ptrs.push_back(extra);
         break;
     }
   }
@@ -752,6 +760,48 @@ void MhaTransposeLayer::Record(ID3D12GraphicsCommandList* command_list,
   command_list->SetComputeRootUnorderedAccessView(2, output.GpuVA());
   const uint64_t total =
       (uint64_t)params.batch_size * params.heads * 64 * params.head_dim;
+  command_list->Dispatch(static_cast<UINT>((total + 63) / 64), 1, 1);
+
+  D3D12_RESOURCE_BARRIER barrier = {};
+  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+  command_list->ResourceBarrier(1, &barrier);
+}
+
+struct SmolgenBiasConstants {
+  uint32_t batch;
+  uint32_t heads;
+  uint32_t gen;
+  uint32_t pad0;
+};
+
+SmolgenBiasLayer::SmolgenBiasLayer(ID3D12Device* device, bool fp16)
+    : device_(device), fp16_(fp16) {
+  ComPtr<ID3DBlob> shader =
+      CompileHlsl(kSmolgenBiasShaderSource, sizeof(kSmolgenBiasShaderSource) - 1,
+                  "smolgen_bias.hlsl", "SmolgenBias", fp16_);
+  root_signature_ = CreateShaderRootSignature(
+      device_.Get(), sizeof(SmolgenBiasConstants) / 4, 2, 1);
+  pso_ = CreateComputePso(device_.Get(), root_signature_.Get(), shader.Get());
+}
+
+void SmolgenBiasLayer::Record(ID3D12GraphicsCommandList* command_list,
+                              const Params& params, DmlPtr table, DmlPtr d2,
+                              DmlPtr bias_out) {
+  SmolgenBiasConstants constants{};
+  constants.batch = params.batch;
+  constants.heads = params.heads;
+  constants.gen = params.gen;
+
+  command_list->SetComputeRootSignature(root_signature_.Get());
+  command_list->SetPipelineState(pso_.Get());
+  command_list->SetComputeRoot32BitConstants(0,
+                                             sizeof(SmolgenBiasConstants) / 4,
+                                             &constants, 0);
+  command_list->SetComputeRootShaderResourceView(1, table.GpuVA());
+  command_list->SetComputeRootShaderResourceView(2, d2.GpuVA());
+  command_list->SetComputeRootUnorderedAccessView(3, bias_out.GpuVA());
+  const uint64_t total =
+      (uint64_t)params.batch * params.heads * 4096u;
   command_list->Dispatch(static_cast<UINT>((total + 63) / 64), 1, 1);
 
   D3D12_RESOURCE_BARRIER barrier = {};
@@ -1350,10 +1400,11 @@ EncoderBlock<DataType>::EncoderBlock(
     }
     kda_recurrence_ = std::make_unique<KdaRecurrenceLayer>(ctx.device(), fp16);
   } else {
-    // MHA head transpose (see mha_transpose.hlsl). Smolgen nets throw at
-    // Eval time: their strided smolgen GEMMs share the same driver
-    // limitation and are out of scope for now.
+    // MHA head transpose (see mha_transpose.hlsl).
     mha_transpose_ = std::make_unique<MhaTransposeLayer>(ctx.device(), fp16);
+    if (has_smolgen_) {
+      smolgen_bias_ = std::make_unique<SmolgenBiasLayer>(ctx.device(), fp16);
+    }
   }
 }
 
@@ -1479,12 +1530,6 @@ void EncoderBlock<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
   }
 
   // MHA block.
-  if (has_smolgen_) {
-    throw Exception(
-        "directml backend: smolgen in MHA encoder heads is not supported "
-        "(its strided GEMMs hit the same driver limitation as the old "
-        "head-split views; matches nothing the backend has been tested with).");
-  }
   const uint32_t H = encoder_heads_;
   const uint32_t d_model = mha_q_size_;
   const uint32_t D = d_model / H;
@@ -1514,10 +1559,69 @@ void EncoderBlock<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
     auto qt_in = g.Input({B, 1, 64, D});
     auto kt_in = g.Input2({B, 1, 64, D});
     auto vt_in = g.Scratch({B, 1, 64, D});
+    if (has_smolgen_) {
+      // Smolgen MLP: compress -> dense1 -> LN -> dense2 -> LN, all dense
+      // GEMMs over the block input; output d2 [N, H*gen] feeds the
+      // SmolgenBiasLayer kernel (the bias matmul itself runs as HLSL --
+      // the DML-graph form needs a 5-D broadcast GEMM operand this driver
+      // rejects).
+      const uint32_t gen = smol_dense_2_size_ / H;
+      auto x_in = g.Extra({1, 1, tokens, d_model});
+      auto compress =
+          g.Weight(smol_compress_,
+                   {1, 1, (uint32_t)smol_compress_size_, d_model});
+      dml::Expression compressed =
+          dml::Gemm(x_in, compress, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                    DML_MATRIX_TRANSFORM_TRANSPOSE);
+      compressed = GraphFactory<DataType>::ReinterpretView(
+          compressed, {1, 1, (uint32_t)N,
+                       (uint32_t)(64 * smol_compress_size_)});
+      auto d1w = g.Weight(smol_dense1_w_,
+                          {1, 1, (uint32_t)smol_dense_1_size_,
+                           (uint32_t)(64 * smol_compress_size_)});
+      auto d1b = g.WeightChannel(smol_dense1_b_, (uint32_t)N,
+                                 (uint32_t)smol_dense_1_size_);
+      auto sln1g = g.WeightChannel(smol_ln1_gammas_, (uint32_t)N,
+                                   (uint32_t)smol_dense_1_size_);
+      auto sln1b = g.WeightChannel(smol_ln1_betas_, (uint32_t)N,
+                                   (uint32_t)smol_dense_1_size_);
+      dml::Expression dense1 =
+          dml::Gemm(compressed, d1w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                    DML_MATRIX_TRANSFORM_TRANSPOSE);
+      dml::Expression bias1 = d1b;
+      dense1 = LayerNormExpr<DataType>(dense1, &bias1, nullptr, sln1g,
+                                       sln1b, 1.0f, 1e-3f,
+                                       smolgen_activation_);
+      auto d2w = g.Weight(smol_dense2_w_,
+                          {1, 1, (uint32_t)smol_dense_2_size_,
+                           (uint32_t)smol_dense_1_size_});
+      auto d2b = g.WeightChannel(smol_dense2_b_, (uint32_t)N,
+                                 (uint32_t)smol_dense_2_size_);
+      auto sln2g = g.WeightChannel(smol_ln2_gammas_, (uint32_t)N,
+                                   (uint32_t)smol_dense_2_size_);
+      auto sln2b = g.WeightChannel(smol_ln2_betas_, (uint32_t)N,
+                                   (uint32_t)smol_dense_2_size_);
+      dml::Expression dense2 =
+          dml::Gemm(dense1, d2w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                    DML_MATRIX_TRANSFORM_TRANSPOSE);
+      dml::Expression bias2 = d2b;
+      dense2 = LayerNormExpr<DataType>(dense2, &bias2, nullptr, sln2g,
+                                       sln2b, 1.0f, 1e-3f,
+                                       smolgen_activation_);
+      // Output dense2 as [1,1,N*H,gen] (memory-identical to [N, H*gen]),
+      // the flat layout the SmolgenBiasLayer kernel indexes.
+      dense2 = GraphFactory<DataType>::ReinterpretView(
+          dense2, {1, 1, (uint32_t)(N * H), gen});
+      mha_mlp_compiled_.emplace(
+          N, g.Compile({dense2}, {(uint64_t)N * H * gen * sizeof(DataType)}));
+    }
     const float softmax_scale = 1.0f / std::sqrt(static_cast<float>(D));
     dml::Expression logits = dml::Gemm(
         qt_in, kt_in, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
         DML_MATRIX_TRANSFORM_TRANSPOSE, softmax_scale);
+
+    auto bias_in = g.Extra({(uint32_t)B, 1, 64, 64});
+    logits = logits + bias_in;
     const uint32_t softmax_axes[] = {3};
     const dml::Span<const uint32_t> softmax_axis(softmax_axes, 1);
     const auto sm_sizes = logits.Impl()->GetOutputDesc().sizes;
@@ -1602,12 +1706,6 @@ template <typename DataType>
 void EncoderBlock<DataType>::EvalMha(int N, DmlPtr in_out_tensor,
                                      DmlPtr scratch, DmlPtr buffer1,
                                      DmlPtr buffer2, DmlExecScope& scope) {
-  if (has_smolgen_) {
-    throw Exception(
-        "directml backend: smolgen in MHA encoder heads is not supported "
-        "(its strided GEMMs hit the same driver limitation as the old "
-        "head-split views; matches nothing the backend has been tested with).");
-  }
   const uint32_t H = encoder_heads_;
   const uint32_t d_model = mha_q_size_;
   if (H == 0 || d_model == 0 || d_model % H != 0) {
@@ -1677,35 +1775,33 @@ void EncoderBlock<DataType>::EvalMha(int N, DmlPtr in_out_tensor,
   {
     auto it = mha_attn_compiled_.find(N);
     if (it == mha_attn_compiled_.end()) {
-      GraphFactory<DataType> g(scope.ctx());
-      auto qt_in = g.Input({B, 1, 64, D});
-      auto kt_in = g.Input2({B, 1, 64, D});
-      auto vt_in = g.Scratch({B, 1, 64, D});
-      dml::Expression logits = dml::Gemm(
-          qt_in, kt_in, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
-          DML_MATRIX_TRANSFORM_TRANSPOSE, softmax_scale);
-      const uint32_t softmax_axes[] = {3};
-      const dml::Span<const uint32_t> softmax_axis(softmax_axes, 1);
-      const auto sm_sizes = logits.Impl()->GetOutputDesc().sizes;
-      const std::vector<uint32_t> sm_bcast{0, 0, 0, 1};
-      dml::Expression max_b = GraphFactory<DataType>::ReinterpretView(
-          dml::Reduce(logits, DML_REDUCE_FUNCTION_MAX, softmax_axis), sm_sizes,
-          sm_bcast);
-      dml::Expression shifted = logits - max_b;
-      dml::Expression exp_shifted = dml::Exp(shifted);
-      dml::Expression sum_b = GraphFactory<DataType>::ReinterpretView(
-          dml::Reduce(exp_shifted, DML_REDUCE_FUNCTION_SUM, softmax_axis),
-          sm_sizes, sm_bcast);
-      dml::Expression attn = exp_shifted * dml::Recip(sum_b);
-      dml::Expression context =
-          dml::Gemm(attn, vt_in, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
-                    DML_MATRIX_TRANSFORM_NONE);
-      it = mha_attn_compiled_
-               .emplace(N, g.Compile({context},
-                                     {(uint64_t)B * 64 * D * elem}))
-               .first;
+      throw Exception(
+          "directml backend: MHA attention graph was not compiled; "
+          "EnsureCompiled must run before Eval.");
     }
-    DispatchOp<DataType>(scope, it->second, qt, kt, vt, {ctxb});
+    DmlPtr bias;
+    if (has_smolgen_) {
+      // Smolgen MLP (dense graphs) then the bias HLSL kernel: d2 [N,H*gen]
+      // and bias [N,H,64,64] are per-batch, so they come from the transient
+      // arena at the real batch size.
+      auto mlp_it = mha_mlp_compiled_.find(N);
+      if (mlp_it == mha_mlp_compiled_.end()) {
+        throw Exception(
+            "directml backend: smolgen MLP graph was not compiled; "
+            "EnsureCompiled must run before Eval.");
+      }
+      const uint32_t gen = smol_dense_2_size_ / H;
+      auto d2 = scope.TakeTransient((uint64_t)N * H * smol_dense_2_size_ * elem);
+      bias = scope.TakeTransient((uint64_t)N * H * smolgen_global_size_ * elem);
+      DispatchOp<DataType>(scope, mlp_it->second, in_out_tensor, DmlPtr(),
+                           DmlPtr(), {d2});
+      SmolgenBiasLayer::Params sp{};
+      sp.batch = N;
+      sp.heads = H;
+      sp.gen = gen;
+      smolgen_bias_->Record(scope.list(), sp, smolgen_global_, d2, bias);
+    }
+    DispatchOp<DataType>(scope, it->second, qt, kt, vt, {ctxb}, bias);
   }
 
   // 4. Merge back to token-major [T, H*D].

@@ -371,6 +371,7 @@ class EncoderBlock {
   // a tail graph per N. KDA: a projections graph and a tail graph per N,
   // with the recurrence shader in between.
   std::unordered_map<int, DmlCompiledOp> mha_qkv_compiled_;
+  std::unordered_map<int, DmlCompiledOp> mha_mlp_compiled_;
   std::unordered_map<int, DmlCompiledOp> mha_attn_compiled_;
   std::unordered_map<int, DmlCompiledOp> mha_tail_compiled_;
   std::unordered_map<int, DmlCompiledOp> kda_proj_compiled_;
@@ -381,6 +382,7 @@ class EncoderBlock {
   // The MHA head-split/merge transpose (compiled once at construction for
   // MHA blocks; see mha_transpose.hlsl for why a shader is needed).
   std::unique_ptr<class MhaTransposeLayer> mha_transpose_;
+  std::unique_ptr<class SmolgenBiasLayer> smolgen_bias_;
 };
 
 // Attention policy head: ip_pol embedding, optional encoder stack, wq/wk
@@ -458,6 +460,31 @@ class MhaTransposeLayer {
 
   void Record(ID3D12GraphicsCommandList* command_list, const Params& params,
               DmlPtr input, DmlPtr output);
+
+ private:
+  ComPtr<ID3D12Device> device_;
+  ComPtr<ID3D12RootSignature> root_signature_;
+  ComPtr<ID3D12PipelineState> pso_;
+  bool fp16_;
+};
+
+// Smolgen generated-bias matmul (shaders/smolgen_bias.hlsl): computes
+// bias[n,h,i] = sum_g table[h,i,g] * d2[n,h,g] -- the per-(batch, head)
+// attention bias -- as a hand-written kernel, because the equivalent DML
+// graph needs a 5-D broadcast GEMM operand this driver rejects. Same
+// build-once/record-only contract as MhaTransposeLayer.
+class SmolgenBiasLayer {
+ public:
+  struct Params {
+    uint32_t batch;  // N
+    uint32_t heads;  // H
+    uint32_t gen;    // per-head generated-vector width
+  };
+
+  SmolgenBiasLayer(ID3D12Device* device, bool fp16);
+
+  void Record(ID3D12GraphicsCommandList* command_list, const Params& params,
+              DmlPtr table, DmlPtr d2, DmlPtr bias_out);
 
  private:
   ComPtr<ID3D12Device> device_;

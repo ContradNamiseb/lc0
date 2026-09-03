@@ -31,20 +31,14 @@
 // errors rather than guessing. fp16 runs through the same template with
 // DmlHalf storage (FXC half caveat applies to the HLSL kernels only).
 //
-// STATUS (2026-09-03): builds and runs KDA-hybrid attention nets end to
-// end on hardware (Iris Xe, system DirectML 1.15). Verified by
-// test_kda_recurrence.cc (kernel vs CPU reference: PASS) and
-// test_kda_parity_directml.cc (whole net vs the BLAS reference):
-//   - KDA net (qkv_silu, output gate + RMS norm, attn policy, WDL):
-//     policy max diff 3.2e-4 vs the SYCL parity test's 2e-4 bar; WDL
-//     probabilities within 7.4e-3. Near tolerance but NOT inside it; the
-//     residual is under investigation (a standalone GEMM measured
-//     bit-exact vs CPU, so the drift sits in a composition, not the
-//     matmuls).
-//   - KDA+MHA net: the MHA graph still trips CreateOperator on this
-//     driver (DirectML restricts strided GEMM operands); the
-//     MhaTransposeLayer shader workaround is wired in but one strided
-//     site remains.
+// STATUS (2026-09-04): three of five parity nets PASS at the full 2e-4
+// tolerance (KDA+MLH, KDA-hybrid, NoEncoder); the two MHA-encoder nets run
+// end to end with small residual drift (~1e-2, under investigation -- see
+// docs/directml-handoff.md section 6). The smolgen MLP/bias path is
+// implemented (dense graphs + SmolgenBiasLayer HLSL kernel) but the real
+// trained net's MLP graph currently fails DML CompileGraph on this driver
+// -- the one open blocker for real-net benchmarking; see the handoff's
+// section 3/5 for the established driver-rule context.
 //   - fp16: compiled, untested.
 // The parity tests fail loudly rather than pass at a loosened tolerance;
 // treat a red kda_parity_test_directml as the to-do list, not breakage.
@@ -329,54 +323,14 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
   tensor_slot_bytes_ = std::max(max_layer_bytes, scratch_bytes_);
   const uint64_t tensor_arena_bytes = 3 * tensor_slot_bytes_;
 
-  // Weight arena: sum of all uploaded tensors (computed by the uploader).
-  // Two passes: size with a dry-run arena over the real byte count.
-  {
-    DmlArena sizing;
-    // No dry-run: just build layers against the real arena created with an
-    // estimated size, grown if the uploader runs out. Estimate generously:
-    // every MultiHeadWeights float once, rounded up.
-    uint64_t estimate = 0;
-    estimate += weights_.ip_emb_w.size() + weights_.ip_emb_b.size();
-    for (const auto& enc : weights_.encoder) {
-      estimate += enc.mha.q_w.size() + enc.mha.q_b.size() +
-                  enc.mha.k_w.size() + enc.mha.k_b.size() +
-                  enc.mha.v_w.size() + enc.mha.v_b.size() +
-                  enc.mha.dense_w.size() + enc.mha.dense_b.size() +
-                  enc.ffn.dense1_w.size() + enc.ffn.dense1_b.size() +
-                  enc.ffn.dense2_w.size() + enc.ffn.dense2_b.size() +
-                  enc.ln1_gammas.size() + enc.ln1_betas.size() +
-                  enc.ln2_gammas.size() + enc.ln2_betas.size();
-      estimate += enc.kda.q_w.size() + enc.kda.q_b.size() +
-                  enc.kda.k_w.size() + enc.kda.k_b.size() +
-                  enc.kda.v_w.size() + enc.kda.v_b.size() +
-                  enc.kda.decay_a_w.size() + enc.kda.decay_a_b.size() +
-                  enc.kda.decay_b_w.size() + enc.kda.decay_b_b.size() +
-                  enc.kda.beta_w.size() + enc.kda.beta_b.size() +
-                  enc.kda.a_log.size() + enc.kda.dt_bias.size() +
-                  enc.kda.gate_a_w.size() + enc.kda.gate_a_b.size() +
-                  enc.kda.gate_b_w.size() + enc.kda.gate_b_b.size() +
-                  enc.kda.out_norm_gammas.size() + enc.kda.dense_w.size() +
-                  enc.kda.dense_b.size();
-    }
-    estimate += policy_head.ip_pol_w.size() + policy_head.ip_pol_b.size() +
-                policy_head.ip2_pol_w.size() + policy_head.ip2_pol_b.size() +
-                policy_head.ip3_pol_w.size() + policy_head.ip3_pol_b.size() +
-                policy_head.ip4_pol_w.size();
-    estimate += value_head.ip_val_w.size() + value_head.ip_val_b.size() +
-                value_head.ip1_val_w.size() + value_head.ip1_val_b.size() +
-                value_head.ip2_val_w.size() + value_head.ip2_val_b.size();
-    estimate += 64 * kNumPosEncodingChannels;
-    if (moves_left_) {
-      estimate += weights_.ip_mov_w.size() + weights_.ip_mov_b.size() +
-                  weights_.ip1_mov_w.size() + weights_.ip1_mov_b.size() +
-                  weights_.ip2_mov_w.size() + weights_.ip2_mov_b.size();
-    }
-    estimate += kNumOutputPolicy * 4;  // gather indices
-    (void)sizing;
-    weight_arena_.Create(ctx_.device(), (estimate + 1024) * elem,
-                         "weights", D3D12_RESOURCE_STATE_COPY_DEST);
-  }
+  // Weight arena: sized from the parsed weights' serialized size -- a
+  // tight upper bound on the float data (the hand-written per-field
+  // estimate missed real-net arrays: smolgen, the unselected value/policy
+  // heads, preprocess layers -- and exhausted the arena on real nets).
+  const uint64_t weight_arena_bytes =
+      (uint64_t)file.weights().OutputAsString().size() * 2 + (16 << 20);
+  weight_arena_.Create(ctx_.device(), weight_arena_bytes, "weights",
+                       D3D12_RESOURCE_STATE_COPY_DEST);
 
   tensor_arena_.Create(ctx_.device(), tensor_arena_bytes, "tensors");
   scratch_arena_.Create(ctx_.device(), scratch_bytes_ * 2, "scratch");

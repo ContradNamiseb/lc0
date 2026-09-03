@@ -249,7 +249,7 @@ class DmlDescriptorPool {
 // transposes into input strides), so layer graphs declare strided views
 // over the dense token-major buffers instead of reshuffling memory.
 struct DmlBindingRef {
-  enum class Kind { kWeight, kInput, kInput2, kScratch } kind;
+  enum class Kind { kWeight, kInput, kInput2, kScratch, kExtra } kind;
   DmlPtr weight;  // only meaningful for kWeight
   uint64_t bytes = 0;
 };
