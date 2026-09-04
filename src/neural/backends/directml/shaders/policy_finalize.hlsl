@@ -29,7 +29,7 @@ StructuredBuffer<INPUT_TYPE> ppo_buf : register(t2);
 RWStructuredBuffer<INPUT_TYPE> output_buf : register(u0);
 
 #define PROMO_BASE 4096
-#define ROW_STRIDE 4168  // 64 * 64 + 8 * 24
+#define ROW_STRIDE 4288  // 64 * 64 + 8 * 24
 
 [numthreads(64, 1, 1)]
 void PolicyFinalize(uint3 tid : SV_GroupThreadID, uint3 gtid : SV_GroupID) {

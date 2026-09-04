@@ -333,7 +333,7 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
   // (layer outputs are all <= tokens*max(embed, pol_map); compute exactly)
   const uint64_t emb = weights_.ip_emb_b.size();
   max_layer_bytes =
-      std::max(max_layer_bytes, max_tokens * std::max<uint64_t>(emb, 4168) * elem);
+      std::max(max_layer_bytes, max_tokens * std::max<uint64_t>(emb, 4288) * elem);
   tensor_slot_bytes_ = std::max(max_layer_bytes, scratch_bytes_);
   const uint64_t tensor_arena_bytes = 3 * tensor_slot_bytes_;
 
@@ -676,7 +676,7 @@ void DirectMlNetwork<DataType>::forwardEval(
 
   int l = 1;
 
-  // Policy head (writes [N, 4168] rows into spare1) + policy map.
+  // Policy head (writes [N, 4288] rows into spare1) + policy map.
   network_[l++]->Eval(batch, spare1, flow, spare2, scratch, scratch_bytes_,
                       scope);
   DmlPtr op_pol(io->policy_gpu_.Get(), 0);

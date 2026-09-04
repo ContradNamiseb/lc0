@@ -340,6 +340,33 @@ pblczero::Net MakeNoEncoderNet() {
 }
 
 
+// Distinct positions. A batch of identical inputs would hide any per-sample
+// indexing bug, because every row would hold the same numbers.
+std::vector<InputPlanes> EncodeDistinctPositions(int count) {
+  static const char* kFens[] = {
+      ChessBoard::kStartposFen,
+      "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1",
+      "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 0 1",
+      "8/8/8/4k3/8/4K3/4P3/8 w - - 0 1",
+      "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+      "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+      "rnbq1rk1/pp2bppp/4pn2/2pp4/2PP4/2N1PN2/PP2BPPP/R1BQ1RK1 w - - 0 1",
+      "4rrk1/pp1n1ppp/2pb4/q2p4/3P4/1QPB1N2/PP3PPP/R4RK1 w - - 0 1",
+  };
+  const int kCount = static_cast<int>(sizeof(kFens) / sizeof(kFens[0]));
+  std::vector<InputPlanes> out;
+  for (int i = 0; i < count; ++i) {
+    ChessBoard board;
+    PositionHistory history;
+    board.SetFromFen(kFens[i % kCount]);
+    history.Reset(board, 0, 1);
+    out.push_back(EncodePositionForNN(
+        pblczero::NetworkFormat::INPUT_CLASSICAL_112_PLANE, history, 8,
+        FillEmptyHistory::NO, nullptr));
+  }
+  return out;
+}
+
 InputPlanes EncodeStartPos() {
   ChessBoard board;
   PositionHistory history;
@@ -375,6 +402,28 @@ Outputs RunNetwork(const std::string& backend, const WeightsFile& weights,
   return out;
 }
 
+// Runs a whole batch and returns EVERY sample, not just the first.
+std::vector<Outputs> RunNetworkBatch(const std::string& backend,
+                                     const WeightsFile& weights,
+                                     const std::vector<InputPlanes>& planes) {
+  OptionsDict options;
+  auto network = NetworkFactory::Get()->Create(backend, weights, options);
+  auto computation = network->NewComputation();
+  for (const auto& p : planes) computation->AddInput(InputPlanes(p));
+  computation->ComputeBlocking();
+  std::vector<Outputs> out(planes.size());
+  for (size_t n = 0; n < planes.size(); ++n) {
+    out[n].q = computation->GetQVal(static_cast<int>(n));
+    out[n].d = computation->GetDVal(static_cast<int>(n));
+    out[n].m = computation->GetMVal(static_cast<int>(n));
+    out[n].policy.reserve(1858);
+    for (int i = 0; i < 1858; ++i) {
+      out[n].policy.push_back(computation->GetPVal(static_cast<int>(n), i));
+    }
+  }
+  return out;
+}
+
 bool HasBackend(const std::string& name) {
   const auto& backends = NetworkFactory::Get()->GetBackendsList();
   return std::find(backends.begin(), backends.end(), name) != backends.end();
@@ -386,6 +435,63 @@ bool HasBackend(const std::string& name) {
 // gate, wrong softmax axis) produces errors ~1e-1+, two orders of magnitude
 // above this bar.
 constexpr float kTol = 2e-4f;
+
+// Every sample of a multi-position batch, against BLAS.
+//
+// The single-position CompareBackends validates exactly one (batch, sample) =
+// (1, 0), and every HLSL kernel here indexes by sample. A wrong per-row stride
+// is invisible at batch 1, because row 0 starts at offset 0 whichever stride
+// is used -- which is exactly how policy_finalize shipped ROW_STRIDE 4168
+// against a 4288-wide reader, scrambling the policy of every sample after the
+// first in every real search.
+void CompareBackendsBatch(const pblczero::Net& net, int batch) {
+  const std::vector<InputPlanes> planes = EncodeDistinctPositions(batch);
+
+  ASSERT_TRUE(HasBackend("blas"))
+      << "blas backend not compiled into the test binary";
+  const std::vector<Outputs> reference =
+      RunNetworkBatch("blas", net, planes);
+
+  const char* backend_env = getenv("LC0_TEST_BACKEND");
+  const std::string test_backend = backend_env ? backend_env : "directml";
+  if (!HasBackend(test_backend)) {
+    GTEST_SKIP() << test_backend << " backend not compiled in";
+  }
+  std::vector<Outputs> dml;
+  try {
+    dml = RunNetworkBatch(test_backend, net, planes);
+  } catch (const Exception& e) {
+    GTEST_SKIP() << "no usable " << test_backend << " device: " << e.what();
+  }
+
+  constexpr float kRelTol = 5e-5f;
+  auto bound = [](float reference_value) {
+    return kTol + kRelTol * std::fabs(reference_value);
+  };
+  for (int n = 0; n < batch; ++n) {
+    EXPECT_NEAR(dml[n].q, reference[n].q, bound(reference[n].q))
+        << "sample " << n << ": WDL value Q diverges";
+    EXPECT_NEAR(dml[n].d, reference[n].d, bound(reference[n].d))
+        << "sample " << n << ": WDL draw probability diverges";
+    EXPECT_NEAR(dml[n].m, reference[n].m, bound(reference[n].m))
+        << "sample " << n << ": moves-left diverges";
+
+    float ref_absmax = 0.0f, worst = 0.0f;
+    int worst_move = -1;
+    for (int i = 0; i < 1858; ++i) {
+      ref_absmax = std::max(ref_absmax, std::fabs(reference[n].policy[i]));
+      const float diff =
+          std::fabs(dml[n].policy[i] - reference[n].policy[i]);
+      if (diff > worst) {
+        worst = diff;
+        worst_move = i;
+      }
+    }
+    EXPECT_LT(worst, bound(ref_absmax))
+        << "sample " << n << ": policy diverges (worst move " << worst_move
+        << ", diff " << worst << ")";
+  }
+}
 
 void CompareBackends(const pblczero::Net& net) {
   const InputPlanes planes = EncodeStartPos();
@@ -652,6 +758,20 @@ pblczero::Net MakeGatedNet(const NetDims& d, unsigned seed) {
   FillLayer(w->mutable_ip_add_gate(),
             RandomVec(rng, static_cast<size_t>(d.embedding) * 64, 0.1f));
   return file;
+}
+
+// Batch tests. These are the ones that cover per-sample indexing in every
+// HLSL kernel; the single-position cases above cannot.
+TEST(DirectMlKdaParity, MatchesBlasOnBatchOfTwo) {
+  CompareBackendsBatch(MakeKdaMlhNet(), 2);
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnBatchOfEight) {
+  CompareBackendsBatch(MakeKdaMlhNet(), 8);
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnBatchOfEightRealisticDims) {
+  CompareBackendsBatch(MakeNetWithDims(RealisticDims(), 8001), 8);
 }
 
 TEST(DirectMlKdaParity, MatchesBlasOnGatedEmbeddingNet) {

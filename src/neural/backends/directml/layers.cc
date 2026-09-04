@@ -598,21 +598,27 @@ void DmlDeviceContext::DispatchOperator(
   for (size_t i = 0; i < inputs.size(); ++i) {
     buffer_bindings[i].Buffer = inputs[i].res;
     buffer_bindings[i].Offset = inputs[i].offset;
-    // Never declare a binding past the end of its resource. The size in
-    // meta[i] is a deliberate over-estimate (see GraphFactory::AddTensor)
-    // and it is quadratic in the tensor's dimensions, so for a wide weight
-    // it runs off the end of the arena: the value head's [1, 1, 128, 8192]
-    // ip1_val_w asked for 268MB of a 25MB weight arena. DirectML then read
-    // out of bounds and the value and moves-left heads came back as
-    // garbage, while narrower heads in the same net stayed in range and
-    // were bit-exact against BLAS.
-    uint64_t size = meta[i].bytes;
+    // A binding must never extend past the end of its resource. This used to
+    // silently clamp, back when meta[i].bytes was a wild over-estimate that
+    // ran off the end of the arena -- the value head's [1, 1, 128, 8192]
+    // ip1_val_w asked for 268MB of a 25MB weight arena, DirectML read out of
+    // bounds, and the value and moves-left heads returned garbage while
+    // narrower heads in the same net stayed bit-exact.
+    //
+    // Sizes are canonical since 794bb49, so this can now only fire on a
+    // genuine sizing or offset bug, and clamping such a bug would under-bind:
+    // a DirectML contract violation that produces wrong numbers quietly,
+    // which is the exact failure mode that cost days here. Throw instead.
+    const uint64_t size = meta[i].bytes;
     if (inputs[i].res) {
       const uint64_t resource_bytes = inputs[i].res->GetDesc().Width;
-      const uint64_t available = resource_bytes > inputs[i].offset
-                                     ? resource_bytes - inputs[i].offset
-                                     : 0;
-      size = std::min(size, available);
+      if (inputs[i].offset + size > resource_bytes) {
+        throw Exception(
+            "directml backend: binding of " + std::to_string(size) +
+            " bytes at offset " + std::to_string(inputs[i].offset) +
+            " runs past the end of a " + std::to_string(resource_bytes) +
+            "-byte resource");
+      }
     }
     buffer_bindings[i].SizeInBytes = size;
     binding_descs[i].Type = DML_BINDING_TYPE_BUFFER;
