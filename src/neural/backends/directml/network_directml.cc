@@ -331,6 +331,23 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
     }
     scratch_elems = std::max(scratch_elems, need);
   }
+  // Policy encoders need the same treatment the body loop gives MHA
+  // encoders, and did not have it: the terms below size the wq/wk/scores
+  // layout and the LayerNorm temporaries, but nothing covered the policy
+  // encoder's own q/k/v scratch (3 * d_model) or its buffer1 carve-up
+  // (5 * d_model). Unlike the body path, AttentionPolicyHead::Eval starts
+  // that carve-up at output + AlignUp(scratch_bytes_ / 2), half a scratch
+  // into the slot, so the slot must hold scratch/2 + 5 * d_model. Since the
+  // slot is sized >= scratch_bytes_, requiring scratch >= 10 * d_model makes
+  // that hold by construction (scratch/2 + 5*d_model <= scratch <= slot) and
+  // covers the 3 * d_model of q/k/v as well.
+  const uint64_t pol_emb = policy_head.ip_pol_b.size();
+  for (const auto& enc : policy_head.pol_encoder) {
+    const uint64_t pol_d = (!enc.mha.q_w.empty() && pol_emb != 0)
+                               ? enc.mha.q_w.size() / pol_emb
+                               : pol_emb;
+    scratch_elems = std::max(scratch_elems, 10 * pol_d);
+  }
   scratch_elems = std::max(
       {scratch_elems,
        2 * policy_head.ip2_pol_b.size() + 64,
@@ -356,42 +373,43 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
       std::max(max_layer_bytes, max_tokens * std::max<uint64_t>(emb, 4288) * elem);
   tensor_slot_bytes_ = std::max(max_layer_bytes, scratch_bytes_);
 
-  // The sizing above accounts only for layer OUTPUTS, but EncoderBlock::
-  // EvalMha carves FIVE max_tokens * d_model regions (qt/kt/vt/ctx/merged)
-  // out of buffer1, which is a tensor slot. Nothing made that an invariant,
-  // so current nets fit by arithmetic luck rather than by construction, and
-  // an overflow here is not a failed allocation -- it is an out-of-bounds
-  // UAV write into the neighbouring slot.
+  // Belt-and-braces on the policy encoder carve-up, in exact bytes.
   //
-  // The bound differs between the two callers, because they hand EvalMha a
-  // different buffer1:
-  //   AttentionBody::Eval    passes the slot BASE            -> 5 * d_model
-  //   AttentionPolicyHead    passes output + scratch/2       -> scratch/2
-  //                                                              + 5 * d_model
-  // Checked here in elements per token, with the net's real numbers in the
-  // message so a future failure names the net rather than the arithmetic.
-  {
-    const uint64_t slot_elems_per_token = tensor_slot_bytes_ / (max_tokens * elem);
-    auto require = [&](uint64_t needed, const char* which, uint64_t d_model) {
-      if (needed > slot_elems_per_token) {
-        throw Exception(
-            std::string("directml backend: this net's ") + which +
-            " attention needs " + std::to_string(needed) +
-            " elements per token but the tensor slot holds only " +
-            std::to_string(slot_elems_per_token) + " (d_model " +
-            std::to_string(d_model) + ", max_batch " +
-            std::to_string(max_batch_size_) +
-            "). Raise the tensor slot sizing to cover the MHA carve-up.");
-      }
-    };
-    for (const auto& enc : weights_.encoder) {
-      const uint64_t d_model = enc.mha.q_b.size();
-      if (d_model == 0) continue;  // KDA encoders do not take this path
-      require(5 * d_model, "body", d_model);
+  // The body path needs no such check: its scratch term is already 8 *
+  // d_model (3 for q/k/v, 5 for the buffer1 carve-up) and the slot is sized
+  // >= scratch_bytes_, so any 5 * d_model requirement is satisfied by
+  // construction. An earlier version of this block asserted that anyway and
+  // was therefore a tautology; it also derived a "breaks at d_model >= 858"
+  // threshold by holding the slot at 4288 while growing d_model, which is
+  // wrong because the slot grows with d_model through exactly that scratch
+  // term.
+  //
+  // The policy path is the one that was uncovered, and the scratch term
+  // above now fixes it. This asserts the resulting inequality in the bytes
+  // AttentionPolicyHead::Eval actually uses -- AlignUp(scratch_bytes_ / 2),
+  // not a truncating scratch_elems / 2 -- so that a future change to either
+  // side is caught rather than assumed.
+  for (const auto& enc : policy_head.pol_encoder) {
+    const uint64_t pol_d = (!enc.mha.q_w.empty() && pol_emb != 0)
+                               ? enc.mha.q_w.size() / pol_emb
+                               : pol_emb;
+    const uint64_t needed =
+        AlignUp(scratch_bytes_ / 2) + 5 * max_tokens * pol_d * elem;
+    if (needed > tensor_slot_bytes_) {
+      throw Exception(
+          "directml backend: this net's policy encoder needs " +
+          std::to_string(needed) + " bytes of tensor slot but only " +
+          std::to_string(tensor_slot_bytes_) + " are sized (policy d_model " +
+          std::to_string(pol_d) + ", max_batch " +
+          std::to_string(max_batch_size_) + ").");
     }
-    const uint64_t pol_d_model = policy_head.ip2_pol_b.size();
-    if (pol_d_model != 0 && !policy_head.pol_encoder.empty()) {
-      require(scratch_elems / 2 + 5 * pol_d_model, "policy-head", pol_d_model);
+    const uint64_t qkv_needed = 3 * max_tokens * pol_d * elem;
+    if (qkv_needed > scratch_bytes_) {
+      throw Exception(
+          "directml backend: this net's policy encoder needs " +
+          std::to_string(qkv_needed) + " bytes of scratch for q/k/v but only " +
+          std::to_string(scratch_bytes_) + " are sized (policy d_model " +
+          std::to_string(pol_d) + ").");
     }
   }
 
