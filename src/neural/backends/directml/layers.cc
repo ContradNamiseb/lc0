@@ -1766,8 +1766,17 @@ void EncoderBlock<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
         qt_in, kt_in, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
         DML_MATRIX_TRANSFORM_TRANSPOSE, softmax_scale);
 
-    auto bias_in = g.Extra({(uint32_t)B, 1, 64, 64});
-    logits = logits + bias_in;
+    // Only smolgen blocks have a per-(batch, head) attention bias. Declaring
+    // the Extra input unconditionally made every non-smolgen MHA block add a
+    // tensor that EvalMha binds as a default-constructed DmlPtr -- a
+    // DML_BUFFER_BINDING with a null resource -- so the logits picked up
+    // whatever that resolved to. That is the ~2e-2 drift the MhaMlh and
+    // KdaMha parity nets showed: both build their MHA encoder without
+    // smolgen weights, while every real net that reaches this path has them.
+    if (has_smolgen_) {
+      auto bias_in = g.Extra({(uint32_t)B, 1, 64, 64});
+      logits = logits + bias_in;
+    }
     const uint32_t softmax_axes[] = {3};
     const dml::Span<const uint32_t> softmax_axis(softmax_axes, 1);
     const auto sm_sizes = logits.Impl()->GetOutputDesc().sizes;
