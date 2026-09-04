@@ -631,6 +631,37 @@ NetDims RealisticDims() {
   return d;
 }
 
+// Input gating populated, in the [channels][64] layout real nets use. Every
+// other synthetic net here leaves ip_mult_gate/ip_add_gate empty, so
+// has_gating_ is false and the gating path is dead under test -- which is
+// exactly how a per-channel broadcast of a per-square matrix survived 36
+// passing tests and was only caught by a real net.
+//
+// The general rule, and worth applying to the other optional features: a
+// feature flag should be exercised in BOTH states somewhere in the suite. A
+// guard that is always true hides its else-branch just as thoroughly as one
+// that is always false.
+pblczero::Net MakeGatedNet(const NetDims& d, unsigned seed) {
+  pblczero::Net file = MakeNetWithDims(d, seed);
+  std::mt19937 rng(seed ^ 0x9e37u);
+  auto* w = file.mutable_weights();
+  // Values must vary across squares, or a per-channel broadcast would still
+  // agree with a per-square read and the test would prove nothing.
+  FillLayer(w->mutable_ip_mult_gate(),
+            RandomVec(rng, static_cast<size_t>(d.embedding) * 64, 0.3f));
+  FillLayer(w->mutable_ip_add_gate(),
+            RandomVec(rng, static_cast<size_t>(d.embedding) * 64, 0.1f));
+  return file;
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnGatedEmbeddingNet) {
+  CompareBackends(MakeGatedNet(NetDims(), 6001));
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnGatedEmbeddingRealisticDims) {
+  CompareBackends(MakeGatedNet(RealisticDims(), 6002));
+}
+
 TEST(DirectMlKdaParity, MatchesBlasOnRealisticDimsNet) {
   CompareBackends(MakeNetWithDims(RealisticDims(), 2024));
 }
