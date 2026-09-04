@@ -28,6 +28,7 @@
 
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <string>
@@ -244,6 +245,11 @@ class GraphFactory {
   dml::Expression Weight(const DmlPtr& w, Sizes sizes) {
     return AddTensor(w, DmlBindingRef::Kind::kWeight, std::move(sizes), {});
   }
+  // Weight bound at its exact size -- see ComputeBindingBytes.
+  dml::Expression WeightExact(const DmlPtr& w, Sizes sizes) {
+    return AddTensor(w, DmlBindingRef::Kind::kWeight, std::move(sizes), {},
+                     /*exact_bytes=*/true);
+  }
   // UINT32 weight tensor (policy-map gather indices): same binding
   // mechanics, different element type.
   dml::Expression WeightU32(const DmlPtr& w, Sizes sizes) {
@@ -349,8 +355,51 @@ class GraphFactory {
     return desc;
   }
 
+  // Bytes a buffer binding must cover.
+  //
+  // `exact` is the tensor's real memory span: the element count for a dense
+  // tensor, 1 + sum((size_i - 1) * stride_i) for a strided view. That is what
+  // MakeDesc puts in the tensor desc and what the API asks the binding to be.
+  //
+  // The default is deliberately NOT that. It is a legacy over-estimate that
+  // substitutes each size for its missing dense stride -- a quantity with no
+  // meaning (it is quadratic in the row count) but a generous one, and the
+  // one every graph in this backend has always been bound with. Binding the
+  // exact size everywhere corrupts the process heap on this runtime: under
+  // cdb, kda-t1-55050 dies with STATUS_HEAP_CORRUPTION (c0000374) inside a
+  // later unrelated malloc, reproducibly, at every batch size and thread
+  // count, while backendbench driving the same graphs stays clean. Padding
+  // by up to 1024 elements does not help, so it is not a slack problem.
+  //
+  // Callers that need the exact size ask for it. So far that is the smolgen
+  // weight table: the over-estimate declares [1, 1, 4096, gen] as ~16.8M
+  // elements against an actual 32768, DirectML reads far past the weight
+  // arena, and the generated attention bias comes out as if it were absent --
+  // the attention output does not move even when a completely unrelated
+  // buffer is bound in its place. That was MatchesBlasOnSmolgenMhaNet's
+  // failure.
+  static uint64_t ComputeBindingBytes(const Sizes& sizes, const Sizes& strides,
+                                      bool exact_only) {
+    uint64_t exact = 1;
+    if (strides.empty()) {
+      for (uint32_t size : sizes) exact *= size;
+    } else {
+      for (size_t i = 0; i < sizes.size(); ++i) {
+        exact += (uint64_t(sizes[i]) - 1) * strides[i];
+      }
+    }
+    if (exact_only) return exact * sizeof(DataType);
+    uint64_t legacy = 1;
+    for (size_t i = 0; i < sizes.size(); ++i) {
+      legacy +=
+          (uint64_t(sizes[i]) - 1) * (strides.empty() ? sizes[i] : strides[i]);
+    }
+    return std::max(exact, legacy) * sizeof(DataType);
+  }
+
   dml::Expression AddTensor(const DmlPtr& w, DmlBindingRef::Kind kind,
-                            Sizes sizes, Sizes strides) {
+                            Sizes sizes, Sizes strides,
+                            bool exact_bytes = false) {
     // Bytes the binding must cover: for a strided view that is the memory
     // span 1 + sum((size_i - 1) * stride_i); for a dense tensor it is simply
     // the element count.
@@ -364,18 +413,37 @@ class GraphFactory {
     // DirectML then read the tensor as though the bias were absent -- the
     // attention output did not change even when a completely different
     // buffer was bound there.
-    const uint64_t bytes = [&] {
-      if (strides.empty()) {
-        uint64_t elements = 1;
-        for (uint32_t size : sizes) elements *= size;
-        return elements * sizeof(DataType);
-      }
-      uint64_t span = 1;
-      for (size_t i = 0; i < sizes.size(); ++i) {
-        span += (uint64_t(sizes[i]) - 1) * strides[i];
-      }
-      return span * sizeof(DataType);
-    }();
+    // Bytes the buffer binding must cover.
+    //
+    // The tensor's own requirement is its memory span: the element count for
+    // a dense tensor, or 1 + sum((size_i - 1) * stride_i) for a strided view.
+    // That is what MakeDesc puts in the tensor desc, and per the API it is
+    // also what the binding needs -- DirectML requires the bound region to be
+    // at least the tensor size.
+    //
+    // Binding exactly that, however, corrupts the process heap on this
+    // runtime. Under cdb, kda-t1-55050 dies with STATUS_HEAP_CORRUPTION
+    // (c0000374) inside a later unrelated malloc; without a debugger it is a
+    // bare access violation partway through the first search. It is not a
+    // slack problem -- padding the binding by up to 1024 elements does not
+    // help -- and it reproduces at every batch size and thread count while
+    // backendbench, which drives the same graphs, stays clean.
+    //
+    // So we never shrink a binding below the historical estimate, which is
+    // this "span" with the size substituted for each missing dense stride.
+    // That is not a meaningful quantity -- it is quadratic in the row count
+    // -- but it is generous, it is what every graph here has always been
+    // bound with, and it is stable.
+    //
+    // Taking the max of the two is what actually matters for correctness:
+    // the historical estimate UNDER-declares whenever the leading dimension
+    // is batched, and the [B, 1, 64, 64] smolgen attention bias came out at
+    // 9057 elements against an actual 131072 at B=32. DirectML then produced
+    // exactly the result it gives with no bias at all -- the attention output
+    // did not move even when a completely unrelated buffer was bound in its
+    // place. That is the bug MatchesBlasOnSmolgenMhaNet was failing on.
+    const uint64_t bytes = ComputeBindingBytes(sizes, strides, exact_bytes);
+    
     dml::Expression e =
         dml::InputTensor(graph_, next_input_++, MakeDesc(sizes, strides));
     bindings_.push_back({kind, w, bytes});
@@ -1808,8 +1876,8 @@ void EncoderBlock<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
       // t1-256x10-distilled -- 94% of the whole network.
       GraphFactory<DataType> g4(scope.ctx());
       auto d2_in = g4.Input({1, 1, (uint32_t)N * H, gen});
-      auto table = g4.Weight(smolgen_global_,
-                             {1, 1, (uint32_t)smolgen_global_size_, gen});
+      auto table = g4.WeightExact(smolgen_global_,
+                                  {1, 1, (uint32_t)smolgen_global_size_, gen});
       dml::Expression bias_e =
           dml::Gemm(d2_in, table, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
                     DML_MATRIX_TRANSFORM_TRANSPOSE);
