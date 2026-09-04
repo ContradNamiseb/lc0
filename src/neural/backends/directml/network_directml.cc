@@ -335,6 +335,46 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
   max_layer_bytes =
       std::max(max_layer_bytes, max_tokens * std::max<uint64_t>(emb, 4288) * elem);
   tensor_slot_bytes_ = std::max(max_layer_bytes, scratch_bytes_);
+
+  // The sizing above accounts only for layer OUTPUTS, but EncoderBlock::
+  // EvalMha carves FIVE max_tokens * d_model regions (qt/kt/vt/ctx/merged)
+  // out of buffer1, which is a tensor slot. Nothing made that an invariant,
+  // so current nets fit by arithmetic luck rather than by construction, and
+  // an overflow here is not a failed allocation -- it is an out-of-bounds
+  // UAV write into the neighbouring slot.
+  //
+  // The bound differs between the two callers, because they hand EvalMha a
+  // different buffer1:
+  //   AttentionBody::Eval    passes the slot BASE            -> 5 * d_model
+  //   AttentionPolicyHead    passes output + scratch/2       -> scratch/2
+  //                                                              + 5 * d_model
+  // Checked here in elements per token, with the net's real numbers in the
+  // message so a future failure names the net rather than the arithmetic.
+  {
+    const uint64_t slot_elems_per_token = tensor_slot_bytes_ / (max_tokens * elem);
+    auto require = [&](uint64_t needed, const char* which, uint64_t d_model) {
+      if (needed > slot_elems_per_token) {
+        throw Exception(
+            std::string("directml backend: this net's ") + which +
+            " attention needs " + std::to_string(needed) +
+            " elements per token but the tensor slot holds only " +
+            std::to_string(slot_elems_per_token) + " (d_model " +
+            std::to_string(d_model) + ", max_batch " +
+            std::to_string(max_batch_size_) +
+            "). Raise the tensor slot sizing to cover the MHA carve-up.");
+      }
+    };
+    for (const auto& enc : weights_.encoder) {
+      const uint64_t d_model = enc.mha.q_b.size();
+      if (d_model == 0) continue;  // KDA encoders do not take this path
+      require(5 * d_model, "body", d_model);
+    }
+    const uint64_t pol_d_model = policy_head.ip2_pol_b.size();
+    if (pol_d_model != 0 && !policy_head.pol_encoder.empty()) {
+      require(scratch_elems / 2 + 5 * pol_d_model, "policy-head", pol_d_model);
+    }
+  }
+
   const uint64_t tensor_arena_bytes = 3 * tensor_slot_bytes_;
 
   // Weight arena: sized from the parsed weights' serialized size -- a
