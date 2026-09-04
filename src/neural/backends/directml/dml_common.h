@@ -341,8 +341,11 @@ class DmlDeviceContext {
 class DmlExecScope {
  public:
   DmlExecScope(DmlDeviceContext& ctx, ID3D12GraphicsCommandList* list,
-               DmlArena* transient_arena)
-      : ctx_(ctx), list_(list), transient_arena_(transient_arena) {}
+               DmlArena* transient_arena, DmlArena* smolgen_arena)
+      : ctx_(ctx),
+        list_(list),
+        transient_arena_(transient_arena),
+        smolgen_arena_(smolgen_arena) {}
 
   ID3D12GraphicsCommandList* list() const { return list_; }
   DmlDeviceContext& ctx() const { return ctx_; }
@@ -352,6 +355,18 @@ class DmlExecScope {
   // global UAV barrier (DispatchOperator), so the region may be legally
   // reused, and DirectML graphs' transient requirements here reach ~100MB
   // -- bump-allocating per dispatch exhausts the arena within one batch.
+  // Base of the region for smolgen's cross-dispatch intermediates. These
+  // must NOT come from TakeTransient: that hands every caller the same
+  // offset-0 region on purpose (DirectML's internal scratch is reusable
+  // between barrier-separated dispatches), so a chain of values that has to
+  // survive from one dispatch to the next aliases itself -- and the
+  // consuming graph's own DML temporary lands on top of it as well. Only one
+  // encoder's smolgen values are live at a time, so a fixed layout in a
+  // dedicated arena is enough; EvalMha carves the sub-ranges.
+  DmlPtr SmolgenBase() const {
+    return DmlPtr(smolgen_arena_->resource(), 0);
+  }
+
   DmlPtr TakeTransient(uint64_t bytes) {
     if (bytes > transient_arena_->size()) {
       throw Exception(
@@ -367,6 +382,7 @@ class DmlExecScope {
   DmlDeviceContext& ctx_;
   ID3D12GraphicsCommandList* list_;
   DmlArena* transient_arena_;
+  DmlArena* smolgen_arena_;
 };
 
 }  // namespace directml_backend

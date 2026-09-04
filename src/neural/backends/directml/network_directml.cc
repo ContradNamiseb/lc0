@@ -190,6 +190,7 @@ class DirectMlNetwork : public Network {
   bool attn_body_ = false;
   int max_batch_size_ = 256;
   int min_batch_size_ = 4;
+  DmlArena smolgen_arena_;
   uint64_t scratch_bytes_ = 0;
   uint64_t tensor_slot_bytes_ = 0;
 
@@ -345,6 +346,30 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
   weight_arena_.Create(ctx_.device(), weight_arena_bytes, "weights",
                        D3D12_RESOURCE_STATE_COPY_DEST);
 
+  // Smolgen intermediates for one encoder at max batch: the compress
+  // output, the two MLP stage outputs and the generated bias, all live at
+  // once and all crossing dispatch boundaries. Only one encoder's are live
+  // at a time, so this is a max over encoders, not a sum.
+  uint64_t smolgen_bytes = 0;
+  for (const auto& enc : weights_.encoder) {
+    if (!enc.mha.has_smolgen || enc.is_kda) continue;
+    const uint64_t compress_size =
+        emb_size ? enc.mha.smolgen.compress.size() / emb_size : 0;
+    const uint64_t need =
+        AlignUp(max_tokens * compress_size * elem) +
+        AlignUp((uint64_t)max_batch_size_ * enc.mha.smolgen.dense1_b.size() *
+                elem) +
+        AlignUp((uint64_t)max_batch_size_ * enc.mha.smolgen.dense2_b.size() *
+                elem) +
+        AlignUp((uint64_t)max_batch_size_ * weights_.encoder_head_count * 64 *
+                64 * elem);
+    smolgen_bytes = std::max(smolgen_bytes, need);
+  }
+  // A zero-size committed resource is invalid; keep one aligned block so the
+  // arena is always bindable even for nets without smolgen.
+  smolgen_arena_.Create(ctx_.device(), std::max<uint64_t>(smolgen_bytes, 256),
+                        "smolgen");
+
   tensor_arena_.Create(ctx_.device(), tensor_arena_bytes, "tensors");
   scratch_arena_.Create(ctx_.device(), scratch_bytes_ * 2, "scratch");
   // 256MB transient: the MHA attention graph's [B=N*H,64,64] scores +
@@ -458,7 +483,8 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
   // each batch UP to the ladder.
   for (int b : {min_batch_size_, 8, 16, 32, 64, 128, 256, max_batch_size_}) {
     if (b < min_batch_size_ || b > max_batch_size_) continue;
-    DmlExecScope pre(ctx_, ctx_.upload_list(), &transient_arena_);
+    DmlExecScope pre(ctx_, ctx_.upload_list(), &transient_arena_,
+                     &smolgen_arena_);
     for (auto& layer : network_) layer->EnsureCompiled(b, pre);
   }
 
@@ -595,7 +621,7 @@ void DirectMlNetwork<DataType>::forwardEval(
   }
   DmlPtr scratch(scratch_arena_.resource(), 0);
 
-  DmlExecScope scope(ctx_, list, &transient_arena_);
+  DmlExecScope scope(ctx_, list, &transient_arena_, &smolgen_arena_);
 
   // Two-phase: compile every layer's graphs for this batch size BEFORE any
   // dispatch is recorded. On this driver, interleaving diverse-shape graph

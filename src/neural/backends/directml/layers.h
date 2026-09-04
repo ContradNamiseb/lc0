@@ -379,6 +379,7 @@ class EncoderBlock {
   std::unordered_map<int, DmlCompiledOp> mha_mlp_compiled_;
   std::unordered_map<int, DmlCompiledOp> mha_mlp2_compiled_;
   std::unordered_map<int, DmlCompiledOp> mha_mlp3_compiled_;
+  std::unordered_map<int, DmlCompiledOp> mha_smolbias_compiled_;
   std::unordered_map<int, DmlCompiledOp> mha_attn_compiled_;
   // The LN/FFN tails split at each fused LayerNorm: "1" is the graph up to
   // the first LN, "2" the FFN sandwiched between the two LNs. The LNs
@@ -395,7 +396,6 @@ class EncoderBlock {
   // The MHA head-split/merge transpose (compiled once at construction for
   // MHA blocks; see mha_transpose.hlsl for why a shader is needed).
   std::unique_ptr<class MhaTransposeLayer> mha_transpose_;
-  std::unique_ptr<class SmolgenBiasLayer> smolgen_bias_;
   std::unique_ptr<class KdaLocalConvLayer> kda_local_conv_layer_;
   // Fused LayerNorm, shared by this block's two LN sites.
   std::unique_ptr<class LayerNormLayer> layer_norm_;

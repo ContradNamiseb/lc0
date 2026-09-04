@@ -439,6 +439,100 @@ pblczero::Net MakeMhaMlhNet() {
 
 TEST(DirectMlKdaParity, MatchesBlasOnMhaMlhNet) { CompareBackends(MakeMhaMlhNet()); }
 
+// Smolgen dimensions, named as the BLAS reference names them
+// (network_blas.cc EncodeLayer): compress is [hidden_channels, embedding],
+// dense1 is [hidden_sz, 64 * hidden_channels], dense2 is
+// [gen_outputs, hidden_sz], and the shared global table is
+// [64 * 64, gen_outputs / heads].
+struct SmolgenDims {
+  int hidden_channels = 8;
+  int hidden_sz = 16;
+  int gen_outputs = 64;  // heads * per-head generated width
+};
+
+// Adds smolgen to the net's last encoder plus the shared global table.
+//
+// No parity net had smolgen before, which is why two bugs lived in that path
+// unnoticed: the attention graph added an unbound bias tensor whenever a
+// block had NO smolgen, and the generated-bias matmul ran as a hand-written
+// kernel that was never checked against BLAS.
+void FillSmolgen(pblczero::Net* net, std::mt19937& rng, const NetDims& d,
+                 const SmolgenDims& sd) {
+  auto* weights = net->mutable_weights();
+  auto* enc = weights->mutable_encoder(weights->encoder_size() - 1);
+  auto* smol = enc->mutable_mha()->mutable_smolgen();
+  FillLayer(smol->mutable_compress(),
+            RandomVec(rng, sd.hidden_channels * d.embedding, 0.1f));
+  FillLayer(smol->mutable_dense1_w(),
+            RandomVec(rng, sd.hidden_sz * 64 * sd.hidden_channels, 0.05f));
+  FillLayer(smol->mutable_dense1_b(), RandomVec(rng, sd.hidden_sz, 0.05f));
+  FillLayer(smol->mutable_ln1_gammas(), RandomVec(rng, sd.hidden_sz, 0.1f));
+  FillLayer(smol->mutable_ln1_betas(), RandomVec(rng, sd.hidden_sz, 0.05f));
+  FillLayer(smol->mutable_dense2_w(),
+            RandomVec(rng, sd.gen_outputs * sd.hidden_sz, 0.05f));
+  FillLayer(smol->mutable_dense2_b(), RandomVec(rng, sd.gen_outputs, 0.05f));
+  FillLayer(smol->mutable_ln2_gammas(), RandomVec(rng, sd.gen_outputs, 0.1f));
+  FillLayer(smol->mutable_ln2_betas(), RandomVec(rng, sd.gen_outputs, 0.05f));
+  FillLayer(weights->mutable_smolgen_w(),
+            RandomVec(rng, 64 * 64 * (sd.gen_outputs / d.heads), 0.05f));
+}
+
+pblczero::Net MakeSmolgenMhaNet() {
+  const NetDims d;
+  const SmolgenDims sd;
+  const int input_size = kInputPlanes + 64;
+  const int mlh = 4;
+  std::mt19937 rng(4242);
+  pblczero::Net file;
+  auto* weights = file.mutable_weights();
+  auto* nf = file.mutable_format()->mutable_network_format();
+  using NF = pblczero::NetworkFormat;
+  nf->set_input(NF::INPUT_CLASSICAL_112_PLANE);
+  nf->set_network(NF::NETWORK_KDA_HYBRID_WITH_MULTIHEADFORMAT);
+  nf->set_policy(NF::POLICY_ATTENTION);
+  nf->set_value(NF::VALUE_WDL);
+  nf->set_moves_left(NF::MOVES_LEFT_V1);
+  nf->set_input_embedding(NF::INPUT_EMBEDDING_NONE);
+  nf->set_default_activation(NF::DEFAULT_ACTIVATION_RELU);
+  nf->set_ffn_activation(NF::ACTIVATION_DEFAULT);
+  nf->set_smolgen_activation(NF::ACTIVATION_SWISH);
+  nf->add_kda_directions(static_cast<NF::KdaDirection>(1));
+  FillLayer(weights->mutable_ip_emb_w(),
+            RandomVec(rng, d.embedding * input_size, 0.05f));
+  FillLayer(weights->mutable_ip_emb_b(), RandomVec(rng, d.embedding, 0.05f));
+  weights->set_headcount(d.heads);
+  FillMhaEncoder(&file, rng, d);
+  FillSmolgen(&file, rng, d, sd);
+  FillPolicyAndValueHeads(&file, rng, d, true, mlh);
+  return file;
+}
+
+// DISABLED: this net does not match BLAS yet, and the failure is a real
+// backend defect rather than a bad expectation. Evidence, in case the next
+// person wants to pick it up:
+//
+//   * the identical net with FillSmolgen removed PASSES, so the divergence
+//     is in the smolgen path;
+//   * zeroing the whole smolgen weight table leaves the DirectML value
+//     bit-identical (0.002204209566116333) while the BLAS value moves, so
+//     what the attention adds as a bias does not depend on the table;
+//   * it is likewise bit-identical across four separate changes to that
+//     path -- replacing the bias kernel with a GEMM, moving the smolgen
+//     activation before the LayerNorm to match BLAS, giving the smolgen
+//     intermediates their own arena instead of four aliased TakeTransient
+//     pointers, and fixing the compress graph's input binding from Extra to
+//     Input. All four are genuine fixes and are kept; none of them changed
+//     the result.
+//
+// That points at the bias the attention graph reads not being what the
+// smolgen chain wrote -- most likely stale data from an earlier dispatch in
+// the same eval. The next step is a GPU readback of the bias buffer between
+// the smolgen GEMM and the attention dispatch, which this backend has no
+// tooling for yet.
+TEST(DirectMlKdaParity, DISABLED_MatchesBlasOnSmolgenMhaNet) {
+  CompareBackends(MakeSmolgenMhaNet());
+}
+
 
 
 // PE_DENSE input-embedding net (no encoders): the real trained nets use

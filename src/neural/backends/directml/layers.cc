@@ -1553,9 +1553,6 @@ EncoderBlock<DataType>::EncoderBlock(
   } else {
     // MHA head transpose (see mha_transpose.hlsl).
     mha_transpose_ = std::make_unique<MhaTransposeLayer>(ctx.device(), fp16);
-    if (has_smolgen_) {
-      smolgen_bias_ = std::make_unique<SmolgenBiasLayer>(ctx.device(), fp16);
-    }
   }
   // Both block kinds have the same two LayerNorms in their tail.
   layer_norm_ = std::make_unique<LayerNormLayer>(ctx.device(), fp16);
@@ -1679,7 +1676,14 @@ void EncoderBlock<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
       const uint32_t gen = smol_dense_2_size_ / H;
       {
       GraphFactory<DataType> g1(scope.ctx());
-      auto x1 = g1.Extra({1, 1, tokens, d_model});
+      // Input, not Extra: DispatchOp fills a kExtra binding from its
+      // `extra` argument, and the smolgen dispatch below passes the block
+      // input in the ordinary `input` position. Declaring this Extra meant
+      // the compress GEMM was bound a default-constructed (null) DmlPtr, so
+      // the whole smolgen chain -- and therefore the generated attention
+      // bias -- was independent of the block's activations and of the
+      // smolgen weight table.
+      auto x1 = g1.Input({1, 1, tokens, d_model});
       auto compress1 =
           g1.Weight(smol_compress_,
                     {1, 1, (uint32_t)smol_compress_size_, d_model});
@@ -1706,7 +1710,13 @@ void EncoderBlock<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
                                     (uint32_t)smol_dense_1_size_);
       auto sln1b = g2.WeightChannel(smol_ln1_betas_, (uint32_t)N,
                                     (uint32_t)smol_dense_1_size_);
-      auto dense1 = d1 + d1b;
+      // The activation goes here, on the dense output, NOT on the
+      // LayerNorm's result: the BLAS reference applies smolgen_activation
+      // inside Forward1D and only then calls LayerNorm2DWithSkipConnection
+      // (network_blas.cc EncodeLayer). Applying it afterwards was invisible
+      // while every smolgen parity net used ACTIVATION_DEFAULT (identity).
+      auto dense1 =
+          ActivationExpr<DataType>(smolgen_activation_, d1 + d1b);
       const uint32_t ln_axes1[] = {3};
       const dml::Span<const uint32_t> ln_axis1(ln_axes1, 1);
       const auto sz1 = dense1.Impl()->GetOutputDesc().sizes;
@@ -1721,7 +1731,6 @@ void EncoderBlock<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
       auto inv1 = GraphFactory<DataType>::ReinterpretView(
           dml::Recip(dml::Sqrt(var1 + 1e-3f)), sz1, {0, 0, 1, 0});
       auto out1 = centered1 * inv1 * sln1g + sln1b;
-      out1 = ActivationExpr<DataType>(smolgen_activation_, out1);
       mha_mlp2_compiled_.emplace(
           N, g2.Compile({out1},
                         {(uint64_t)N * smol_dense_1_size_ * sizeof(DataType)}));
@@ -1741,7 +1750,10 @@ void EncoderBlock<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
                                     (uint32_t)smol_dense_2_size_);
       auto sln2b = g3.WeightChannel(smol_ln2_betas_, (uint32_t)N,
                                     (uint32_t)smol_dense_2_size_);
-      auto dense2 = d2 + d2b;
+      // Same ordering as dense1 above; this activation was missing
+      // entirely, which the identity-activation parity nets could not see.
+      auto dense2 =
+          ActivationExpr<DataType>(smolgen_activation_, d2 + d2b);
       const uint32_t ln_axes2[] = {3};
       const dml::Span<const uint32_t> ln_axis2(ln_axes2, 1);
       const auto sz2 = dense2.Impl()->GetOutputDesc().sizes;
@@ -1759,6 +1771,33 @@ void EncoderBlock<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
       mha_mlp3_compiled_.emplace(
           N, g3.Compile({out2},
                         {(uint64_t)N * smol_dense_2_size_ * sizeof(DataType)}));
+      }
+      {
+      // The generated bias, bias[n,h,i] = sum_g table[i,g] * d2[n,h,g].
+      //
+      // This was an HLSL kernel (shaders/smolgen_bias.hlsl) because the
+      // DML-graph form was believed to need a 5-D broadcast GEMM operand
+      // this driver rejects. That was true only of the per-head reading of
+      // the weight table; the table is ONE SHARED [4096, gen] matrix, so
+      // the whole thing is a plain 2-D GEMM: d2 seen as [N*H, gen] (already
+      // dense in that order) times the table transposed, giving [N*H, 4096]
+      // -- exactly the bias buffer's layout.
+      //
+      // It matters a lot. The kernel gave one thread per output element,
+      // each re-reading gen table floats with no reuse and a gen*4-byte
+      // stride between neighbouring lanes, so it moved ~1GB per encoder at
+      // batch 32 and measured at 501ms of a 533ms eval on
+      // t1-256x10-distilled -- 94% of the whole network.
+      GraphFactory<DataType> g4(scope.ctx());
+      auto d2_in = g4.Input({1, 1, (uint32_t)N * H, gen});
+      auto table = g4.Weight(smolgen_global_,
+                             {1, 1, (uint32_t)smolgen_global_size_, gen});
+      dml::Expression bias_e =
+          dml::Gemm(d2_in, table, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                    DML_MATRIX_TRANSFORM_TRANSPOSE);
+      mha_smolbias_compiled_.emplace(
+          N, g4.Compile({bias_e}, {(uint64_t)N * H * smolgen_global_size_ *
+                                   sizeof(DataType)}));
       }
     }
     const float softmax_scale = 1.0f / std::sqrt(static_cast<float>(D));
@@ -2003,28 +2042,30 @@ void EncoderBlock<DataType>::EvalMha(int N, DmlPtr in_out_tensor,
       auto m1 = mha_mlp_compiled_.find(N);
       auto m2 = mha_mlp2_compiled_.find(N);
       auto m3 = mha_mlp3_compiled_.find(N);
+      auto m4 = mha_smolbias_compiled_.find(N);
       if (m1 == mha_mlp_compiled_.end() || m2 == mha_mlp2_compiled_.end() ||
-          m3 == mha_mlp3_compiled_.end()) {
+          m3 == mha_mlp3_compiled_.end() ||
+          m4 == mha_smolbias_compiled_.end()) {
         throw Exception(
             "directml backend: smolgen MLP graphs were not compiled; "
             "EnsureCompiled must run before Eval.");
       }
-      const uint32_t gen = smol_dense_2_size_ / H;
-      auto compressed =
-          scope.TakeTransient((uint64_t)N * 64 * smol_compress_size_ * elem);
-      auto d1 = scope.TakeTransient((uint64_t)N * smol_dense_1_size_ * elem);
-      auto d2 = scope.TakeTransient((uint64_t)N * smol_dense_2_size_ * elem);
-      bias = scope.TakeTransient((uint64_t)N * H * smolgen_global_size_ * elem);
+      // Sized at max_batch and laid out end to end, matching the sizing in
+      // network_directml.cc. See DmlExecScope::SmolgenBase for why these
+      // cannot be TakeTransient allocations.
+      const DmlPtr smol_base = scope.SmolgenBase();
+      const uint64_t max_batch = (uint64_t)max_batch_size_;
+      const DmlPtr compressed = smol_base;
+      const DmlPtr d1 =
+          compressed + AlignUp(max_batch * 64 * smol_compress_size_ * elem);
+      const DmlPtr d2 = d1 + AlignUp(max_batch * smol_dense_1_size_ * elem);
+      bias = d2 + AlignUp(max_batch * smol_dense_2_size_ * elem);
       DispatchOp<DataType>(scope, m1->second, in_out_tensor, DmlPtr(),
                            DmlPtr(), {compressed});
       DispatchOp<DataType>(scope, m2->second, compressed, DmlPtr(), DmlPtr(),
                            {d1});
       DispatchOp<DataType>(scope, m3->second, d1, DmlPtr(), DmlPtr(), {d2});
-      SmolgenBiasLayer::Params sp{};
-      sp.batch = N;
-      sp.heads = H;
-      sp.gen = gen;
-      smolgen_bias_->Record(scope.list(), sp, smolgen_global_, d2, bias);
+      DispatchOp<DataType>(scope, m4->second, d2, DmlPtr(), DmlPtr(), {bias});
     }
     DispatchOp<DataType>(scope, it->second, qt, kt, vt, {ctxb}, bias);
   }
