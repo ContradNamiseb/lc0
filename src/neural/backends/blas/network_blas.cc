@@ -17,6 +17,7 @@
  */
 
 #include <algorithm>
+#include <fstream>
 #include <cassert>
 #include <cmath>
 #include <iostream>
@@ -937,11 +938,27 @@ void BlasComputation<use_eigen>::ComputeBlocking() {
       }
 
       // Attention body encoders.
+      // LC0_DUMP_BODY=<prefix> writes the embedding output and each encoder's
+      // output as raw floats, so another backend's dumps can be diffed
+      // against them to find which layer diverges. Debug aid only.
+      const char* dump_prefix = getenv("LC0_DUMP_BODY");
+      auto dump_stage = [&](const char* stage, const std::vector<float>& buf) {
+        if (!dump_prefix) return;
+        const std::string path =
+            std::string(dump_prefix) + ".blas." + stage + ".bin";
+        const size_t n = std::min<size_t>(buf.size(), 64 * 1024);
+        std::ofstream f(path, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(buf.data()),
+                n * sizeof(float));
+      };
+      dump_stage("emb", buffer1);
+      int dump_index = 0;
       for (auto& layer : weights_.encoder) {
         ForwardEncoderLayer(buffer1, buffer2, buffer3, head_buffer, batch_size,
                             layer, embedding_size, weights_.encoder_head_count,
                             smolgen_activation_, ffn_activation_, alpha,
                             is_pe_dense_embedding_ ? 1e-3 : 1e-6);
+        dump_stage(("enc" + std::to_string(dump_index++)).c_str(), buffer1);
       }
     }
 

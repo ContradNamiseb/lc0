@@ -63,6 +63,18 @@
 namespace lczero {
 namespace directml_backend {
 
+// Debug aid (LC0_DUMP_BODY): AttentionBody records a copy of its embedding
+// output and each encoder's output into readback buffers; forwardEval drains
+// them once the fence has signalled and writes them as raw floats, so they
+// can be diffed against the BLAS reference's dumps of the same stages to see
+// which layer first diverges. Empty and inert unless the variable is set.
+struct BodyDump {
+  std::string stage;
+  Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+  uint64_t bytes;
+};
+std::vector<BodyDump>& BodyDumps();
+
 using Microsoft::WRL::ComPtr;
 
 template <typename DataType>

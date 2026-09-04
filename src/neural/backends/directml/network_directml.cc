@@ -755,6 +755,18 @@ void DirectMlNetwork<DataType>::forwardEval(
   ReportD3DErrors(ctx_.queue()->Signal(io->fence_.Get(), io->fence_value_),
                   "Signal");
   ctx_.WaitForFence(io->fence_.Get(), io->fence_value_);
+  if (const char* prefix = getenv("LC0_DUMP_BODY")) {
+    for (auto& d : BodyDumps()) {
+      const float* p = nullptr;
+      d.readback->Map(0, nullptr,
+                      const_cast<void**>(reinterpret_cast<const void**>(&p)));
+      std::ofstream f(std::string(prefix) + ".dml." + d.stage + ".bin",
+                      std::ios::binary);
+      f.write(reinterpret_cast<const char*>(p), d.bytes);
+      d.readback->Unmap(0, nullptr);
+    }
+    BodyDumps().clear();
+  }
   if (wdl_) {
     // Value softmax done CPU-side, exactly like the CUDA/SYCL finishEval.
     float* v = const_cast<float*>(io->value_mapped_);

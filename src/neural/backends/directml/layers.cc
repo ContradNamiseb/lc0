@@ -18,6 +18,7 @@
 
 #include "neural/backends/directml/layers.h"
 
+#include "neural/backends/directml/inputs_outputs.h"
 #include "neural/kda_directions.h"
 
 // <span>/<version> first: DirectMLX.h only includes <span> when
@@ -32,6 +33,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <numeric>
 #include <string>
 #include <utility>
@@ -1312,9 +1314,27 @@ void AttentionBody<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
       dml::Expression pre_ln = LayerNormExpr<DataType>(emb, &bias_b, nullptr, ln_g, ln_b, 1.0f, 1e-3f,
           activations_.default_activation);
       if (has_gating_) {
-        auto mult = g.WeightChannel(ip_mult_gate_, tokens, static_cast<uint32_t>(embedding_op_size_));
-        auto add = g.WeightChannel(ip_add_gate_, tokens, static_cast<uint32_t>(embedding_op_size_));
-        pre_ln = pre_ln * mult + add;
+        // ip_mult_gate/ip_add_gate are a [channels][64] matrix, not a
+        // per-channel vector: BLAS reads ip_mult_gate[channel * 64 + square].
+        // WeightChannel's {0, 0, 0, 1} strides map element (row, c) to offset
+        // c, so every square got the same channel value -- the first C of
+        // C * 64 weights -- and a real net's embedding came out 39% wrong
+        // before any encoder ran. Viewing both operands as [N, 1, 64, C] and
+        // striding the gate {0, 0, 1, 64} lands (n, s, c) on c * 64 + s, and
+        // repeats the same gate for every position in the batch.
+        //
+        // No synthetic parity net populates these tensors, so has_gating_ was
+        // false throughout the suite and this path never executed in a test.
+        const uint32_t gate_c = static_cast<uint32_t>(embedding_op_size_);
+        const uint32_t gate_n = static_cast<uint32_t>(N);
+        auto mult = g.WeightStrided(ip_mult_gate_, {gate_n, 1, 64, gate_c},
+                                    {0, 0, 1, 64});
+        auto add = g.WeightStrided(ip_add_gate_, {gate_n, 1, 64, gate_c},
+                                   {0, 0, 1, 64});
+        auto gated = GraphFactory<DataType>::ReinterpretView(
+                         pre_ln, {gate_n, 1, 64, gate_c}) * mult + add;
+        pre_ln = GraphFactory<DataType>::ReinterpretView(
+            gated, {1, 1, tokens, gate_c});
       }
       auto ffn1_w = g.Weight(
           ip_emb_ffn_d1_w_,
@@ -1356,9 +1376,27 @@ void AttentionBody<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
       dml::Expression y = g0 + b;
       y = ActivationExpr<DataType>(activations_.default_activation, y);
       if (has_gating_) {
-        auto mult = g.WeightChannel(ip_mult_gate_, tokens, static_cast<uint32_t>(embedding_op_size_));
-        auto add = g.WeightChannel(ip_add_gate_, tokens, static_cast<uint32_t>(embedding_op_size_));
-        y = y * mult + add;
+        // ip_mult_gate/ip_add_gate are a [channels][64] matrix, not a
+        // per-channel vector: BLAS reads ip_mult_gate[channel * 64 + square].
+        // WeightChannel's {0, 0, 0, 1} strides map element (row, c) to offset
+        // c, so every square got the same channel value -- the first C of
+        // C * 64 weights -- and a real net's embedding came out 39% wrong
+        // before any encoder ran. Viewing both operands as [N, 1, 64, C] and
+        // striding the gate {0, 0, 1, 64} lands (n, s, c) on c * 64 + s, and
+        // repeats the same gate for every position in the batch.
+        //
+        // No synthetic parity net populates these tensors, so has_gating_ was
+        // false throughout the suite and this path never executed in a test.
+        const uint32_t gate_c = static_cast<uint32_t>(embedding_op_size_);
+        const uint32_t gate_n = static_cast<uint32_t>(N);
+        auto mult = g.WeightStrided(ip_mult_gate_, {gate_n, 1, 64, gate_c},
+                                    {0, 0, 1, 64});
+        auto add = g.WeightStrided(ip_add_gate_, {gate_n, 1, 64, gate_c},
+                                   {0, 0, 1, 64});
+        auto gated = GraphFactory<DataType>::ReinterpretView(
+                         y, {gate_n, 1, 64, gate_c}) * mult + add;
+        y = GraphFactory<DataType>::ReinterpretView(
+            gated, {1, 1, tokens, gate_c});
       }
       compiled_.emplace(
           N, g.Compile({y}, {(uint64_t)tokens * embedding_op_size_ *
@@ -1368,6 +1406,11 @@ void AttentionBody<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
   for (const auto& enc : encoder_weights_) {
     enc->EnsureCompiled(N, scope);
   }
+}
+
+std::vector<BodyDump>& BodyDumps() {
+  static std::vector<BodyDump> dumps;
+  return dumps;
 }
 
 template <typename DataType>
@@ -1438,9 +1481,27 @@ void AttentionBody<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
       dml::Expression y = g0 + b;
       y = ActivationExpr<DataType>(activations_.default_activation, y);
       if (has_gating_) {
-        auto mult = g.WeightChannel(ip_mult_gate_, tokens, static_cast<uint32_t>(embedding_op_size_));
-        auto add = g.WeightChannel(ip_add_gate_, tokens, static_cast<uint32_t>(embedding_op_size_));
-        y = y * mult + add;
+        // ip_mult_gate/ip_add_gate are a [channels][64] matrix, not a
+        // per-channel vector: BLAS reads ip_mult_gate[channel * 64 + square].
+        // WeightChannel's {0, 0, 0, 1} strides map element (row, c) to offset
+        // c, so every square got the same channel value -- the first C of
+        // C * 64 weights -- and a real net's embedding came out 39% wrong
+        // before any encoder ran. Viewing both operands as [N, 1, 64, C] and
+        // striding the gate {0, 0, 1, 64} lands (n, s, c) on c * 64 + s, and
+        // repeats the same gate for every position in the batch.
+        //
+        // No synthetic parity net populates these tensors, so has_gating_ was
+        // false throughout the suite and this path never executed in a test.
+        const uint32_t gate_c = static_cast<uint32_t>(embedding_op_size_);
+        const uint32_t gate_n = static_cast<uint32_t>(N);
+        auto mult = g.WeightStrided(ip_mult_gate_, {gate_n, 1, 64, gate_c},
+                                    {0, 0, 1, 64});
+        auto add = g.WeightStrided(ip_add_gate_, {gate_n, 1, 64, gate_c},
+                                   {0, 0, 1, 64});
+        auto gated = GraphFactory<DataType>::ReinterpretView(
+                         y, {gate_n, 1, 64, gate_c}) * mult + add;
+        y = GraphFactory<DataType>::ReinterpretView(
+            gated, {1, 1, tokens, gate_c});
       }
       it = compiled_.emplace(
                N, g.Compile({y}, {(uint64_t)tokens * embedding_op_size_ *
@@ -1503,9 +1564,27 @@ void AttentionBody<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
         dml::Expression pre_ln = LayerNormExpr<DataType>(emb, &bias_b, nullptr, ln_g, ln_b, 1.0f, 1e-3f,
             activations_.default_activation);
         if (has_gating_) {
-          auto mult = g.WeightChannel(ip_mult_gate_, tokens, static_cast<uint32_t>(embedding_op_size_));
-          auto add = g.WeightChannel(ip_add_gate_, tokens, static_cast<uint32_t>(embedding_op_size_));
-          pre_ln = pre_ln * mult + add;
+          // ip_mult_gate/ip_add_gate are a [channels][64] matrix, not a
+          // per-channel vector: BLAS reads ip_mult_gate[channel * 64 + square].
+          // WeightChannel's {0, 0, 0, 1} strides map element (row, c) to offset
+          // c, so every square got the same channel value -- the first C of
+          // C * 64 weights -- and a real net's embedding came out 39% wrong
+          // before any encoder ran. Viewing both operands as [N, 1, 64, C] and
+          // striding the gate {0, 0, 1, 64} lands (n, s, c) on c * 64 + s, and
+          // repeats the same gate for every position in the batch.
+          //
+          // No synthetic parity net populates these tensors, so has_gating_ was
+          // false throughout the suite and this path never executed in a test.
+          const uint32_t gate_c = static_cast<uint32_t>(embedding_op_size_);
+          const uint32_t gate_n = static_cast<uint32_t>(N);
+          auto mult = g.WeightStrided(ip_mult_gate_, {gate_n, 1, 64, gate_c},
+                                      {0, 0, 1, 64});
+          auto add = g.WeightStrided(ip_add_gate_, {gate_n, 1, 64, gate_c},
+                                     {0, 0, 1, 64});
+          auto gated = GraphFactory<DataType>::ReinterpretView(
+                           pre_ln, {gate_n, 1, 64, gate_c}) * mult + add;
+          pre_ln = GraphFactory<DataType>::ReinterpretView(
+              gated, {1, 1, tokens, gate_c});
         }
         auto ffn1_w = g.Weight(
             ip_emb_ffn_d1_w_,
@@ -1539,8 +1618,33 @@ void AttentionBody<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
     }
   }
 
+  auto stage_dump = [&](const std::string& stage, DmlPtr src) {
+    if (!getenv("LC0_DUMP_BODY")) return;
+    const uint64_t bytes = 64 * 1024 * sizeof(float);
+    BodyDump d;
+    d.stage = stage;
+    d.bytes = bytes;
+    d.readback = detail::CreateBuffer(scope.ctx().device(), bytes,
+                                      D3D12_HEAP_TYPE_READBACK,
+                                      D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_RESOURCE_BARRIER b = {};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = src.res;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    list->ResourceBarrier(1, &b);
+    list->CopyBufferRegion(d.readback.Get(), 0, src.res, src.offset, bytes);
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    list->ResourceBarrier(1, &b);
+    BodyDumps().push_back(std::move(d));
+  };
+
+  stage_dump("emb", output);
+  int dump_index = 0;
   for (const auto& enc : encoder_weights_) {
     enc->Eval(N, output, scratch, buffer1, buffer2, ln_scratch, scope);
+    stage_dump("enc" + std::to_string(dump_index++), output);
   }
 }
 
