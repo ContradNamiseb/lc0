@@ -624,7 +624,23 @@ void DmlDeviceContext::DispatchOperator(
   for (size_t i = 0; i < inputs.size(); ++i) {
     buffer_bindings[i].Buffer = inputs[i].res;
     buffer_bindings[i].Offset = inputs[i].offset;
-    buffer_bindings[i].SizeInBytes = meta[i].bytes;
+    // Never declare a binding past the end of its resource. The size in
+    // meta[i] is a deliberate over-estimate (see GraphFactory::AddTensor)
+    // and it is quadratic in the tensor's dimensions, so for a wide weight
+    // it runs off the end of the arena: the value head's [1, 1, 128, 8192]
+    // ip1_val_w asked for 268MB of a 25MB weight arena. DirectML then read
+    // out of bounds and the value and moves-left heads came back as
+    // garbage, while narrower heads in the same net stayed in range and
+    // were bit-exact against BLAS.
+    uint64_t size = meta[i].bytes;
+    if (inputs[i].res) {
+      const uint64_t resource_bytes = inputs[i].res->GetDesc().Width;
+      const uint64_t available = resource_bytes > inputs[i].offset
+                                     ? resource_bytes - inputs[i].offset
+                                     : 0;
+      size = std::min(size, available);
+    }
+    buffer_bindings[i].SizeInBytes = size;
     binding_descs[i].Type = DML_BINDING_TYPE_BUFFER;
     binding_descs[i].Desc = &buffer_bindings[i];
   }
@@ -1921,7 +1937,22 @@ void EncoderBlock<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
     const uint32_t softmax_axes[] = {3};
     const dml::Span<const uint32_t> softmax_axis(softmax_axes, 1);
     const auto sm_sizes = logits.Impl()->GetOutputDesc().sizes;
-    const std::vector<uint32_t> sm_bcast{0, 0, 0, 1};
+    // Broadcast the per-row reduction back over the row.
+    //
+    // logits is [B, 1, 64, 64] and the reduce over axis 3 gives [B, 1, 64, 1],
+    // laid out densely as B * 64 scalars with element (b, 0, r, 0) at
+    // b * 64 + r. Viewing that as [B, 1, 64, 64] therefore needs stride 64 on
+    // the batch axis, 1 on the row axis and 0 on the reduced axis.
+    //
+    // This was {0, 0, 0, 1}: stride 1 on the axis that was just reduced away
+    // and 0 on both the row and the batch axis, so every row of every batch
+    // subtracted the same 64 values indexed by column. It survived because
+    // the synthetic parity nets use weights around 0.05, which leaves the
+    // attention logits small enough that softmax is nearly uniform and a
+    // wrong max/sum moves the result by less than the 2e-4 bar. At trained
+    // weight magnitudes the softmax is peaked and it does not survive: this
+    // is what made every real net diverge while every MHA parity net passed.
+    const std::vector<uint32_t> sm_bcast{64, 64, 1, 0};
     dml::Expression max_b = GraphFactory<DataType>::ReinterpretView(
         dml::Reduce(logits, DML_REDUCE_FUNCTION_MAX, softmax_axis), sm_sizes,
         sm_bcast);

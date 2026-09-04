@@ -50,8 +50,32 @@
 namespace lczero {
 namespace {
 
+// Every synthetic net here stores weights as FLOAT32 while every real
+// trained net is LINEAR16 (min/max plus uint16 thetas, decoded by
+// LayerAdapter as min * (1 - theta) + max * theta). Set LC0_TEST_LINEAR16=1
+// to quantise instead, so the same nets can be run through the encoding real
+// nets actually use.
 void FillLayer(pblczero::Weights::Layer* layer,
                const std::vector<float>& values) {
+  if (getenv("LC0_TEST_LINEAR16") && !values.empty()) {
+    float mn = values[0], mx = values[0];
+    for (float v : values) {
+      mn = std::min(mn, v);
+      mx = std::max(mx, v);
+    }
+    if (mx == mn) mx = mn + 1.0f;  // avoid a zero range
+    layer->set_min_val(mn);
+    layer->set_max_val(mx);
+    layer->set_encoding(pblczero::Weights::Layer::LINEAR16);
+    std::string params(values.size() * sizeof(uint16_t), '\0');
+    uint16_t* q = reinterpret_cast<uint16_t*>(&params[0]);
+    for (size_t i = 0; i < values.size(); ++i) {
+      const float theta = (values[i] - mn) / (mx - mn);
+      q[i] = static_cast<uint16_t>(std::lround(theta * 65535.0f));
+    }
+    layer->set_params(params);
+    return;
+  }
   layer->set_encoding(pblczero::Weights::Layer::FLOAT32);
   layer->set_params(std::string(reinterpret_cast<const char*>(values.data()),
                                 values.size() * sizeof(float)));
@@ -68,9 +92,15 @@ struct NetDims {
   int pol_dmodel = 32;  // policy attention d_model
   int val_planes = 32;  // value head embedding (ip_val_b)
   int val_channels = 32;  // ip1_val_b
+  int mlh_hidden = 8;     // ip1_mov_b
 };
 
 std::vector<float> RandomVec(std::mt19937& rng, size_t n, float scale) {
+  // Synthetic weights are tiny (0.05-0.1) next to trained ones, and the KDA
+  // decay and the softmax both exponentiate, so magnitude is its own axis.
+  if (const char* mul = getenv("LC0_TEST_WEIGHT_SCALE")) {
+    scale *= static_cast<float>(atof(mul));
+  }
   std::uniform_real_distribution<float> dist(-scale, scale);
   std::vector<float> v(n);
   for (auto& x : v) x = dist(rng);
@@ -189,9 +219,11 @@ void FillPolicyAndValueHeads(pblczero::Net* net, std::mt19937& rng,
               RandomVec(rng, mlh * d.embedding, 0.1f));
     FillLayer(weights->mutable_ip_mov_b(), RandomVec(rng, mlh, 0.05f));
     FillLayer(weights->mutable_ip1_mov_w(),
-              RandomVec(rng, 8 * mlh * 64, 0.05f));
-    FillLayer(weights->mutable_ip1_mov_b(), RandomVec(rng, 8, 0.05f));
-    FillLayer(weights->mutable_ip2_mov_w(), RandomVec(rng, 8, 0.05f));
+              RandomVec(rng, d.mlh_hidden * mlh * 64, 0.05f));
+    FillLayer(weights->mutable_ip1_mov_b(),
+              RandomVec(rng, d.mlh_hidden, 0.05f));
+    FillLayer(weights->mutable_ip2_mov_w(),
+              RandomVec(rng, d.mlh_hidden, 0.05f));
     FillLayer(weights->mutable_ip2_mov_b(), RandomVec(rng, 1, 0.05f));
   }
 }
@@ -420,6 +452,278 @@ pblczero::Net MakeKdaMlhNet() {
 
 TEST(DirectMlKdaParity, MatchesBlasOnKdaMlhNet) { CompareBackends(MakeKdaMlhNet()); }
 
+// Smolgen dimensions, named as the BLAS reference names them
+// (network_blas.cc EncodeLayer): compress is [hidden_channels, embedding],
+// dense1 is [hidden_sz, 64 * hidden_channels], dense2 is
+// [gen_outputs, hidden_sz], and the shared global table is
+// [64 * 64, gen_outputs / heads].
+struct SmolgenDims {
+  int hidden_channels = 8;
+  int hidden_sz = 16;
+  int gen_outputs = 64;  // heads * per-head generated width
+};
+
+// Adds smolgen to the net's last encoder plus the shared global table.
+//
+// No parity net had smolgen before, which is why two bugs lived in that path
+// unnoticed: the attention graph added an unbound bias tensor whenever a
+// block had NO smolgen, and the generated-bias matmul ran as a hand-written
+// kernel that was never checked against BLAS.
+void FillSmolgen(pblczero::Net* net, std::mt19937& rng, const NetDims& d,
+                 const SmolgenDims& sd) {
+  auto* weights = net->mutable_weights();
+  auto* enc = weights->mutable_encoder(weights->encoder_size() - 1);
+  auto* smol = enc->mutable_mha()->mutable_smolgen();
+  FillLayer(smol->mutable_compress(),
+            RandomVec(rng, sd.hidden_channels * d.embedding, 0.1f));
+  FillLayer(smol->mutable_dense1_w(),
+            RandomVec(rng, sd.hidden_sz * 64 * sd.hidden_channels, 0.05f));
+  FillLayer(smol->mutable_dense1_b(), RandomVec(rng, sd.hidden_sz, 0.05f));
+  FillLayer(smol->mutable_ln1_gammas(), RandomVec(rng, sd.hidden_sz, 0.1f));
+  FillLayer(smol->mutable_ln1_betas(), RandomVec(rng, sd.hidden_sz, 0.05f));
+  FillLayer(smol->mutable_dense2_w(),
+            RandomVec(rng, sd.gen_outputs * sd.hidden_sz, 0.05f));
+  FillLayer(smol->mutable_dense2_b(), RandomVec(rng, sd.gen_outputs, 0.05f));
+  FillLayer(smol->mutable_ln2_gammas(), RandomVec(rng, sd.gen_outputs, 0.1f));
+  FillLayer(smol->mutable_ln2_betas(), RandomVec(rng, sd.gen_outputs, 0.05f));
+  FillLayer(weights->mutable_smolgen_w(),
+            RandomVec(rng, 64 * 64 * (sd.gen_outputs / d.heads), 0.05f));
+}
+
+// The same net at a real net's dimensions. Every other synthetic net here is
+// tiny (embedding 32, 8 heads, policy d_model 32) while every trained net is
+// embedding 128 with 16 heads and policy d_model 128, and the backend is
+// wrong on real nets while passing all the small ones -- so the dimensions
+// are the variable worth isolating.
+pblczero::Net MakeNetWithDims(const NetDims& d, unsigned seed) {
+  const int input_size = kInputPlanes + 64;
+  const int mlh = 4;
+  std::mt19937 rng(seed);
+  pblczero::Net file;
+  auto* weights = file.mutable_weights();
+  auto* nf = file.mutable_format()->mutable_network_format();
+  using NF = pblczero::NetworkFormat;
+  nf->set_input(NF::INPUT_CLASSICAL_112_PLANE);
+  nf->set_network(NF::NETWORK_KDA_HYBRID_WITH_MULTIHEADFORMAT);
+  nf->set_policy(NF::POLICY_ATTENTION);
+  nf->set_value(NF::VALUE_WDL);
+  nf->set_moves_left(NF::MOVES_LEFT_V1);
+  nf->set_input_embedding(NF::INPUT_EMBEDDING_NONE);
+  nf->set_default_activation(NF::DEFAULT_ACTIVATION_RELU);
+  nf->set_ffn_activation(NF::ACTIVATION_DEFAULT);
+  nf->set_smolgen_activation(NF::ACTIVATION_DEFAULT);
+  nf->add_kda_directions(static_cast<NF::KdaDirection>(1));
+  FillLayer(weights->mutable_ip_emb_w(),
+            RandomVec(rng, d.embedding * input_size, 0.05f));
+  FillLayer(weights->mutable_ip_emb_b(), RandomVec(rng, d.embedding, 0.05f));
+  weights->set_headcount(d.heads);
+  FillKdaEncoder(&file, rng, d);
+  FillPolicyAndValueHeads(&file, rng, d, true, mlh);
+  return file;
+}
+
+// Matches kda-native-935532: embedding 128, 16 heads, KDA key/value dim 32,
+// gate rank 32, encoder DFF 256, policy d_model 128.
+NetDims RealisticDims() {
+  NetDims d;
+  d.embedding = 128;
+  d.heads = 16;
+  d.key_dim = 32;
+  d.value_dim = 32;
+  d.gate_rank = 32;
+  d.dff = 256;
+  d.pol_emb = 128;
+  d.pol_dmodel = 128;
+  d.val_planes = 128;
+  d.val_channels = 128;
+  d.mlh_hidden = 128;
+  return d;
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnRealisticDimsNet) {
+  CompareBackends(MakeNetWithDims(RealisticDims(), 2024));
+}
+
+// Same, but with only the policy head widened, to separate a policy-head
+// size problem from a body/encoder one.
+TEST(DirectMlKdaParity, MatchesBlasOnWidePolicyHeadNet) {
+  NetDims d;
+  d.pol_emb = 128;
+  d.pol_dmodel = 128;
+  CompareBackends(MakeNetWithDims(d, 2025));
+}
+
+// One dimension at a time, to name the one that breaks it.
+TEST(DirectMlKdaParity, DimBisect_Embedding128) {
+  NetDims d; d.embedding = 128;
+  CompareBackends(MakeNetWithDims(d, 3001));
+}
+TEST(DirectMlKdaParity, DimBisect_Heads16) {
+  NetDims d; d.heads = 16;
+  CompareBackends(MakeNetWithDims(d, 3002));
+}
+TEST(DirectMlKdaParity, DimBisect_KeyValue32) {
+  NetDims d; d.key_dim = 32; d.value_dim = 32;
+  CompareBackends(MakeNetWithDims(d, 3003));
+}
+TEST(DirectMlKdaParity, DimBisect_GateRank32) {
+  NetDims d; d.gate_rank = 32;
+  CompareBackends(MakeNetWithDims(d, 3004));
+}
+TEST(DirectMlKdaParity, DimBisect_Dff256) {
+  NetDims d; d.dff = 256;
+  CompareBackends(MakeNetWithDims(d, 3005));
+}
+// Pairs. KD = heads * key_dim and VD = heads * value_dim scale
+// multiplicatively, so those are the ones that can blow a per-token budget
+// while each factor alone looks harmless.
+TEST(DirectMlKdaParity, DimBisect_Heads16_KeyValue32) {
+  NetDims d; d.heads = 16; d.key_dim = 32; d.value_dim = 32;
+  CompareBackends(MakeNetWithDims(d, 3006));
+}
+TEST(DirectMlKdaParity, DimBisect_Emb128_Heads16) {
+  NetDims d; d.embedding = 128; d.heads = 16;
+  CompareBackends(MakeNetWithDims(d, 3007));
+}
+TEST(DirectMlKdaParity, DimBisect_Emb128_KeyValue32) {
+  NetDims d; d.embedding = 128; d.key_dim = 32; d.value_dim = 32;
+  CompareBackends(MakeNetWithDims(d, 3008));
+}
+TEST(DirectMlKdaParity, DimBisect_Heads16_Key32Only) {
+  NetDims d; d.heads = 16; d.key_dim = 32;
+  CompareBackends(MakeNetWithDims(d, 3009));
+}
+TEST(DirectMlKdaParity, DimBisect_Heads16_Value32Only) {
+  NetDims d; d.heads = 16; d.value_dim = 32;
+  CompareBackends(MakeNetWithDims(d, 3010));
+}
+// Delta-debug from the failing side: RealisticDims with one field put back
+// to its small default. Whichever revert makes it pass is required for the
+// bug.
+TEST(DirectMlKdaParity, DeltaRevert_Embedding) {
+  NetDims d = RealisticDims(); d.embedding = 32;
+  CompareBackends(MakeNetWithDims(d, 4001));
+}
+TEST(DirectMlKdaParity, DeltaRevert_Heads) {
+  NetDims d = RealisticDims(); d.heads = 8;
+  CompareBackends(MakeNetWithDims(d, 4002));
+}
+TEST(DirectMlKdaParity, DeltaRevert_KeyValue) {
+  NetDims d = RealisticDims(); d.key_dim = 4; d.value_dim = 4;
+  CompareBackends(MakeNetWithDims(d, 4003));
+}
+TEST(DirectMlKdaParity, DeltaRevert_GateRank) {
+  NetDims d = RealisticDims(); d.gate_rank = 4;
+  CompareBackends(MakeNetWithDims(d, 4004));
+}
+TEST(DirectMlKdaParity, DeltaRevert_Dff) {
+  NetDims d = RealisticDims(); d.dff = 64;
+  CompareBackends(MakeNetWithDims(d, 4005));
+}
+TEST(DirectMlKdaParity, DeltaRevert_HeadSizes) {
+  NetDims d = RealisticDims();
+  d.pol_emb = 32; d.pol_dmodel = 32; d.val_planes = 32; d.val_channels = 32;
+  CompareBackends(MakeNetWithDims(d, 4006));
+}
+// Head sizes are the necessary ingredient; split policy from value.
+TEST(DirectMlKdaParity, DeltaRevert_PolicyHeadOnly) {
+  NetDims d = RealisticDims(); d.pol_emb = 32; d.pol_dmodel = 32;
+  CompareBackends(MakeNetWithDims(d, 4007));
+}
+TEST(DirectMlKdaParity, DeltaRevert_ValueHeadOnly) {
+  NetDims d = RealisticDims(); d.val_planes = 32; d.val_channels = 32;
+  CompareBackends(MakeNetWithDims(d, 4008));
+}
+TEST(DirectMlKdaParity, WideValueHeadSmallBody) {
+  NetDims d; d.val_planes = 128; d.val_channels = 128;
+  CompareBackends(MakeNetWithDims(d, 4009));
+}
+
+// The full shape of a real trained net at real dimensions: PE_DENSE input
+// embedding, three KDA encoders plus one MHA encoder carrying smolgen, MLH,
+// and 128-wide heads. Everything a real net has except LINEAR16 weights.
+pblczero::Net MakeFullRealisticNet(bool pe_dense, bool smolgen, bool mha) {
+  const NetDims d = RealisticDims();
+  const int dense_size = 32;
+  const int input_size =
+      kInputPlanes + (pe_dense ? dense_size : 64);
+  std::mt19937 rng(5150);
+  pblczero::Net file;
+  auto* weights = file.mutable_weights();
+  auto* nf = file.mutable_format()->mutable_network_format();
+  using NF = pblczero::NetworkFormat;
+  nf->set_input(NF::INPUT_CLASSICAL_112_PLANE);
+  nf->set_network(NF::NETWORK_KDA_HYBRID_WITH_MULTIHEADFORMAT);
+  nf->set_policy(NF::POLICY_ATTENTION);
+  nf->set_value(NF::VALUE_WDL);
+  nf->set_moves_left(NF::MOVES_LEFT_V1);
+  nf->set_input_embedding(pe_dense ? NF::INPUT_EMBEDDING_PE_DENSE
+                                   : NF::INPUT_EMBEDDING_NONE);
+  nf->set_default_activation(NF::DEFAULT_ACTIVATION_MISH);
+  nf->set_ffn_activation(NF::ACTIVATION_DEFAULT);
+  nf->set_smolgen_activation(NF::ACTIVATION_SWISH);
+  for (int dir : {9, 10, 11, 12}) {
+    nf->add_kda_directions(static_cast<NF::KdaDirection>(dir));
+  }
+
+  FillLayer(weights->mutable_ip_emb_w(),
+            RandomVec(rng, d.embedding * input_size, 0.05f));
+  FillLayer(weights->mutable_ip_emb_b(), RandomVec(rng, d.embedding, 0.05f));
+  if (pe_dense) {
+    FillLayer(weights->mutable_ip_emb_preproc_w(),
+              RandomVec(rng, 64 * dense_size * 64 * 12, 0.05f));
+    FillLayer(weights->mutable_ip_emb_preproc_b(),
+              RandomVec(rng, 64 * dense_size, 0.05f));
+    FillLayer(weights->mutable_ip_emb_ln_gammas(),
+              RandomVec(rng, d.embedding, 0.1f));
+    FillLayer(weights->mutable_ip_emb_ln_betas(),
+              RandomVec(rng, d.embedding, 0.05f));
+    auto* ffn = weights->mutable_ip_emb_ffn();
+    FillLayer(ffn->mutable_dense1_w(),
+              RandomVec(rng, d.embedding * d.embedding, 0.1f));
+    FillLayer(ffn->mutable_dense1_b(), RandomVec(rng, d.embedding, 0.05f));
+    FillLayer(ffn->mutable_dense2_w(),
+              RandomVec(rng, d.embedding * d.embedding, 0.1f));
+    FillLayer(ffn->mutable_dense2_b(), RandomVec(rng, d.embedding, 0.05f));
+    FillLayer(weights->mutable_ip_emb_ffn_ln_gammas(),
+              RandomVec(rng, d.embedding, 0.1f));
+    FillLayer(weights->mutable_ip_emb_ffn_ln_betas(),
+              RandomVec(rng, d.embedding, 0.05f));
+  }
+  weights->set_headcount(d.heads);
+  FillKdaEncoder(&file, rng, d);
+  FillKdaEncoder(&file, rng, d);
+  FillKdaEncoder(&file, rng, d);
+  if (mha) {
+    FillMhaEncoder(&file, rng, d);
+    if (smolgen) {
+      SmolgenDims sd;
+      sd.hidden_channels = 32;
+      sd.hidden_sz = 256;
+      sd.gen_outputs = d.heads * 16;
+      FillSmolgen(&file, rng, d, sd);
+    }
+  }
+  FillPolicyAndValueHeads(&file, rng, d, true, 32);
+  return file;
+}
+
+TEST(DirectMlKdaParity, FullRealistic_NoPeDenseNoMha) {
+  CompareBackends(MakeFullRealisticNet(false, false, false));
+}
+TEST(DirectMlKdaParity, FullRealistic_PeDenseOnly) {
+  CompareBackends(MakeFullRealisticNet(true, false, false));
+}
+TEST(DirectMlKdaParity, FullRealistic_MhaNoSmolgen) {
+  CompareBackends(MakeFullRealisticNet(false, false, true));
+}
+TEST(DirectMlKdaParity, FullRealistic_MhaSmolgen) {
+  CompareBackends(MakeFullRealisticNet(false, true, true));
+}
+TEST(DirectMlKdaParity, FullRealistic_Everything) {
+  CompareBackends(MakeFullRealisticNet(true, true, true));
+}
+
 // The same KDA encoder driven by the four serpentine (boustrophedon)
 // traversals, directions 13/14/15/16 alongside 9 and 11.
 //
@@ -495,6 +799,27 @@ TEST(DirectMlKdaParity, MatchesBlasOnRealNetFromEnv) {
     while (w->encoder_size() > n) w->mutable_encoder()->pop_back();
     CERR << "[bisect] encoders kept: " << w->encoder_size();
   }
+  // Keep only encoders of one mixer type, to see which diverges.
+  if (const char* mixer = getenv("LC0_TEST_KEEP_MIXER")) {
+    const bool want_kda = std::string(mixer) == "kda";
+    auto* w = net.mutable_weights();
+    std::vector<pblczero::Weights::EncoderLayer> kept;
+    for (size_t i = 0; i < w->encoder_size(); ++i) {
+      const auto& enc = w->encoder(i);
+      const bool is_kda =
+          enc.mixer() == pblczero::Weights::EncoderLayer::MIXER_KDA;
+      if (is_kda == want_kda) kept.push_back(enc);
+    }
+    w->mutable_encoder()->clear();
+    for (const auto& e : kept) *w->add_encoder() = e;
+    CERR << "[bisect] kept " << w->encoder_size() << " " << mixer
+         << " encoders";
+  }
+  if (getenv("LC0_TEST_STRIP_MLH")) {
+    net.mutable_format()->mutable_network_format()->set_moves_left(
+        pblczero::NetworkFormat::MOVES_LEFT_NONE);
+    CERR << "[bisect] mlh stripped";
+  }
   CompareBackends(net);
 }
 
@@ -528,44 +853,6 @@ pblczero::Net MakeMhaMlhNet() {
 }
 
 TEST(DirectMlKdaParity, MatchesBlasOnMhaMlhNet) { CompareBackends(MakeMhaMlhNet()); }
-
-// Smolgen dimensions, named as the BLAS reference names them
-// (network_blas.cc EncodeLayer): compress is [hidden_channels, embedding],
-// dense1 is [hidden_sz, 64 * hidden_channels], dense2 is
-// [gen_outputs, hidden_sz], and the shared global table is
-// [64 * 64, gen_outputs / heads].
-struct SmolgenDims {
-  int hidden_channels = 8;
-  int hidden_sz = 16;
-  int gen_outputs = 64;  // heads * per-head generated width
-};
-
-// Adds smolgen to the net's last encoder plus the shared global table.
-//
-// No parity net had smolgen before, which is why two bugs lived in that path
-// unnoticed: the attention graph added an unbound bias tensor whenever a
-// block had NO smolgen, and the generated-bias matmul ran as a hand-written
-// kernel that was never checked against BLAS.
-void FillSmolgen(pblczero::Net* net, std::mt19937& rng, const NetDims& d,
-                 const SmolgenDims& sd) {
-  auto* weights = net->mutable_weights();
-  auto* enc = weights->mutable_encoder(weights->encoder_size() - 1);
-  auto* smol = enc->mutable_mha()->mutable_smolgen();
-  FillLayer(smol->mutable_compress(),
-            RandomVec(rng, sd.hidden_channels * d.embedding, 0.1f));
-  FillLayer(smol->mutable_dense1_w(),
-            RandomVec(rng, sd.hidden_sz * 64 * sd.hidden_channels, 0.05f));
-  FillLayer(smol->mutable_dense1_b(), RandomVec(rng, sd.hidden_sz, 0.05f));
-  FillLayer(smol->mutable_ln1_gammas(), RandomVec(rng, sd.hidden_sz, 0.1f));
-  FillLayer(smol->mutable_ln1_betas(), RandomVec(rng, sd.hidden_sz, 0.05f));
-  FillLayer(smol->mutable_dense2_w(),
-            RandomVec(rng, sd.gen_outputs * sd.hidden_sz, 0.05f));
-  FillLayer(smol->mutable_dense2_b(), RandomVec(rng, sd.gen_outputs, 0.05f));
-  FillLayer(smol->mutable_ln2_gammas(), RandomVec(rng, sd.gen_outputs, 0.1f));
-  FillLayer(smol->mutable_ln2_betas(), RandomVec(rng, sd.gen_outputs, 0.05f));
-  FillLayer(weights->mutable_smolgen_w(),
-            RandomVec(rng, 64 * 64 * (sd.gen_outputs / d.heads), 0.05f));
-}
 
 pblczero::Net MakeSmolgenMhaNet() {
   const NetDims d;
