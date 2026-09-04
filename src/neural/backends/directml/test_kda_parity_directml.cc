@@ -507,29 +507,13 @@ pblczero::Net MakeSmolgenMhaNet() {
   return file;
 }
 
-// DISABLED: this net does not match BLAS yet, and the failure is a real
-// backend defect rather than a bad expectation. Evidence, in case the next
-// person wants to pick it up:
-//
-//   * the identical net with FillSmolgen removed PASSES, so the divergence
-//     is in the smolgen path;
-//   * zeroing the whole smolgen weight table leaves the DirectML value
-//     bit-identical (0.002204209566116333) while the BLAS value moves, so
-//     what the attention adds as a bias does not depend on the table;
-//   * it is likewise bit-identical across four separate changes to that
-//     path -- replacing the bias kernel with a GEMM, moving the smolgen
-//     activation before the LayerNorm to match BLAS, giving the smolgen
-//     intermediates their own arena instead of four aliased TakeTransient
-//     pointers, and fixing the compress graph's input binding from Extra to
-//     Input. All four are genuine fixes and are kept; none of them changed
-//     the result.
-//
-// That points at the bias the attention graph reads not being what the
-// smolgen chain wrote -- most likely stale data from an earlier dispatch in
-// the same eval. The next step is a GPU readback of the bias buffer between
-// the smolgen GEMM and the attention dispatch, which this backend has no
-// tooling for yet.
-TEST(DirectMlKdaParity, DISABLED_MatchesBlasOnSmolgenMhaNet) {
+// Exercises smolgen end to end: the compress GEMM, both MLP stages with
+// their LayerNorms and activations, the shared-table bias GEMM, and the bias
+// reaching the attention logits. Nothing covered any of that before, which
+// is why several defects lived there -- including a graph input that was
+// bound with a byte count computed from the wrong strides, so the bias was
+// read as though it were absent.
+TEST(DirectMlKdaParity, MatchesBlasOnSmolgenMhaNet) {
   CompareBackends(MakeSmolgenMhaNet());
 }
 

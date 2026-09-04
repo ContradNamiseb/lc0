@@ -351,10 +351,28 @@ class GraphFactory {
 
   dml::Expression AddTensor(const DmlPtr& w, DmlBindingRef::Kind kind,
                             Sizes sizes, Sizes strides) {
+    // Bytes the binding must cover: for a strided view that is the memory
+    // span 1 + sum((size_i - 1) * stride_i); for a dense tensor it is simply
+    // the element count.
+    //
+    // This used to substitute sizes[i] for the missing stride in the dense
+    // case, which is not the dense stride (that is the suffix product of the
+    // sizes). For the usual [1, 1, rows, C] shapes it happened to
+    // over-declare, which is harmless, but for a batched shape it
+    // under-declares badly: the [B, 1, 64, 64] smolgen attention bias at
+    // B=32 came out as 9057 elements against an actual 131072, and
+    // DirectML then read the tensor as though the bias were absent -- the
+    // attention output did not change even when a completely different
+    // buffer was bound there.
     const uint64_t bytes = [&] {
+      if (strides.empty()) {
+        uint64_t elements = 1;
+        for (uint32_t size : sizes) elements *= size;
+        return elements * sizeof(DataType);
+      }
       uint64_t span = 1;
       for (size_t i = 0; i < sizes.size(); ++i) {
-        span += (uint64_t(sizes[i]) - 1) * (strides.empty() ? sizes[i] : strides[i]);
+        span += (uint64_t(sizes[i]) - 1) * strides[i];
       }
       return span * sizeof(DataType);
     }();
