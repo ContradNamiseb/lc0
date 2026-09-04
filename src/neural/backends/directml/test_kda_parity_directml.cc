@@ -408,6 +408,66 @@ pblczero::Net MakeKdaMlhNet() {
 
 TEST(DirectMlKdaParity, MatchesBlasOnKdaMlhNet) { CompareBackends(MakeKdaMlhNet()); }
 
+// The same KDA encoder driven by the four serpentine (boustrophedon)
+// traversals, directions 13/14/15/16 alongside 9 and 11.
+//
+// These were not covered anywhere, and the DirectML recurrence kernel used to
+// resolve the square order with a branch chain that stopped at direction 8.
+// Anything above it fell through to `square = token`, so a net trained with a
+// serpentine direction loaded, ran, and returned quietly wrong evaluations --
+// no error, no warning. The kernel now indexes the shared table from
+// neural/kda_directions.h, and the backend rejects anything outside 1-16 at
+// load rather than guessing.
+pblczero::Net MakeKdaSerpentineNet() {
+  const NetDims d;
+  const int input_size = kInputPlanes + 64;
+  const int mlh = 4;
+  std::mt19937 rng(99);
+  pblczero::Net file;
+  auto* weights = file.mutable_weights();
+  auto* nf = file.mutable_format()->mutable_network_format();
+  using NF = pblczero::NetworkFormat;
+  nf->set_input(NF::INPUT_CLASSICAL_112_PLANE);
+  nf->set_network(NF::NETWORK_KDA_HYBRID_WITH_MULTIHEADFORMAT);
+  nf->set_policy(NF::POLICY_ATTENTION);
+  nf->set_value(NF::VALUE_WDL);
+  nf->set_moves_left(NF::MOVES_LEFT_V1);
+  nf->set_input_embedding(NF::INPUT_EMBEDDING_NONE);
+  nf->set_default_activation(NF::DEFAULT_ACTIVATION_RELU);
+  nf->set_ffn_activation(NF::ACTIVATION_DEFAULT);
+  nf->set_smolgen_activation(NF::ACTIVATION_DEFAULT);
+  for (int dir : {9, 11, 13, 15}) {
+    nf->add_kda_directions(static_cast<NF::KdaDirection>(dir));
+  }
+  FillLayer(weights->mutable_ip_emb_w(),
+            RandomVec(rng, d.embedding * input_size, 0.05f));
+  FillLayer(weights->mutable_ip_emb_b(), RandomVec(rng, d.embedding, 0.05f));
+  weights->set_headcount(d.heads);
+  FillKdaEncoder(&file, rng, d);
+  FillPolicyAndValueHeads(&file, rng, d, true, mlh);
+  return file;
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnKdaSerpentineNet) {
+  CompareBackends(MakeKdaSerpentineNet());
+}
+
+// The reverse serpentine traversals, directions 10/12/14/16.
+pblczero::Net MakeKdaSerpentineReverseNet() {
+  pblczero::Net file = MakeKdaSerpentineNet();
+  auto* nf = file.mutable_format()->mutable_network_format();
+  nf->mutable_kda_directions()->clear();
+  using NF = pblczero::NetworkFormat;
+  for (int dir : {10, 12, 14, 16}) {
+    nf->add_kda_directions(static_cast<NF::KdaDirection>(dir));
+  }
+  return file;
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnKdaSerpentineReverseNet) {
+  CompareBackends(MakeKdaSerpentineReverseNet());
+}
+
 // MHA + moves-left head, no KDA encoder: covers the MHA encoder and
 // MLH paths together against the BLAS reference.
 pblczero::Net MakeMhaMlhNet() {

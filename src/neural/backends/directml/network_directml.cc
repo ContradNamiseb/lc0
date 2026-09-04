@@ -383,6 +383,16 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
       nf.input_embedding() == NF::INPUT_EMBEDDING_PE_DENSE;
   const std::vector<int> kda_directions(nf.kda_directions().begin(),
                                         nf.kda_directions().end());
+  // Reject anything the traversal table does not cover. Without this an
+  // unknown direction silently fell through to plain rank order, so a net
+  // trained with one would load, run, and return quietly wrong evaluations.
+  for (const int direction : kda_directions) {
+    if (direction < 1 || direction > 16) {
+      throw Exception(
+          "directml backend: unsupported KDA traversal direction " +
+          std::to_string(direction) + " (expected 1-16).");
+    }
+  }
 
   // Build the topology, in execution order (network_cuda.cc's "2. Build the
   // network, and copy the weights to GPU memory").

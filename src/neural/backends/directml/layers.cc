@@ -18,6 +18,8 @@
 
 #include "neural/backends/directml/layers.h"
 
+#include "neural/kda_directions.h"
+
 // <span>/<version> first: DirectMLX.h only includes <span> when
 // __cpp_lib_span is already visible, and falls back to a detail::span that
 // leaves later std::span uses broken under this toolchain.
@@ -697,7 +699,8 @@ static_assert(sizeof(KdaShaderConstants) == 96,
 constexpr UINT kKdaNum32BitConstants = sizeof(KdaShaderConstants) / 4;
 constexpr UINT kKdaRootParamConstants = 0;
 constexpr UINT kKdaRootParamSrvBase = 1;
-constexpr UINT kKdaRootParamUav = 9;
+constexpr UINT kKdaSrvCount = 9;  // 8 tensors + the direction-order table
+constexpr UINT kKdaRootParamUav = kKdaRootParamSrvBase + kKdaSrvCount;
 
 struct PreprocessConstants {
   uint32_t mode;
@@ -742,7 +745,7 @@ KdaRecurrenceLayer::KdaRecurrenceLayer(ID3D12Device* device, bool fp16,
         "directml backend: KDA value_dim exceeds the 1024-thread group "
         "limit.");
   }
-  D3D12_ROOT_PARAMETER params[10] = {};
+  D3D12_ROOT_PARAMETER params[kKdaRootParamUav + 1] = {};
 
   params[kKdaRootParamConstants].ParameterType =
       D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -752,7 +755,7 @@ KdaRecurrenceLayer::KdaRecurrenceLayer(ID3D12Device* device, bool fp16,
       kKdaNum32BitConstants;
   params[kKdaRootParamConstants].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
-  for (UINT i = 0; i < 8; ++i) {
+  for (UINT i = 0; i < kKdaSrvCount; ++i) {
     auto& p = params[kKdaRootParamSrvBase + i];
     p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     p.Descriptor.ShaderRegister = i;
@@ -766,7 +769,7 @@ KdaRecurrenceLayer::KdaRecurrenceLayer(ID3D12Device* device, bool fp16,
   params[kKdaRootParamUav].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
   D3D12_ROOT_SIGNATURE_DESC root_desc = {};
-  root_desc.NumParameters = 10;
+  root_desc.NumParameters = kKdaRootParamUav + 1;
   root_desc.pParameters = params;
 
   ComPtr<ID3DBlob> signature_blob;
@@ -802,7 +805,7 @@ void KdaRecurrenceLayer::Record(ID3D12GraphicsCommandList* command_list,
                                 const Params& params, DmlPtr qkv, DmlPtr q,
                                 DmlPtr k, DmlPtr v, DmlPtr raw_decay,
                                 DmlPtr dt_bias, DmlPtr a_log, DmlPtr beta,
-                                DmlPtr mixed_out) {
+                                DmlPtr direction_order, DmlPtr mixed_out) {
   const bool fused = params.use_fused_qkv;
   assert(fused ? !!qkv : (!!q && !!k && !!v));
   if (params.key_dim != key_dim_ || params.value_dim != value_dim_) {
@@ -830,15 +833,16 @@ void KdaRecurrenceLayer::Record(ID3D12GraphicsCommandList* command_list,
   const DmlPtr q_slot = fused ? qkv : q;
   const DmlPtr k_slot = fused ? qkv : k;
   const DmlPtr v_slot = fused ? qkv : v;
-  DmlPtr slots[8] = {q_slot, q_slot, k_slot, v_slot,
-                     raw_decay, dt_bias, a_log, beta};
+  DmlPtr slots[kKdaSrvCount] = {q_slot,    q_slot,  k_slot, v_slot,
+                                raw_decay, dt_bias, a_log,  beta,
+                                direction_order};
 
   command_list->SetComputeRootSignature(root_signature_.Get());
   command_list->SetPipelineState(pso_.Get());
   command_list->SetComputeRoot32BitConstants(kKdaRootParamConstants,
                                              kKdaNum32BitConstants, &constants,
                                              0);
-  for (UINT i = 0; i < 8; ++i) {
+  for (UINT i = 0; i < kKdaSrvCount; ++i) {
     command_list->SetComputeRootShaderResourceView(
         kKdaRootParamSrvBase + i, slots[i].GpuVA());
   }
@@ -1630,6 +1634,18 @@ EncoderBlock<DataType>::EncoderBlock(
                                ? kda_directions[i]
                                : kda_directions_[std::max(0, i - 1)];
     }
+    // The traversal order, uploaded from neural/kda_directions.h so the GPU
+    // never carries a transcribed copy. 16 x 64 uint32 = 4KB.
+    {
+      std::vector<uint32_t> order(16 * 64);
+      for (int d = 0; d < 16; ++d) {
+        for (int t = 0; t < 64; ++t) {
+          order[d * 64 + t] = static_cast<uint32_t>(kKdaDirectionOrder[d][t]);
+        }
+      }
+      kda_direction_order_ =
+          uploader.AddRaw(order.data(), order.size() * sizeof(uint32_t));
+    }
     kda_recurrence_ = std::make_unique<KdaRecurrenceLayer>(
         ctx.device(), fp16, kda_key_dim_, kda_value_dim_);
     if (kda_local_conv_) {
@@ -2312,7 +2328,8 @@ void EncoderBlock<DataType>::EvalKda(int N, DmlPtr in_out_tensor,
     params.log_decay_floor = kKdaLogDecayFloor;
     params.fp16 = fp16_;
     kda_recurrence_->Record(scope.list(), params, DmlPtr(), q, k, v,
-                            raw_decay, kda_dt_bias_, kda_a_log_, beta, mixed);
+                            raw_decay, kda_dt_bias_, kda_a_log_, beta,
+                            kda_direction_order_, mixed);
   }
 
   // Output norm + gate + dense projection, LN1, FFN, LN2: two GEMM graphs

@@ -101,31 +101,6 @@ cbuffer KdaRecurrenceConstants : register(b0) {
   uint4 directions[4];
 };
 
-// 64-square traversal orders for the two diagonal scan directions. Board
-// index is rank*8+file; these must stay byte-for-byte identical to
-// kKdaDiagForward/kKdaDiagReverse/kKdaAntiDiagForward/kKdaAntiDiagReverse in
-// sycl/common_kernels.dp.cpp.
-static const uint kKdaDiagForward[64] = {
-    7,  6,  15, 5,  14, 23, 4,  13, 22, 31, 3,  12, 21, 30, 39, 2,
-    11, 20, 29, 38, 47, 1,  10, 19, 28, 37, 46, 55, 0,  9,  18, 27,
-    36, 45, 54, 63, 8,  17, 26, 35, 44, 53, 62, 16, 25, 34, 43, 52,
-    61, 24, 33, 42, 51, 60, 32, 41, 50, 59, 40, 49, 58, 48, 57, 56};
-static const uint kKdaDiagReverse[64] = {
-    56, 57, 48, 58, 49, 40, 59, 50, 41, 32, 60, 51, 42, 33, 24, 61,
-    52, 43, 34, 25, 16, 62, 53, 44, 35, 26, 17, 8,  63, 54, 45, 36,
-    27, 18, 9,  0,  55, 46, 37, 28, 19, 10, 1,  47, 38, 29, 20, 11,
-    2,  39, 30, 21, 12, 3,  31, 22, 13, 4,  23, 14, 5,  15, 6,  7};
-static const uint kKdaAntiDiagForward[64] = {
-    0,  1,  8,  2,  9,  16, 3,  10, 17, 24, 4,  11, 18, 25, 32, 5,
-    12, 19, 26, 33, 40, 6,  13, 20, 27, 34, 41, 48, 7,  14, 21, 28,
-    35, 42, 49, 56, 15, 22, 29, 36, 43, 50, 57, 23, 30, 37, 44, 51,
-    58, 31, 38, 45, 52, 59, 39, 46, 53, 60, 47, 54, 61, 55, 62, 63};
-static const uint kKdaAntiDiagReverse[64] = {
-    63, 62, 55, 61, 54, 47, 60, 53, 46, 39, 59, 52, 45, 38, 31, 58,
-    51, 44, 37, 30, 23, 57, 50, 43, 36, 29, 22, 15, 56, 49, 42, 35,
-    28, 21, 14, 7,  48, 41, 34, 27, 20, 13, 6,  40, 33, 26, 19, 12,
-    5,  32, 25, 18, 11, 4,  24, 17, 10, 3,  16, 9,  2,  8,  1,  0};
-
 // Bound as typed buffers so INPUT_TYPE (float or half, set at PSO creation
 // via a #define) controls the storage width without a second copy of this
 // file -- the same "fp16 only at the memory boundary" split the fixed SYCL
@@ -146,6 +121,14 @@ StructuredBuffer<INPUT_TYPE> raw_decay     : register(t4);
 StructuredBuffer<INPUT_TYPE> dt_bias       : register(t5);
 StructuredBuffer<INPUT_TYPE> a_log         : register(t6);
 StructuredBuffer<INPUT_TYPE> beta          : register(t7);
+// The 16 x 64 square traversal order, uploaded from the single definition in
+// neural/kda_directions.h rather than transcribed here. Transcribing it is
+// exactly the hazard that header warns about: a divergence between the C++
+// table and a GPU copy is not a compile error, it is silently wrong chess.
+// It also used to be a branch chain that only covered directions 1-8, so the
+// eight serpentine directions (9-16) fell through to plain rank order and
+// produced quietly wrong output for any net trained with them.
+StructuredBuffer<uint> direction_order      : register(t8);
 RWStructuredBuffer<INPUT_TYPE> mixed       : register(u0);
 
 groupshared float p_q[KDA_KEY_DIM];
@@ -168,6 +151,9 @@ void KdaRecurrence(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
 
   const uint direction_index = head / (heads / direction_count);
   const uint direction = directions[direction_index / 4][direction_index % 4];
+  // Clamped like neural/kda_directions.h's KdaSquareForToken; the range is
+  // validated at network load, so this never actually clamps.
+  const uint direction_base = (min(max(direction, 1u), 16u) - 1u) * 64u;
 
   const float scale = 1.0 / sqrt((float)KDA_KEY_DIM);
   const float decay_scale = exp((float)a_log[head]);
@@ -181,23 +167,7 @@ void KdaRecurrence(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
   }
 
   for (uint token = 0; token < 64; ++token) {
-    uint square = token;
-    if (direction == 2) {
-      square = 63 - token;
-    } else if (direction == 3) {
-      square = (token % 8) * 8 + token / 8;
-    } else if (direction == 4) {
-      uint reverse = 63 - token;
-      square = (reverse % 8) * 8 + reverse / 8;
-    } else if (direction == 5) {
-      square = kKdaDiagForward[token];
-    } else if (direction == 6) {
-      square = kKdaDiagReverse[token];
-    } else if (direction == 7) {
-      square = kKdaAntiDiagForward[token];
-    } else if (direction == 8) {
-      square = kKdaAntiDiagReverse[token];
-    }
+    const uint square = direction_order[direction_base + token];
 
     const uint token_idx = batch * 64 + square;
     uint q_off, k_off, v_off;

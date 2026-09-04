@@ -43,6 +43,7 @@
 
 #include "neural/backends/directml/inputs_outputs.h"
 #include "neural/backends/directml/layers.h"
+#include "neural/kda_directions.h"
 
 namespace lczero {
 namespace directml_backend {
@@ -262,6 +263,22 @@ TEST(KdaRecurrence, MatchesCpuReferenceAtProductionShape) {
   auto dt_bias_buf = upload_and_get(dt_bias);
   auto a_log_buf = upload_and_get(a_log);
   auto beta_buf = upload_and_get(beta);
+  // The traversal table the kernel indexes, straight from the shared header.
+  std::vector<uint32_t> order(16 * 64);
+  for (int d = 0; d < 16; ++d) {
+    for (int t = 0; t < 64; ++t) {
+      order[d * 64 + t] = static_cast<uint32_t>(kKdaDirectionOrder[d][t]);
+    }
+  }
+  auto order_buf = detail::CreateBuffer(
+      test_device.device.Get(), order.size() * sizeof(uint32_t),
+      D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+  {
+    void* mapped = nullptr;
+    order_buf->Map(0, nullptr, &mapped);
+    std::memcpy(mapped, order.data(), order.size() * sizeof(uint32_t));
+    order_buf->Unmap(0, nullptr);
+  }
   auto mixed_buf = detail::CreateBuffer(
       test_device.device.Get(), expected.size() * sizeof(float),
       D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -296,7 +313,8 @@ TEST(KdaRecurrence, MatchesCpuReferenceAtProductionShape) {
                DmlPtr(q_buf.Get(), 0), DmlPtr(k_buf.Get(), 0),
                DmlPtr(v_buf.Get(), 0), DmlPtr(raw_decay_buf.Get(), 0),
                DmlPtr(dt_bias_buf.Get(), 0), DmlPtr(a_log_buf.Get(), 0),
-               DmlPtr(beta_buf.Get(), 0), DmlPtr(mixed_buf.Get(), 0));
+               DmlPtr(beta_buf.Get(), 0), DmlPtr(order_buf.Get(), 0),
+               DmlPtr(mixed_buf.Get(), 0));
 
   D3D12_RESOURCE_BARRIER barrier = {};
   barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;

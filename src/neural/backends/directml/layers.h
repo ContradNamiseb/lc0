@@ -345,6 +345,7 @@ class EncoderBlock {
   DmlPtr kda_out_norm_gammas_;
   DmlPtr kda_dense_w_, kda_dense_b_;
   DmlPtr kda_local_conv_w_, kda_local_conv_b_;
+  DmlPtr kda_direction_order_;
 
   // Smolgen weights.
   DmlPtr smol_compress_, smol_dense1_w_, smol_dense1_b_;
@@ -595,9 +596,13 @@ class KdaRecurrenceLayer {
   KdaRecurrenceLayer(ID3D12Device* device, bool fp16, uint32_t key_dim,
                      uint32_t value_dim);
 
+  // direction_order is the 16 x 64 uint32 traversal table from
+  // neural/kda_directions.h; see shaders/kda_recurrence.hlsl for why it is
+  // uploaded rather than transcribed into the kernel.
   void Record(ID3D12GraphicsCommandList* command_list, const Params& params,
               DmlPtr qkv, DmlPtr q, DmlPtr k, DmlPtr v, DmlPtr raw_decay,
-              DmlPtr dt_bias, DmlPtr a_log, DmlPtr beta, DmlPtr mixed_out);
+              DmlPtr dt_bias, DmlPtr a_log, DmlPtr beta,
+              DmlPtr direction_order, DmlPtr mixed_out);
 
  private:
   ComPtr<ID3D12Device> device_;
