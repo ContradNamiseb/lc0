@@ -243,6 +243,26 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
   }
 
   constexpr bool fp16 = std::is_same<DataType, DmlHalf>::value;
+  if (fp16 && !options.GetOrDefault<bool>("allow_broken_fp16", false)) {
+    // The fp16 path compiles and runs but its numbers are garbage, not merely
+    // imprecise: on MatchesBlasOnKdaMlhNet it returns policy logits up to
+    // 2.67e36 against a reference maximum of 0.032, with q -0.4999 and d
+    // 0.5000 -- a degenerate softmax over nonsense. fp16 cannot represent
+    // 2.67e36 at all (its maximum is 65504), so this is reinterpreted bits
+    // somewhere, not rounding.
+    //
+    // Registering a selectable backend that silently returns garbage
+    // evaluations is the same failure mode that cost days on the fp32 path,
+    // so it refuses to load until the numerics are fixed. Set
+    // backend-opts=allow_broken_fp16=true to run it anyway while working on
+    // it. The buffer-sizing work in 1491280/ebc0dcf made fp16 bindings
+    // LEGAL; it did not make them correct.
+    throw Exception(
+        "The directml-fp16 backend is numerically broken (policy magnitudes "
+        "~1e36 against a ~0.03 reference) and refuses to load. Use the fp32 "
+        "'directml' backend, or pass "
+        "backend-opts=allow_broken_fp16=true to work on the fp16 path.");
+  }
   CERR << "Initializing directml backend (" << (fp16 ? "fp16" : "fp32")
        << ")";
 
