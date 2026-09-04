@@ -109,6 +109,19 @@ DmlDeviceContext::tables_, rebound per dispatch, never re-created. The
 descriptor pool is now permanent (no per-batch reset) since cached tables
 hold their slots.
 
+Note that this rebind-without-reset scheme is DRIVER-VALIDATED, not
+CONTRACT-VERIFIED. Nothing in the backend calls IDMLBindingTable::Reset --
+see the deliberate note at dml_common.h:225 -- so every dispatch rebinds
+over the previous dispatch's bindings in a table that was never reset. That
+has been empirically stable across thousands of evals and three real nets on
+this driver, but we have not established that the DirectML contract
+guarantees it on other implementations. If a future driver or vendor shows
+stale-binding symptoms (an eval that returns the *previous* eval's outputs),
+this is the first thing to suspect. Every D3D12 Reset that does return an
+HRESULT -- the command allocators and lists in network_directml.cc -- is
+already checked via ReportD3DErrors; the binding tables are the sole
+un-reset resource, and by design.
+
 Also fixed en route: binding tables sized exactly to RequiredDescriptorCount
 (the KDA projection graph needs 105; a fixed 64-slot table failed
 E_INVALIDARG), and the MHA scratch estimate (EvalMha keeps 5*d_model/token

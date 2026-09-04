@@ -47,6 +47,7 @@
 #include "neural/network.h"
 #include "proto/net.pb.h"
 #include "utils/optionsdict.h"
+#include "neural/backends/directml/dml_common.h"
 
 namespace lczero {
 namespace {
@@ -196,6 +197,45 @@ void FillMhaEncoder(pblczero::Net* net, std::mt19937& rng, const NetDims& d) {
   FillLayer(enc->mutable_ffn()->mutable_dense2_b(), RandomVec(rng, d.embedding, 0.05f));
   FillLayer(enc->mutable_ln2_gammas(), GammaVec(rng, d.embedding));
   FillLayer(enc->mutable_ln2_betas(), RandomVec(rng, d.embedding, 0.05f));
+}
+
+// Adds one MHA encoder to the POLICY head. Every other net here leaves
+// pol_encoder empty, so AttentionPolicyHead's encoder path and the scratch
+// terms that must cover it were entirely untested: the head's q/k/v need
+// 3 * pol_d_model per token and its buffer1 carve-up another 5, none of which
+// the wq/wk/scores term (2 * ip2_pol_b + 64) accounts for once pol_d_model
+// exceeds 64.
+void FillPolicyEncoder(pblczero::Net* net, std::mt19937& rng, int pol_emb,
+                       int pol_d_model, int heads, int dff) {
+  // pol_encoder and pol_headcount live on the individual head (proto
+  // PolicyHead fields 8 and 9), not on the PolicyHeads container.
+  auto* ph = net->mutable_weights()->mutable_policy_heads()->mutable_vanilla();
+  ph->set_pol_headcount(heads);
+  auto* enc = ph->add_pol_encoder();
+  enc->set_mixer(pblczero::Weights::EncoderLayer::MIXER_MHA);
+  auto* mha = enc->mutable_mha();
+  // q_w is [pol_emb, pol_d_model]: the sizing derives d_model from
+  // q_w.size() / pol_emb, so this is what sets the requirement under test.
+  FillLayer(mha->mutable_q_w(), RandomVec(rng, pol_emb * pol_d_model, 0.1f));
+  FillLayer(mha->mutable_q_b(), RandomVec(rng, pol_d_model, 0.05f));
+  FillLayer(mha->mutable_k_w(), RandomVec(rng, pol_emb * pol_d_model, 0.1f));
+  FillLayer(mha->mutable_k_b(), RandomVec(rng, pol_d_model, 0.05f));
+  FillLayer(mha->mutable_v_w(), RandomVec(rng, pol_emb * pol_d_model, 0.1f));
+  FillLayer(mha->mutable_v_b(), RandomVec(rng, pol_d_model, 0.05f));
+  FillLayer(mha->mutable_dense_w(),
+            RandomVec(rng, pol_d_model * pol_emb, 0.1f));
+  FillLayer(mha->mutable_dense_b(), RandomVec(rng, pol_emb, 0.05f));
+  FillLayer(enc->mutable_ln1_gammas(), GammaVec(rng, pol_emb));
+  FillLayer(enc->mutable_ln1_betas(), RandomVec(rng, pol_emb, 0.05f));
+  FillLayer(enc->mutable_ffn()->mutable_dense1_w(),
+            RandomVec(rng, pol_emb * dff, 0.1f));
+  FillLayer(enc->mutable_ffn()->mutable_dense1_b(), RandomVec(rng, dff, 0.05f));
+  FillLayer(enc->mutable_ffn()->mutable_dense2_w(),
+            RandomVec(rng, dff * pol_emb, 0.1f));
+  FillLayer(enc->mutable_ffn()->mutable_dense2_b(),
+            RandomVec(rng, pol_emb, 0.05f));
+  FillLayer(enc->mutable_ln2_gammas(), GammaVec(rng, pol_emb));
+  FillLayer(enc->mutable_ln2_betas(), RandomVec(rng, pol_emb, 0.05f));
 }
 
 void FillPolicyAndValueHeads(pblczero::Net* net, std::mt19937& rng,
@@ -429,6 +469,49 @@ bool HasBackend(const std::string& name) {
   return std::find(backends.begin(), backends.end(), name) != backends.end();
 }
 
+// Hardware availability, decided ONCE and independently of any net.
+//
+// This used to be a catch-to-GTEST_SKIP wrapped around the whole subject
+// network's Create/Compute path, which conflated two unrelated things: "this
+// machine has no DirectML device" and "the backend REJECTED this net". The
+// second is a defect, and folding it into a skip made every such defect exit
+// the suite green -- the policy-encoder scratch guard fired for both new
+// wide-encoder tests and the run still reported success, which is how a
+// regression test that never bit shipped as if it had.
+//
+// Availability is a property of the MACHINE, so it is settled here, by
+// bringing the device up on its own with no weights involved. Deliberately
+// NOT a known-good probe network: a regression in the probe would put backend
+// defects straight back into suite-wide skips, which is the failure this
+// replaces.
+struct DmlAvailability {
+  bool available = false;
+  std::string reason;
+};
+
+const DmlAvailability& DirectMlAvailability() {
+  static const DmlAvailability cached = [] {
+    DmlAvailability r;
+    try {
+      OptionsDict options;
+      // The skip path has to be testable on a machine whose DirectML works,
+      // or it is itself untested -- the same one-sided-coverage trap this
+      // whole change exists to close. Point this at an adapter index that
+      // does not resolve and Init throws before any net exists.
+      if (const char* gpu = getenv("LC0_TEST_DML_GPU")) {
+        options.Set<int>("gpu", std::atoi(gpu));
+      }
+      directml_backend::DmlDeviceContext ctx;
+      ctx.Init(options);
+      r.available = true;
+    } catch (const Exception& e) {
+      r.reason = e.what();
+    }
+    return r;
+  }();
+  return cached;
+}
+
 // Same tolerance rationale as the SYCL parity test: the recurrence is
 // sequential-float in both backends, the surrounding GEMMs accumulate in
 // different orders, and an actual math divergence (wrong traversal, dropped
@@ -457,12 +540,16 @@ void CompareBackendsBatch(const pblczero::Net& net, int batch) {
   if (!HasBackend(test_backend)) {
     GTEST_SKIP() << test_backend << " backend not compiled in";
   }
-  std::vector<Outputs> dml;
-  try {
-    dml = RunNetworkBatch(test_backend, net, planes);
-  } catch (const Exception& e) {
-    GTEST_SKIP() << "no usable " << test_backend << " device: " << e.what();
+  // Availability was settled above, for the machine. Past this point every
+  // backend exception -- CreateOperator, a sizing guard, dispatch, output --
+  // is a real failure and must fail the test, not skip it. eigen is CPU, so
+  // no hardware preflight applies to it.
+  if (test_backend == "directml" && !DirectMlAvailability().available) {
+    GTEST_SKIP() << "no usable directml device: "
+                 << DirectMlAvailability().reason;
   }
+  const std::vector<Outputs> dml =
+      RunNetworkBatch(test_backend, net, planes);
 
   constexpr float kRelTol = 5e-5f;
   auto bound = [](float reference_value) {
@@ -511,12 +598,15 @@ void CompareBackends(const pblczero::Net& net) {
   if (!HasBackend(test_backend)) {
     GTEST_SKIP() << test_backend << " backend not compiled in";
   }
-  Outputs dml;
-  try {
-    dml = RunNetwork(test_backend, net, planes);
-  } catch (const Exception& e) {
-    GTEST_SKIP() << "no usable " << test_backend << " device: " << e.what();
+  // Availability was settled above, for the machine. Past this point every
+  // backend exception -- CreateOperator, a sizing guard, dispatch, output --
+  // is a real failure and must fail the test, not skip it. eigen is CPU, so
+  // no hardware preflight applies to it.
+  if (test_backend == "directml" && !DirectMlAvailability().available) {
+    GTEST_SKIP() << "no usable directml device: "
+                 << DirectMlAvailability().reason;
   }
+  const Outputs dml = RunNetwork(test_backend, net, planes);
 
   // kTol alone is an ABSOLUTE bar, which is the right shape for q and d --
   // both bounded in [-1, 1] -- but wrong for moves-left and for policy
@@ -780,6 +870,43 @@ TEST(DirectMlKdaParity, MatchesBlasOnGatedEmbeddingNet) {
 
 TEST(DirectMlKdaParity, MatchesBlasOnGatedEmbeddingRealisticDims) {
   CompareBackends(MakeGatedNet(RealisticDims(), 6002));
+}
+
+// A policy encoder wide enough that its own scratch requirement dominates.
+//
+// The shape matters: the body must stay SMALL. A realistic KDA body pushes
+// scratch_elems to ~2720, which would swamp a policy encoder's 3 * d_model and
+// prove nothing. With the default tiny body the old sizing offered 320
+// elements per token -- max(2 * ip2_pol_b + 64, 2 * ip_pol_b, KDA terms) --
+// against the 3 * d_model = 384 the encoder's q/k/v actually need.
+//
+// 128 is the smallest power-of-two width that trips it: at 64 the encoder
+// needs 3 * 64 = 192, which still fits under the ~196 the KDA body reserves
+// anyway, so a narrower net would pass with or without the fix and prove
+// nothing. Verified as a real regression test by disabling the policy fold in
+// network_directml.cc: the guard then fires with "needs 25165824 bytes of
+// scratch for q/k/v but only 20971520 are sized (policy d_model 128)", and
+// both tests below pass with it restored.
+pblczero::Net MakeWidePolicyEncoderNet(int pol_d_model) {
+  NetDims d;
+  // The encoder's embedding and d_model must match: every encoder in this
+  // backend projects q/k/v from the embedding width, and DirectML rejects
+  // the graph outright (CreateOperator throws) when they differ.
+  d.pol_emb = pol_d_model;
+  d.pol_dmodel = pol_d_model;
+  std::mt19937 rng(9100 + pol_d_model);
+  pblczero::Net file = MakeNetWithDims(d, 9100 + pol_d_model);
+  FillPolicyEncoder(&file, rng, d.pol_emb, pol_d_model, /*heads=*/8,
+                    /*dff=*/64);
+  return file;
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnWidePolicyEncoderNet) {
+  CompareBackends(MakeWidePolicyEncoderNet(128));
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnWidePolicyEncoderBatch) {
+  CompareBackendsBatch(MakeWidePolicyEncoderNet(128), 4);
 }
 
 TEST(DirectMlKdaParity, MatchesBlasOnRealisticDimsNet) {
