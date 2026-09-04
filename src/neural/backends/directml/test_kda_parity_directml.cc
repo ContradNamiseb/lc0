@@ -108,6 +108,20 @@ std::vector<float> RandomVec(std::mt19937& rng, size_t n, float scale) {
   return v;
 }
 
+// Trained LayerNorm gammas cluster near 1.0; every synthetic gamma here is
+// uniform around ZERO. That is the one distribution axis the parity suite
+// never varied -- shape, encoding and magnitude are all matched to real
+// nets, but not the distribution -- and a near-zero gamma scales a
+// normalisation's output toward zero, which would mask an indexing or
+// broadcast bug inside it. LC0_TEST_GAMMA_ONE=1 centres them on 1.0.
+std::vector<float> GammaVec(std::mt19937& rng, size_t n) {
+  std::vector<float> v = RandomVec(rng, n, 0.1f);
+  if (getenv("LC0_TEST_GAMMA_ONE")) {
+    for (auto& x : v) x += 1.0f;
+  }
+  return v;
+}
+
 void FillKdaEncoder(pblczero::Net* net, std::mt19937& rng, const NetDims& d) {
   const int key_depth = d.heads * d.key_dim;
   const int value_depth = d.heads * d.value_dim;
@@ -136,7 +150,7 @@ void FillKdaEncoder(pblczero::Net* net, std::mt19937& rng, const NetDims& d) {
   FillLayer(kda->mutable_gate_b_w(),
             RandomVec(rng, d.gate_rank * value_depth, 0.1f));
   FillLayer(kda->mutable_gate_b_b(), RandomVec(rng, value_depth, 0.05f));
-  FillLayer(kda->mutable_out_norm_gammas(), RandomVec(rng, value_depth, 0.1f));
+  FillLayer(kda->mutable_out_norm_gammas(), GammaVec(rng, value_depth));
   FillLayer(kda->mutable_dense_w(), RandomVec(rng, value_depth * d.embedding, 0.1f));
   FillLayer(kda->mutable_dense_b(), RandomVec(rng, d.embedding, 0.05f));
   kda->set_key_dim(d.key_dim);
@@ -147,7 +161,7 @@ void FillKdaEncoder(pblczero::Net* net, std::mt19937& rng, const NetDims& d) {
   kda->set_output_rms_norm(true);
   kda->set_local_conv(false);
   kda->set_qkv_silu(true);
-  FillLayer(enc->mutable_ln1_gammas(), RandomVec(rng, d.embedding, 0.1f));
+  FillLayer(enc->mutable_ln1_gammas(), GammaVec(rng, d.embedding));
   FillLayer(enc->mutable_ln1_betas(), RandomVec(rng, d.embedding, 0.05f));
   FillLayer(enc->mutable_ffn()->mutable_dense1_w(),
             RandomVec(rng, d.embedding * d.dff, 0.1f));
@@ -155,7 +169,7 @@ void FillKdaEncoder(pblczero::Net* net, std::mt19937& rng, const NetDims& d) {
   FillLayer(enc->mutable_ffn()->mutable_dense2_w(),
             RandomVec(rng, d.dff * d.embedding, 0.1f));
   FillLayer(enc->mutable_ffn()->mutable_dense2_b(), RandomVec(rng, d.embedding, 0.05f));
-  FillLayer(enc->mutable_ln2_gammas(), RandomVec(rng, d.embedding, 0.1f));
+  FillLayer(enc->mutable_ln2_gammas(), GammaVec(rng, d.embedding));
   FillLayer(enc->mutable_ln2_betas(), RandomVec(rng, d.embedding, 0.05f));
 }
 
@@ -172,7 +186,7 @@ void FillMhaEncoder(pblczero::Net* net, std::mt19937& rng, const NetDims& d) {
   FillLayer(mha->mutable_dense_w(),
             RandomVec(rng, d.embedding * d.embedding, 0.1f));
   FillLayer(mha->mutable_dense_b(), RandomVec(rng, d.embedding, 0.05f));
-  FillLayer(enc->mutable_ln1_gammas(), RandomVec(rng, d.embedding, 0.1f));
+  FillLayer(enc->mutable_ln1_gammas(), GammaVec(rng, d.embedding));
   FillLayer(enc->mutable_ln1_betas(), RandomVec(rng, d.embedding, 0.05f));
   FillLayer(enc->mutable_ffn()->mutable_dense1_w(),
             RandomVec(rng, d.embedding * d.dff, 0.1f));
@@ -180,7 +194,7 @@ void FillMhaEncoder(pblczero::Net* net, std::mt19937& rng, const NetDims& d) {
   FillLayer(enc->mutable_ffn()->mutable_dense2_w(),
             RandomVec(rng, d.dff * d.embedding, 0.1f));
   FillLayer(enc->mutable_ffn()->mutable_dense2_b(), RandomVec(rng, d.embedding, 0.05f));
-  FillLayer(enc->mutable_ln2_gammas(), RandomVec(rng, d.embedding, 0.1f));
+  FillLayer(enc->mutable_ln2_gammas(), GammaVec(rng, d.embedding));
   FillLayer(enc->mutable_ln2_betas(), RandomVec(rng, d.embedding, 0.05f));
 }
 
@@ -380,21 +394,61 @@ void CompareBackends(const pblczero::Net& net) {
       << "blas backend not compiled into the test binary";
   const Outputs reference = RunNetwork("blas", net, planes);
 
-  if (!HasBackend("directml")) {
-    GTEST_SKIP() << "directml backend not compiled in; nothing to compare";
+  // LC0_TEST_BACKEND swaps what is compared against the BLAS reference.
+  // Setting it to "eigen" measures the reference against ITSELF: eigen runs
+  // the same network_blas.cc code with a different GEMM, so the difference is
+  // purely accumulation order. That is the noise floor this suite's tolerance
+  // should sit just above -- a bar derived from a measurement rather than
+  // from the size of the bugs already caught, which is survivorship.
+  const char* backend_env = getenv("LC0_TEST_BACKEND");
+  const std::string test_backend = backend_env ? backend_env : "directml";
+  if (!HasBackend(test_backend)) {
+    GTEST_SKIP() << test_backend << " backend not compiled in";
   }
   Outputs dml;
   try {
-    dml = RunNetwork("directml", net, planes);
+    dml = RunNetwork(test_backend, net, planes);
   } catch (const Exception& e) {
-    GTEST_SKIP() << "no usable DirectML device: " << e.what();
+    GTEST_SKIP() << "no usable " << test_backend << " device: " << e.what();
   }
 
-  EXPECT_NEAR(dml.q, reference.q, kTol)
+  // kTol alone is an ABSOLUTE bar, which is the right shape for q and d --
+  // both bounded in [-1, 1] -- but wrong for moves-left and for policy
+  // logits, neither of which is bounded. Moves-left is a ply count: on
+  // kda-native-825532 it is 17.455, so 2e-4 absolute demands 1.1e-5
+  // relative, tighter than two fp32 GEMM orderings agree. That net's body
+  // matches BLAS to 4e-6 relative at every stage, and q, d and policy all
+  // pass; only m missed, by 2.5e-4 on 17.455 (1.4e-5 relative).
+  //
+  // So allow atol + rtol * |reference|, with rtol anchored to a MEASURED
+  // noise floor rather than to the size of the bugs already caught. That
+  // latter argument is survivorship: the binding-overrun bug left the policy
+  // head bit-exact while the value head was garbage, so partial wrongness is
+  // this backend's real signature, and a smaller overrun or a single wrong
+  // broadcast element lands at O(1/N) relative -- under any bar calibrated on
+  // 39% errors.
+  //
+  // The floor is measured by running the reference against ITSELF under a
+  // different accumulation order: LC0_TEST_BACKEND=eigen compares MKL BLAS
+  // against Eigen through the same network_blas.cc code. Worst relative
+  // difference over the real nets, position 0:
+  //   blas vs eigen     m 1.3e-6 .. 1.9e-6,  policy 9.4e-7 .. 2.8e-6
+  //   blas vs directml  m 1.1e-7 .. 1.4e-5,  policy 7.8e-6 .. 9.4e-6
+  // DirectML sits within ~10x of the reference's own floor, which is what a
+  // different device with different tiling and FMA contraction should cost --
+  // not the ~100x that would mean something systematic is left.
+  //
+  // rtol is set just above the worst observed (1.4e-5), not an order above:
+  // slack is where the first small systematic error hides.
+  constexpr float kRelTol = 5e-5f;
+  auto bound = [](float reference_value) {
+    return kTol + kRelTol * std::fabs(reference_value);
+  };
+  EXPECT_NEAR(dml.q, reference.q, bound(reference.q))
       << "WDL value Q diverges between directml and blas";
-  EXPECT_NEAR(dml.d, reference.d, kTol)
+  EXPECT_NEAR(dml.d, reference.d, bound(reference.d))
       << "WDL draw probability diverges between directml and blas";
-  EXPECT_NEAR(dml.m, reference.m, kTol)
+  EXPECT_NEAR(dml.m, reference.m, bound(reference.m))
       << "moves-left diverges between directml and blas";
 
   if (getenv("LC0_DIAG_OUTPUTS")) {
@@ -407,6 +461,28 @@ void CompareBackends(const pblczero::Net& net) {
          << " policy|max|=" << dml_absmax;
     CERR << "[diag] ref q=" << reference.q << " d=" << reference.d
          << " m=" << reference.m << " policy|max|=" << ref_absmax;
+    float pol_worst = 0.0f;
+    for (int i = 0; i < 1858; ++i) {
+      pol_worst =
+          std::max(pol_worst, std::fabs(dml.policy[i] - reference.policy[i]));
+    }
+    auto rel = [](float diff, float ref) {
+      return ref != 0.0f ? diff / std::fabs(ref) : 0.0f;
+    };
+    const float mdiff = std::fabs(dml.m - reference.m);
+    const float qdiff = std::fabs(dml.q - reference.q);
+    CERR << std::scientific << std::setprecision(3)
+         << "[diff] q " << qdiff << " (rel " << rel(qdiff, reference.q)
+         << ")  m " << mdiff << " (rel " << rel(mdiff, reference.m)
+         << ")  policy " << pol_worst << " (rel "
+         << rel(pol_worst, ref_absmax) << ")";
+  }
+  // Policy logits are unbounded too -- 6.5 on a real net, and hundreds once
+  // weights are scaled up -- so scale the bar by the largest reference logit
+  // rather than comparing each move against a flat 2e-4.
+  float ref_absmax = 0.0f;
+  for (int i = 0; i < 1858; ++i) {
+    ref_absmax = std::max(ref_absmax, std::fabs(reference.policy[i]));
   }
   float worst = 0.0f;
   int worst_move = -1;
@@ -417,9 +493,23 @@ void CompareBackends(const pblczero::Net& net) {
       worst_move = i;
     }
   }
-  EXPECT_LT(worst, kTol)
+  EXPECT_LT(worst, bound(ref_absmax))
       << "policy diverges between directml and blas (worst move "
       << worst_move << ", diff " << worst << ")";
+
+  // Parity of decisions, not just of tensors: a net a little off everywhere
+  // that never changes its best move is a better result than one closer in
+  // norm that flips the move it plays. Nearly free once both outputs are in
+  // hand, and it is the property the engine actually depends on.
+  int dml_best = 0, ref_best = 0;
+  for (int i = 1; i < 1858; ++i) {
+    if (dml.policy[i] > dml.policy[dml_best]) dml_best = i;
+    if (reference.policy[i] > reference.policy[ref_best]) ref_best = i;
+  }
+  EXPECT_EQ(dml_best, ref_best)
+      << "policy argmax differs: directml picks move index " << dml_best
+      << " (logit " << dml.policy[dml_best] << "), blas picks " << ref_best
+      << " (logit " << reference.policy[ref_best] << ")";
 }
 
 // KDA + moves-left head, no MHA encoder: covers the MLH path
@@ -480,12 +570,12 @@ void FillSmolgen(pblczero::Net* net, std::mt19937& rng, const NetDims& d,
   FillLayer(smol->mutable_dense1_w(),
             RandomVec(rng, sd.hidden_sz * 64 * sd.hidden_channels, 0.05f));
   FillLayer(smol->mutable_dense1_b(), RandomVec(rng, sd.hidden_sz, 0.05f));
-  FillLayer(smol->mutable_ln1_gammas(), RandomVec(rng, sd.hidden_sz, 0.1f));
+  FillLayer(smol->mutable_ln1_gammas(), GammaVec(rng, sd.hidden_sz));
   FillLayer(smol->mutable_ln1_betas(), RandomVec(rng, sd.hidden_sz, 0.05f));
   FillLayer(smol->mutable_dense2_w(),
             RandomVec(rng, sd.gen_outputs * sd.hidden_sz, 0.05f));
   FillLayer(smol->mutable_dense2_b(), RandomVec(rng, sd.gen_outputs, 0.05f));
-  FillLayer(smol->mutable_ln2_gammas(), RandomVec(rng, sd.gen_outputs, 0.1f));
+  FillLayer(smol->mutable_ln2_gammas(), GammaVec(rng, sd.gen_outputs));
   FillLayer(smol->mutable_ln2_betas(), RandomVec(rng, sd.gen_outputs, 0.05f));
   FillLayer(weights->mutable_smolgen_w(),
             RandomVec(rng, 64 * 64 * (sd.gen_outputs / d.heads), 0.05f));
@@ -676,18 +766,18 @@ pblczero::Net MakeFullRealisticNet(bool pe_dense, bool smolgen, bool mha) {
     FillLayer(weights->mutable_ip_emb_preproc_b(),
               RandomVec(rng, 64 * dense_size, 0.05f));
     FillLayer(weights->mutable_ip_emb_ln_gammas(),
-              RandomVec(rng, d.embedding, 0.1f));
+              GammaVec(rng, d.embedding));
     FillLayer(weights->mutable_ip_emb_ln_betas(),
               RandomVec(rng, d.embedding, 0.05f));
     auto* ffn = weights->mutable_ip_emb_ffn();
     FillLayer(ffn->mutable_dense1_w(),
-              RandomVec(rng, d.embedding * d.embedding, 0.1f));
+              GammaVec(rng, d.embedding * d.embedding));
     FillLayer(ffn->mutable_dense1_b(), RandomVec(rng, d.embedding, 0.05f));
     FillLayer(ffn->mutable_dense2_w(),
-              RandomVec(rng, d.embedding * d.embedding, 0.1f));
+              GammaVec(rng, d.embedding * d.embedding));
     FillLayer(ffn->mutable_dense2_b(), RandomVec(rng, d.embedding, 0.05f));
     FillLayer(weights->mutable_ip_emb_ffn_ln_gammas(),
-              RandomVec(rng, d.embedding, 0.1f));
+              GammaVec(rng, d.embedding));
     FillLayer(weights->mutable_ip_emb_ffn_ln_betas(),
               RandomVec(rng, d.embedding, 0.05f));
   }
@@ -829,7 +919,7 @@ TEST(DirectMlKdaParity, MatchesBlasOnRealNetFromEnv) {
       if (n == 0) return;
       FillLayer(layer, RandomVec(rng, n, 0.05f));
     };
-    if (g == "embedding") {
+    if (g == "all" || g == "embedding") {
       reroll(w->mutable_ip_emb_w());
       reroll(w->mutable_ip_emb_b());
       reroll(w->mutable_ip_emb_preproc_w());
@@ -842,7 +932,8 @@ TEST(DirectMlKdaParity, MatchesBlasOnRealNetFromEnv) {
       reroll(w->mutable_ip_emb_ffn()->mutable_dense2_b());
       reroll(w->mutable_ip_emb_ffn_ln_gammas());
       reroll(w->mutable_ip_emb_ffn_ln_betas());
-    } else if (g == "encoders") {
+    }
+    if (g == "all" || g == "encoders") {
       for (size_t i = 0; i < w->encoder_size(); ++i) {
         auto* e = w->mutable_encoder(i);
         reroll(e->mutable_ln1_gammas());
@@ -863,7 +954,26 @@ TEST(DirectMlKdaParity, MatchesBlasOnRealNetFromEnv) {
         reroll(m->mutable_dense_w());
         reroll(m->mutable_dense_b());
       }
-    } else if (g == "kda") {
+    }
+    // Narrower than "kda": only the two parameters the decay path
+    // exponentiates. decay_scale = exp(a_log[head]) turns a trained value
+    // into a multiplier directly, so a large trained a_log lands somewhere a
+    // near-zero synthetic one never reaches.
+    if (g == "decay") {
+      for (size_t i = 0; i < w->encoder_size(); ++i) {
+        auto* k = w->mutable_encoder(i)->mutable_kda();
+        reroll(k->mutable_a_log());
+        reroll(k->mutable_dt_bias());
+      }
+    }
+    if (g == "beta") {
+      for (size_t i = 0; i < w->encoder_size(); ++i) {
+        auto* k = w->mutable_encoder(i)->mutable_kda();
+        reroll(k->mutable_beta_w());
+        reroll(k->mutable_beta_b());
+      }
+    }
+    if (g == "all" || g == "kda") {
       for (size_t i = 0; i < w->encoder_size(); ++i) {
         auto* k = w->mutable_encoder(i)->mutable_kda();
         reroll(k->mutable_q_w());
@@ -879,7 +989,8 @@ TEST(DirectMlKdaParity, MatchesBlasOnRealNetFromEnv) {
         reroll(k->mutable_dense_w());
         reroll(k->mutable_dense_b());
       }
-    } else if (g == "heads") {
+    }
+    if (g == "all" || g == "heads") {
       auto* ph = w->mutable_policy_heads();
       reroll(ph->mutable_ip_pol_w());
       reroll(ph->mutable_ip_pol_b());
@@ -889,6 +1000,20 @@ TEST(DirectMlKdaParity, MatchesBlasOnRealNetFromEnv) {
       reroll(v->mutable_ip3_pol_w());
       reroll(v->mutable_ip3_pol_b());
       reroll(v->mutable_ip4_pol_w());
+      // The value and moves-left heads, which this group used to miss.
+      auto* vh = w->mutable_value_heads()->mutable_winner();
+      reroll(vh->mutable_ip_val_w());
+      reroll(vh->mutable_ip_val_b());
+      reroll(vh->mutable_ip1_val_w());
+      reroll(vh->mutable_ip1_val_b());
+      reroll(vh->mutable_ip2_val_w());
+      reroll(vh->mutable_ip2_val_b());
+      reroll(w->mutable_ip_mov_w());
+      reroll(w->mutable_ip_mov_b());
+      reroll(w->mutable_ip1_mov_w());
+      reroll(w->mutable_ip1_mov_b());
+      reroll(w->mutable_ip2_mov_w());
+      reroll(w->mutable_ip2_mov_b());
     }
     CERR << "[bisect] randomized group: " << g;
   }
@@ -1004,7 +1129,7 @@ pblczero::Net MakePeDenseNet() {
   FillLayer(weights->mutable_ip_emb_preproc_b(),
             RandomVec(rng, 64 * dense_size, 0.05f));
   FillLayer(weights->mutable_ip_emb_ln_gammas(),
-            RandomVec(rng, d.embedding, 0.1f));
+            GammaVec(rng, d.embedding));
   FillLayer(weights->mutable_ip_emb_ln_betas(),
             RandomVec(rng, d.embedding, 0.05f));
   auto* ffn = weights->mutable_ip_emb_ffn();
@@ -1015,7 +1140,7 @@ pblczero::Net MakePeDenseNet() {
             RandomVec(rng, d.embedding * d.embedding, 0.1f));
   FillLayer(ffn->mutable_dense2_b(), RandomVec(rng, d.embedding, 0.05f));
   FillLayer(weights->mutable_ip_emb_ffn_ln_gammas(),
-            RandomVec(rng, d.embedding, 0.1f));
+            GammaVec(rng, d.embedding));
   FillLayer(weights->mutable_ip_emb_ffn_ln_betas(),
             RandomVec(rng, d.embedding, 0.05f));
   weights->set_headcount(d.heads);
