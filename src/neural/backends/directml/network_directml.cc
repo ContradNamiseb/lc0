@@ -78,6 +78,7 @@ class DirectMlNetworkComputation;
 // ===========================================================================
 void DmlDeviceContext::Init(const OptionsDict& options) {
   const int gpu_id = options.GetOrDefault<int>("gpu", 0);
+  meta_commands_ = options.GetOrDefault<bool>("meta_commands", true);
 
   ReportD3DErrors(CreateDXGIFactory1(IID_PPV_ARGS(&dxgi_factory_)),
                   "CreateDXGIFactory1");
@@ -312,7 +313,16 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
   scratch_elems = std::max(
       {scratch_elems,
        2 * policy_head.ip2_pol_b.size() + 64,
-       emb_size + 64 + 64 /* dense concat */});
+       emb_size + 64 + 64 /* dense concat */,
+       // Fused-LayerNorm temporaries. Splitting each encoder tail at its
+       // LayerNorms (see LayerNormLayer) leaves two [tokens, C] buffers
+       // alive across the split graphs. They are carved out of the scratch
+       // arena's second half -- which is `scratch_bytes_` bytes, i.e.
+       // max_tokens * scratch_elems elements -- so scratch_elems must cover
+       // 2 * C for every C a LayerNorm is applied at. Underestimating here
+       // is not a failed allocation but an out-of-bounds UAV write.
+       2 * emb_size,
+       2 * policy_head.ip_pol_b.size()});
   scratch_bytes_ = max_tokens * scratch_elems * elem;
 
   // Tensor slots: at least the largest layer output, the raw input, and

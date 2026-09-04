@@ -279,6 +279,13 @@ class DmlDeviceContext {
   // work has completed.
   IDMLBindingTable* GetOrCreateBindingTable(IDMLCompiledOperator* op);
   IDMLDevice* dml_device() const { return dml_device_.Get(); }
+
+  // DirectML compiles GEMMs and convolutions to vendor meta-commands by
+  // default. They are tuned per architecture and are usually the fast path,
+  // but not always on integrated Intel parts, so `meta_commands=false`
+  // compiles every graph with DML_EXECUTION_FLAG_DISABLE_META_COMMANDS to
+  // measure the difference.
+  bool meta_commands() const { return meta_commands_; }
   IDMLCommandRecorder* recorder() const { return recorder_.Get(); }
   ID3D12CommandQueue* queue() const { return queue_.Get(); }
   DmlDescriptorPool& descriptors() { return descriptors_; }
@@ -309,6 +316,7 @@ class DmlDeviceContext {
   void WaitForFence(ID3D12Fence* fence, uint64_t value);
 
  private:
+  bool meta_commands_ = true;
   ComPtr<IDXGIFactory4> dxgi_factory_;
   ComPtr<IDXGIAdapter1> adapter_;
   ComPtr<ID3D12Device> device_;

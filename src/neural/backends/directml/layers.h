@@ -313,17 +313,22 @@ class EncoderBlock {
   // in_out_tensor is updated in place (input on entry, output on exit), like
   // the SYCL EncoderBlock::Eval; scratch/buffer1/buffer2 are scratch.
   void Eval(int N, DmlPtr in_out_tensor, DmlPtr scratch, DmlPtr buffer1,
-            DmlPtr buffer2, DmlExecScope& scope);
+            DmlPtr buffer2, DmlPtr ln_scratch, DmlExecScope& scope);
 
   // Two-phase compile support: builds this block's per-N graphs without
   // recording (see BaseLayer::EnsureCompiled).
   void EnsureCompiled(int N, DmlExecScope& scope);
 
  private:
+  // Idempotent builders for the split LN/FFN tail graphs, shared by
+  // EnsureCompiled and the Eval paths so the two cannot diverge.
+  void BuildKdaTails(int N, DmlExecScope& scope);
+  void BuildMhaTails(int N, DmlExecScope& scope);
+
   void EvalKda(int N, DmlPtr in_out_tensor, DmlPtr scratch, DmlPtr buffer1,
-               DmlPtr buffer2, DmlExecScope& scope);
+               DmlPtr buffer2, DmlPtr ln_scratch, DmlExecScope& scope);
   void EvalMha(int N, DmlPtr in_out_tensor, DmlPtr scratch, DmlPtr buffer1,
-               DmlPtr buffer2, DmlExecScope& scope);
+               DmlPtr buffer2, DmlPtr ln_scratch, DmlExecScope& scope);
 
   // MHA weights.
   DmlPtr mha_q_w_, mha_q_b_, mha_k_w_, mha_k_b_;
@@ -375,9 +380,15 @@ class EncoderBlock {
   std::unordered_map<int, DmlCompiledOp> mha_mlp2_compiled_;
   std::unordered_map<int, DmlCompiledOp> mha_mlp3_compiled_;
   std::unordered_map<int, DmlCompiledOp> mha_attn_compiled_;
-  std::unordered_map<int, DmlCompiledOp> mha_tail_compiled_;
+  // The LN/FFN tails split at each fused LayerNorm: "1" is the graph up to
+  // the first LN, "2" the FFN sandwiched between the two LNs. The LNs
+  // themselves are LayerNormLayer dispatches (HLSL cannot live inside a
+  // dml::Graph), so an encoder is alternating GEMM graphs and kernels.
+  std::unordered_map<int, DmlCompiledOp> mha_tail1_compiled_;
+  std::unordered_map<int, DmlCompiledOp> mha_tail2_compiled_;
   std::unordered_map<int, DmlCompiledOp> kda_proj_compiled_;
-  std::unordered_map<int, DmlCompiledOp> kda_tail_compiled_;
+  std::unordered_map<int, DmlCompiledOp> kda_tail1_compiled_;
+  std::unordered_map<int, DmlCompiledOp> kda_tail2_compiled_;
 
   // The KDA recurrence compute layer (compiled once at construction).
   std::unique_ptr<class KdaRecurrenceLayer> kda_recurrence_;
@@ -386,6 +397,8 @@ class EncoderBlock {
   std::unique_ptr<class MhaTransposeLayer> mha_transpose_;
   std::unique_ptr<class SmolgenBiasLayer> smolgen_bias_;
   std::unique_ptr<class KdaLocalConvLayer> kda_local_conv_layer_;
+  // Fused LayerNorm, shared by this block's two LN sites.
+  std::unique_ptr<class LayerNormLayer> layer_norm_;
 };
 
 // Attention policy head: ip_pol embedding, optional encoder stack, wq/wk
@@ -510,6 +523,46 @@ class SmolgenBiasLayer {
 
   void Record(ID3D12GraphicsCommandList* command_list, const Params& params,
               DmlPtr table, DmlPtr d2, DmlPtr bias_out);
+
+ private:
+  ComPtr<ID3D12Device> device_;
+  ComPtr<ID3D12RootSignature> root_signature_;
+  ComPtr<ID3D12PipelineState> pso_;
+  bool fp16_;
+};
+
+// Fused layer normalization (shaders/layer_norm.hlsl):
+//   y = gamma * (act(input + bias) * alpha + skip - mean) / sqrt(var + eps)
+//       + beta
+// replacing the ~10-node composed DML expression LayerNormExpr builds. Each
+// of those nodes is a separate dispatch streaming the whole [rows, channels]
+// tensor, so the composed form costs an order of magnitude more memory
+// traffic than the arithmetic warrants; this is one dispatch. Same
+// build-once/record-only contract as SmolgenBiasLayer.
+//
+// Because HLSL cannot live inside a dml::Graph, every call site splits its
+// graph here -- an encoder becomes alternating GEMM graphs and kernels,
+// which is the shape the SYCL backend already has.
+class LayerNormLayer {
+ public:
+  struct Params {
+    uint32_t rows;      // token count, N * 64
+    uint32_t channels;  // normalized dimension
+    bool has_bias;      // fold the previous gemm's bias in
+    bool has_skip;      // residual added after alpha
+    ActivationFunction act;
+    float alpha;
+    float eps;
+  };
+
+  LayerNormLayer(ID3D12Device* device, bool fp16);
+
+  // bias/skip may be empty DmlPtrs when the matching Params flag is false;
+  // they are then bound to `input` so the root SRV stays valid (a null root
+  // SRV removes the device on this driver).
+  void Record(ID3D12GraphicsCommandList* command_list, const Params& params,
+              DmlPtr input, DmlPtr bias, DmlPtr skip, DmlPtr gammas,
+              DmlPtr betas, DmlPtr output);
 
  private:
   ComPtr<ID3D12Device> device_;

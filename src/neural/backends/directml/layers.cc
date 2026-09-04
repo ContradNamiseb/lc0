@@ -34,6 +34,7 @@
 #include "neural/backends/directml/attention_preprocess_shader_source.h"
 #include "neural/backends/directml/kda_local_conv_shader_source.h"
 #include "neural/backends/directml/kda_recurrence_shader_source.h"
+#include "neural/backends/directml/layer_norm_shader_source.h"
 #include "neural/backends/directml/mha_transpose_shader_source.h"
 #include "neural/backends/directml/policy_finalize_shader_source.h"
 #include "neural/backends/directml/smolgen_bias_shader_source.h"
@@ -296,7 +297,10 @@ class GraphFactory {
   DmlCompiledOp Compile(std::vector<dml::Expression> outputs,
                         std::vector<uint64_t> output_bytes) {
     DmlCompiledOp out;
-    out.op = graph_.Compile(DML_EXECUTION_FLAG_NONE, outputs);
+    out.op = graph_.Compile(ctx_.meta_commands()
+                                ? DML_EXECUTION_FLAG_NONE
+                                : DML_EXECUTION_FLAG_DISABLE_META_COMMANDS,
+                            outputs);
     DML_BINDING_PROPERTIES props = out.op->GetBindingProperties();
     if (props.PersistentResourceSize != 0) {
       throw Exception(
@@ -810,6 +814,64 @@ void SmolgenBiasLayer::Record(ID3D12GraphicsCommandList* command_list,
   command_list->ResourceBarrier(1, &barrier);
 }
 
+struct LayerNormConstants {
+  uint32_t rows;
+  uint32_t channels;
+  uint32_t flags;
+  uint32_t activation;
+  float alpha;
+  float eps;
+  uint32_t pad0;
+  uint32_t pad1;
+};
+
+LayerNormLayer::LayerNormLayer(ID3D12Device* device, bool fp16)
+    : device_(device), fp16_(fp16) {
+  ComPtr<ID3DBlob> shader =
+      CompileHlsl(kLayerNormShaderSource, sizeof(kLayerNormShaderSource) - 1,
+                  "layer_norm.hlsl", "LayerNorm", fp16_);
+  root_signature_ = CreateShaderRootSignature(
+      device_.Get(), sizeof(LayerNormConstants) / 4, 5, 1);
+  pso_ = CreateComputePso(device_.Get(), root_signature_.Get(), shader.Get());
+}
+
+void LayerNormLayer::Record(ID3D12GraphicsCommandList* command_list,
+                            const Params& params, DmlPtr input, DmlPtr bias,
+                            DmlPtr skip, DmlPtr gammas, DmlPtr betas,
+                            DmlPtr output) {
+  LayerNormConstants constants{};
+  constants.rows = params.rows;
+  constants.channels = params.channels;
+  constants.flags = (params.has_bias ? 1u : 0u) | (params.has_skip ? 2u : 0u);
+  constants.activation = static_cast<uint32_t>(params.act);
+  constants.alpha = params.alpha;
+  constants.eps = params.eps;
+
+  // Every root SRV must point at a real allocation even when the shader
+  // never reads it: a zero GPU VA in a root descriptor removes the device on
+  // this driver (the same failure the PE_DENSE preprocess kernel hit).
+  const DmlPtr bias_srv = params.has_bias ? bias : input;
+  const DmlPtr skip_srv = params.has_skip ? skip : input;
+
+  command_list->SetComputeRootSignature(root_signature_.Get());
+  command_list->SetPipelineState(pso_.Get());
+  command_list->SetComputeRoot32BitConstants(0, sizeof(LayerNormConstants) / 4,
+                                             &constants, 0);
+  command_list->SetComputeRootShaderResourceView(1, input.GpuVA());
+  command_list->SetComputeRootShaderResourceView(2, bias_srv.GpuVA());
+  command_list->SetComputeRootShaderResourceView(3, skip_srv.GpuVA());
+  command_list->SetComputeRootShaderResourceView(4, gammas.GpuVA());
+  command_list->SetComputeRootShaderResourceView(5, betas.GpuVA());
+  command_list->SetComputeRootUnorderedAccessView(6, output.GpuVA());
+  // One thread group per token row (LN_GROUP_SIZE threads cooperate on the
+  // channel reduction), so the group count is the row count.
+  command_list->Dispatch(static_cast<UINT>(params.rows), 1, 1);
+
+  D3D12_RESOURCE_BARRIER barrier = {};
+  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+  command_list->ResourceBarrier(1, &barrier);
+}
+
 struct KdaLocalConvConstants {
   uint32_t tokens;
   uint32_t emb;
@@ -1179,6 +1241,12 @@ void AttentionBody<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
   ID3D12GraphicsCommandList* list = scope.list();
   DmlPtr buffer1 = input2;
   DmlPtr buffer2 = input2 + AlignUp(scratch_size / 2);
+  // The fused LayerNorms need two [tokens, C] temporaries that outlive the
+  // graph dispatches around them. They live in the scratch arena's second
+  // half, which nothing else uses: every Eval is handed `scratch` with
+  // `scratch_size` bytes, and the arena is allocated at twice that (see
+  // network_directml.cc, where scratch_elems is held to >= 2 * emb).
+  DmlPtr ln_scratch = scratch + AlignUp(scratch_size);
   const uint32_t tokens = N * 64;
   const int input_size = kNumInputPlanes;
 
@@ -1336,7 +1404,7 @@ void AttentionBody<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
   }
 
   for (const auto& enc : encoder_weights_) {
-    enc->Eval(N, output, scratch, buffer1, buffer2, scope);
+    enc->Eval(N, output, scratch, buffer1, buffer2, ln_scratch, scope);
   }
 }
 
@@ -1458,23 +1526,27 @@ EncoderBlock<DataType>::EncoderBlock(
       smolgen_bias_ = std::make_unique<SmolgenBiasLayer>(ctx.device(), fp16);
     }
   }
+  // Both block kinds have the same two LayerNorms in their tail.
+  layer_norm_ = std::make_unique<LayerNormLayer>(ctx.device(), fp16);
 }
 
 template <typename DataType>
 void EncoderBlock<DataType>::Eval(int N, DmlPtr in_out_tensor, DmlPtr scratch,
                                   DmlPtr buffer1, DmlPtr buffer2,
-                                  DmlExecScope& scope) {
+                                  DmlPtr ln_scratch, DmlExecScope& scope) {
   if (is_kda_) {
-    EvalKda(N, in_out_tensor, scratch, buffer1, buffer2, scope);
+    EvalKda(N, in_out_tensor, scratch, buffer1, buffer2, ln_scratch, scope);
   } else {
-    EvalMha(N, in_out_tensor, scratch, buffer1, buffer2, scope);
+    EvalMha(N, in_out_tensor, scratch, buffer1, buffer2, ln_scratch, scope);
   }
 }
 
 template <typename DataType>
 void EncoderBlock<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
-  // NOTE: these build blocks mirror the lazy fallback blocks inside
-  // EvalKda/EvalMha (which stay as dead-man's fuses). Keep them in sync.
+  // NOTE: the projection/attention build blocks below mirror the lazy
+  // fallback blocks inside EvalKda/EvalMha (which stay as dead-man's fuses)
+  // -- keep those in sync. The LN/FFN tails no longer can drift: both paths
+  // call BuildKdaTails/BuildMhaTails.
   if (is_kda_) {
     const uint32_t tokens = N * 64;
     const uint32_t max_tokens = max_batch_size_ * 64;
@@ -1533,51 +1605,7 @@ void EncoderBlock<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
       out_bytes.push_back((uint64_t)tokens * encoder_heads_ * elem);
       kda_proj_compiled_.emplace(N, g.Compile(outs, out_bytes));
     }
-    if (!kda_tail_compiled_.count(N)) {
-      GraphFactory<DataType> g(scope.ctx());
-      auto mixed_in = g.Input({1, 1, tokens, VD});
-      dml::Expression normed = mixed_in;
-      if (kda_output_rms_norm_) {
-        auto gammas = g.WeightChannel(kda_out_norm_gammas_, tokens, VD);
-        normed = RmsNormExpr<DataType>(normed, gammas, kda_rms_norm_epsilon_);
-      }
-      if (kda_output_gate_) {
-        // Gate applies after the RMS norm on purpose (they do not commute).
-        auto gate_in = g.Input2({1, 1, tokens, VD});
-        normed = normed * dml::ActivationSigmoid(gate_in);
-      }
-      auto dw = g.Weight(kda_dense_w_, {1, 1, emb, VD});
-      dml::Expression dense =
-          dml::Gemm(normed, dw, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
-                    DML_MATRIX_TRANSFORM_TRANSPOSE);
-      auto db = g.WeightChannel(kda_dense_b_, tokens, emb);
-      auto ln1g = g.WeightChannel(ln1_gammas_, tokens, emb);
-      auto ln1b = g.WeightChannel(ln1_betas_, tokens, emb);
-      auto x = g.Scratch({1, 1, tokens, emb});  // original input (skip)
-      dml::Expression bias_dense = db;
-      dml::Expression ln1 = LayerNormExpr<DataType>(
-          dense, &bias_dense, &x, ln1g, ln1b, alpha_, default_eps_,
-          ACTIVATION_NONE);
-      auto f1w = g.Weight(ffn_dense1_w_, {1, 1, (uint32_t)ffn_dense1_size_, emb});
-      auto f1b = g.WeightChannel(ffn_dense1_b_, tokens, (uint32_t)ffn_dense1_size_);
-      dml::Expression ffn1 =
-          dml::Gemm(ln1, f1w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
-                    DML_MATRIX_TRANSFORM_TRANSPOSE) + f1b;
-      ffn1 = ActivationExpr<DataType>(ffn_activation_, ffn1);
-      auto f2w = g.Weight(ffn_dense2_w_, {1, 1, emb, (uint32_t)ffn_dense1_size_});
-      auto f2b = g.WeightChannel(ffn_dense2_b_, tokens, emb);
-      dml::Expression ffn2 =
-          dml::Gemm(ffn1, f2w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
-                    DML_MATRIX_TRANSFORM_TRANSPOSE);
-      auto ln2g = g.WeightChannel(ln2_gammas_, tokens, emb);
-      auto ln2b = g.WeightChannel(ln2_betas_, tokens, emb);
-      dml::Expression bias_ffn2 = f2b;
-      dml::Expression ln2 = LayerNormExpr<DataType>(
-          ffn2, &bias_ffn2, &ln1, ln2g, ln2b, alpha_, default_eps_,
-          ACTIVATION_NONE);
-      kda_tail_compiled_.emplace(
-          N, g.Compile({ln2}, {(uint64_t)tokens * emb * elem}));
-    }
+    BuildKdaTails(N, scope);
     return;
   }
 
@@ -1728,59 +1756,119 @@ void EncoderBlock<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
     mha_attn_compiled_.emplace(N, g.Compile({context},
                                             {(uint64_t)B * 64 * D * elem}));
   }
-  if (!mha_tail_compiled_.count(N)) {
+  BuildMhaTails(N, scope);
+}
+
+// The LN/FFN tail of an encoder block, split at its two LayerNorms.
+//
+// Each half is a pure GEMM graph (DirectML's meta-commands are good at
+// those); the LayerNorms between and after them are single fused HLSL
+// dispatches. The composed dml::Graph form these replace spent ~10 nodes per
+// LayerNorm, each node a separate dispatch streaming the whole
+// [tokens, channels] tensor, which dominated eval time on this hardware.
+//
+// Idempotent, and the only place these graphs are built -- both the
+// two-phase EnsureCompiled pre-pass and the Eval paths call it, so they
+// cannot fall out of step.
+template <typename DataType>
+void EncoderBlock<DataType>::BuildKdaTails(int N, DmlExecScope& scope) {
+  const uint32_t tokens = N * 64;
+  const uint32_t VD = encoder_heads_ * kda_value_dim_;
+  const uint32_t emb = embedding_op_size_;
+  const size_t elem = sizeof(DataType);
+
+  // 1: KDA output norm + gate + dense projection -> raw gemm. The dense
+  // bias, the alpha scale and the block-input skip all belong to the fused
+  // LayerNorm that follows, so they are absent here.
+  if (!kda_tail1_compiled_.count(N)) {
     GraphFactory<DataType> g(scope.ctx());
-    auto mg = g.Input({1, 1, tokens, d_model});
-    auto skip = g.Input2({1, 1, tokens, (uint32_t)embedding_op_size_});
-    auto dw = g.Weight(mha_dense_w_,
-                       {1, 1, (uint32_t)embedding_op_size_, d_model});
-    auto db = g.WeightChannel(mha_dense_b_, tokens,
-                              (uint32_t)embedding_op_size_);
+    auto mixed_in = g.Input({1, 1, tokens, VD});
+    dml::Expression normed = mixed_in;
+    if (kda_output_rms_norm_) {
+      auto gammas = g.WeightChannel(kda_out_norm_gammas_, tokens, VD);
+      normed = RmsNormExpr<DataType>(normed, gammas, kda_rms_norm_epsilon_);
+    }
+    if (kda_output_gate_) {
+      // Gate applies after the RMS norm on purpose (they do not commute).
+      auto gate_in = g.Input2({1, 1, tokens, VD});
+      normed = normed * dml::ActivationSigmoid(gate_in);
+    }
+    auto dw = g.Weight(kda_dense_w_, {1, 1, emb, VD});
     dml::Expression dense =
-        dml::Gemm(mg, dw, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+        dml::Gemm(normed, dw, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
                   DML_MATRIX_TRANSFORM_TRANSPOSE);
-    auto ln1g = g.WeightChannel(ln1_gammas_, tokens,
-                                (uint32_t)embedding_op_size_);
-    auto ln1b = g.WeightChannel(ln1_betas_, tokens,
-                                (uint32_t)embedding_op_size_);
-    dml::Expression bias_dense = db;
-    dml::Expression ln1 = LayerNormExpr<DataType>(
-        dense, &bias_dense, &skip, ln1g, ln1b, alpha_, default_eps_,
-        ACTIVATION_NONE);
-    auto f1w = g.Weight(ffn_dense1_w_,
-                        {1, 1, (uint32_t)ffn_dense1_size_,
-                         (uint32_t)embedding_op_size_});
-    auto f1b = g.WeightChannel(ffn_dense1_b_, tokens,
-                               (uint32_t)ffn_dense1_size_);
+    kda_tail1_compiled_.emplace(
+        N, g.Compile({dense}, {(uint64_t)tokens * emb * elem}));
+  }
+
+  // 2: the FFN between the two LayerNorms. ffn_dense2's bias is left to the
+  // second fused LayerNorm.
+  if (!kda_tail2_compiled_.count(N)) {
+    GraphFactory<DataType> g(scope.ctx());
+    auto ln1 = g.Input({1, 1, tokens, emb});
+    auto f1w = g.Weight(ffn_dense1_w_, {1, 1, (uint32_t)ffn_dense1_size_, emb});
+    auto f1b =
+        g.WeightChannel(ffn_dense1_b_, tokens, (uint32_t)ffn_dense1_size_);
     dml::Expression ffn1 =
         dml::Gemm(ln1, f1w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
                   DML_MATRIX_TRANSFORM_TRANSPOSE) + f1b;
     ffn1 = ActivationExpr<DataType>(ffn_activation_, ffn1);
-    auto f2w = g.Weight(ffn_dense2_w_,
-                        {1, 1, (uint32_t)embedding_op_size_,
-                         (uint32_t)ffn_dense1_size_});
-    auto f2b = g.WeightChannel(ffn_dense2_b_, tokens,
-                               (uint32_t)embedding_op_size_);
+    auto f2w = g.Weight(ffn_dense2_w_, {1, 1, emb, (uint32_t)ffn_dense1_size_});
     dml::Expression ffn2 =
         dml::Gemm(ffn1, f2w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
                   DML_MATRIX_TRANSFORM_TRANSPOSE);
-    auto ln2g = g.WeightChannel(ln2_gammas_, tokens,
-                                (uint32_t)embedding_op_size_);
-    auto ln2b = g.WeightChannel(ln2_betas_, tokens,
-                                (uint32_t)embedding_op_size_);
-    dml::Expression bias_ffn2 = f2b;
-    dml::Expression ln2 = LayerNormExpr<DataType>(
-        ffn2, &bias_ffn2, &ln1, ln2g, ln2b, alpha_, default_eps_,
-        ACTIVATION_NONE);
-    mha_tail_compiled_.emplace(
-        N, g.Compile({ln2}, {(uint64_t)tokens * embedding_op_size_ * elem}));
+    kda_tail2_compiled_.emplace(
+        N, g.Compile({ffn2}, {(uint64_t)tokens * emb * elem}));
+  }
+}
+
+template <typename DataType>
+void EncoderBlock<DataType>::BuildMhaTails(int N, DmlExecScope& scope) {
+  const uint32_t tokens = N * 64;
+  const uint32_t d_model = mha_q_size_;
+  const uint32_t emb = embedding_op_size_;
+  const size_t elem = sizeof(DataType);
+
+  // 1: the merged-heads dense projection -> raw gemm.
+  if (!mha_tail1_compiled_.count(N)) {
+    GraphFactory<DataType> g(scope.ctx());
+    auto mg = g.Input({1, 1, tokens, d_model});
+    auto dw = g.Weight(mha_dense_w_, {1, 1, emb, d_model});
+    dml::Expression dense =
+        dml::Gemm(mg, dw, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                  DML_MATRIX_TRANSFORM_TRANSPOSE);
+    mha_tail1_compiled_.emplace(
+        N, g.Compile({dense}, {(uint64_t)tokens * emb * elem}));
+  }
+
+  // 2: the FFN between the two LayerNorms.
+  //
+  // NOTE: biases here MUST be WeightChannel (strided matching-sizes), not
+  // dense size-1 [1,1,1,C]: this runtime rejects size-1 broadcast in
+  // elementwise Add (E_INVALIDARG at CreateOperator).
+  if (!mha_tail2_compiled_.count(N)) {
+    GraphFactory<DataType> g(scope.ctx());
+    auto ln1 = g.Input({1, 1, tokens, emb});
+    auto f1w = g.Weight(ffn_dense1_w_, {1, 1, (uint32_t)ffn_dense1_size_, emb});
+    auto f1b =
+        g.WeightChannel(ffn_dense1_b_, tokens, (uint32_t)ffn_dense1_size_);
+    dml::Expression ffn1 =
+        dml::Gemm(ln1, f1w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                  DML_MATRIX_TRANSFORM_TRANSPOSE) + f1b;
+    ffn1 = ActivationExpr<DataType>(ffn_activation_, ffn1);
+    auto f2w = g.Weight(ffn_dense2_w_, {1, 1, emb, (uint32_t)ffn_dense1_size_});
+    dml::Expression ffn2 =
+        dml::Gemm(ffn1, f2w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+                  DML_MATRIX_TRANSFORM_TRANSPOSE);
+    mha_tail2_compiled_.emplace(
+        N, g.Compile({ffn2}, {(uint64_t)tokens * emb * elem}));
   }
 }
 
 // MHA evaluation with dense [N*H,1]-batch attention (see mha_transpose.hlsl
 // for why the head interleave cannot stay a strided GEMM input on this
-// driver). Three DML graphs (qkv projections, attention, LN/FFN tail) with
-// two HLSL transposes between them:
+// driver). Four DML graphs (qkv projections, attention, dense projection,
+// FFN) with two HLSL transposes and two fused LayerNorms between them:
 //
 //   in_out [T,H*D] --qkv--> scratch q/k/v --split--> buffer1 qt/kt/vt [B,64,D]
 //     --attn--> buffer1 ctx [B,64,D] --merge--> buffer1 merged [T,H*D]
@@ -1792,7 +1880,8 @@ void EncoderBlock<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
 template <typename DataType>
 void EncoderBlock<DataType>::EvalMha(int N, DmlPtr in_out_tensor,
                                      DmlPtr scratch, DmlPtr buffer1,
-                                     DmlPtr buffer2, DmlExecScope& scope) {
+                                     DmlPtr buffer2, DmlPtr ln_scratch,
+                                     DmlExecScope& scope) {
   const uint32_t H = encoder_heads_;
   const uint32_t d_model = mha_q_size_;
   if (H == 0 || d_model == 0 || d_model % H != 0) {
@@ -1910,72 +1999,45 @@ void EncoderBlock<DataType>::EvalMha(int N, DmlPtr in_out_tensor,
     mha_transpose_->Record(scope.list(), params, ctxb, merged);
   }
 
-  // 5. Dense projection + LN1 + FFN + LN2 (all [1,1]-batch, as before).
+  // 5. Dense projection, LN1, FFN, LN2: two GEMM graphs with a fused
+  // LayerNorm dispatch after each. `dense` is dead once LN1 has consumed it,
+  // so the FFN's output reuses its buffer -- two [tokens, emb] temporaries
+  // in total, which is what the LN scratch region is sized for.
   {
-    auto it = mha_tail_compiled_.find(N);
-    if (it == mha_tail_compiled_.end()) {
-      GraphFactory<DataType> g(scope.ctx());
-      auto mg = g.Input({1, 1, tokens, d_model});
-      auto skip = g.Input2({1, 1, tokens, (uint32_t)embedding_op_size_});
-      auto dw = g.Weight(mha_dense_w_,
-                         {1, 1, (uint32_t)embedding_op_size_, d_model});
-      auto db = g.WeightChannel(mha_dense_b_, tokens,
-                                (uint32_t)embedding_op_size_);
-      dml::Expression dense =
-          dml::Gemm(mg, dw, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
-                    DML_MATRIX_TRANSFORM_TRANSPOSE);
-      auto ln1g = g.WeightChannel(ln1_gammas_, tokens,
-                                  (uint32_t)embedding_op_size_);
-      auto ln1b = g.WeightChannel(ln1_betas_, tokens,
-                                  (uint32_t)embedding_op_size_);
-      dml::Expression bias_dense = db;
-      dml::Expression ln1 = LayerNormExpr<DataType>(
-          dense, &bias_dense, &skip, ln1g, ln1b, alpha_, default_eps_,
-          ACTIVATION_NONE);
-      // NOTE: biases here MUST be WeightChannel (strided matching-sizes),
-      // not dense size-1 [1,1,1,C]: this runtime rejects size-1 broadcast
-      // in elementwise Add (E_INVALIDARG at CreateOperator). The original
-      // MHA code used dense size-1 f1b/f2b and could never compile.
-      auto f1w = g.Weight(ffn_dense1_w_,
-                          {1, 1, (uint32_t)ffn_dense1_size_,
-                           (uint32_t)embedding_op_size_});
-      auto f1b = g.WeightChannel(ffn_dense1_b_, tokens,
-                                 (uint32_t)ffn_dense1_size_);
-      dml::Expression ffn1 =
-          dml::Gemm(ln1, f1w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
-                    DML_MATRIX_TRANSFORM_TRANSPOSE) +
-          f1b;
-      ffn1 = ActivationExpr<DataType>(ffn_activation_, ffn1);
-      auto f2w = g.Weight(ffn_dense2_w_,
-                          {1, 1, (uint32_t)embedding_op_size_,
-                           (uint32_t)ffn_dense1_size_});
-      auto f2b = g.WeightChannel(ffn_dense2_b_, tokens,
-                                 (uint32_t)embedding_op_size_);
-      dml::Expression ffn2 =
-          dml::Gemm(ffn1, f2w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
-                    DML_MATRIX_TRANSFORM_TRANSPOSE);
-      auto ln2g = g.WeightChannel(ln2_gammas_, tokens,
-                                  (uint32_t)embedding_op_size_);
-      auto ln2b = g.WeightChannel(ln2_betas_, tokens,
-                                  (uint32_t)embedding_op_size_);
-      dml::Expression bias_ffn2 = f2b;
-      dml::Expression ln2 = LayerNormExpr<DataType>(
-          ffn2, &bias_ffn2, &ln1, ln2g, ln2b, alpha_, default_eps_,
-          ACTIVATION_NONE);
-      it = mha_tail_compiled_
-               .emplace(N, g.Compile({ln2}, {(uint64_t)tokens *
-                                             embedding_op_size_ * elem}))
-               .first;
-    }
-    DispatchOp<DataType>(scope, it->second, merged, in_out_tensor, buffer2,
-                         {in_out_tensor});
+    BuildMhaTails(N, scope);
+    const uint32_t emb = (uint32_t)embedding_op_size_;
+    const DmlPtr dense = ln_scratch;
+    const DmlPtr ln1 = ln_scratch + max_tokens * emb * elem;
+    const DmlPtr ffn2 = dense;
+
+    DispatchOp<DataType>(scope, mha_tail1_compiled_.at(N), merged, buffer2,
+                         buffer2, {dense});
+
+    LayerNormLayer::Params ln{};
+    ln.rows = tokens;
+    ln.channels = emb;
+    ln.has_bias = true;
+    ln.has_skip = true;
+    ln.act = ACTIVATION_NONE;
+    ln.alpha = alpha_;
+    ln.eps = default_eps_;
+    // LN1's skip is the block input, which in_out_tensor still holds.
+    layer_norm_->Record(scope.list(), ln, dense, mha_dense_b_, in_out_tensor,
+                        ln1_gammas_, ln1_betas_, ln1);
+
+    DispatchOp<DataType>(scope, mha_tail2_compiled_.at(N), ln1, buffer2,
+                         buffer2, {ffn2});
+
+    layer_norm_->Record(scope.list(), ln, ffn2, ffn_dense2_b_, ln1,
+                        ln2_gammas_, ln2_betas_, in_out_tensor);
   }
 }
 
 template <typename DataType>
 void EncoderBlock<DataType>::EvalKda(int N, DmlPtr in_out_tensor,
                                      DmlPtr scratch, DmlPtr buffer1,
-                                     DmlPtr buffer2, DmlExecScope& scope) {
+                                     DmlPtr buffer2, DmlPtr ln_scratch,
+                                     DmlExecScope& scope) {
   constexpr float kKdaLogDecayFloor = -10.0f;
   const uint32_t tokens = N * 64;
   const uint32_t max_tokens = max_batch_size_ * 64;
@@ -2086,54 +2148,35 @@ void EncoderBlock<DataType>::EvalKda(int N, DmlPtr in_out_tensor,
                             raw_decay, kda_dt_bias_, kda_a_log_, beta, mixed);
   }
 
+  // Output norm + gate + dense projection, LN1, FFN, LN2: two GEMM graphs
+  // with a fused LayerNorm dispatch after each (see BuildKdaTails). `dense`
+  // dies at LN1, so the FFN output reuses its buffer.
   {
-    auto it = kda_tail_compiled_.find(N);
-    if (it == kda_tail_compiled_.end()) {
-      GraphFactory<DataType> g(scope.ctx());
-      auto mixed_in = g.Input({1, 1, tokens, VD});
-      dml::Expression normed = mixed_in;
-      if (kda_output_rms_norm_) {
-        auto gammas = g.WeightChannel(kda_out_norm_gammas_, tokens, VD);
-        normed = RmsNormExpr<DataType>(normed, gammas, kda_rms_norm_epsilon_);
-      }
-      if (kda_output_gate_) {
-        // Gate applies after the RMS norm on purpose (they do not commute).
-        auto gate_in = g.Input2({1, 1, tokens, VD});
-        normed = normed * dml::ActivationSigmoid(gate_in);
-      }
-      auto dw = g.Weight(kda_dense_w_, {1, 1, emb, VD});
-      dml::Expression dense =
-          dml::Gemm(normed, dw, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
-                    DML_MATRIX_TRANSFORM_TRANSPOSE);
-      auto db = g.WeightChannel(kda_dense_b_, tokens, emb);
-      auto ln1g = g.WeightChannel(ln1_gammas_, tokens, emb);
-      auto ln1b = g.WeightChannel(ln1_betas_, tokens, emb);
-      auto x = g.Scratch({1, 1, tokens, emb});  // original input (skip)
-      dml::Expression bias_dense = db;
-      dml::Expression ln1 = LayerNormExpr<DataType>(dense, &bias_dense, &x, ln1g, ln1b, alpha_, default_eps_,
-          ACTIVATION_NONE);
-      auto f1w = g.Weight(ffn_dense1_w_, {1, 1, (uint32_t)ffn_dense1_size_, emb});
-      auto f1b = g.WeightChannel(ffn_dense1_b_, tokens, (uint32_t)ffn_dense1_size_);
-      dml::Expression ffn1 =
-          dml::Gemm(ln1, f1w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
-                    DML_MATRIX_TRANSFORM_TRANSPOSE) + f1b;
-      ffn1 = ActivationExpr<DataType>(ffn_activation_, ffn1);
-      auto f2w = g.Weight(ffn_dense2_w_, {1, 1, emb, (uint32_t)ffn_dense1_size_});
-      auto f2b = g.WeightChannel(ffn_dense2_b_, tokens, emb);
-      dml::Expression ffn2 =
-          dml::Gemm(ffn1, f2w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
-                    DML_MATRIX_TRANSFORM_TRANSPOSE);
-      auto ln2g = g.WeightChannel(ln2_gammas_, tokens, emb);
-      auto ln2b = g.WeightChannel(ln2_betas_, tokens, emb);
-      dml::Expression bias_ffn2 = f2b;
-      dml::Expression ln2 = LayerNormExpr<DataType>(ffn2, &bias_ffn2, &ln1, ln2g, ln2b, alpha_, default_eps_,
-          ACTIVATION_NONE);
-      it = kda_tail_compiled_.emplace(
-               N, g.Compile({ln2}, {(uint64_t)tokens * emb * sizeof(DataType)}))
-               .first;
-    }
-    DispatchOp<DataType>(scope, it->second, mixed, gate, in_out_tensor,
-                         {in_out_tensor});
+    BuildKdaTails(N, scope);
+    const DmlPtr dense = ln_scratch;
+    const DmlPtr ln1 = ln_scratch + (uint64_t)max_tokens * emb * elem;
+    const DmlPtr ffn2 = dense;
+
+    DispatchOp<DataType>(scope, kda_tail1_compiled_.at(N), mixed, gate,
+                         buffer2, {dense});
+
+    LayerNormLayer::Params ln{};
+    ln.rows = tokens;
+    ln.channels = emb;
+    ln.has_bias = true;
+    ln.has_skip = true;
+    ln.act = ACTIVATION_NONE;
+    ln.alpha = alpha_;
+    ln.eps = default_eps_;
+    // LN1's skip is the block input, still in in_out_tensor at this point.
+    layer_norm_->Record(scope.list(), ln, dense, kda_dense_b_, in_out_tensor,
+                        ln1_gammas_, ln1_betas_, ln1);
+
+    DispatchOp<DataType>(scope, kda_tail2_compiled_.at(N), ln1, buffer2,
+                         buffer2, {ffn2});
+
+    layer_norm_->Record(scope.list(), ln, ffn2, ffn_dense2_b_, ln1,
+                        ln2_gammas_, ln2_betas_, in_out_tensor);
   }
 }
 
@@ -2260,6 +2303,12 @@ void AttentionPolicyHead<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
   const size_t elem = sizeof(DataType);
   DmlPtr buffer1 = output + AlignUp(scratch_size / 2);
   DmlPtr buffer2 = input2 + AlignUp(scratch_size / 2);
+  // The fused LayerNorms need two [tokens, C] temporaries that outlive the
+  // graph dispatches around them. They live in the scratch arena's second
+  // half, which nothing else uses: every Eval is handed `scratch` with
+  // `scratch_size` bytes, and the arena is allocated at twice that (see
+  // network_directml.cc, where scratch_elems is held to >= 2 * emb).
+  DmlPtr ln_scratch = scratch + AlignUp(scratch_size);
 
   DmlPtr embedding = input2;  // policy embedding + encoders run here
   {
@@ -2269,7 +2318,7 @@ void AttentionPolicyHead<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
   }
 
   for (const auto& enc : encoder_weights_) {
-    enc->Eval(N, embedding, scratch, buffer1, buffer2, scope);
+    enc->Eval(N, embedding, scratch, buffer1, buffer2, ln_scratch, scope);
   }
 
   DmlPtr wq = scratch;
