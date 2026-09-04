@@ -43,6 +43,7 @@
 #include "neural/encoder.h"
 #include "neural/factory.h"
 #include "neural/loader.h"
+#include "utils/weights_adapter.h"
 #include "neural/network.h"
 #include "proto/net.pb.h"
 #include "utils/optionsdict.h"
@@ -814,6 +815,82 @@ TEST(DirectMlKdaParity, MatchesBlasOnRealNetFromEnv) {
     for (const auto& e : kept) *w->add_encoder() = e;
     CERR << "[bisect] kept " << w->encoder_size() << " " << mixer
          << " encoders";
+  }
+  // Replace one group of a real net's weights with random values of the same
+  // length. Both backends see the same mutated net, so the comparison stays
+  // fair; if a group's real values are what trigger a divergence, replacing
+  // that group makes the test pass.
+  if (const char* group = getenv("LC0_TEST_RANDOMIZE")) {
+    std::mt19937 rng(7777);
+    const std::string g = group;
+    auto* w = net.mutable_weights();
+    auto reroll = [&](pblczero::Weights::Layer* layer) {
+      const size_t n = LayerAdapter(*layer).size();
+      if (n == 0) return;
+      FillLayer(layer, RandomVec(rng, n, 0.05f));
+    };
+    if (g == "embedding") {
+      reroll(w->mutable_ip_emb_w());
+      reroll(w->mutable_ip_emb_b());
+      reroll(w->mutable_ip_emb_preproc_w());
+      reroll(w->mutable_ip_emb_preproc_b());
+      reroll(w->mutable_ip_emb_ln_gammas());
+      reroll(w->mutable_ip_emb_ln_betas());
+      reroll(w->mutable_ip_emb_ffn()->mutable_dense1_w());
+      reroll(w->mutable_ip_emb_ffn()->mutable_dense1_b());
+      reroll(w->mutable_ip_emb_ffn()->mutable_dense2_w());
+      reroll(w->mutable_ip_emb_ffn()->mutable_dense2_b());
+      reroll(w->mutable_ip_emb_ffn_ln_gammas());
+      reroll(w->mutable_ip_emb_ffn_ln_betas());
+    } else if (g == "encoders") {
+      for (size_t i = 0; i < w->encoder_size(); ++i) {
+        auto* e = w->mutable_encoder(i);
+        reroll(e->mutable_ln1_gammas());
+        reroll(e->mutable_ln1_betas());
+        reroll(e->mutable_ln2_gammas());
+        reroll(e->mutable_ln2_betas());
+        reroll(e->mutable_ffn()->mutable_dense1_w());
+        reroll(e->mutable_ffn()->mutable_dense1_b());
+        reroll(e->mutable_ffn()->mutable_dense2_w());
+        reroll(e->mutable_ffn()->mutable_dense2_b());
+        auto* m = e->mutable_mha();
+        reroll(m->mutable_q_w());
+        reroll(m->mutable_q_b());
+        reroll(m->mutable_k_w());
+        reroll(m->mutable_k_b());
+        reroll(m->mutable_v_w());
+        reroll(m->mutable_v_b());
+        reroll(m->mutable_dense_w());
+        reroll(m->mutable_dense_b());
+      }
+    } else if (g == "kda") {
+      for (size_t i = 0; i < w->encoder_size(); ++i) {
+        auto* k = w->mutable_encoder(i)->mutable_kda();
+        reroll(k->mutable_q_w());
+        reroll(k->mutable_q_b());
+        reroll(k->mutable_k_w());
+        reroll(k->mutable_k_b());
+        reroll(k->mutable_v_w());
+        reroll(k->mutable_v_b());
+        reroll(k->mutable_a_log());
+        reroll(k->mutable_dt_bias());
+        reroll(k->mutable_beta_w());
+        reroll(k->mutable_beta_b());
+        reroll(k->mutable_dense_w());
+        reroll(k->mutable_dense_b());
+      }
+    } else if (g == "heads") {
+      auto* ph = w->mutable_policy_heads();
+      reroll(ph->mutable_ip_pol_w());
+      reroll(ph->mutable_ip_pol_b());
+      auto* v = ph->mutable_vanilla();
+      reroll(v->mutable_ip2_pol_w());
+      reroll(v->mutable_ip2_pol_b());
+      reroll(v->mutable_ip3_pol_w());
+      reroll(v->mutable_ip3_pol_b());
+      reroll(v->mutable_ip4_pol_w());
+    }
+    CERR << "[bisect] randomized group: " << g;
   }
   if (getenv("LC0_TEST_STRIP_MLH")) {
     net.mutable_format()->mutable_network_format()->set_moves_left(
