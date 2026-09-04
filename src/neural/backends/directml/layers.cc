@@ -30,6 +30,9 @@
 #include <cmath>
 #include <cstring>
 #include <numeric>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "neural/backends/directml/attention_preprocess_shader_source.h"
 #include "neural/backends/directml/kda_local_conv_shader_source.h"
@@ -119,13 +122,19 @@ inline float F16BitsToF32(uint16_t h) {
 // keeps its bespoke 10-parameter layout from the original stub.
 // ===========================================================================
 
-ComPtr<ID3DBlob> CompileHlsl(const char* source, size_t source_len,
-                             const char* filename, const char* entry_point,
-                             bool fp16) {
-  D3D_SHADER_MACRO macros[] = {
-      {"INPUT_TYPE", fp16 ? "half" : "float"},
-      {nullptr, nullptr},
-  };
+ComPtr<ID3DBlob> CompileHlsl(
+    const char* source, size_t source_len, const char* filename,
+    const char* entry_point, bool fp16,
+    const std::vector<std::pair<std::string, std::string>>& extra_defines =
+        {}) {
+  // Owned storage: D3D_SHADER_MACRO holds bare pointers into whatever the
+  // caller passed, and the terminator must stay a {nullptr, nullptr} pair.
+  std::vector<D3D_SHADER_MACRO> macros;
+  macros.push_back({"INPUT_TYPE", fp16 ? "half" : "float"});
+  for (const auto& d : extra_defines) {
+    macros.push_back({d.first.c_str(), d.second.c_str()});
+  }
+  macros.push_back({nullptr, nullptr});
   UINT flags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
 #ifndef NDEBUG
   flags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
@@ -134,7 +143,7 @@ ComPtr<ID3DBlob> CompileHlsl(const char* source, size_t source_len,
   // storage would need DXC (cs_6_2 + -enable-16bit-types), same caveat as
   // kda_recurrence.hlsl.
   ComPtr<ID3DBlob> shader, errors;
-  HRESULT hr = D3DCompile(source, source_len, filename, macros,
+  HRESULT hr = D3DCompile(source, source_len, filename, macros.data(),
                           nullptr /* no shader #includes */, entry_point,
                           "cs_5_1", flags, 0, &shader, &errors);
   if (FAILED(hr)) {
@@ -633,8 +642,20 @@ static_assert(sizeof(TransposeConstants) % 4 == 0);
 
 }  // namespace
 
-KdaRecurrenceLayer::KdaRecurrenceLayer(ID3D12Device* device, bool fp16)
-    : device_(device), fp16_(fp16) {
+KdaRecurrenceLayer::KdaRecurrenceLayer(ID3D12Device* device, bool fp16,
+                                       uint32_t key_dim, uint32_t value_dim)
+    : device_(device), fp16_(fp16), key_dim_(key_dim), value_dim_(value_dim) {
+  if (key_dim_ == 0 || value_dim_ == 0) {
+    throw Exception(
+        "directml backend: KDA key_dim/value_dim must both be non-zero.");
+  }
+  // D3D12 caps a thread group at 1024 threads, and one lane per value
+  // dimension is the shader's whole structure.
+  if (value_dim_ > 1024) {
+    throw Exception(
+        "directml backend: KDA value_dim exceeds the 1024-thread group "
+        "limit.");
+  }
   D3D12_ROOT_PARAMETER params[10] = {};
 
   params[kKdaRootParamConstants].ParameterType =
@@ -679,9 +700,14 @@ KdaRecurrenceLayer::KdaRecurrenceLayer(ID3D12Device* device, bool fp16)
                                                IID_PPV_ARGS(&root_signature_)),
                   "CreateRootSignature (kda)");
 
+  // Specialised, not parameterised: with key_dim only known at runtime the
+  // scan's four inner loops cannot be unrolled and `state` spills to scratch
+  // memory. See the header comment in shaders/kda_recurrence.hlsl.
   ComPtr<ID3DBlob> shader_blob = CompileHlsl(
       kKdaRecurrenceShaderSource, sizeof(kKdaRecurrenceShaderSource) - 1,
-      "kda_recurrence.hlsl", "KdaRecurrence", fp16_);
+      "kda_recurrence.hlsl", "KdaRecurrence", fp16_,
+      {{"KDA_KEY_DIM", std::to_string(key_dim_)},
+       {"KDA_VALUE_DIM", std::to_string(value_dim_)}});
   pso_ = CreateComputePso(device_.Get(), root_signature_.Get(),
                          shader_blob.Get());
 }
@@ -693,9 +719,13 @@ void KdaRecurrenceLayer::Record(ID3D12GraphicsCommandList* command_list,
                                 DmlPtr mixed_out) {
   const bool fused = params.use_fused_qkv;
   assert(fused ? !!qkv : (!!q && !!k && !!v));
-  assert(params.key_dim <= 32 && params.value_dim <= 32 &&
-         "KdaRecurrenceLayer's shader is compiled for BLOCK_SIZE=32; a "
-         "larger key_dim/value_dim needs a second shader variant.");
+  if (params.key_dim != key_dim_ || params.value_dim != value_dim_) {
+    // The PSO bakes the geometry in, so a mismatch would silently read and
+    // write the wrong slices rather than fail.
+    throw Exception(
+        "directml backend: KDA recurrence dispatched with a geometry other "
+        "than the one its shader was compiled for.");
+  }
 
   KdaShaderConstants constants{};
   constants.N = params.batch_size;
@@ -1514,7 +1544,8 @@ EncoderBlock<DataType>::EncoderBlock(
                                ? kda_directions[i]
                                : kda_directions_[std::max(0, i - 1)];
     }
-    kda_recurrence_ = std::make_unique<KdaRecurrenceLayer>(ctx.device(), fp16);
+    kda_recurrence_ = std::make_unique<KdaRecurrenceLayer>(
+        ctx.device(), fp16, kda_key_dim_, kda_value_dim_);
     if (kda_local_conv_) {
       kda_local_conv_layer_ =
           std::make_unique<KdaLocalConvLayer>(ctx.device(), fp16);

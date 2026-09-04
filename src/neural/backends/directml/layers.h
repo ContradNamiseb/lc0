@@ -572,9 +572,9 @@ class LayerNormLayer {
 };
 
 // ---------------------------------------------------------------------------
-// KDA recurrence layer -- pre-existing, moved here unchanged from the
-// original stub (see test_kda_recurrence.cc). Construction compiles the HLSL
-// once; Record() only appends commands.
+// KDA recurrence layer (see test_kda_recurrence.cc). Construction compiles
+// the HLSL once, specialised to this net's (key_dim, value_dim); Record()
+// only appends commands.
 class KdaRecurrenceLayer {
  public:
   struct Params {
@@ -590,7 +590,10 @@ class KdaRecurrenceLayer {
     bool fp16;
   };
 
-  KdaRecurrenceLayer(ID3D12Device* device, bool fp16);
+  // key_dim/value_dim are baked into the shader at PSO creation, so one
+  // instance serves exactly one geometry -- Record() rejects any other.
+  KdaRecurrenceLayer(ID3D12Device* device, bool fp16, uint32_t key_dim,
+                     uint32_t value_dim);
 
   void Record(ID3D12GraphicsCommandList* command_list, const Params& params,
               DmlPtr qkv, DmlPtr q, DmlPtr k, DmlPtr v, DmlPtr raw_decay,
@@ -601,6 +604,8 @@ class KdaRecurrenceLayer {
   ComPtr<ID3D12RootSignature> root_signature_;
   ComPtr<ID3D12PipelineState> pso_;
   bool fp16_;
+  uint32_t key_dim_;
+  uint32_t value_dim_;
 };
 
 }  // namespace directml_backend

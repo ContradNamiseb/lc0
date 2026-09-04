@@ -243,7 +243,8 @@ TEST(KdaRecurrence, MatchesCpuReferenceAtProductionShape) {
       kN, kHeads, kKeyDim, kValueDim, directions, kDirectionCount, q, k, v,
       raw_decay, dt_bias, a_log, beta);
 
-  KdaRecurrenceLayer layer(test_device.device.Get(), /*fp16=*/false);
+  KdaRecurrenceLayer layer(test_device.device.Get(), /*fp16=*/false, kKeyDim,
+                           kValueDim);
 
   auto upload_and_get = [&](const std::vector<float>& data) {
     auto buf = UploadBuffer(test_device.device.Get(), data);
