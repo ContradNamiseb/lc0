@@ -333,35 +333,36 @@ class GraphFactory {
   }
 
  private:
-  // DirectML requires every bound buffer range to be DWORD-aligned:
-  // DMLCalcBufferTensorSize rounds the implied byte size up to 4 bytes. For
-  // fp32 that is a no-op, but a DmlHalf tensor with an odd element count
-  // lands on 2 mod 4 -- three fp16 values span 6 bytes where DirectML
-  // requires 8. The dense MakeDesc path goes through DirectMLX's TensorDesc
-  // constructor, which already rounds, so without this the descriptor and the
-  // binding disagree for exactly those shapes; the explicit-stride path and
-  // the binding size are both raw and would sit below the legal minimum.
-  static uint64_t RoundToDword(uint64_t bytes) {
-    return (bytes + 3) & ~uint64_t{3};
+  // The one definition of a tensor's byte size, for both the descriptor and
+  // the binding: DirectMLX's own DMLCalcBufferTensorSize, vendored in-tree at
+  // third_party/directml/DirectMLX.h. It is the product of the sizes for a
+  // dense tensor and 1 + sum((size_i - 1) * strides_i) for a strided view,
+  // converted to bytes and rounded UP to a 4-byte boundary because every
+  // bound buffer range must be DWORD-aligned.
+  //
+  // That rounding is why this calls the library rather than repeating the
+  // arithmetic. For fp32 it never bites -- four bytes an element is always a
+  // multiple of four -- but a DmlHalf tensor with an odd element count lands
+  // on 2 mod 4, and the WDL value head's ip2_val_b is exactly that: three
+  // elements, six bytes, eight required. Hand-rolled sizing shipped that bug
+  // once already.
+  static uint64_t CanonicalTensorBytes(const Sizes& sizes,
+                                       const Sizes& strides) {
+    return DMLCalcBufferTensorSize(
+        DmlTensorType<DataType>(), static_cast<UINT>(sizes.size()),
+        sizes.data(), strides.empty() ? nullptr : strides.data());
   }
 
   dml::TensorDesc MakeDesc(const Sizes& sizes, const Sizes& strides) {
-    const uint64_t elements = std::accumulate(
-        sizes.begin(), sizes.end(), uint64_t{1},
-        [](uint64_t a, uint32_t b) { return a * b; });
     if (strides.empty()) {
       return dml::TensorDesc(DmlTensorType<DataType>(), sizes);
-    }
-    uint64_t span = 1;
-    for (size_t i = 0; i < sizes.size(); ++i) {
-      span += (uint64_t(sizes[i]) - 1) * strides[i];
     }
     dml::TensorDesc desc;
     desc.dataType = DmlTensorType<DataType>();
     desc.flags = DML_TENSOR_FLAG_NONE;
     desc.sizes.assign(sizes.begin(), sizes.end());
     desc.strides.emplace(strides.begin(), strides.end());
-    desc.totalTensorSizeInBytes = RoundToDword(span * sizeof(DataType));
+    desc.totalTensorSizeInBytes = CanonicalTensorBytes(sizes, strides);
     desc.guaranteedBaseOffsetAlignment = 0;
     return desc;
   }
@@ -401,15 +402,7 @@ class GraphFactory {
   // one), so the speed came from work that was not being done properly.
   static uint64_t ComputeBindingBytes(const Sizes& sizes,
                                       const Sizes& strides) {
-    uint64_t exact = 1;
-    if (strides.empty()) {
-      for (uint32_t size : sizes) exact *= size;
-    } else {
-      for (size_t i = 0; i < sizes.size(); ++i) {
-        exact += (uint64_t(sizes[i]) - 1) * strides[i];
-      }
-    }
-    return RoundToDword(exact * sizeof(DataType));
+    return CanonicalTensorBytes(sizes, strides);
   }
 
   dml::Expression AddTensor(const DmlPtr& w, DmlBindingRef::Kind kind,
