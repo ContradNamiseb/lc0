@@ -333,6 +333,18 @@ class GraphFactory {
   }
 
  private:
+  // DirectML requires every bound buffer range to be DWORD-aligned:
+  // DMLCalcBufferTensorSize rounds the implied byte size up to 4 bytes. For
+  // fp32 that is a no-op, but a DmlHalf tensor with an odd element count
+  // lands on 2 mod 4 -- three fp16 values span 6 bytes where DirectML
+  // requires 8. The dense MakeDesc path goes through DirectMLX's TensorDesc
+  // constructor, which already rounds, so without this the descriptor and the
+  // binding disagree for exactly those shapes; the explicit-stride path and
+  // the binding size are both raw and would sit below the legal minimum.
+  static uint64_t RoundToDword(uint64_t bytes) {
+    return (bytes + 3) & ~uint64_t{3};
+  }
+
   dml::TensorDesc MakeDesc(const Sizes& sizes, const Sizes& strides) {
     const uint64_t elements = std::accumulate(
         sizes.begin(), sizes.end(), uint64_t{1},
@@ -349,7 +361,7 @@ class GraphFactory {
     desc.flags = DML_TENSOR_FLAG_NONE;
     desc.sizes.assign(sizes.begin(), sizes.end());
     desc.strides.emplace(strides.begin(), strides.end());
-    desc.totalTensorSizeInBytes = span * sizeof(DataType);
+    desc.totalTensorSizeInBytes = RoundToDword(span * sizeof(DataType));
     desc.guaranteedBaseOffsetAlignment = 0;
     return desc;
   }
@@ -370,12 +382,16 @@ class GraphFactory {
   //
   // The over-estimate survived because binding exact sizes had once been tried
   // and appeared to corrupt the heap: kda-t1-55050 died under cdb with
-  // STATUS_HEAP_CORRUPTION in a later unrelated malloc. That is fixed rather
-  // than avoided now -- the corruption was a descriptor-versus-binding
-  // mismatch, and with both at the canonical size it is gone. Re-verified on
-  // that same net: 4-thread search over 8 positions at 4000 nodes (64s,
-  // 32k nodes) and a full backendbench sweep, both clean, plus 38/38 parity
-  // tests and 3/3 real nets.
+  // STATUS_HEAP_CORRUPTION in a later unrelated malloc. That no longer
+  // reproduces -- re-verified on that same net with exact sizes: a 4-thread
+  // search over 8 positions at 4000 nodes (64s, 32k nodes) and a full
+  // backendbench sweep, both clean, plus 38/38 parity tests and 3/3 real
+  // nets. The original cause was never identified, so this is a
+  // non-reproduction and not a diagnosis; if it returns, note that binding
+  // sizes and arena layout are independent here (allocations come from
+  // floats.size() * sizeof(float), never from the binding estimate), so
+  // shrinking a binding moves no suballocation offset and cannot overlap a
+  // neighbour -- that mechanism is already excluded.
   //
   // Note for anyone benchmarking against history: the over-declared build
   // measured ~4x FASTER (11.6ms vs 54ms per batch-32 eval). That number is not
@@ -393,57 +409,26 @@ class GraphFactory {
         exact += (uint64_t(sizes[i]) - 1) * strides[i];
       }
     }
-    return exact * sizeof(DataType);
+    return RoundToDword(exact * sizeof(DataType));
   }
 
   dml::Expression AddTensor(const DmlPtr& w, DmlBindingRef::Kind kind,
                             Sizes sizes, Sizes strides) {
-    // Bytes the binding must cover: for a strided view that is the memory
-    // span 1 + sum((size_i - 1) * stride_i); for a dense tensor it is simply
-    // the element count.
-    //
-    // This used to substitute sizes[i] for the missing stride in the dense
-    // case, which is not the dense stride (that is the suffix product of the
-    // sizes). For the usual [1, 1, rows, C] shapes it happened to
-    // over-declare, which is harmless, but for a batched shape it
-    // under-declares badly: the [B, 1, 64, 64] smolgen attention bias at
-    // B=32 came out as 9057 elements against an actual 131072, and
-    // DirectML then read the tensor as though the bias were absent -- the
-    // attention output did not change even when a completely different
-    // buffer was bound there.
-    // Bytes the buffer binding must cover.
-    //
-    // The tensor's own requirement is its memory span: the element count for
-    // a dense tensor, or 1 + sum((size_i - 1) * stride_i) for a strided view.
-    // That is what MakeDesc puts in the tensor desc, and per the API it is
-    // also what the binding needs -- DirectML requires the bound region to be
-    // at least the tensor size.
-    //
-    // Binding exactly that, however, corrupts the process heap on this
-    // runtime. Under cdb, kda-t1-55050 dies with STATUS_HEAP_CORRUPTION
-    // (c0000374) inside a later unrelated malloc; without a debugger it is a
-    // bare access violation partway through the first search. It is not a
-    // slack problem -- padding the binding by up to 1024 elements does not
-    // help -- and it reproduces at every batch size and thread count while
-    // backendbench, which drives the same graphs, stays clean.
-    //
-    // So we never shrink a binding below the historical estimate, which is
-    // this "span" with the size substituted for each missing dense stride.
-    // That is not a meaningful quantity -- it is quadratic in the row count
-    // -- but it is generous, it is what every graph here has always been
-    // bound with, and it is stable.
-    //
-    // Taking the max of the two is what actually matters for correctness:
-    // the historical estimate UNDER-declares whenever the leading dimension
-    // is batched, and the [B, 1, 64, 64] smolgen attention bias came out at
-    // 9057 elements against an actual 131072 at B=32. DirectML then produced
-    // exactly the result it gives with no bias at all -- the attention output
-    // did not move even when a completely unrelated buffer was bound in its
-    // place. That is the bug MatchesBlasOnSmolgenMhaNet was failing on.
     const uint64_t bytes = ComputeBindingBytes(sizes, strides);
-    
-    dml::Expression e =
-        dml::InputTensor(graph_, next_input_++, MakeDesc(sizes, strides));
+    const dml::TensorDesc desc = MakeDesc(sizes, strides);
+    // Contract assertion at the boundary rather than a test case: the
+    // descriptor and the binding must agree on the tensor's size, for every
+    // shape, including ones no parity net covers. Two sizing paths meet here
+    // -- DirectMLX's TensorDesc constructor for dense tensors and this file's
+    // arithmetic for strided views -- and a bug in either stays invisible
+    // until it produces silently wrong output on a shape nobody tested.
+    if (bytes != desc.totalTensorSizeInBytes) {
+      throw Exception(
+          "directml backend: binding size " + std::to_string(bytes) +
+          " disagrees with the tensor descriptor's " +
+          std::to_string(desc.totalTensorSizeInBytes) + " bytes");
+    }
+    dml::Expression e = dml::InputTensor(graph_, next_input_++, desc);
     bindings_.push_back({kind, w, bytes});
     return e;
   }
