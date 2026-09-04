@@ -42,6 +42,7 @@
 #include "chess/position.h"
 #include "neural/encoder.h"
 #include "neural/factory.h"
+#include "neural/loader.h"
 #include "neural/network.h"
 #include "proto/net.pb.h"
 #include "utils/optionsdict.h"
@@ -363,6 +364,17 @@ void CompareBackends(const pblczero::Net& net) {
   EXPECT_NEAR(dml.m, reference.m, kTol)
       << "moves-left diverges between directml and blas";
 
+  if (getenv("LC0_DIAG_OUTPUTS")) {
+    float dml_absmax = 0.0f, ref_absmax = 0.0f;
+    for (int i = 0; i < 1858; ++i) {
+      dml_absmax = std::max(dml_absmax, std::fabs(dml.policy[i]));
+      ref_absmax = std::max(ref_absmax, std::fabs(reference.policy[i]));
+    }
+    CERR << "[diag] dml q=" << dml.q << " d=" << dml.d << " m=" << dml.m
+         << " policy|max|=" << dml_absmax;
+    CERR << "[diag] ref q=" << reference.q << " d=" << reference.d
+         << " m=" << reference.m << " policy|max|=" << ref_absmax;
+  }
   float worst = 0.0f;
   int worst_move = -1;
   for (int i = 0; i < 1858; ++i) {
@@ -466,6 +478,24 @@ pblczero::Net MakeKdaSerpentineReverseNet() {
 
 TEST(DirectMlKdaParity, MatchesBlasOnKdaSerpentineReverseNet) {
   CompareBackends(MakeKdaSerpentineReverseNet());
+}
+
+// End-to-end check against a real trained net, if one is pointed at. Set
+// LC0_TEST_REAL_NET to a .pb.gz path to run it; skipped otherwise so the
+// suite stays self-contained and hermetic.
+TEST(DirectMlKdaParity, MatchesBlasOnRealNetFromEnv) {
+  const char* path = getenv("LC0_TEST_REAL_NET");
+  if (!path) GTEST_SKIP() << "set LC0_TEST_REAL_NET to a .pb.gz to run";
+  pblczero::Net net = LoadWeightsFromFile(path);
+  // Bisection knob: keep only the first N encoders. Both backends see the
+  // same truncated net, so the comparison stays fair.
+  if (const char* keep = getenv("LC0_TEST_REAL_NET_ENCODERS")) {
+    const int n = atoi(keep);
+    auto* w = net.mutable_weights();
+    while (w->encoder_size() > n) w->mutable_encoder()->pop_back();
+    CERR << "[bisect] encoders kept: " << w->encoder_size();
+  }
+  CompareBackends(net);
 }
 
 // MHA + moves-left head, no KDA encoder: covers the MHA encoder and
@@ -631,6 +661,27 @@ pblczero::Net MakePeDenseNet() {
 
 TEST(DirectMlKdaParity, MatchesBlasOnPeDenseNet) {
   CompareBackends(MakePeDenseNet());
+}
+
+// PE_DENSE feeding an actual encoder stack, which is the shape every real
+// trained net has and which no synthetic net covered: MakePeDenseNet has no
+// encoder, and every net that does have one uses INPUT_EMBEDDING_NONE.
+pblczero::Net MakePeDenseWithEncodersNet() {
+  const NetDims d;
+  std::mt19937 rng(4711);
+  pblczero::Net file = MakePeDenseNet();
+  auto* weights = file.mutable_weights();
+  auto* nf = file.mutable_format()->mutable_network_format();
+  nf->set_moves_left(pblczero::NetworkFormat::MOVES_LEFT_V1);
+  FillKdaEncoder(&file, rng, d);
+  FillMhaEncoder(&file, rng, d);
+  weights->set_headcount(d.heads);
+  FillPolicyAndValueHeads(&file, rng, d, true, 4);
+  return file;
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnPeDenseWithEncodersNet) {
+  CompareBackends(MakePeDenseWithEncodersNet());
 }
 
 TEST(DirectMlKdaParity, MatchesBlasOnKdaHybridNet) {
