@@ -909,6 +909,57 @@ TEST(DirectMlKdaParity, MatchesBlasOnWidePolicyEncoderBatch) {
   CompareBackendsBatch(MakeWidePolicyEncoderNet(128), 4);
 }
 
+// The BLAS reference sizes buffer1/buffer2/buffer3 from max_channels, a BODY
+// quantity, but the attention policy head writes into all three with its OWN
+// widths. Either width crossing max_channels overruns the allocation and
+// smashes the process heap; the fault then surfaces at some later unrelated
+// allocation, pointing nowhere near the cause. This is a defect in the
+// REFERENCE, so it takes the whole parity harness down with it rather than
+// failing the backend under test.
+//
+// max_channels for these synthetic nets is the input width, kInputPlanes(112)
+// + 64 positional-encoding channels = 176, which is why 192 is the trip width
+// and 128 the safe one.
+//
+// The two hazards are separated deliberately. MakeWidePolicyEncoderNet above
+// ties pol_emb == pol_dmodel, because an encoder projects q/k/v from the
+// embedding width and DirectML rejects the graph when they differ -- but that
+// coupling would leave it unknown WHICH of the two writes overflowed. These
+// nets carry no policy encoder, so the widths are free, and each one isolates
+// a single write:
+//
+//   embedding-wide: exercises the policy-embedding Forward1D into buffer2
+//   d_model-wide:   exercises the Q/K writes into buffer1/buffer3 and the
+//                   policy_d_model strides that index them afterwards
+pblczero::Net MakePolicyEmbeddingWiderThanBodyNet() {
+  NetDims d;
+  d.pol_emb = 192;     // > max_channels 176
+  d.pol_dmodel = 128;  // <= max_channels, so only the embedding write trips
+  return MakeNetWithDims(d, 9301);
+}
+
+pblczero::Net MakePolicyDModelWiderThanBodyNet() {
+  NetDims d;
+  d.pol_emb = 128;     // <= max_channels, so the embedding write is safe
+  d.pol_dmodel = 192;  // > max_channels 176
+  return MakeNetWithDims(d, 9302);
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnPolicyEmbeddingWiderThanBody) {
+  CompareBackends(MakePolicyEmbeddingWiderThanBodyNet());
+}
+
+// Batch > 1 on at least one of the pair: the Q/K path is indexed per sample
+// with a policy_d_model stride, so a batch case covers strides the
+// single-position case cannot reach.
+TEST(DirectMlKdaParity, MatchesBlasOnPolicyDModelWiderThanBodyBatch) {
+  CompareBackendsBatch(MakePolicyDModelWiderThanBodyNet(), 4);
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnPolicyDModelWiderThanBody) {
+  CompareBackends(MakePolicyDModelWiderThanBodyNet());
+}
+
 TEST(DirectMlKdaParity, MatchesBlasOnRealisticDimsNet) {
   CompareBackends(MakeNetWithDims(RealisticDims(), 2024));
 }

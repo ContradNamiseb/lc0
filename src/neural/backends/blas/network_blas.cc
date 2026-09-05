@@ -760,16 +760,46 @@ void BlasComputation<use_eigen>::ComputeBlocking() {
                                policy_head.ip_pol_b.size());
   }
 
+  // The attention policy head writes into buffer1/buffer2/buffer3 with its
+  // OWN widths, which are head quantities and have nothing to do with the
+  // body. max_channels above stays exactly what it is -- a body/Winograd
+  // bound -- because inflating it globally would enlarge unrelated
+  // allocations and hide the coupling. What has to grow is only the width
+  // the three shared buffers are sized from:
+  //
+  //   - the policy embedding writes batch * kSquares * policy_embedding_size
+  //     floats into buffer2 (see the Forward1D below "Policy Embedding");
+  //   - Q and K write batch * kSquares * policy_d_model into buffer1 and
+  //     buffer3, and are then INDEXED with a policy_d_model stride, as is
+  //     the promotion-offset loop.
+  //
+  // Either width exceeding max_channels overruns the allocation. The symptom
+  // is heap corruption reported at some later, unrelated allocation, which
+  // points nowhere near the cause.
+  size_t buffer_width = max_channels;
+  if (attn_policy_) {
+    const size_t policy_embedding_size = policy_head.ip_pol_b.size();
+    // policy_d_model is derived the same way the head derives it, but the
+    // division is guarded here: this runs during allocation, before any of
+    // the head's own validity assumptions have been exercised.
+    const size_t policy_d_model =
+        policy_embedding_size > 0
+            ? policy_head.ip2_pol_w.size() / policy_embedding_size
+            : 0;
+    buffer_width = std::max(buffer_width,
+                            std::max(policy_embedding_size, policy_d_model));
+  }
+
   std::unique_ptr<Buffers> buffers = network_->GetBuffers();
 
   // Allocate data for the whole batch.
   std::vector<float>& buffer1 = buffers->buffer1;
-  vec_adjust(buffer1, largest_batch_size * max_channels * kSquares);
+  vec_adjust(buffer1, largest_batch_size * buffer_width * kSquares);
   std::vector<float>& buffer2 = buffers->buffer2;
-  vec_adjust(buffer2, largest_batch_size * max_channels * kSquares);
+  vec_adjust(buffer2, largest_batch_size * buffer_width * kSquares);
   std::vector<float>& buffer3 = buffers->buffer3;
   vec_adjust(buffer3, largest_batch_size *
-                          std::max(max_channels * kSquares, max_fc_channels));
+                          std::max(buffer_width * kSquares, max_fc_channels));
   std::vector<float>& head_buffer = buffers->buffer4;
   vec_adjust(head_buffer, largest_batch_size * max_head_planes * kSquares);
 
