@@ -2065,6 +2065,55 @@ TEST(BenchmarkExitStatus, ZeroOnSuccessfulBenchmark) {
       << "a benchmark that loads and runs must exit zero: " << output;
 }
 
+
+// The same three cases for backendbench. It is the tool an automated sweep
+// drives, so a load failure that exits zero there is worse than in benchmark:
+// the caller reads exit codes to decide which rows are real measurements, and
+// a configuration that never loaded would be recorded as one that did.
+TEST(BackendBenchExitStatus, NonzeroOnRejectedNet) {
+  if (TestBinaryDir().empty()) GTEST_SKIP() << "binary dir unknown";
+  const ScopedTempDir dir;
+  const std::string path =
+      WriteNet(dir, MakeConsumingNet(kEmb, 0, kEmb, kEmb), "rejected.pb");
+  std::string output;
+  EXPECT_NE(RunLc0(dir, "backendbench --backend=blas --weights=\"" + path +
+                       "\" --batches=1 --start-batch-size=1 --max-batch-size=1",
+                   &output),
+            0)
+      << "a rejected net must exit nonzero";
+  EXPECT_NE(output.find(kLc0Started), std::string::npos)
+      << "lc0 did not run at all: " << output;
+  EXPECT_NE(output.find("ip_emb_ln_betas"), std::string::npos)
+      << "expected the embedding-normalisation rejection, got: " << output;
+}
+
+TEST(BackendBenchExitStatus, NonzeroOnMissingWeightsFile) {
+  if (TestBinaryDir().empty()) GTEST_SKIP() << "binary dir unknown";
+  const ScopedTempDir dir;
+  const std::string missing = dir.File("no_such_net.pb");
+  std::string output;
+  EXPECT_NE(RunLc0(dir, "backendbench --backend=blas --weights=\"" + missing +
+                       "\" --batches=1 --start-batch-size=1 --max-batch-size=1",
+                   &output),
+            0)
+      << "a missing weights file must exit nonzero";
+  EXPECT_NE(output.find(kLc0Started), std::string::npos)
+      << "lc0 did not run at all; nonzero here would prove nothing: " << output;
+}
+
+TEST(BackendBenchExitStatus, ZeroOnSuccessfulRun) {
+  if (TestBinaryDir().empty()) GTEST_SKIP() << "binary dir unknown";
+  const ScopedTempDir dir;
+  const std::string path =
+      WriteNet(dir, MakeNetWithDims(NetDims(), 7801), "valid.pb");
+  std::string output;
+  EXPECT_EQ(RunLc0(dir, "backendbench --backend=blas --weights=\"" + path +
+                       "\" --batches=1 --start-batch-size=1 --max-batch-size=1",
+                   &output),
+            0)
+      << "a backendbench run that loads must exit zero: " << output;
+}
+
 }  // namespace lczero
 
 int main(int argc, char** argv) {
