@@ -28,6 +28,7 @@
 #include "tools/backendbench.h"
 
 #include <atomic>
+#include <cstdlib>
 
 #include "chess/board.h"
 #include "neural/register.h"
@@ -310,6 +311,13 @@ void BackendBenchmark::Run() {
     }
   } catch (Exception& ex) {
     std::cerr << ex.what() << std::endl;
+    // Exit nonzero, for the same reason benchmark does. A net this build
+    // rejects -- a missing file, or one that fails weight validation --
+    // printed its message here and then let the process end at status 0,
+    // so an automated sweep parsing exit codes recorded the failed
+    // configuration as a successful measurement. The message is unchanged;
+    // only the status is.
+    std::exit(EXIT_FAILURE);
   }
 }
 }  // namespace lczero
