@@ -123,7 +123,23 @@ std::vector<float> GammaVec(std::mt19937& rng, size_t n) {
   return v;
 }
 
-void FillKdaEncoder(pblczero::Net* net, std::mt19937& rng, const NetDims& d) {
+// Behavioural switches for the KDA encoder, kept SEPARATE from NetDims.
+// Dimensions and feature flags are different axes: a width is a number to
+// vary, a flag is a branch that has to be taken both ways somewhere in the
+// suite. Keeping them in one struct is how four of these came to be
+// hardcoded to a single value in every net in this file.
+//
+// The defaults reproduce exactly what every existing net already used, so
+// introducing this changes no existing test.
+struct KdaFeatures {
+  bool output_gate = true;
+  bool output_rms_norm = true;
+  bool local_conv = false;
+  bool qkv_silu = true;
+};
+
+void FillKdaEncoder(pblczero::Net* net, std::mt19937& rng, const NetDims& d,
+                    const KdaFeatures& feat = KdaFeatures()) {
   const int key_depth = d.heads * d.key_dim;
   const int value_depth = d.heads * d.value_dim;
   auto* enc = net->mutable_weights()->add_encoder();
@@ -158,10 +174,53 @@ void FillKdaEncoder(pblczero::Net* net, std::mt19937& rng, const NetDims& d) {
   kda->set_value_dim(d.value_dim);
   kda->set_gate_rank(d.gate_rank);
   kda->set_rms_norm_epsilon(1e-6f);
-  kda->set_output_gate(true);
-  kda->set_output_rms_norm(true);
-  kda->set_local_conv(false);
-  kda->set_qkv_silu(true);
+  kda->set_output_gate(feat.output_gate);
+  kda->set_output_rms_norm(feat.output_rms_norm);
+  kda->set_local_conv(feat.local_conv);
+  kda->set_qkv_silu(feat.qkv_silu);
+  // Setting the flag alone would prove nothing: BOTH backends additionally
+  // guard execution on the weights being non-empty (network_blas.cc:323
+  // requires local_conv && !local_conv_w.empty(); the DirectML layer uploads
+  // local_conv_w/b at layers.cc:1718-1719 before dispatching). A flag-only
+  // net would run the same code as local_conv=false and pass trivially.
+  //
+  // local_conv_w is [emb, 1, 3, 3] flattened, read as
+  // local_conv_w[c * 9 + kr * 3 + kf] (network_blas.cc:339). The values must
+  // vary ACROSS THE KERNEL, not merely across channels: a spatially uniform
+  // 3x3 kernel is a scaled blur whose output barely depends on the row/file
+  // indexing, and the board-edge clamping and per-sample batch_base in the
+  // HLSL path are exactly what these tests exist to check.
+  if (feat.local_conv) {
+    std::vector<float> w(static_cast<size_t>(d.embedding) * 9);
+    for (size_t i = 0; i < w.size(); ++i) {
+      const size_t c = i / 9, tap = i % 9;
+      // Deliberately STRONG and sign-varying, and fixture-specific: these
+      // values exist only on this net. A gentle kernel was measurably
+      // insufficient -- bypassing the dispatch moved q by 3% relative but
+      // only 1.07e-04 absolute, under the suite's 2e-4 absolute floor, so
+      // the tests exercised the feature without protecting it.
+      //
+      // Uniform scaling would not have fixed that: the KDA mixer's output
+      // RMS norm is scale-invariant, so inflating the kernel uniformly is
+      // normalised straight back out. What has to change is the spatial
+      // PATTERN, so that removing the convolution alters the direction of
+      // the mixer input rather than only its length. Hence taps that change
+      // sign across the 3x3 and a channel term that shifts the pattern
+      // rather than merely rescaling it.
+      const float tap_term = 0.9f * (static_cast<float>(tap % 3) - 1.0f);
+      const float chan_term = 0.35f * (static_cast<float>(c % 5) - 2.0f) *
+                              (static_cast<float>(tap / 3) - 1.0f);
+      w[i] = tap_term + chan_term;
+    }
+    FillLayer(kda->mutable_local_conv_w(), w);
+    // Non-zero bias too: network_blas.cc:343 guards the bias separately, so
+    // leaving it empty would keep that branch untested even with weights.
+    std::vector<float> b(static_cast<size_t>(d.embedding));
+    for (size_t i = 0; i < b.size(); ++i) {
+      b[i] = 0.25f * (static_cast<float>(i % 7) - 3.0f);
+    }
+    FillLayer(kda->mutable_local_conv_b(), b);
+  }
   FillLayer(enc->mutable_ln1_gammas(), GammaVec(rng, d.embedding));
   FillLayer(enc->mutable_ln1_betas(), RandomVec(rng, d.embedding, 0.05f));
   FillLayer(enc->mutable_ffn()->mutable_dense1_w(),
@@ -238,8 +297,16 @@ void FillPolicyEncoder(pblczero::Net* net, std::mt19937& rng, int pol_emb,
   FillLayer(enc->mutable_ln2_betas(), RandomVec(rng, pol_emb, 0.05f));
 }
 
+// head_scale is a FIXTURE-SPECIFIC amplifier, default 1.0 so every existing
+// net is untouched. It scales only the three projections that set OUTPUT
+// magnitude -- the policy Q/K and the WDL logits -- because the suite's bar
+// is kTol + kRelTol*|ref| with kTol an ABSOLUTE 2e-4. A net whose policy
+// peaks at 0.037 and whose q is 0.0036 sits far below that floor, so a
+// multi-percent relative defect passes unseen. Raising the magnitude puts a
+// fixture in the regime the bar was designed for; it does NOT change the bar.
 void FillPolicyAndValueHeads(pblczero::Net* net, std::mt19937& rng,
-                             const NetDims& d, bool moves_left, int mlh) {
+                             const NetDims& d, bool moves_left, int mlh,
+                             float head_scale = 1.0f) {
   auto* weights = net->mutable_weights();
   auto* ph = weights->mutable_policy_heads();
   FillLayer(ph->mutable_ip_pol_w(),
@@ -247,11 +314,11 @@ void FillPolicyAndValueHeads(pblczero::Net* net, std::mt19937& rng,
   FillLayer(ph->mutable_ip_pol_b(), RandomVec(rng, d.pol_emb, 0.05f));
   auto* vanilla = ph->mutable_vanilla();
   FillLayer(vanilla->mutable_ip2_pol_w(),
-            RandomVec(rng, d.pol_dmodel * d.pol_emb, 0.1f));
+            RandomVec(rng, d.pol_dmodel * d.pol_emb, 0.1f * head_scale));
   FillLayer(vanilla->mutable_ip2_pol_b(),
             RandomVec(rng, d.pol_dmodel, 0.05f));
   FillLayer(vanilla->mutable_ip3_pol_w(),
-            RandomVec(rng, d.pol_dmodel * d.pol_emb, 0.1f));
+            RandomVec(rng, d.pol_dmodel * d.pol_emb, 0.1f * head_scale));
   FillLayer(vanilla->mutable_ip3_pol_b(),
             RandomVec(rng, d.pol_dmodel, 0.05f));
   FillLayer(vanilla->mutable_ip4_pol_w(),
@@ -266,7 +333,7 @@ void FillPolicyAndValueHeads(pblczero::Net* net, std::mt19937& rng,
   FillLayer(winner->mutable_ip1_val_b(),
             RandomVec(rng, d.val_channels, 0.05f));
   FillLayer(winner->mutable_ip2_val_w(),
-            RandomVec(rng, 3 * d.val_channels, 0.05f));
+            RandomVec(rng, 3 * d.val_channels, 0.05f * head_scale));
   FillLayer(winner->mutable_ip2_val_b(), RandomVec(rng, 3, 0.05f));
 
   if (moves_left) {
@@ -782,7 +849,9 @@ void FillSmolgen(pblczero::Net* net, std::mt19937& rng, const NetDims& d,
 // embedding 128 with 16 heads and policy d_model 128, and the backend is
 // wrong on real nets while passing all the small ones -- so the dimensions
 // are the variable worth isolating.
-pblczero::Net MakeNetWithDims(const NetDims& d, unsigned seed) {
+pblczero::Net MakeNetWithDims(const NetDims& d, unsigned seed,
+                              const KdaFeatures& feat = KdaFeatures(),
+                              float head_scale = 1.0f) {
   const int input_size = kInputPlanes + 64;
   const int mlh = 4;
   std::mt19937 rng(seed);
@@ -804,8 +873,8 @@ pblczero::Net MakeNetWithDims(const NetDims& d, unsigned seed) {
             RandomVec(rng, d.embedding * input_size, 0.05f));
   FillLayer(weights->mutable_ip_emb_b(), RandomVec(rng, d.embedding, 0.05f));
   weights->set_headcount(d.heads);
-  FillKdaEncoder(&file, rng, d);
-  FillPolicyAndValueHeads(&file, rng, d, true, mlh);
+  FillKdaEncoder(&file, rng, d, feat);
+  FillPolicyAndValueHeads(&file, rng, d, true, mlh, head_scale);
   return file;
 }
 
@@ -907,6 +976,35 @@ TEST(DirectMlKdaParity, MatchesBlasOnWidePolicyEncoderNet) {
 
 TEST(DirectMlKdaParity, MatchesBlasOnWidePolicyEncoderBatch) {
   CompareBackendsBatch(MakeWidePolicyEncoderNet(128), 4);
+}
+
+// The local 3x3 depthwise convolution before the KDA mixer (added in b3bc1c5)
+// had ZERO parity coverage in either direction: every net in this suite
+// hardcoded local_conv=false, so the feature was live in production and never
+// once compared against BLAS. Same shape as the input-gating bug, whose guard
+// was likewise false in all 36 tests of the day.
+//
+// It is its own handwritten HLSL path with board-edge clamping and an explicit
+// per-sample batch_base, so a batch > 1 case is required as well: at batch 1
+// every batch_base is 0 and a wrong sample stride cannot be seen.
+pblczero::Net MakeLocalConvNet(unsigned seed) {
+  KdaFeatures feat;
+  feat.local_conv = true;
+  // Measured, not guessed: at the default scale this net's policy peaks at
+  // 0.037 and q at 0.0036, so bypassing the convolution moved policy by only
+  // 1.9e-4 -- under the 2e-4 absolute floor, and the test passed while the
+  // feature was demonstrably absent. This amplifier lifts the outputs into
+  // the range the bar discriminates in.
+  constexpr float kLocalConvHeadScale = 12.0f;
+  return MakeNetWithDims(NetDims(), seed, feat, kLocalConvHeadScale);
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnLocalConvNet) {
+  CompareBackends(MakeLocalConvNet(9401));
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnLocalConvBatch) {
+  CompareBackendsBatch(MakeLocalConvNet(9402), 4);
 }
 
 // The BLAS reference sizes buffer1/buffer2/buffer3 from max_channels, a BODY
