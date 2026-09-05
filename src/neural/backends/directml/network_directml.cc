@@ -691,6 +691,18 @@ template <typename DataType>
 void DirectMlNetwork<DataType>::forwardEval(
     InputsOutputs* io, int batch, const std::vector<InputPlanes>& planes) {
   batch = std::max(batch, min_batch_size_);
+  // A batch above the top rung would fall straight through the loop below
+  // with its size unchanged, and EnsureCompiled would then compile a graph
+  // for a size the load-time pre-compile never saw -- compilation after
+  // dispatch, which this driver answers with bogus errors for every
+  // subsequent operator. The arenas are sized for max_batch too, so this
+  // cannot be served by padding either. Fail loudly instead.
+  if (batch > max_batch_size_) {
+    throw Exception("directml backend asked to evaluate a batch of " +
+                    std::to_string(batch) + ", above the configured max_batch of " +
+                    std::to_string(max_batch_size_) +
+                    "; raise max_batch so its graphs are compiled at load.");
+  }
   // Round UP to the pre-compiled ladder: only these sizes have graphs (see
   // the pre-compile at load -- post-dispatch compilation fails on this
   // driver). The layers are row/batch independent, so extra padding rows
