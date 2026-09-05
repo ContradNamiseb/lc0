@@ -93,6 +93,22 @@ BaseWeights::BaseWeights(const pblczero::Weights& weights)
 // Each site is sized against the width its own consumer uses: the first
 // LayerNorm runs at embedding_size (ip_emb_b), the second at
 // ip_emb_ffn.dense2_b.size(), which are separate quantities.
+// COVERAGE, so the gap is discoverable here and not only in review history.
+// Callers pass the flag they derive from input_embedding(); only backends that
+// branch on INPUT_EMBEDDING_PE_DENSE can consume these tensors at all.
+//   called:      blas      network_blas.cc, after is_pe_dense_embedding_
+//                directml  network_directml.cc, after is_pe_dense
+//   NOT called:  cuda      network_cuda.cc:499
+//                sycl      network_sycl.cc.dp.cpp:543
+//                metal     network_metal.cc:246, mps/MetalNetworkBuilder.mm:82
+//   not applicable: dx, tf_cc, onednn, opencl, cudnn -- none reference
+//                PE_DENSE, so none can reach these reads.
+// The three uncalled backends need the flag hoisted into a local first: cuda
+// and sycl compute it inline as a constructor argument and metal branches on
+// it in a switch, so none takes a one-line insertion. They are left for
+// someone who can build them; this machine has only blas and directml
+// toolchains, and an unverifiable edit to a backend nobody here can compile is
+// how a silent break gets shipped.
 void ValidateEmbeddingNormWeights(const BaseWeights& weights,
                                   bool consumes_pe_dense_embedding) {
   if (!consumes_pe_dense_embedding) return;

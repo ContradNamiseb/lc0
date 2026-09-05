@@ -1876,6 +1876,34 @@ TEST(EmbeddingLnValidation, AcceptsNonConsumingArchitecture) {
 
 // And a non-consuming net that happens to CARRY the tensors must also load:
 // nothing reads them, so their sizes are not this validation's business.
+// The format gate must be inert for every malformed shape, not just the one
+// tried above. A guard that rejected any of these on a non-consuming net would
+// break the other 60-odd fixtures in this file, all of which are non-consuming
+// -- and it would do so for tensors nothing in the execution path reads.
+TEST(EmbeddingLnValidation, NonConsumingIgnoresEveryMalformedShape) {
+  struct Case {
+    const char* name;
+    int ln_g, ln_b, ffn_g, ffn_b, ffn_out;
+  };
+  const Case cases[] = {
+      {"gammas without betas", kEmb, 0, kEmb, kEmb, -1},
+      {"ffn gammas without betas", kEmb, kEmb, kEmb, 0, -1},
+      {"both absent", 0, 0, kEmb, kEmb, -1},
+      {"beta wrong length", kEmb, kEmb / 2, kEmb, kEmb, -1},
+      {"gamma wrong length", kEmb / 2, kEmb, kEmb, kEmb, -1},
+      {"ffn width disagrees with embedding", kEmb, kEmb, kEmb / 2, kEmb / 2,
+       kEmb / 2},
+  };
+  for (const Case& c : cases) {
+    const pblczero::Net net =
+        MakeConsumingNet(c.ln_g, c.ln_b, c.ffn_g, c.ffn_b, c.ffn_out);
+    const MultiHeadWeights decoded{net.weights()};
+    EXPECT_NO_THROW(ValidateEmbeddingNormWeights(decoded, /*consumes=*/false))
+        << "non-consuming net rejected over " << c.name
+        << ", which nothing on that path reads";
+  }
+}
+
 TEST(EmbeddingLnValidation, AcceptsNonConsumingWithTensorsPresent) {
   const pblczero::Net net = MakeConsumingNet(kEmb / 2, kEmb, 0, 0);
   const MultiHeadWeights decoded{net.weights()};
