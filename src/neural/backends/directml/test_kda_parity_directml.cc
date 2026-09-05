@@ -57,6 +57,8 @@
 #include <iterator>
 #include "utils/optionsdict.h"
 #include "neural/backends/directml/dml_common.h"
+#include "neural/backends/directml/layers.h"
+#include <thread>
 
 namespace lczero {
 namespace {
@@ -1744,6 +1746,344 @@ TEST(DirectMlKdaParity, MatchesBlasOnKdaMhaNet) {
 
 TEST(DirectMlKdaParity, MatchesBlasOnNoEncoderNet) {
   CompareBackends(MakeNoEncoderNet());
+}
+
+
+// ---------------------------------------------------------------------------
+// Shader-blob cache. FXC dominates backend startup (the KDA recurrence shader
+// is the expensive one and a net compiles it once per KDA encoder), so
+// CompileHlsl memoises its results. These assert the cache's behaviour through
+// its own counters rather than inferring it from timing, which would be flaky.
+//
+// A trivial shader is used deliberately: it compiles in milliseconds, so these
+// test the cache and not FXC. Every test calls ResetForTesting() first, so no
+// test depends on another's leftovers or on gtest's execution order.
+constexpr char kCacheTestShader[] =
+    "RWStructuredBuffer<float> Out : register(u0);\n"
+    "[numthreads(1,1,1)]\n"
+    "void CsMain(uint3 tid : SV_DispatchThreadID) { Out[0] = SCALE; }\n";
+
+// Namespace scope so the concurrency test's lambdas can reach it.
+constexpr char kInvalidShader[] = "still not valid HLSL @@@";
+
+directml_backend::ComPtr<ID3DBlob> CompileCacheTestShader(
+    const std::string& test_id, const char* scale) {
+  return directml_backend::CompileHlsl(
+      kCacheTestShader, sizeof(kCacheTestShader) - 1, "cache_test.hlsl",
+      "CsMain", /*fp16=*/false, {{"SCALE", scale}, {"TESTID", test_id}});
+}
+
+// Waits for `count` callers to be blocked on someone else's flight, with a
+// deadline. Returns false on timeout rather than spinning forever: if
+// single-flight regresses, the waiters never arrive, and a test that hung
+// would be strictly worse than one that fails -- a hang gives CI nothing to
+// report and no stack to read.
+bool WaitForFlightWaiters(size_t count) {
+  namespace sc = directml_backend::shader_cache;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (sc::Waiting() < count) {
+    if (std::chrono::steady_clock::now() > deadline) return false;
+    std::this_thread::yield();
+  }
+  return true;
+}
+
+TEST(DirectMlShaderCache, IdenticalInputsHitWithoutRecompiling) {
+  namespace sc = directml_backend::shader_cache;
+  sc::ResetForTesting();
+
+  auto first = CompileCacheTestShader("hit", "1.0");
+  ASSERT_NE(first.Get(), nullptr);
+  EXPECT_EQ(sc::Attempts(), 1) << "first call must actually compile";
+  EXPECT_EQ(sc::Hits(), 0);
+
+  auto second = CompileCacheTestShader("hit", "1.0");
+  EXPECT_EQ(sc::Attempts(), 1) << "second call must not recompile";
+  EXPECT_EQ(sc::Hits(), 1);
+  // The same blob, not merely an equivalent one: callers create pipeline
+  // states from it and sharing is the whole point.
+  EXPECT_EQ(first.Get(), second.Get());
+}
+
+TEST(DirectMlShaderCache, DifferingDefinesDoNotCollide) {
+  namespace sc = directml_backend::shader_cache;
+  sc::ResetForTesting();
+
+  // This is the failure that matters. The defines carry the KDA
+  // specialisation (KDA_KEY_DIM/KDA_VALUE_DIM); if they were left out of the
+  // key, two different specialisations would share one blob and the second
+  // net would silently execute the first net's bytecode.
+  auto a = CompileCacheTestShader("miss", "1.0");
+  auto b = CompileCacheTestShader("miss", "2.0");
+  EXPECT_EQ(sc::Attempts(), 2) << "differing defines must compile twice";
+  EXPECT_EQ(sc::Hits(), 0);
+  EXPECT_NE(a.Get(), b.Get()) << "differing defines must not share a blob";
+}
+
+TEST(DirectMlShaderCache, ConcurrentCallersCompileOnceAndShare) {
+  namespace sc = directml_backend::shader_cache;
+  sc::ResetForTesting();
+
+  constexpr int kThreads = 8;
+  std::vector<directml_backend::ComPtr<ID3DBlob>> results(kThreads);
+  std::vector<std::thread> threads;
+  for (int i = 0; i < kThreads; ++i) {
+    threads.emplace_back(
+        [&results, i] { results[i] = CompileCacheTestShader("conc", "1.0"); });
+  }
+  for (auto& t : threads) t.join();
+
+  // Exactly one compile total: the losers of the race wait for the winner and
+  // take its blob rather than each compiling their own copy.
+  EXPECT_EQ(sc::Attempts(), 1);
+  EXPECT_EQ(sc::Hits(), kThreads - 1);
+  for (int i = 0; i < kThreads; ++i) {
+    ASSERT_NE(results[i].Get(), nullptr);
+    EXPECT_EQ(results[i].Get(), results[0].Get());
+  }
+}
+
+TEST(DirectMlShaderCache, KeyCoversEveryCompilationInput) {
+  using directml_backend::shader_cache::MakeKey;
+  const std::vector<std::pair<std::string, std::string>> macros = {{"X", "1"},
+                                                                  {"Y", "2"}};
+  const std::vector<std::pair<std::string, std::string>> reordered = {
+      {"Y", "2"}, {"X", "1"}};
+  const char* src = "AA";
+  const auto base = MakeKey(src, 2, "f.hlsl", "Main", "cs_5_1", 0, macros);
+
+  EXPECT_EQ(base, MakeKey(src, 2, "f.hlsl", "Main", "cs_5_1", 0, macros))
+      << "identical inputs must produce an identical key";
+  EXPECT_NE(base, MakeKey("AB", 2, "f.hlsl", "Main", "cs_5_1", 0, macros));
+  EXPECT_NE(base, MakeKey(src, 2, "g.hlsl", "Main", "cs_5_1", 0, macros));
+  EXPECT_NE(base, MakeKey(src, 2, "f.hlsl", "Other", "cs_5_1", 0, macros));
+  EXPECT_NE(base, MakeKey(src, 2, "f.hlsl", "Main", "cs_6_0", 0, macros));
+  EXPECT_NE(base, MakeKey(src, 2, "f.hlsl", "Main", "cs_5_1", 1, macros));
+  EXPECT_NE(base, MakeKey(src, 2, "f.hlsl", "Main", "cs_5_1", 0, reordered))
+      << "macro order is part of what was compiled";
+
+  // Length-prefixing exists so field boundaries cannot be forged by shifting
+  // a character from one field into the next. Without it these two collide.
+  EXPECT_NE(MakeKey("A", 1, "bc", "Main", "cs_5_1", 0, {}),
+            MakeKey("A", 1, "b", "cMain", "cs_5_1", 0, {}));
+}
+
+TEST(DirectMlShaderCache, SaturationRespectsBoundAndStopsRetaining) {
+  namespace sc = directml_backend::shader_cache;
+  sc::ResetForTesting();
+  const size_t capacity = sc::Capacity();
+  ASSERT_GT(capacity, 0u);
+
+  // Drive past the cap with distinct shaders. This is what makes the bound
+  // testable: asserting Size() <= Capacity() on a near-empty cache holds
+  // trivially and would not notice the insertion guard regressing.
+  for (size_t i = 0; i < capacity + 8; ++i) {
+    CompileCacheTestShader("sat" + std::to_string(i), "1.0");
+  }
+  EXPECT_EQ(sc::Size(), capacity) << "retained entries must stop at the bound";
+
+  // Defined behaviour for a shader first seen after saturation: it compiles
+  // and is returned, but is never retained, so repeat calls recompile rather
+  // than evicting something else.
+  const int attempts = sc::Attempts();
+  const int hits = sc::Hits();
+  auto a = CompileCacheTestShader("post_saturation", "1.0");
+  auto b = CompileCacheTestShader("post_saturation", "1.0");
+  ASSERT_NE(a.Get(), nullptr);
+  ASSERT_NE(b.Get(), nullptr);
+  EXPECT_EQ(sc::Attempts(), attempts + 2);
+  EXPECT_EQ(sc::Hits(), hits);
+  EXPECT_EQ(sc::Size(), capacity) << "the bound must still hold";
+}
+
+TEST(DirectMlShaderCache, FailedCompilationIsNotCachedAndRetries) {
+  namespace sc = directml_backend::shader_cache;
+  sc::ResetForTesting();
+  constexpr char kInvalid[] = "this is not valid HLSL @@@";
+
+  EXPECT_THROW(directml_backend::CompileHlsl(kInvalid, sizeof(kInvalid) - 1,
+                                             "invalid.hlsl", "CsMain",
+                                             /*fp16=*/false, {}),
+               Exception);
+  EXPECT_EQ(sc::Attempts(), 1) << "a failed compile is still an attempt";
+  EXPECT_EQ(sc::Size(), 0u) << "failures must not be retained";
+
+  // The second call must compile again and raise its own diagnostics, rather
+  // than being served a cached failure.
+  EXPECT_THROW(directml_backend::CompileHlsl(kInvalid, sizeof(kInvalid) - 1,
+                                             "invalid.hlsl", "CsMain",
+                                             /*fp16=*/false, {}),
+               Exception);
+  EXPECT_EQ(sc::Attempts(), 2);
+  EXPECT_EQ(sc::Hits(), 0);
+}
+
+TEST(DirectMlShaderCache, ConcurrentDistinctKeysEachCompile) {
+  namespace sc = directml_backend::shader_cache;
+  sc::ResetForTesting();
+
+  // The companion to the same-key case: single-flight must deduplicate
+  // identical shaders WITHOUT making distinct shaders wait for each other.
+  // Each thread compiles a different shader, so none may be served from the
+  // cache and every one must produce its own blob.
+  constexpr int kThreads = 8;
+  std::vector<directml_backend::ComPtr<ID3DBlob>> results(kThreads);
+  std::vector<std::thread> threads;
+  for (int i = 0; i < kThreads; ++i) {
+    threads.emplace_back([&results, i] {
+      results[i] = CompileCacheTestShader("distinct" + std::to_string(i), "1.0");
+    });
+  }
+  for (auto& t : threads) t.join();
+
+  EXPECT_EQ(sc::Attempts(), kThreads);
+  EXPECT_EQ(sc::Hits(), 0);
+  EXPECT_EQ(sc::Size(), static_cast<size_t>(kThreads));
+  for (int i = 0; i < kThreads; ++i) {
+    ASSERT_NE(results[i].Get(), nullptr);
+    for (int j = i + 1; j < kThreads; ++j) {
+      EXPECT_NE(results[i].Get(), results[j].Get());
+    }
+  }
+}
+
+TEST(DirectMlShaderCache, ConcurrentFailuresShareOneAttemptThenRetryLater) {
+  namespace sc = directml_backend::shader_cache;
+  sc::ResetForTesting();
+
+  // Single-flight must hold for FAILURES too, which is where the previous
+  // implementation was wrong: it let every waiter start its own compile, so a
+  // wave of N callers paid N times for the same failure. One attempt serves
+  // the wave, every caller sees that attempt's failure, and nothing is
+  // retained -- so a LATER call, arriving after the flight has retired,
+  // legitimately starts a fresh attempt.
+  // Deterministic, not opportunistic. The owning call is held inside the
+  // flight hook until the other three have provably joined its flight, so
+  // "one attempt for the wave" is forced rather than dependent on the threads
+  // happening to overlap.
+  constexpr int kThreads = 4;
+  constexpr size_t kWaiters = kThreads - 1;
+  std::atomic<bool> release{false};
+  sc::SetFlightHookForTesting([&release] {
+    while (!release.load()) std::this_thread::yield();
+  });
+
+  std::atomic<int> threw{0};
+  std::vector<std::thread> threads;
+  for (int i = 0; i < kThreads; ++i) {
+    threads.emplace_back([&threw] {
+      try {
+        directml_backend::CompileHlsl(kInvalidShader,
+                                      sizeof(kInvalidShader) - 1,
+                                      "invalid_concurrent.hlsl", "CsMain",
+                                      /*fp16=*/false, {});
+      } catch (const Exception&) {
+        ++threw;
+      }
+    });
+  }
+  const bool joined = WaitForFlightWaiters(kWaiters);
+  EXPECT_TRUE(joined) << "waiters never joined: single-flight has regressed";
+  if (joined) {
+    EXPECT_EQ(sc::InFlight(), 1u) << "the wave must be one flight, not four";
+  }
+  release.store(true);
+  for (auto& t : threads) t.join();
+  sc::SetFlightHookForTesting({});
+
+  EXPECT_EQ(threw.load(), kThreads) << "every caller must observe the failure";
+  EXPECT_EQ(sc::Attempts(), 1) << "one attempt serves the whole wave";
+  EXPECT_EQ(sc::Size(), 0u) << "a failed key must leave nothing retained";
+  EXPECT_EQ(sc::InFlight(), 0u) << "the failed flight must be retired";
+  EXPECT_EQ(sc::Hits(), 0) << "joining a failed flight is not a hit";
+
+  // A later call is a new wave and must compile again rather than inherit.
+  EXPECT_THROW(directml_backend::CompileHlsl(
+                   kInvalidShader, sizeof(kInvalidShader) - 1,
+                   "invalid_concurrent.hlsl", "CsMain", /*fp16=*/false, {}),
+               Exception);
+  EXPECT_EQ(sc::Attempts(), 2);
+}
+
+TEST(DirectMlShaderCache, FailureLeavesRetainedBlobsIntact) {
+  namespace sc = directml_backend::shader_cache;
+  sc::ResetForTesting();
+
+  // The retire-by-identity property, in the form that can be asserted
+  // deterministically: a failing compile must not disturb what is already
+  // retained under any other key, and must not leave the retained entry
+  // reachable-but-broken. The previous implementation erased by key alone,
+  // so a failure could delete an entry another call had installed.
+  auto good = CompileCacheTestShader("survives_failure", "1.0");
+  ASSERT_NE(good.Get(), nullptr);
+  ASSERT_EQ(sc::Size(), 1u);
+
+  EXPECT_THROW(directml_backend::CompileHlsl(
+                   kInvalidShader, sizeof(kInvalidShader) - 1, "invalid.hlsl",
+                   "CsMain", /*fp16=*/false, {}),
+               Exception);
+
+  EXPECT_EQ(sc::Size(), 1u) << "the failure must not evict a retained blob";
+  const int hits = sc::Hits();
+  auto again = CompileCacheTestShader("survives_failure", "1.0");
+  EXPECT_EQ(sc::Hits(), hits + 1) << "the retained blob must still serve";
+  EXPECT_EQ(again.Get(), good.Get());
+}
+
+TEST(DirectMlShaderCache, PostSaturationConcurrentCallersShareOneAttempt) {
+  namespace sc = directml_backend::shader_cache;
+  sc::ResetForTesting();
+  const size_t capacity = sc::Capacity();
+
+  for (size_t i = 0; i < capacity; ++i) {
+    CompileCacheTestShader("presat" + std::to_string(i), "1.0");
+  }
+  ASSERT_EQ(sc::Size(), capacity) << "cache must be saturated for this test";
+
+  // Past the retention bound a shader is not stored -- but deduplication of
+  // work in flight is a separate concern from retention, so a wave of callers
+  // for one post-capacity key must still cost exactly one compile. The earlier
+  // implementation handed each caller a private entry here and compiled once
+  // per caller.
+  const int attempts = sc::Attempts();
+  constexpr int kThreads = 8;
+  constexpr size_t kWaiters = kThreads - 1;
+  std::atomic<bool> release{false};
+  sc::SetFlightHookForTesting([&release] {
+    while (!release.load()) std::this_thread::yield();
+  });
+
+  std::vector<directml_backend::ComPtr<ID3DBlob>> results(kThreads);
+  std::vector<std::thread> threads;
+  for (int i = 0; i < kThreads; ++i) {
+    threads.emplace_back([&results, i] {
+      results[i] = CompileCacheTestShader("post_sat_wave", "1.0");
+    });
+  }
+  // Hold the owner until every other caller has joined its flight, so this
+  // asserts single-flight past the retention bound rather than a race won.
+  const bool joined = WaitForFlightWaiters(kWaiters);
+  EXPECT_TRUE(joined)
+      << "waiters never joined past capacity: in-flight dedup has regressed";
+  if (joined) EXPECT_EQ(sc::InFlight(), 1u);
+  release.store(true);
+  for (auto& t : threads) t.join();
+  sc::SetFlightHookForTesting({});
+
+  EXPECT_EQ(sc::Attempts(), attempts + 1) << "one attempt for the whole wave";
+  EXPECT_EQ(sc::Size(), capacity) << "no retained growth past the bound";
+  EXPECT_EQ(sc::InFlight(), 0u);
+  for (int i = 0; i < kThreads; ++i) {
+    ASSERT_NE(results[i].Get(), nullptr);
+    EXPECT_EQ(results[i].Get(), results[0].Get()) << "the wave must share one blob";
+  }
+
+  // A later wave finds nothing retained and recompiles exactly once.
+  const int after_wave = sc::Attempts();
+  CompileCacheTestShader("post_sat_wave", "1.0");
+  EXPECT_EQ(sc::Attempts(), after_wave + 1);
+  EXPECT_EQ(sc::Size(), capacity);
 }
 
 }  // namespace

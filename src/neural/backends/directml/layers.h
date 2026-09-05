@@ -47,8 +47,11 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <utility>
 #include <unordered_map>
 #include <vector>
 
@@ -62,6 +65,55 @@
 
 namespace lczero {
 namespace directml_backend {
+
+// Compiles an HLSL compute shader to bytecode, memoising the result. FXC
+// dominates backend startup -- kda_recurrence.hlsl alone takes ~5.2s because
+// it is specialised on key_dim/value_dim and unrolls a 64-step scan -- and a
+// net compiles that shader once per KDA encoder, identically each time.
+// Declared here rather than kept file-local so the cache's behaviour can be
+// asserted directly by tests instead of inferred from timing.
+ComPtr<ID3DBlob> CompileHlsl(
+    const char* source, size_t source_len, const char* filename,
+    const char* entry_point, bool fp16,
+    const std::vector<std::pair<std::string, std::string>>& extra_defines = {});
+
+// Observability for the shader cache above. Counters are process-wide and
+// monotonic; Size()/Capacity() describe the bound.
+namespace shader_cache {
+// Builds the cache key from every input D3DCompile receives. Exposed so the
+// key can be tested directly: a key that silently drops a field returns a
+// wrong blob rather than merely missing it, and fields that are constant
+// today (target, flags) still belong in it so a future change cannot alias
+// two different compilations onto one blob.
+std::string MakeKey(
+    const char* source, size_t source_len, const char* filename,
+    const char* entry_point, const char* target, uint32_t flags,
+    const std::vector<std::pair<std::string, std::string>>& effective_macros);
+
+int Attempts();     // D3DCompile invocations, counted before the call so a
+                    // compile that fails is still an attempt. Concurrent
+                    // callers of one key share a single attempt, whether it
+                    // succeeds or fails.
+int Hits();         // calls answered without compiling: from a retained blob,
+                    // or by joining an in-flight compile that then succeeded
+size_t Size();      // successful blobs currently retained
+size_t Capacity();  // maximum retained. Past this a shader still compiles and
+                    // is returned, it is just not stored -- but concurrent
+                    // callers still share one attempt, because deduplication
+                    // of in-flight work is independent of retention.
+size_t InFlight();  // compiles currently running; transient, never bounded
+size_t Waiting();   // callers blocked on another caller's flight
+// Test-only seam: runs in the owning call after its flight is registered and
+// before D3DCompile. Lets a test hold a flight open until waiters have
+// provably joined, so single-flight assertions are deterministic rather than
+// dependent on threads happening to overlap. Pass {} to clear.
+void SetFlightHookForTesting(std::function<void()> hook);
+void ResetForTesting();  // quiescent-test-only: drops retained blobs and
+                         // zeroes counters. It cannot cancel a running
+                         // compile, so callers must join their threads first;
+                         // it asserts nothing is in flight.
+}  // namespace shader_cache
+
 
 // Debug aid (LC0_DUMP_BODY): AttentionBody records a copy of its embedding
 // output and each encoder's output into readback buffers; forwardEval drains

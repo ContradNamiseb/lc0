@@ -35,6 +35,12 @@
 #include <cstring>
 #include <fstream>
 #include <numeric>
+#include <cstdint>
+#include <condition_variable>
+#include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -127,44 +133,6 @@ inline float F16BitsToF32(uint16_t h) {
 // keeps its bespoke 10-parameter layout from the original stub.
 // ===========================================================================
 
-ComPtr<ID3DBlob> CompileHlsl(
-    const char* source, size_t source_len, const char* filename,
-    const char* entry_point, bool fp16,
-    const std::vector<std::pair<std::string, std::string>>& extra_defines =
-        {}) {
-  // Owned storage: D3D_SHADER_MACRO holds bare pointers into whatever the
-  // caller passed, and the terminator must stay a {nullptr, nullptr} pair.
-  std::vector<D3D_SHADER_MACRO> macros;
-  macros.push_back({"INPUT_TYPE", fp16 ? "half" : "float"});
-  for (const auto& d : extra_defines) {
-    macros.push_back({d.first.c_str(), d.second.c_str()});
-  }
-  macros.push_back({nullptr, nullptr});
-  UINT flags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
-#ifndef NDEBUG
-  flags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
-#endif
-  // FXC caps at shader model 5.1 where `half` is min16float; genuine 16-bit
-  // storage would need DXC (cs_6_2 + -enable-16bit-types), same caveat as
-  // kda_recurrence.hlsl.
-  ComPtr<ID3DBlob> shader, errors;
-  HRESULT hr = D3DCompile(source, source_len, filename, macros.data(),
-                          nullptr /* no shader #includes */, entry_point,
-                          "cs_5_1", flags, 0, &shader, &errors);
-  if (FAILED(hr)) {
-    std::string message = "Failed to compile ";
-    message += filename;
-    message += ": ";
-    if (errors) {
-      message.append(static_cast<const char*>(errors->GetBufferPointer()),
-                     errors->GetBufferSize());
-    } else {
-      message += "HRESULT 0x" + std::to_string(static_cast<uint32_t>(hr));
-    }
-    throw Exception(message);
-  }
-  return shader;
-}
 
 // Root signature: parameter 0 = num_32bit_constants root constants,
 // then srv_count root SRVs (t0..), then uav_count root UAVs (u0..).
@@ -547,6 +515,281 @@ void DispatchOp(DmlExecScope& scope, DmlCompiledOp& op, DmlPtr input,
 }
 
 }  // namespace
+
+// Shader-cache counters. Guarded by the same mutex as the map itself, so the
+// accessors below report a consistent snapshot rather than torn reads.
+namespace {
+// Shader cache. Two structures with different jobs, which is the point:
+//
+//   completed_blobs  successful bytecode, BOUNDED. This is the memory the
+//                    cache costs, so it is what the cap limits.
+//   in_flight        compilations currently running, UNBOUNDED but transient:
+//                    an entry exists only while its compile runs. Bounding
+//                    this would reintroduce redundant concurrent compiles for
+//                    exactly the keys the cap excluded, so the two are kept
+//                    separate. Its size is bounded in practice by the number
+//                    of threads compiling at once.
+//
+// Keeping them separate is what makes single-flight hold for every key,
+// including keys past the retention cap and keys whose compile fails.
+//
+// Deliberately leaked rather than plain statics: entries hold COM references,
+// and running their Release at static-destruction time would order them
+// against the runtime's own teardown.
+constexpr size_t kMaxShaderCacheEntries = 64;
+constexpr char kShaderTarget[] = "cs_5_1";
+
+// One compilation, shared by every caller that asks for the same key while it
+// runs. A wave of callers costs exactly one D3DCompile whether it succeeds or
+// fails, and every one of them sees that attempt's outcome.
+struct ShaderFlight {
+  std::mutex mutex;
+  std::condition_variable done_cv;
+  bool done = false;
+  bool failed = false;
+  ComPtr<ID3DBlob> blob;  // set iff it succeeded
+  std::string error;      // set iff it failed
+};
+
+std::mutex* shader_cache_mutex = new std::mutex();
+std::map<std::string, ComPtr<ID3DBlob>>* completed_blobs =
+    new std::map<std::string, ComPtr<ID3DBlob>>();
+std::map<std::string, std::shared_ptr<ShaderFlight>>* in_flight =
+    new std::map<std::string, std::shared_ptr<ShaderFlight>>();
+int shader_cache_hits = 0;
+int shader_cache_attempts = 0;
+// Callers currently blocked on someone else's flight. Exposed for tests so a
+// single-flight assertion can be made deterministic -- a test can wait until
+// the waiters have provably joined instead of hoping the threads overlapped.
+int shader_cache_waiting = 0;
+// Test-only seam: run by the owning call after its flight is registered and
+// before D3DCompile, so a test can hold the flight open. Null in production.
+std::function<void()>* shader_cache_flight_hook = new std::function<void()>();
+}  // namespace
+
+namespace shader_cache {
+
+std::string MakeKey(
+    const char* source, size_t source_len, const char* filename,
+    const char* entry_point, const char* target, uint32_t flags,
+    const std::vector<std::pair<std::string, std::string>>& effective_macros) {
+  // Length-prefix every field so the concatenation cannot be ambiguous: no
+  // separator byte can collide with shader source text, which may contain
+  // anything.
+  //
+  // Every input D3DCompile receives is in the key, including ones that are
+  // constant today. filename reaches the compiler as source metadata, and
+  // target and flags are fixed only by current convention -- keying on them
+  // costs nothing and means a future change cannot silently alias two
+  // different compilations onto one blob.
+  std::string key;
+  key.reserve(source_len + 128);
+  const auto add_field = [&key](const char* data, size_t len) {
+    key += std::to_string(len);
+    key += ':';
+    key.append(data, len);
+  };
+  add_field(source, source_len);
+  add_field(filename, strlen(filename));
+  add_field(entry_point, strlen(entry_point));
+  add_field(target, strlen(target));
+  const std::string flag_text = std::to_string(flags);
+  add_field(flag_text.data(), flag_text.size());
+  // Ordered, not sorted: macro order is part of what was compiled.
+  for (const auto& m : effective_macros) {
+    add_field(m.first.data(), m.first.size());
+    add_field(m.second.data(), m.second.size());
+  }
+  return key;
+}
+
+int Attempts() {
+  std::lock_guard<std::mutex> lock(*shader_cache_mutex);
+  return shader_cache_attempts;
+}
+int Hits() {
+  std::lock_guard<std::mutex> lock(*shader_cache_mutex);
+  return shader_cache_hits;
+}
+size_t Size() {
+  std::lock_guard<std::mutex> lock(*shader_cache_mutex);
+  return completed_blobs->size();
+}
+size_t Capacity() { return kMaxShaderCacheEntries; }
+size_t InFlight() {
+  std::lock_guard<std::mutex> lock(*shader_cache_mutex);
+  return in_flight->size();
+}
+size_t Waiting() {
+  std::lock_guard<std::mutex> lock(*shader_cache_mutex);
+  return static_cast<size_t>(shader_cache_waiting);
+}
+void SetFlightHookForTesting(std::function<void()> hook) {
+  std::lock_guard<std::mutex> lock(*shader_cache_mutex);
+  *shader_cache_flight_hook = std::move(hook);
+}
+
+void ResetForTesting() {
+  // QUIESCENT ONLY. This drops the retained blobs and zeroes the counters; it
+  // does not and cannot cancel a compile that is already running. Calling it
+  // while any CompileHlsl is in flight would let that call finish and then
+  // publish its result into a cache the test believes it just emptied, so
+  // every caller must ensure its threads are joined first. Asserted rather
+  // than trusted.
+  std::lock_guard<std::mutex> lock(*shader_cache_mutex);
+  assert(in_flight->empty() &&
+         "ResetForTesting called while a compile is in flight");
+  completed_blobs->clear();
+  in_flight->clear();
+  shader_cache_hits = 0;
+  shader_cache_attempts = 0;
+}
+
+}  // namespace shader_cache
+
+// Compiles an HLSL compute shader, memoising the result. FXC dominates backend
+// startup: the KDA recurrence shader is specialised on key_dim/value_dim and
+// unrolls a 64-step scan, making it by far the most expensive compile, and a
+// net compiles it once per KDA encoder -- identically each time. Measurements
+// live in the review record rather than here, because they are specific to a
+// machine and a net and go stale in a way this comment cannot.
+ComPtr<ID3DBlob> CompileHlsl(
+    const char* source, size_t source_len, const char* filename,
+    const char* entry_point, bool fp16,
+    const std::vector<std::pair<std::string, std::string>>& extra_defines) {
+  // The effective macro list, built once and used for BOTH the key and the
+  // compile, so the key cannot drift from what was actually compiled.
+  std::vector<std::pair<std::string, std::string>> effective_macros;
+  effective_macros.reserve(extra_defines.size() + 1);
+  effective_macros.emplace_back("INPUT_TYPE", fp16 ? "half" : "float");
+  for (const auto& d : extra_defines) effective_macros.push_back(d);
+
+  // Owned storage: D3D_SHADER_MACRO holds bare pointers into whatever the
+  // caller passed, and the terminator must stay a {nullptr, nullptr} pair.
+  std::vector<D3D_SHADER_MACRO> macros;
+  macros.reserve(effective_macros.size() + 1);
+  for (const auto& m : effective_macros) {
+    macros.push_back({m.first.c_str(), m.second.c_str()});
+  }
+  macros.push_back({nullptr, nullptr});
+
+  UINT flags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
+#ifndef NDEBUG
+  flags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+#endif
+
+  const std::string key =
+      shader_cache::MakeKey(source, source_len, filename, entry_point,
+                            kShaderTarget, flags, effective_macros);
+
+  // Resolve under the global lock, then release it. A compile never runs while
+  // this lock is held, so distinct keys compile concurrently.
+  std::shared_ptr<ShaderFlight> flight;
+  bool owner = false;
+  {
+    std::lock_guard<std::mutex> lock(*shader_cache_mutex);
+    auto done = completed_blobs->find(key);
+    if (done != completed_blobs->end()) {
+      ++shader_cache_hits;
+      return done->second;
+    }
+    auto running = in_flight->find(key);
+    if (running != in_flight->end()) {
+      flight = running->second;  // join the compile already under way
+    } else {
+      flight = std::make_shared<ShaderFlight>();
+      (*in_flight)[key] = flight;
+      owner = true;
+    }
+  }
+
+  if (!owner) {
+    // Wait for the in-flight attempt and take its outcome, success or failure.
+    // Waiters never start a second compile of a key already being compiled,
+    // and never touch the maps -- which is why a waiter cannot erase an entry
+    // installed by a later call.
+    {
+      std::lock_guard<std::mutex> lock(*shader_cache_mutex);
+      ++shader_cache_waiting;
+    }
+    std::unique_lock<std::mutex> wait_lock(flight->mutex);
+    flight->done_cv.wait(wait_lock, [&flight] { return flight->done; });
+    {
+      std::lock_guard<std::mutex> lock(*shader_cache_mutex);
+      --shader_cache_waiting;
+    }
+    if (flight->failed) throw Exception(flight->error);
+    ComPtr<ID3DBlob> blob = flight->blob;
+    wait_lock.unlock();
+    std::lock_guard<std::mutex> lock(*shader_cache_mutex);
+    ++shader_cache_hits;
+    return blob;
+  }
+
+  {
+    std::function<void()> hook;
+    {
+      std::lock_guard<std::mutex> lock(*shader_cache_mutex);
+      hook = *shader_cache_flight_hook;
+      // Counted before the call, so a compile that fails is still an attempt.
+      ++shader_cache_attempts;
+    }
+    // Outside the lock: the hook exists precisely to block, and holding the
+    // global lock here would stop waiters from ever joining the flight.
+    if (hook) hook();
+  }
+  // FXC caps at shader model 5.1 where `half` is min16float; genuine 16-bit
+  // storage would need DXC (cs_6_2 + -enable-16bit-types), same caveat as
+  // kda_recurrence.hlsl.
+  ComPtr<ID3DBlob> shader, errors;
+  HRESULT hr = D3DCompile(source, source_len, filename, macros.data(),
+                          nullptr /* no shader #includes */, entry_point,
+                          kShaderTarget, flags, 0, &shader, &errors);
+  const bool failed = FAILED(hr);
+  std::string message;
+  if (failed) {
+    message = "Failed to compile ";
+    message += filename;
+    message += ": ";
+    if (errors) {
+      message.append(static_cast<const char*>(errors->GetBufferPointer()),
+                     errors->GetBufferSize());
+    } else {
+      message += "HRESULT 0x" + std::to_string(static_cast<uint32_t>(hr));
+    }
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(*shader_cache_mutex);
+    // Retire THIS flight, identified by pointer. Erasing by key alone could
+    // delete a different flight that a later call installed for the same key
+    // after ours finished, silently discarding its result.
+    auto running = in_flight->find(key);
+    if (running != in_flight->end() && running->second == flight) {
+      in_flight->erase(running);
+    }
+    // Only successes are retained, and only within the bound. A failure
+    // leaves nothing behind, so the next call starts a fresh attempt; past
+    // the bound the blob is returned but not stored, so a later wave
+    // recompiles it once rather than evicting something else.
+    if (!failed && completed_blobs->size() < kMaxShaderCacheEntries) {
+      (*completed_blobs)[key] = shader;
+    }
+  }
+
+  {
+    std::lock_guard<std::mutex> publish_lock(flight->mutex);
+    flight->failed = failed;
+    flight->error = message;
+    flight->blob = shader;
+    flight->done = true;
+  }
+  flight->done_cv.notify_all();
+
+  if (failed) throw Exception(message);
+  return shader;
+}
+
 
 // ===========================================================================
 // DmlDeviceContext / DmlHalf / DmlWeightUploader plumbing
