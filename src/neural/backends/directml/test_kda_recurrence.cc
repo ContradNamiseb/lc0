@@ -543,6 +543,18 @@ TEST(KdaRecurrence, FusedQkvMatchesCpuReferenceAtAsymmetricDims) {
   RunFusedQkvCase(/*heads=*/16, /*key_dim=*/32, /*value_dim=*/4);
 }
 
+// Mirror geometry: the only one of the three where value_depth EXCEEDS
+// key_depth, so it is the only case exercising the V-dominant buffer
+// arithmetic. It is not merely a third data point: the shader is compile-time
+// specialised on KDA_KEY_DIM/KDA_VALUE_DIM, runs [numthreads(KDA_VALUE_DIM,1,1)],
+// and walks keys with `for (i = local_id; i < KDA_KEY_DIM; i += KDA_VALUE_DIM)`.
+// At value_dim > key_dim that loop body executes at most once per lane and most
+// lanes sit idle -- a different execution pattern, from a different compiled
+// kernel, than either case above.
+TEST(KdaRecurrence, FusedQkvMatchesCpuReferenceAtMirrorDims) {
+  RunFusedQkvCase(/*heads=*/16, /*key_dim=*/4, /*value_dim=*/32);
+}
+
 }  // namespace
 }  // namespace directml_backend
 }  // namespace lczero
