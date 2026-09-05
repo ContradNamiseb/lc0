@@ -983,6 +983,31 @@ TEST(DirectMlKdaParity, MatchesBlasOnBatchOfEightRealisticDims) {
   CompareBackendsBatch(MakeNetWithDims(RealisticDims(), 8001), 8);
 }
 
+// Batches that land on rungs the 8-rung ladder never had. Every size here is
+// a rung in its own right, so each compiles a graph at load that no other
+// test exercises, and each is a size the OLD ladder would have padded away
+// to 16/32/64 -- meaning these paths ran in production under a padded graph
+// and are only now evaluated at their true width.
+//
+// Distinct positions per slot, as always: a batch of identical inputs makes
+// every row hold the same numbers, so any per-sample indexing error hides
+// behind a green checkmark.
+TEST(DirectMlKdaParity, MatchesBlasOnNewLadderRungTwelve) {
+  CompareBackendsBatch(MakeKdaMlhNet(), 12);
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnNewLadderRungTwentyFour) {
+  CompareBackendsBatch(MakeKdaMlhNet(), 24);
+}
+
+// One size BETWEEN two new rungs, so the padding path itself is covered: 20
+// rounds up to 24, and the extra four rows must not disturb the twenty real
+// ones.
+TEST(DirectMlKdaParity, MatchesBlasOnBatchPaddedToNewRung) {
+  CompareBackendsBatch(MakeKdaMlhNet(), 20);
+}
+
+
 TEST(DirectMlKdaParity, MatchesBlasOnGatedEmbeddingNet) {
   CompareBackends(MakeGatedNet(NetDims(), 6001));
 }

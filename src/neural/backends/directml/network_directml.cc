@@ -189,8 +189,9 @@ class DirectMlNetwork : public Network {
   // batch up to a rung that was never compiled would try to compile after
   // dispatch and fail. Keeping one definition is what makes that
   // impossible -- they were two separate literal lists before.
-  std::array<int, 8> BatchLadder() const {
-    return {min_batch_size_, 8, 16, 32, 64, 128, 256, max_batch_size_};
+  std::array<int, 14> BatchLadder() const {
+    return {min_batch_size_, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256,
+            max_batch_size_};
   }
   void FlushWeights(DmlWeightUploader& uploader);
   BaseLayer<DataType>* getLastLayer() { return network_.back().get(); }
