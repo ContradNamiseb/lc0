@@ -1048,6 +1048,65 @@ TEST(DirectMlKdaParity, MatchesBlasOnLocalConvBatch) {
   CompareBackendsBatch(MakeLocalConvNet(9402), 4);
 }
 
+// The other three KDA feature switches were pinned to a single value in every
+// net in this file: output_gate and output_rms_norm always true, qkv_silu
+// always true. Their disabled branches were therefore dead under test while
+// live in production -- the same one-sided-coverage shape as the input-gating
+// bug and the local convolution, found by auditing the switches rather than by
+// anything failing.
+//
+// One flag per net, deliberately. A single all-off net would be cheaper but
+// worse: combined toggles can cancel or mask an isolated branch defect, and
+// when such a net failed it would not say which branch broke.
+//
+// Dimensions are RealisticDims() throughout, and every feature setting except
+// the named toggle matches the existing passing MatchesBlasOnRealisticDimsNet.
+// The WEIGHTS differ from it: that fixture seeds 2024 and these seed 9501-9504,
+// which is deliberate seed diversity rather than an oversight. So these are not
+// a controlled A/B against that fixture, and nothing here should be read as
+// isolating the flag's effect on OUTPUT. What each parity comparison isolates
+// is the flag's effect on AGREEMENT: BLAS and DirectML are handed byte-identical
+// weights, so any divergence is an implementation difference in the branch the
+// toggle selects, whatever the weights happen to be.
+pblczero::Net MakeOutputGateDisabledNet(unsigned seed) {
+  KdaFeatures feat;
+  feat.output_gate = false;
+  return MakeNetWithDims(RealisticDims(), seed, feat);
+}
+
+pblczero::Net MakeOutputRmsNormDisabledNet(unsigned seed) {
+  KdaFeatures feat;
+  feat.output_rms_norm = false;
+  return MakeNetWithDims(RealisticDims(), seed, feat);
+}
+
+pblczero::Net MakeQkvSiluDisabledNet(unsigned seed) {
+  KdaFeatures feat;
+  feat.qkv_silu = false;
+  return MakeNetWithDims(RealisticDims(), seed, feat);
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnOutputGateDisabled) {
+  CompareBackends(MakeOutputGateDisabledNet(9501));
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnOutputRmsNormDisabled) {
+  CompareBackends(MakeOutputRmsNormDisabledNet(9502));
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnQkvSiluDisabled) {
+  CompareBackends(MakeQkvSiluDisabledNet(9503));
+}
+
+// Batch > 1 on one of the three. The disabled branches sit inside the KDA
+// mixer, which indexes per sample, so a batch case covers strides the
+// single-position tests cannot reach. Kept on one fixture rather than all
+// three: the per-sample indexing is shared, so repeating it would add runtime
+// without adding coverage.
+TEST(DirectMlKdaParity, MatchesBlasOnOutputGateDisabledBatch) {
+  CompareBackendsBatch(MakeOutputGateDisabledNet(9504), 4);
+}
+
 // The BLAS reference sizes buffer1/buffer2/buffer3 from max_channels, a BODY
 // quantity, but the attention policy head writes into all three with its OWN
 // widths. Either width crossing max_channels overruns the allocation and
