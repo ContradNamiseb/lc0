@@ -44,6 +44,7 @@
 // treat a red kda_parity_test_directml as the to-do list, not breakage.
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <list>
@@ -182,6 +183,15 @@ class DirectMlNetwork : public Network {
 
   void forwardEval(InputsOutputs* io, int batch,
                    const std::vector<InputPlanes>& planes);
+  // The batch sizes that get compiled graphs. The pre-compile at load and
+  // the round-up in forwardEval MUST walk the same list: this driver fails
+  // all operator creation once dispatches have been recorded, so rounding a
+  // batch up to a rung that was never compiled would try to compile after
+  // dispatch and fail. Keeping one definition is what makes that
+  // impossible -- they were two separate literal lists before.
+  std::array<int, 8> BatchLadder() const {
+    return {min_batch_size_, 8, 16, 32, 64, 128, 256, max_batch_size_};
+  }
   void FlushWeights(DmlWeightUploader& uploader);
   BaseLayer<DataType>* getLastLayer() { return network_.back().get(); }
 
@@ -588,7 +598,7 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
   // dispatches have been recorded (docs/directml-handoff.md section 3), so
   // nothing may be compiled after the first batch runs. forwardEval rounds
   // each batch UP to the ladder.
-  for (int b : {min_batch_size_, 8, 16, 32, 64, 128, 256, max_batch_size_}) {
+  for (int b : BatchLadder()) {
     if (b < min_batch_size_ || b > max_batch_size_) continue;
     DmlExecScope pre(ctx_, ctx_.upload_list(), &transient_arena_,
                      &smolgen_arena_);
@@ -685,7 +695,7 @@ void DirectMlNetwork<DataType>::forwardEval(
   // the pre-compile at load -- post-dispatch compilation fails on this
   // driver). The layers are row/batch independent, so extra padding rows
   // are harmless; buffers are sized for max_batch.
-  for (int b : {min_batch_size_, 8, 16, 32, 64, 128, 256, max_batch_size_}) {
+  for (int b : BatchLadder()) {
     if (b >= batch) { batch = std::clamp(b, min_batch_size_, max_batch_size_); break; }
   }
   std::lock_guard<std::mutex> guard(eval_lock_);
