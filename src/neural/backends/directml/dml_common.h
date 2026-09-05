@@ -265,6 +265,21 @@ struct DmlCompiledOp {
 
 class DmlDeviceContext {
  public:
+  DmlDeviceContext() = default;
+
+  // fence_event_ below is a raw HANDLE this class creates, so it has to
+  // close it. Without this the event outlives every context: one handle per
+  // successful Init, for the life of the process.
+  ~DmlDeviceContext();
+
+  // Owning a raw HANDLE makes the implicit copy operations wrong -- they
+  // would duplicate the handle value and close it twice. Nothing copies a
+  // context today, and deleting the copies states that rather than leaving
+  // it to chance. Move support is deliberately NOT added: no call site
+  // needs it, and the compiler will say so if that ever changes.
+  DmlDeviceContext(const DmlDeviceContext&) = delete;
+  DmlDeviceContext& operator=(const DmlDeviceContext&) = delete;
+
   void Init(const OptionsDict& options);
 
   ID3D12Device* device() const { return device_.Get(); }

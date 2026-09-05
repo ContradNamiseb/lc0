@@ -76,6 +76,18 @@ class DirectMlNetworkComputation;
 // ===========================================================================
 // Device bring-up (the network_cuda.cc showInfo/showDeviceInfo analogue).
 // ===========================================================================
+DmlDeviceContext::~DmlDeviceContext() {
+  // Safe after a partial Init. fence_event_ is null-initialised in the
+  // header and is only ever assigned the result of CreateEvent below, so
+  // every earlier throw in Init -- no adapter, D3D12CreateDevice, the DML
+  // device, the command recorder -- leaves it null and this is a no-op.
+  // CreateEvent failing likewise leaves it null before Init throws.
+  if (fence_event_) {
+    CloseHandle(fence_event_);
+    fence_event_ = nullptr;
+  }
+}
+
 void DmlDeviceContext::Init(const OptionsDict& options) {
   const int gpu_id = options.GetOrDefault<int>("gpu", 0);
   meta_commands_ = options.GetOrDefault<bool>("meta_commands", true);
