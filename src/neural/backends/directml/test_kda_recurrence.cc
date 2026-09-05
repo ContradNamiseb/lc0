@@ -352,6 +352,197 @@ TEST(KdaRecurrence, MatchesCpuReferenceAtProductionShape) {
                            << max_abs_diff;
 }
 
+// The fused-qkv read path had NO coverage: the only assignments of
+// use_fused_qkv anywhere in the tree were `false` (production at layers.cc, and
+// the unfused test above). The shader branch at
+// kda_recurrence_shader_source.h:174 has therefore never executed. That is the
+// one-sided-coverage shape that produced the input-gating bug -- a flag
+// exercised in one direction only, dormant in production and unverified in
+// test, that goes live the day someone flips it.
+//
+// Both cases below anchor to the SAME CpuReferenceKdaRecurrence the unfused
+// test uses. Comparing against an independent CPU reference is stronger than
+// comparing the two GPU paths to each other: a packing mistake that happened to
+// be self-consistent on the GPU would still fail here.
+void RunFusedQkvCase(int heads, int key_dim, int value_dim) {
+  TestDevice test_device;
+  if (!TestDevice::TryCreate(&test_device)) {
+    GTEST_SKIP() << "No hardware D3D12 adapter available on this machine.";
+  }
+
+  constexpr int kN = 2;
+  constexpr int kDirectionCount = 8;
+  const std::vector<int> directions = {1, 2, 3, 4, 1, 2, 3, 4};
+
+  const int key_depth = heads * key_dim;
+  const int value_depth = heads * value_dim;
+  const size_t tokens = static_cast<size_t>(kN) * 64;
+
+  std::mt19937 rng(42);
+  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+  auto random_vec = [&](size_t n) {
+    std::vector<float> v(n);
+    for (auto& x : v) x = dist(rng);
+    return v;
+  };
+
+  const auto q = random_vec(tokens * key_depth);
+  const auto k = random_vec(tokens * key_depth);
+  const auto v = random_vec(tokens * value_depth);
+  const auto raw_decay = random_vec(tokens * key_depth);
+  const auto dt_bias = random_vec(key_depth);
+  const auto a_log = random_vec(heads);
+  const auto beta = random_vec(tokens * heads);
+
+  const auto expected = CpuReferenceKdaRecurrence(
+      kN, heads, key_dim, value_dim, directions, kDirectionCount, q, k, v,
+      raw_decay, dt_bias, a_log, beta);
+
+  // The layout the shader reads when the flag is set, taken from
+  // kda_recurrence_shader_source.h:175-177 directly:
+  //   q_off = token * qkv_stride                + head * KDA_KEY_DIM
+  //   k_off = token * qkv_stride + key_depth    + head * KDA_KEY_DIM
+  //   v_off = token * qkv_stride + 2*key_depth  + head * KDA_VALUE_DIM
+  // i.e. per token, [ Q: key_depth ][ K: key_depth ][ V: value_depth ].
+  // NOTE k_off strides by KEY_DIM, not VALUE_DIM. At key_dim == value_dim the
+  // two are indistinguishable, which is why the asymmetric case below exists.
+  const int qkv_stride = 2 * key_depth + value_depth;
+  std::vector<float> qkv(tokens * static_cast<size_t>(qkv_stride));
+  for (size_t t = 0; t < tokens; ++t) {
+    float* dst = qkv.data() + t * qkv_stride;
+    std::memcpy(dst, q.data() + t * key_depth, key_depth * sizeof(float));
+    std::memcpy(dst + key_depth, k.data() + t * key_depth,
+                key_depth * sizeof(float));
+    std::memcpy(dst + 2 * key_depth, v.data() + t * value_depth,
+                value_depth * sizeof(float));
+  }
+
+  KdaRecurrenceLayer layer(test_device.device.Get(), /*fp16=*/false, key_dim,
+                           value_dim);
+
+  auto upload_and_get = [&](const std::vector<float>& data) {
+    auto buf = UploadBuffer(test_device.device.Get(), data);
+    void* mapped = nullptr;
+    buf->Map(0, nullptr, &mapped);
+    std::memcpy(mapped, data.data(), data.size() * sizeof(float));
+    buf->Unmap(0, nullptr);
+    return buf;
+  };
+
+  auto qkv_buf = upload_and_get(qkv);
+  auto raw_decay_buf = upload_and_get(raw_decay);
+  auto dt_bias_buf = upload_and_get(dt_bias);
+  auto a_log_buf = upload_and_get(a_log);
+  auto beta_buf = upload_and_get(beta);
+
+  std::vector<uint32_t> order(16 * 64);
+  for (int d = 0; d < 16; ++d) {
+    for (int t = 0; t < 64; ++t) {
+      order[d * 64 + t] = static_cast<uint32_t>(kKdaDirectionOrder[d][t]);
+    }
+  }
+  auto order_buf = detail::CreateBuffer(
+      test_device.device.Get(), order.size() * sizeof(uint32_t),
+      D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+  {
+    void* mapped = nullptr;
+    order_buf->Map(0, nullptr, &mapped);
+    std::memcpy(mapped, order.data(), order.size() * sizeof(uint32_t));
+    order_buf->Unmap(0, nullptr);
+  }
+  auto mixed_buf = detail::CreateBuffer(
+      test_device.device.Get(), expected.size() * sizeof(float),
+      D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+  auto readback_buf = detail::CreateBuffer(
+      test_device.device.Get(), expected.size() * sizeof(float),
+      D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+
+  ComPtr<ID3D12CommandAllocator> allocator;
+  ComPtr<ID3D12GraphicsCommandList> command_list;
+  test_device.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                             IID_PPV_ARGS(&allocator));
+  test_device.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                        allocator.Get(), nullptr,
+                                        IID_PPV_ARGS(&command_list));
+
+  KdaRecurrenceLayer::Params params{};
+  params.batch_size = kN;
+  params.heads = heads;
+  params.key_dim = key_dim;
+  params.value_dim = value_dim;
+  params.direction_count = kDirectionCount;
+  for (size_t i = 0; i < directions.size() && i < 16; ++i) {
+    params.directions[i] = directions[i];
+  }
+  params.use_fused_qkv = true;
+  params.qkv_stride = qkv_stride;
+  params.log_decay_floor = kLogDecayFloor;
+  params.fp16 = false;
+
+  // Fused: the packed buffer goes in as `qkv` and the separate pointers are
+  // null. Record() asserts exactly this pairing.
+  layer.Record(command_list.Get(), params, DmlPtr(qkv_buf.Get(), 0),
+               /*q=*/DmlPtr(), /*k=*/DmlPtr(), /*v=*/DmlPtr(),
+               DmlPtr(raw_decay_buf.Get(), 0), DmlPtr(dt_bias_buf.Get(), 0),
+               DmlPtr(a_log_buf.Get(), 0), DmlPtr(beta_buf.Get(), 0),
+               DmlPtr(order_buf.Get(), 0), DmlPtr(mixed_buf.Get(), 0));
+
+  D3D12_RESOURCE_BARRIER barrier = {};
+  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  barrier.Transition.pResource = mixed_buf.Get();
+  barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  command_list->ResourceBarrier(1, &barrier);
+  command_list->CopyBufferRegion(readback_buf.Get(), 0, mixed_buf.Get(), 0,
+                                 expected.size() * sizeof(float));
+  command_list->Close();
+
+  test_device.RunAndWait(command_list.Get());
+
+  float* readback_ptr = nullptr;
+  readback_buf->Map(0, nullptr, reinterpret_cast<void**>(&readback_ptr));
+
+  int mismatches = 0;
+  float max_abs_diff = 0.0f;
+  for (size_t i = 0; i < expected.size(); ++i) {
+    const float diff = std::fabs(readback_ptr[i] - expected[i]);
+    max_abs_diff = std::max(max_abs_diff, diff);
+    if (diff > 1.0e-3f) {
+      if (mismatches < 5) {
+        ADD_FAILURE() << "fused-qkv mismatch at index " << i
+                      << ": gpu=" << readback_ptr[i] << " cpu=" << expected[i]
+                      << " diff=" << diff;
+      }
+      ++mismatches;
+    }
+  }
+  readback_buf->Unmap(0, nullptr);
+
+  EXPECT_EQ(mismatches, 0)
+      << mismatches << "/" << expected.size() << " elements mismatched at "
+      << "heads=" << heads << " key_dim=" << key_dim
+      << " value_dim=" << value_dim
+      << " under use_fused_qkv=true, max abs diff = " << max_abs_diff;
+}
+
+// Production geometry, identical shape and seed to the unfused test above, so
+// the two differ ONLY in qkv memory layout.
+TEST(KdaRecurrence, FusedQkvMatchesCpuReferenceAtProductionShape) {
+  RunFusedQkvCase(/*heads=*/16, /*key_dim=*/32, /*value_dim=*/32);
+}
+
+// Asymmetric geometry, and it is not decoration. The fused k offset strides by
+// KDA_KEY_DIM while the v offset strides by KDA_VALUE_DIM; at key_dim ==
+// value_dim those two are the same number, so the production-shape case above
+// cannot tell them apart and would pass with the two swapped. This shape is the
+// only thing in the suite that pins that distinction down. Mirrors the
+// DimBisect_Heads16_Key32Only geometry the parity suite already uses.
+TEST(KdaRecurrence, FusedQkvMatchesCpuReferenceAtAsymmetricDims) {
+  RunFusedQkvCase(/*heads=*/16, /*key_dim=*/32, /*value_dim=*/4);
+}
+
 }  // namespace
 }  // namespace directml_backend
 }  // namespace lczero
