@@ -299,11 +299,19 @@ void FillPolicyEncoder(pblczero::Net* net, std::mt19937& rng, int pol_emb,
 
 // head_scale is a FIXTURE-SPECIFIC amplifier, default 1.0 so every existing
 // net is untouched. It scales only the three projections that set OUTPUT
-// magnitude -- the policy Q/K and the WDL logits -- because the suite's bar
-// is kTol + kRelTol*|ref| with kTol an ABSOLUTE 2e-4. A net whose policy
-// peaks at 0.037 and whose q is 0.0036 sits far below that floor, so a
-// multi-percent relative defect passes unseen. Raising the magnitude puts a
-// fixture in the regime the bar was designed for; it does NOT change the bar.
+// magnitude -- the policy Q/K and the WDL logits.
+//
+// It was introduced under the OLD additive bar, where it was necessary for
+// detectability: at this fixture's unamplified policy peak of 0.0374 that bar
+// was 2.019e-4, i.e. 0.54% relative, and the measured local-conv control
+// defect of 1.278e-4 (0.34% relative) fell under it and passed.
+//
+// Under the calibrated rule it is NO LONGER required for detectability. The
+// floor at that same peak is 5e-5, i.e. 0.134% relative, and the same 0.34%
+// control defect is rejected without any amplification. What the amplifier
+// still buys is margin: it moves the fixture from a 2.6x rejection to 86x,
+// which is worth keeping so the test is not sitting just over the line. It
+// does NOT change the bar.
 void FillPolicyAndValueHeads(pblczero::Net* net, std::mt19937& rng,
                              const NetDims& d, bool moves_left, int mlh,
                              float head_scale = 1.0f) {
@@ -579,12 +587,61 @@ const DmlAvailability& DirectMlAvailability() {
   return cached;
 }
 
-// Same tolerance rationale as the SYCL parity test: the recurrence is
-// sequential-float in both backends, the surrounding GEMMs accumulate in
-// different orders, and an actual math divergence (wrong traversal, dropped
-// gate, wrong softmax axis) produces errors ~1e-1+, two orders of magnitude
-// above this bar.
-constexpr float kTol = 2e-4f;
+// Comparison bounds, calibrated by MEASUREMENT rather than by the size of
+// bugs already caught. The previous rationale claimed real divergences run
+// ~1e-1+; that is false by three orders of magnitude, and believing it cost
+// real coverage. Under the old additive rule (2e-4 + 5e-5*|ref|), removing
+// the KDA local convolution outright moved policy by 1.278e-4 on a net whose
+// policy peaks at 0.037 -- 3.4e-3 relative -- and PASSED. The feature shipped
+// with a test that exercised it and could not fail.
+//
+// MEASURED NOISE, 2026-09-05, this machine:
+//   synthetic single-position, 12 fixtures, blas~eigen and dml~blas:
+//     q, d and policy absolute max 2.98e-08. That is exactly one float32 ULP
+//     at ~0.33, the magnitude the WDL probabilities sit at; the floor is one
+//     last-bit rounding difference, not a distribution with a tail.
+//   synthetic batch, 5 fixtures, every sample: same 2.98e-08 ceiling, and
+//     m max 9.3e-10.
+//   real nets kda-native-935532 and kda-native-825532, dml~blas:
+//     q 7.86781e-06, d 8.00192e-06, m 1.421e-05 relative, policy 9.408e-06
+//     relative. Real nets are two orders looser than synthetic ones, which
+//     is why a bound calibrated only on synthetic fixtures would reject
+//     healthy real nets.
+//   DirectML is bit-identical run to run over the complete 1858-element
+//     policy vector, single and batch, so none of the above is
+//     nondeterminism. (That rules out nondeterminism as a source; it does
+//     not by itself prove every remaining delta is accumulation order.)
+//
+// SHAPE OF THE BOUND. q and d are bounded in [-1,1] and get a pure ABSOLUTE
+// bar. A relative bar is meaningless for them: one measured batch sample has
+// q = 0.00015, where a single ULP is already 2e-4 relative. m and policy are
+// unbounded -- m is a ply count reaching 34.6, policy logits reach 6.5 -- so
+// their bars scale with the reference's own magnitude.
+//
+// max(), NOT addition. The old rule added the absolute and relative terms,
+// which makes it looser than a pure relative bar at every scale above 4: at
+// m=17.4553 it allowed 1.073e-3 where 5e-5*|ref| allows 8.728e-4. Taking the
+// max is uniformly tighter and still never falls below the absolute floor.
+//
+// MARGINS over the measured maxima: q 6.4x, d 6.2x, policy 5.3x, m 3.5x.
+// The m margin is the WEAKEST of the four, it rests on two real nets alone,
+// and it has no rejection evidence behind it at all -- every synthetic
+// fixture here returns m=0, so no control defect has ever moved m. It is
+// justified by noise headroom only, and it is the first number to revisit
+// when more real nets are available. Nothing here is proof about other
+// devices or drivers; it is this machine, today.
+constexpr float kAbsTol = 5e-5f;
+constexpr float kScaleTol = 5e-5f;
+
+// q and d: bounded in [-1,1], so absolute only. Deliberately takes no
+// reference value -- passing one would invite reintroducing relative scaling.
+inline float BoundedOutputBound() { return kAbsTol; }
+
+// m and policy: unbounded, so the bar scales with the reference's own
+// magnitude and never drops below the absolute floor.
+inline float ScaledOutputBound(float reference_scale) {
+  return std::max(kAbsTol, kScaleTol * std::fabs(reference_scale));
+}
 
 // Every sample of a multi-position batch, against BLAS.
 //
@@ -618,16 +675,12 @@ void CompareBackendsBatch(const pblczero::Net& net, int batch) {
   const std::vector<Outputs> dml =
       RunNetworkBatch(test_backend, net, planes);
 
-  constexpr float kRelTol = 5e-5f;
-  auto bound = [](float reference_value) {
-    return kTol + kRelTol * std::fabs(reference_value);
-  };
   for (int n = 0; n < batch; ++n) {
-    EXPECT_NEAR(dml[n].q, reference[n].q, bound(reference[n].q))
+    EXPECT_NEAR(dml[n].q, reference[n].q, BoundedOutputBound())
         << "sample " << n << ": WDL value Q diverges";
-    EXPECT_NEAR(dml[n].d, reference[n].d, bound(reference[n].d))
+    EXPECT_NEAR(dml[n].d, reference[n].d, BoundedOutputBound())
         << "sample " << n << ": WDL draw probability diverges";
-    EXPECT_NEAR(dml[n].m, reference[n].m, bound(reference[n].m))
+    EXPECT_NEAR(dml[n].m, reference[n].m, ScaledOutputBound(reference[n].m))
         << "sample " << n << ": moves-left diverges";
 
     float ref_absmax = 0.0f, worst = 0.0f;
@@ -641,9 +694,23 @@ void CompareBackendsBatch(const pblczero::Net& net, int batch) {
         worst_move = i;
       }
     }
-    EXPECT_LT(worst, bound(ref_absmax))
+    EXPECT_LT(worst, ScaledOutputBound(ref_absmax))
         << "sample " << n << ": policy diverges (worst move " << worst_move
         << ", diff " << worst << ")";
+
+    // Decision parity per SAMPLE, not only for sample 0. A wrong per-sample
+    // stride can leave sample 0 correct and flip the move played in every
+    // other position of the batch, which is exactly how the policy_finalize
+    // ROW_STRIDE bug presented.
+    int dml_best = 0, ref_best = 0;
+    for (int i = 1; i < 1858; ++i) {
+      if (dml[n].policy[i] > dml[n].policy[dml_best]) dml_best = i;
+      if (reference[n].policy[i] > reference[n].policy[ref_best]) ref_best = i;
+    }
+    EXPECT_EQ(dml_best, ref_best)
+        << "sample " << n << ": policy argmax differs, directml picks "
+        << dml_best << " (logit " << dml[n].policy[dml_best] << "), blas picks "
+        << ref_best << " (logit " << reference[n].policy[ref_best] << ")";
   }
 }
 
@@ -675,43 +742,12 @@ void CompareBackends(const pblczero::Net& net) {
   }
   const Outputs dml = RunNetwork(test_backend, net, planes);
 
-  // kTol alone is an ABSOLUTE bar, which is the right shape for q and d --
-  // both bounded in [-1, 1] -- but wrong for moves-left and for policy
-  // logits, neither of which is bounded. Moves-left is a ply count: on
-  // kda-native-825532 it is 17.455, so 2e-4 absolute demands 1.1e-5
-  // relative, tighter than two fp32 GEMM orderings agree. That net's body
-  // matches BLAS to 4e-6 relative at every stage, and q, d and policy all
-  // pass; only m missed, by 2.5e-4 on 17.455 (1.4e-5 relative).
-  //
-  // So allow atol + rtol * |reference|, with rtol anchored to a MEASURED
-  // noise floor rather than to the size of the bugs already caught. That
-  // latter argument is survivorship: the binding-overrun bug left the policy
-  // head bit-exact while the value head was garbage, so partial wrongness is
-  // this backend's real signature, and a smaller overrun or a single wrong
-  // broadcast element lands at O(1/N) relative -- under any bar calibrated on
-  // 39% errors.
-  //
-  // The floor is measured by running the reference against ITSELF under a
-  // different accumulation order: LC0_TEST_BACKEND=eigen compares MKL BLAS
-  // against Eigen through the same network_blas.cc code. Worst relative
-  // difference over the real nets, position 0:
-  //   blas vs eigen     m 1.3e-6 .. 1.9e-6,  policy 9.4e-7 .. 2.8e-6
-  //   blas vs directml  m 1.1e-7 .. 1.4e-5,  policy 7.8e-6 .. 9.4e-6
-  // DirectML sits within ~10x of the reference's own floor, which is what a
-  // different device with different tiling and FMA contraction should cost --
-  // not the ~100x that would mean something systematic is left.
-  //
-  // rtol is set just above the worst observed (1.4e-5), not an order above:
-  // slack is where the first small systematic error hides.
-  constexpr float kRelTol = 5e-5f;
-  auto bound = [](float reference_value) {
-    return kTol + kRelTol * std::fabs(reference_value);
-  };
-  EXPECT_NEAR(dml.q, reference.q, bound(reference.q))
+  // Bounds and their calibration live with the constants above.
+  EXPECT_NEAR(dml.q, reference.q, BoundedOutputBound())
       << "WDL value Q diverges between directml and blas";
-  EXPECT_NEAR(dml.d, reference.d, bound(reference.d))
+  EXPECT_NEAR(dml.d, reference.d, BoundedOutputBound())
       << "WDL draw probability diverges between directml and blas";
-  EXPECT_NEAR(dml.m, reference.m, bound(reference.m))
+  EXPECT_NEAR(dml.m, reference.m, ScaledOutputBound(reference.m))
       << "moves-left diverges between directml and blas";
 
   if (getenv("LC0_DIAG_OUTPUTS")) {
@@ -734,8 +770,13 @@ void CompareBackends(const pblczero::Net& net) {
     };
     const float mdiff = std::fabs(dml.m - reference.m);
     const float qdiff = std::fabs(dml.q - reference.q);
+    // d was missing here, which meant an output the suite ASSERTS on was
+    // never reported by its own diagnostic; the tolerance study had to infer
+    // it by subtracting rounded text.
+    const float ddiff = std::fabs(dml.d - reference.d);
     CERR << std::scientific << std::setprecision(3)
          << "[diff] q " << qdiff << " (rel " << rel(qdiff, reference.q)
+         << ")  d " << ddiff << " (rel " << rel(ddiff, reference.d)
          << ")  m " << mdiff << " (rel " << rel(mdiff, reference.m)
          << ")  policy " << pol_worst << " (rel "
          << rel(pol_worst, ref_absmax) << ")";
@@ -756,7 +797,7 @@ void CompareBackends(const pblczero::Net& net) {
       worst_move = i;
     }
   }
-  EXPECT_LT(worst, bound(ref_absmax))
+  EXPECT_LT(worst, ScaledOutputBound(ref_absmax))
       << "policy diverges between directml and blas (worst move "
       << worst_move << ", diff " << worst << ")";
 
