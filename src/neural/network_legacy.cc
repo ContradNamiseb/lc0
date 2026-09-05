@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <string>
 #include <utility>
 
 #include "utils/exception.h"
@@ -60,6 +61,91 @@ BaseWeights::BaseWeights(const pblczero::Weights& weights)
   encoder_head_count = weights.headcount();
   for (const auto& enc : weights.encoder()) {
     encoder.emplace_back(enc);
+  }
+
+}
+
+// Validation for the attention-body embedding normalisation tensors.
+//
+// Gated on CONSUMPTION, not on tensor presence. Both LayerNorm calls in the
+// BLAS reference sit inside `if (is_pe_dense_embedding_)` (network_blas.cc
+// :917 and :941) and neither checks whether the tensors exist, so presence is
+// the wrong predicate in both directions: a consuming net with BOTH tensors
+// absent would still reach the unguarded reads, and a NON-consuming net that
+// happens to carry them would be rejected for tensors nobody touches.
+//
+// Callers pass the flag they already derive from the network format --
+// input_embedding() == INPUT_EMBEDDING_PE_DENSE -- so the predicate here is
+// the same one that selects the code doing the reading.
+//
+// Why REJECT rather than substitute zeros. The reference LayerNorm CENTRES
+// its input: LayerNorm2DWithSkipConnection in backends/blas/encoder.h
+// computes betas[c] + gammas[c] * (x - mean) * den. Zero betas would give
+// gamma * (x - mean) / sqrt(var + eps) -- centred normalisation with no
+// offset, which is NOT RMSNorm, since that omits centring entirely. So zeros
+// are right only if the absent beta meant a zero offset and silently wrong if
+// it meant RMSNorm, and nothing in the proto distinguishes those:
+// ip_emb_ln_gammas/betas are bare optional Layers, and the only rms fields
+// (rms_norm_epsilon, output_rms_norm) live inside the Kda message and are
+// per-encoder. A net that legitimately wants an offset-free normalisation
+// needs a proto field saying so, not an absent tensor.
+//
+// Each site is sized against the width its own consumer uses: the first
+// LayerNorm runs at embedding_size (ip_emb_b), the second at
+// ip_emb_ffn.dense2_b.size(), which are separate quantities.
+void ValidateEmbeddingNormWeights(const BaseWeights& weights,
+                                  bool consumes_pe_dense_embedding) {
+  if (!consumes_pe_dense_embedding) return;
+
+  auto check = [](const BaseWeights::Vec& gammas, const BaseWeights::Vec& betas,
+                  size_t width, const char* g_name, const char* b_name,
+                  const char* width_name) {
+    if (width == 0) {
+      throw Exception(std::string("net selects the dense positional-encoding "
+                                  "embedding, which normalises at ") +
+                      width_name + ", but that is empty");
+    }
+    for (const auto& t : {std::make_pair(&gammas, g_name),
+                          std::make_pair(&betas, b_name)}) {
+      if (t.first->size() == width) continue;
+      throw Exception(
+          std::string("net selects the dense positional-encoding embedding, "
+                      "which reads ") +
+          t.second + " unconditionally, but that tensor has " +
+          std::to_string(t.first->size()) + " elements and " + width_name +
+          " is " + std::to_string(width) +
+          ". A net that normalises here must carry complete, correctly sized "
+          "gamma AND beta: the normalisation an absent beta intends is "
+          "unknowable from the weights alone, and guessing it would silently "
+          "change the network's arithmetic");
+    }
+  };
+
+  check(weights.ip_emb_ln_gammas, weights.ip_emb_ln_betas,
+        weights.ip_emb_b.size(), "ip_emb_ln_gammas", "ip_emb_ln_betas",
+        "the embedding width (ip_emb_b)");
+  check(weights.ip_emb_ffn_ln_gammas, weights.ip_emb_ffn_ln_betas,
+        weights.ip_emb_ffn.dense2_b.size(), "ip_emb_ffn_ln_gammas",
+        "ip_emb_ffn_ln_betas", "the embedding FFN output width "
+        "(ip_emb_ffn.dense2_b)");
+
+  // Residual compatibility, which sizing each tensor to its own consumer does
+  // NOT establish. The FFN LayerNorm normalises at dense2_b.size() channels
+  // but takes its SKIP input from buffer1, which holds ip_emb_b.size()
+  // channels per token (network_blas.cc:959-964). Gamma, beta and the FFN
+  // output can all agree with each other and still disagree with that skip,
+  // and the add would then read across token boundaries.
+  if (weights.ip_emb_ffn.dense2_b.size() != weights.ip_emb_b.size()) {
+    throw Exception(
+        "net selects the dense positional-encoding embedding, whose FFN "
+        "LayerNorm adds a skip connection from the embedding output, but the "
+        "FFN output width (ip_emb_ffn.dense2_b) is " +
+        std::to_string(weights.ip_emb_ffn.dense2_b.size()) +
+        " while the embedding width (ip_emb_b) is " +
+        std::to_string(weights.ip_emb_b.size()) +
+        ". These must match: the skip is read with the embedding stride and "
+        "normalised with the FFN stride, so a mismatch reads across token "
+        "boundaries");
   }
 }
 

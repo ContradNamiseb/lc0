@@ -471,6 +471,13 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
 
   const bool is_pe_dense =
       nf.input_embedding() == NF::INPUT_EMBEDDING_PE_DENSE;
+
+  // Same check the reference performs. DirectML uploads these tensors by
+  // size (layers.cc:1203, 1209), so an absent one yields a zero-byte arena
+  // allocation that a WeightChannel then reads across -- a potential invalid
+  // read rather than the reference's outright fault, which is a worse way to
+  // find out.
+  ValidateEmbeddingNormWeights(weights_, is_pe_dense);
   const std::vector<int> kda_directions(nf.kda_directions().begin(),
                                         nf.kda_directions().end());
   // Reject anything the traversal table does not cover. Without this an

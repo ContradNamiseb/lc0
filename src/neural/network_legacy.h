@@ -212,6 +212,13 @@ struct LegacyWeights : public BaseWeights {
   Vec ip2_val_b;
 };
 
+// Rejects a net whose attention-body embedding normalisation tensors are
+// absent or mis-sized, when the network format says that path is used.
+// Declared here so every consumer calls the same check; see the definition
+// for why absence is rejected rather than defaulted.
+void ValidateEmbeddingNormWeights(const BaseWeights& weights,
+                                  bool consumes_pe_dense_embedding);
+
 struct MultiHeadWeights : public BaseWeights {
   explicit MultiHeadWeights(const pblczero::Weights& weights);
 

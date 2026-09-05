@@ -46,6 +46,8 @@
 #include "utils/weights_adapter.h"
 #include "neural/network.h"
 #include "proto/net.pb.h"
+#include "neural/network_legacy.h"
+#include "utils/exception.h"
 #include "utils/optionsdict.h"
 #include "neural/backends/directml/dml_common.h"
 
@@ -1713,6 +1715,158 @@ TEST(DirectMlKdaParity, MatchesBlasOnNoEncoderNet) {
 }
 
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// Embedding LayerNorm weight validation. LOAD-TIME, no GPU.
+//
+// The validation is gated on CONSUMPTION, not on tensor presence, and these
+// tests exercise the same format-aware entry point production uses:
+// ValidateEmbeddingNormWeights(weights, consumes_pe_dense_embedding), called
+// from network_blas.cc where is_pe_dense_embedding_ is derived and from
+// network_directml.cc where is_pe_dense is.
+//
+// Presence is the wrong predicate in both directions, which is why an earlier
+// version of this guard was wrong: both LayerNorm calls sit inside
+// `if (is_pe_dense_embedding_)` and neither checks that the tensors exist, so
+// a CONSUMING net with both absent still reached the unguarded reads, while a
+// NON-consuming net carrying them would have been rejected over tensors
+// nobody touches. Both cases are tested below.
+namespace {
+
+// A net on the consuming path: dense positional-encoding embedding, so it
+// carries ip_emb_preproc and an embedding FFN, whose dense2_b width is what
+// the SECOND LayerNorm normalises at -- a different quantity from ip_emb_b,
+// which is what the first uses. Callers choose each tensor's length; 0 omits.
+pblczero::Net MakeConsumingNet(int ln_gammas, int ln_betas, int ffn_gammas,
+                               int ffn_betas, int ffn_out = -1) {
+  NetDims d;
+  pblczero::Net file = MakeNetWithDims(d, 7701);
+  std::mt19937 rng(7702);
+  auto* w = file.mutable_weights();
+  FillLayer(w->mutable_ip_emb_preproc_w(),
+            RandomVec(rng, 64 * d.embedding * 64 * 12, 0.05f));
+  FillLayer(w->mutable_ip_emb_preproc_b(),
+            RandomVec(rng, 64 * d.embedding, 0.05f));
+  auto* ffn = w->mutable_ip_emb_ffn();
+  FillLayer(ffn->mutable_dense1_w(), GammaVec(rng, d.embedding * d.embedding));
+  FillLayer(ffn->mutable_dense1_b(), RandomVec(rng, d.embedding, 0.05f));
+  // ffn_out defaults to the embedding width, which is what the FFN LayerNorm's
+  // skip connection requires; tests override it to exercise that check.
+  const int out = ffn_out < 0 ? d.embedding : ffn_out;
+  FillLayer(ffn->mutable_dense2_w(), GammaVec(rng, d.embedding * out));
+  FillLayer(ffn->mutable_dense2_b(), RandomVec(rng, out, 0.05f));
+  if (ln_gammas > 0) {
+    FillLayer(w->mutable_ip_emb_ln_gammas(), GammaVec(rng, ln_gammas));
+  }
+  if (ln_betas > 0) {
+    FillLayer(w->mutable_ip_emb_ln_betas(), RandomVec(rng, ln_betas, 0.05f));
+  }
+  if (ffn_gammas > 0) {
+    FillLayer(w->mutable_ip_emb_ffn_ln_gammas(), GammaVec(rng, ffn_gammas));
+  }
+  if (ffn_betas > 0) {
+    FillLayer(w->mutable_ip_emb_ffn_ln_betas(),
+              RandomVec(rng, ffn_betas, 0.05f));
+  }
+  return file;
+}
+
+// Requires the rejection AND that the message names the offending tensor. An
+// earlier version of these tests asserted only that something was thrown, and
+// every case "passed" by throwing "Could not find valid policy head weights"
+// -- the right verdict for the wrong reason. A test that cannot say WHY it
+// rejected is not evidence.
+void ExpectRejectedNaming(const pblczero::Net& net, const char* tensor) {
+  const MultiHeadWeights decoded{net.weights()};
+  try {
+    ValidateEmbeddingNormWeights(decoded, /*consumes=*/true);
+    ADD_FAILURE() << "expected validation to throw, naming " << tensor;
+  } catch (const Exception& e) {
+    EXPECT_NE(std::string(e.what()).find(tensor), std::string::npos)
+        << "threw, but not about " << tensor << ": " << e.what();
+  }
+}
+
+constexpr int kEmb = 32;  // NetDims::embedding, what ip_emb_b is sized to.
+
+}  // namespace
+
+// The case that motivated this: gammas present, betas absent. Exactly
+// kda-hybrid-512x8-transformer-3000, which faulted at 0xC0000005.
+TEST(EmbeddingLnValidation, RejectsAbsentBeta) {
+  ExpectRejectedNaming(MakeConsumingNet(kEmb, 0, kEmb, kEmb),
+                       "ip_emb_ln_betas");
+}
+
+TEST(EmbeddingLnValidation, RejectsAbsentFfnBeta) {
+  ExpectRejectedNaming(MakeConsumingNet(kEmb, kEmb, kEmb, 0),
+                       "ip_emb_ffn_ln_betas");
+}
+
+// BOTH absent while the format says the path is taken. This is the hole the
+// presence-based version of the guard left open: it returned early and let
+// the net through to the unguarded reads.
+TEST(EmbeddingLnValidation, RejectsBothAbsentOnConsumingPath) {
+  ExpectRejectedNaming(MakeConsumingNet(0, 0, kEmb, kEmb),
+                       "ip_emb_ln_gammas");
+}
+
+TEST(EmbeddingLnValidation, RejectsBothAbsentFfnOnConsumingPath) {
+  ExpectRejectedNaming(MakeConsumingNet(kEmb, kEmb, 0, 0),
+                       "ip_emb_ffn_ln_gammas");
+}
+
+// Present but wrong length, separate from absence: the bound is the width the
+// consumer normalises at, not agreement between the two tensors.
+TEST(EmbeddingLnValidation, RejectsWrongLengthBeta) {
+  ExpectRejectedNaming(MakeConsumingNet(kEmb, kEmb / 2, kEmb, kEmb),
+                       "ip_emb_ln_betas");
+}
+
+TEST(EmbeddingLnValidation, RejectsWrongLengthGamma) {
+  ExpectRejectedNaming(MakeConsumingNet(kEmb / 2, kEmb, kEmb, kEmb),
+                       "ip_emb_ln_gammas");
+}
+
+TEST(EmbeddingLnValidation, RejectsWrongLengthFfnBeta) {
+  ExpectRejectedNaming(MakeConsumingNet(kEmb, kEmb, kEmb, kEmb / 2),
+                       "ip_emb_ffn_ln_betas");
+}
+
+// Everything internally consistent at the WRONG width: the FFN output and both
+// its norm tensors agree with each other at 16 while the embedding is 32.
+// Sizing each tensor to its own consumer accepts this; only the residual
+// check catches it. The FFN LayerNorm adds a skip from the embedding output,
+// so the two strides must agree.
+TEST(EmbeddingLnValidation, RejectsFfnWidthDisagreeingWithEmbedding) {
+  ExpectRejectedNaming(
+      MakeConsumingNet(kEmb, kEmb, kEmb / 2, kEmb / 2, kEmb / 2),
+      "ip_emb_ffn.dense2_b");
+}
+
+TEST(EmbeddingLnValidation, AcceptsCompleteTensorsOnConsumingPath) {
+  const pblczero::Net net = MakeConsumingNet(kEmb, kEmb, kEmb, kEmb);
+  const MultiHeadWeights decoded{net.weights()};
+  EXPECT_NO_THROW(ValidateEmbeddingNormWeights(decoded, /*consumes=*/true));
+}
+
+// Non-consuming architectures are preserved by FORMAT, not by tensor absence.
+// Every other fixture in this file is one of these, so over-broad validation
+// here would take the whole suite down with it.
+TEST(EmbeddingLnValidation, AcceptsNonConsumingArchitecture) {
+  const pblczero::Net net = MakeNetWithDims(NetDims(), 7703);
+  const MultiHeadWeights decoded{net.weights()};
+  EXPECT_NO_THROW(ValidateEmbeddingNormWeights(decoded, /*consumes=*/false));
+}
+
+// And a non-consuming net that happens to CARRY the tensors must also load:
+// nothing reads them, so their sizes are not this validation's business.
+TEST(EmbeddingLnValidation, AcceptsNonConsumingWithTensorsPresent) {
+  const pblczero::Net net = MakeConsumingNet(kEmb / 2, kEmb, 0, 0);
+  const MultiHeadWeights decoded{net.weights()};
+  EXPECT_NO_THROW(ValidateEmbeddingNormWeights(decoded, /*consumes=*/false));
+}
+
 }  // namespace lczero
 
 int main(int argc, char** argv) {

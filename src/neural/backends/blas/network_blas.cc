@@ -1298,6 +1298,11 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
           file.format().network_format().input_embedding()) ==
       InputEmbedding::INPUT_EMBEDDING_PE_DENSE;
 
+  // Both embedding LayerNorm calls below are selected by this flag and read
+  // their gamma/beta unconditionally, so validate them against the widths
+  // their own consumers use before any of that runs.
+  ValidateEmbeddingNormWeights(weights_, is_pe_dense_embedding_);
+
   if (attn_body_) {
     const auto smol_act = nf.smolgen_activation();
     smolgen_activation_ = smol_act == NF::ACTIVATION_DEFAULT
