@@ -48,6 +48,13 @@
 #include "proto/net.pb.h"
 #include "neural/network_legacy.h"
 #include "utils/exception.h"
+#include "utils/files.h"
+#include <cstdlib>
+#include <atomic>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include "utils/optionsdict.h"
 #include "neural/backends/directml/dml_common.h"
 
@@ -1742,6 +1749,14 @@ pblczero::Net MakeConsumingNet(int ln_gammas, int ln_betas, int ffn_gammas,
   NetDims d;
   pblczero::Net file = MakeNetWithDims(d, 7701);
   std::mt19937 rng(7702);
+  // MakeNetWithDims sets INPUT_EMBEDDING_NONE, which is NOT the consuming
+  // path: the backends gate the embedding LayerNorm on
+  // input_embedding() == INPUT_EMBEDDING_PE_DENSE. Without this the net is
+  // correctly skipped by the validation and loads fine, which made the
+  // subprocess rejection test fail with the guard working exactly as
+  // designed and the fixture simply not being what it claimed.
+  file.mutable_format()->mutable_network_format()->set_input_embedding(
+      pblczero::NetworkFormat::INPUT_EMBEDDING_PE_DENSE);
   auto* w = file.mutable_weights();
   FillLayer(w->mutable_ip_emb_preproc_w(),
             RandomVec(rng, 64 * d.embedding * 64 * 12, 0.05f));
@@ -1867,9 +1882,171 @@ TEST(EmbeddingLnValidation, AcceptsNonConsumingWithTensorsPresent) {
   EXPECT_NO_THROW(ValidateEmbeddingNormWeights(decoded, /*consumes=*/false));
 }
 
+
+// ---------------------------------------------------------------------------
+// `lc0 benchmark` exit status on load failure.
+//
+// The benchmark printed the failure and returned normally, leaving the
+// process status at 0, so a net that could not be loaded looked like a
+// successful benchmark to anything checking exit codes -- including any CI
+// step that runs one. Found while validating the embedding normalisation
+// weights: the rejection message appeared and the shell still reported
+// success.
+//
+// These drive the real binary as a subprocess, because the property under
+// test IS the process exit status and nothing in-process can observe it.
+namespace {
+
+// Directory of this test binary, captured in main(). lc0 sits beside it in
+// the build tree.
+std::string& TestBinaryDir() {
+  static std::string dir;
+  return dir;
+}
+
+// A private directory for one test's fixtures and captured output, removed
+// when the test ends. Fixed names in the shared TEMP would let concurrent
+// test processes overwrite each other's inputs and logs, and the resulting
+// verdicts would be about whichever process wrote last.
+class ScopedTempDir {
+ public:
+  ScopedTempDir() {
+    static std::atomic<unsigned> counter{0};
+    const auto stamp = std::chrono::high_resolution_clock::now()
+                           .time_since_epoch()
+                           .count();
+    path_ = std::filesystem::temp_directory_path() /
+            ("lc0_exit_test_" + std::to_string(stamp) + "_" +
+             std::to_string(counter++));
+    std::filesystem::create_directories(path_);
+  }
+  ~ScopedTempDir() {
+    std::error_code ec;  // best effort; a leaked temp dir must not fail a test
+    std::filesystem::remove_all(path_, ec);
+  }
+  ScopedTempDir(const ScopedTempDir&) = delete;
+  ScopedTempDir& operator=(const ScopedTempDir&) = delete;
+
+  std::string File(const char* name) const {
+    return (path_ / name).string();
+  }
+
+ private:
+  std::filesystem::path path_;
+};
+
+// Returns lc0's exit status, capturing its output so a caller can assert WHY
+// it failed. Status alone is not enough: an early version of these fixtures
+// omitted the weight magic, so the rejection cases "passed" by failing on
+// "bad header" without ever reaching the validation they claim to test.
+// Substring proving the binary actually started; without checking it, a
+// missing or unfindable lc0.exe would make cmd return nonzero and every
+// rejection test would pass without lc0 ever running.
+constexpr const char* kLc0Started = "Loading weights file from";
+
+int RunLc0(const ScopedTempDir& dir, const std::string& args,
+           std::string* output = nullptr) {
+  const std::string log = dir.File("output.txt");
+  // cmd.exe strips the first and last quote of a command that begins with
+  // one, which silently broke the redirect and left the captured output
+  // empty. Wrapping the whole command in an additional pair is the documented
+  // workaround.
+  const std::string cmd = "\"\"" + TestBinaryDir() + "lc0.exe\" " + args +
+                          " > \"" + log + "\" 2>&1\"";
+  const int status = std::system(cmd.c_str());
+  if (output) {
+    std::ifstream in(log);
+    *output = std::string((std::istreambuf_iterator<char>(in)),
+                          std::istreambuf_iterator<char>());
+  }
+  return status;
+}
+
+// Writes a net where a serialized proto is all that is needed: zlib's gzread
+// reads uncompressed files transparently, so the loader accepts this without
+// the test having to compress anything.
+std::string WriteNet(const ScopedTempDir& dir, const pblczero::Net& net,
+                     const char* name) {
+  const std::string path = dir.File(name);
+  // The loader requires the weight magic (loader.cc:57, kWeightMagic 0x1c0).
+  // Without it a net is rejected as "bad header" before anything else is
+  // examined, which is how an early version of these tests passed for the
+  // wrong reason.
+  pblczero::Net loadable = net;
+  loadable.set_magic(0x1c0);
+  // loader.cc:184-187 rejects any encoding but LINEAR16 below version 0.33.0,
+  // which is what FillLayer already writes (min/max plus quantised params).
+  loadable.mutable_format()->set_weights_encoding(pblczero::Format::LINEAR16);
+  WriteStringToFile(path, loadable.OutputAsString());
+  return path;
+}
+
+}  // namespace
+
+// A net this build rejects must fail the process, not just print. Uses the
+// embedding-normalisation rejection because it is deterministic and needs no
+// external file.
+TEST(BenchmarkExitStatus, NonzeroOnRejectedNet) {
+  if (TestBinaryDir().empty()) GTEST_SKIP() << "binary dir unknown";
+  const ScopedTempDir dir;
+  const std::string path =
+      WriteNet(dir, MakeConsumingNet(kEmb, 0, kEmb, kEmb), "rejected.pb");
+  std::string output;
+  EXPECT_NE(RunLc0(dir, "benchmark --backend=blas --weights=\"" + path +
+                       "\" --nodes=1 --num-positions=1",
+                   &output),
+            0)
+      << "a rejected net must exit nonzero";
+  // And for the right reason: it must be the validation that rejected it, not
+  // a malformed fixture failing earlier.
+  EXPECT_NE(output.find(kLc0Started), std::string::npos)
+      << "lc0 did not run at all: " << output;
+  EXPECT_NE(output.find("ip_emb_ln_betas"), std::string::npos)
+      << "expected the embedding-normalisation rejection, got: " << output;
+}
+
+TEST(BenchmarkExitStatus, NonzeroOnMissingWeightsFile) {
+  if (TestBinaryDir().empty()) GTEST_SKIP() << "binary dir unknown";
+  const ScopedTempDir dir;
+  // Guaranteed missing because the directory is fresh and this file is never
+  // written into it.
+  const std::string missing = dir.File("no_such_net.pb");
+  std::string output;
+  EXPECT_NE(RunLc0(dir,
+                   "benchmark --backend=blas --weights=\"" + missing +
+                       "\" --nodes=1 --num-positions=1",
+                   &output),
+            0)
+      << "a missing weights file must exit nonzero";
+  EXPECT_NE(output.find(kLc0Started), std::string::npos)
+      << "lc0 did not run at all; nonzero here would prove nothing: " << output;
+}
+
+// The converse, so the fix cannot be "always fail": a net that loads and runs
+// must still report success.
+TEST(BenchmarkExitStatus, ZeroOnSuccessfulBenchmark) {
+  if (TestBinaryDir().empty()) GTEST_SKIP() << "binary dir unknown";
+  const ScopedTempDir dir;
+  const std::string path =
+      WriteNet(dir, MakeNetWithDims(NetDims(), 7801), "valid.pb");
+  std::string output;
+  EXPECT_EQ(RunLc0(dir, "benchmark --backend=blas --weights=\"" + path +
+                       "\" --nodes=1 --num-positions=1",
+                   &output),
+            0)
+      << "a benchmark that loads and runs must exit zero: " << output;
+}
+
 }  // namespace lczero
 
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
+  // The subprocess tests need lc0, which sits beside this binary.
+  if (argc > 0 && argv[0]) {
+    const std::string self = argv[0];
+    const size_t slash = self.find_last_of("/\\");
+    lczero::TestBinaryDir() =
+        slash == std::string::npos ? std::string() : self.substr(0, slash + 1);
+  }
   return RUN_ALL_TESTS();
 }
