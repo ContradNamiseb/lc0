@@ -859,15 +859,30 @@ void DirectMlNetwork<DataType>::forwardEval(
     list->ResourceBarrier(1, &vcopy);
   }
 
-  // Moves left head.
+  // Moves left head. Same scratch + copy workaround as the value head above
+  // (network_directml.cc:835-843's comment): binding this graph's output
+  // straight to io->moves_left_gpu_ hits the identical driver quirk (silent
+  // no-op write to an io buffer), just never worked around here before.
   if (moves_left_) {
     network_[l++]->Eval(batch, spare1, flow, spare2, scratch, scratch_bytes_,
                         scope);
     network_[l++]->Eval(batch, spare2, spare1, spare2, scratch, scratch_bytes_,
                         scope);
-    DmlPtr op_mov(io->moves_left_gpu_.Get(), 0);
-    network_[l++]->Eval(batch, op_mov, spare2, spare2, scratch, scratch_bytes_,
-                        scope);
+    DmlPtr op_mov_scratch(scratch_arena_.resource(), 0);
+    network_[l++]->Eval(batch, op_mov_scratch, spare2, spare2, scratch,
+                        scratch_bytes_, scope);
+    D3D12_RESOURCE_BARRIER mcopy = {};
+    mcopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    mcopy.Transition.pResource = io->moves_left_gpu_.Get();
+    mcopy.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    mcopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    list->ResourceBarrier(1, &mcopy);
+    list->CopyBufferRegion(io->moves_left_gpu_.Get(), 0,
+                           scratch_arena_.resource(), 0,
+                           (uint64_t)batch * sizeof(DataType));
+    mcopy.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    mcopy.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    list->ResourceBarrier(1, &mcopy);
   }
 
   // Readback: policy/value/moves-left UAV -> COPY_SOURCE -> readback.
