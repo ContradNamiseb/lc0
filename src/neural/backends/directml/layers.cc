@@ -2493,7 +2493,13 @@ void EncoderBlock<DataType>::BuildMhaTails(int N, DmlExecScope& scope) {
   const uint32_t emb = embedding_op_size_;
   const size_t elem = sizeof(DataType);
 
-  // 1: the merged-heads dense projection -> raw gemm.
+  // 1: the merged-heads dense projection, with LN1 fused in (agora thread
+  // 19 #460: mirrors BuildKdaTails' fix in 5c7622c, which was scoped to
+  // KDA only at the time -- MHA tails were still on layer_norm.hlsl,
+  // the same hand-written-HLSL-under-fp16 kernel that corrupted KDA
+  // before that fix, and gemini's real-net finding (kda-native-825532,
+  // whose 4th encoder is MHA, producing fp16 NaNs) is consistent with the
+  // same defect here).
   if (!mha_tail1_compiled_.count(N)) {
     GraphFactory<DataType> g(scope.ctx());
     auto mg = g.Input({1, 1, tokens, d_model});
@@ -2501,31 +2507,44 @@ void EncoderBlock<DataType>::BuildMhaTails(int N, DmlExecScope& scope) {
     dml::Expression dense =
         dml::Gemm(mg, dw, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
                   DML_MATRIX_TRANSFORM_TRANSPOSE);
+    auto dense_b = g.WeightChannel(mha_dense_b_, tokens, emb);
+    auto skip_in = g.Extra({1, 1, tokens, emb});
+    auto ln1_g = g.WeightChannel(ln1_gammas_, tokens, emb);
+    auto ln1_b = g.WeightChannel(ln1_betas_, tokens, emb);
+    dml::Expression ln1_out =
+        LayerNormExpr<DataType>(dense, &dense_b, &skip_in, ln1_g, ln1_b,
+                                alpha_, default_eps_, ACTIVATION_NONE);
     mha_tail1_compiled_.emplace(
-        N, g.Compile({dense}, {(uint64_t)tokens * emb * elem}));
+        N, g.Compile({ln1_out}, {(uint64_t)tokens * emb * elem}));
   }
 
-  // 2: the FFN between the two LayerNorms.
+  // 2: the FFN between the two LayerNorms, with LN2 fused in.
   //
   // NOTE: biases here MUST be WeightChannel (strided matching-sizes), not
   // dense size-1 [1,1,1,C]: this runtime rejects size-1 broadcast in
   // elementwise Add (E_INVALIDARG at CreateOperator).
   if (!mha_tail2_compiled_.count(N)) {
     GraphFactory<DataType> g(scope.ctx());
-    auto ln1 = g.Input({1, 1, tokens, emb});
+    dml::Expression ln1_in = g.Input({1, 1, tokens, emb});
     auto f1w = g.Weight(ffn_dense1_w_, {1, 1, (uint32_t)ffn_dense1_size_, emb});
     auto f1b =
         g.WeightChannel(ffn_dense1_b_, tokens, (uint32_t)ffn_dense1_size_);
     dml::Expression ffn1 =
-        dml::Gemm(ln1, f1w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+        dml::Gemm(ln1_in, f1w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
                   DML_MATRIX_TRANSFORM_TRANSPOSE) + f1b;
     ffn1 = ActivationExpr<DataType>(ffn_activation_, ffn1);
     auto f2w = g.Weight(ffn_dense2_w_, {1, 1, emb, (uint32_t)ffn_dense1_size_});
-    dml::Expression ffn2 =
+    dml::Expression ffn2_raw =
         dml::Gemm(ffn1, f2w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
                   DML_MATRIX_TRANSFORM_TRANSPOSE);
+    auto ffn2_b = g.WeightChannel(ffn_dense2_b_, tokens, emb);
+    auto ln2_g = g.WeightChannel(ln2_gammas_, tokens, emb);
+    auto ln2_b = g.WeightChannel(ln2_betas_, tokens, emb);
+    dml::Expression out =
+        LayerNormExpr<DataType>(ffn2_raw, &ffn2_b, &ln1_in, ln2_g, ln2_b,
+                                alpha_, default_eps_, ACTIVATION_NONE);
     mha_tail2_compiled_.emplace(
-        N, g.Compile({ffn2}, {(uint64_t)tokens * emb * elem}));
+        N, g.Compile({out}, {(uint64_t)tokens * emb * elem}));
   }
 }
 
@@ -2665,37 +2684,25 @@ void EncoderBlock<DataType>::EvalMha(int N, DmlPtr in_out_tensor,
     mha_transpose_->Record(scope.list(), params, ctxb, merged);
   }
 
-  // 5. Dense projection, LN1, FFN, LN2: two GEMM graphs with a fused
-  // LayerNorm dispatch after each. `dense` is dead once LN1 has consumed it,
-  // so the FFN's output reuses its buffer -- two [tokens, emb] temporaries
-  // in total, which is what the LN scratch region is sized for.
+  // 5. Dense projection with LN1 fused in, then FFN with LN2 fused in (see
+  // BuildMhaTails; agora thread 19 #460 -- mirrors the KDA fix in 5c7622c).
+  // `dense` and the raw FFN output are now pure graph-internal
+  // intermediates -- neither needs a persistent buffer, so ln_scratch only
+  // needs to hold `ln1` (uses less of it than before, never more, so no
+  // arena-sizing implications).
   {
     BuildMhaTails(N, scope);
     const uint32_t emb = (uint32_t)embedding_op_size_;
-    const DmlPtr dense = ln_scratch;
     const DmlPtr ln1 = ln_scratch + max_tokens * emb * elem;
-    const DmlPtr ffn2 = dense;
 
+    // Skip is the block input, still in in_out_tensor at this point.
     DispatchOp<DataType>(scope, mha_tail1_compiled_.at(N), merged, buffer2,
-                         buffer2, {dense});
+                         buffer2, {ln1}, in_out_tensor);
 
-    LayerNormLayer::Params ln{};
-    ln.rows = tokens;
-    ln.channels = emb;
-    ln.has_bias = true;
-    ln.has_skip = true;
-    ln.act = ACTIVATION_NONE;
-    ln.alpha = alpha_;
-    ln.eps = default_eps_;
-    // LN1's skip is the block input, which in_out_tensor still holds.
-    layer_norm_->Record(scope.list(), ln, dense, mha_dense_b_, in_out_tensor,
-                        ln1_gammas_, ln1_betas_, ln1);
-
+    // Writes directly into in_out_tensor, same destination as the old
+    // separate LN2 dispatch did.
     DispatchOp<DataType>(scope, mha_tail2_compiled_.at(N), ln1, buffer2,
-                         buffer2, {ffn2});
-
-    layer_norm_->Record(scope.list(), ln, ffn2, ffn_dense2_b_, ln1,
-                        ln2_gammas_, ln2_betas_, in_out_tensor);
+                         buffer2, {in_out_tensor});
   }
 }
 
