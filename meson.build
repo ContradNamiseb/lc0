@@ -642,6 +642,39 @@ if get_option('build_backends')
   endif
 
   ## ~~~~~~~~~~
+  ## DirectML
+  ## ~~~~~~~~~~
+  # Native DirectMLX operator graph, hand-built the same way the SYCL backend
+  # hand-writes kernels: network_directml.cc only orchestrates, layers.cc
+  # holds one Build() per layer type mirroring sycl/layers.h's Eval() split,
+  # and inputs_outputs.h owns the D3D12 upload/default/readback buffers the
+  # same way sycl/inputs_outputs.h owns its USM allocations.
+  directml_ready = false
+  if host_machine.system() == 'windows' and get_option('directml')
+    dml_d3d12_lib = cc.find_library('d3d12', required: false)
+    dml_dxgi_lib = cc.find_library('dxgi', required: false)
+    dml_lib = cc.find_library('directml', required: false)
+    dml_compiler_lib = cc.find_library('d3dcompiler', required: false)
+    if dml_d3d12_lib.found() and dml_dxgi_lib.found() and dml_lib.found()
+      dml_deps = [dml_d3d12_lib, dml_dxgi_lib, dml_lib]
+      if dml_compiler_lib.found()
+        dml_deps += [dml_compiler_lib]
+      endif
+      deps += dml_deps
+      includes += include_directories('third_party/directml')
+      files += [
+        'src/neural/backends/directml/network_directml.cc',
+        'src/neural/backends/directml/layers.cc',
+      ]
+      has_backends = true
+      directml_ready = true
+    else
+      warning('directml requested but d3d12/dxgi/DirectML.lib were not all found; ' +
+              'needs the Windows 10/11 SDK (DirectML.h/.lib ship in it since 10.0.18362).')
+    endif
+  endif
+
+  ## ~~~~~~~~~~
   ## ONNX
   ## ~~~~~~~~~~
   onnxruntime = cc.find_library('onnxruntime', dirs: get_option('onnx_libdir'),
@@ -1010,6 +1043,33 @@ if get_option('gtest')
                'src/neural/memcache.cc', pb_files,
     include_directories: includes, link_with: lc0_lib, dependencies: [gtest, gmock]),
     args: '--gtest_output=xml:engine_test.xml', timeout: 90)
+
+  if directml_ready
+    # Standalone kernel-level test: links layers.cc only, no factory, no
+    # backend registration (its own main).
+    test('KdaRecurrenceDirectML',
+      executable('kda_recurrence_test_directml',
+                 'src/neural/backends/directml/test_kda_recurrence.cc',
+                 'src/neural/backends/directml/layers.cc', pb_files,
+                 'src/utils/logging.cc',
+        include_directories: includes + include_directories('third_party/directml'),
+        dependencies: [gtest] + dml_deps),
+      args: '--gtest_output=xml:kda_recurrence_directml.xml', timeout: 300)
+
+    # Whole-network parity vs the BLAS reference, the same harness the SYCL
+    # kda_parity_test uses.
+    # Sources ('files', like the lc0 executable -- common_files has no
+    # backends) compiled straight into the executable: backend registration
+    # happens in static initializers inside each backend object, so archive
+    # linking would drop the unreferenced registration objects.
+    test('KdaParityDirectML',
+      executable('kda_parity_test_directml',
+                 'src/neural/backends/directml/test_kda_parity_directml.cc',
+                 files,
+        include_directories: includes + include_directories('third_party/directml'),
+        dependencies: [deps, gtest]),
+      args: '--gtest_output=xml:kda_parity_directml.xml', timeout: 600)
+  endif
 endif
 
 

@@ -113,6 +113,11 @@ option('onednn',
        value: false,
        description: 'Enable oneDNN backend')
 
+option('directml',
+       type: 'boolean',
+       value: false,
+       description: 'Enable native DirectML backend')
+
 option('openblas',
        type: 'boolean',
        value: true,

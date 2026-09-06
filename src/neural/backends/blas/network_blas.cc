@@ -17,6 +17,7 @@
  */
 
 #include <algorithm>
+#include <fstream>
 #include <cassert>
 #include <cmath>
 #include <iostream>
@@ -31,6 +32,7 @@
 #include "neural/backends/shared/winograd_filter.h"
 #include "neural/factory.h"
 #include "neural/network.h"
+#include "neural/kda_directions.h"
 #include "neural/network_legacy.h"
 #include "neural/tables/attention_policy_map.h"
 #include "neural/tables/policy_map.h"
@@ -278,59 +280,6 @@ void vec_adjust(std::vector<float>& vec, size_t size) {
 
 // Traversal order of the 64 squares for each KdaDirection value. Must match
 // KDA_TRAVERSALS in the trainer.
-static int KdaSquareForToken(int direction, int token) {
-  switch (direction) {
-    case 1:
-      return token;
-    case 2:
-      return 63 - token;
-    case 3:
-      return (token % 8) * 8 + token / 8;
-    case 4: {
-      const int reverse = 63 - token;
-      return (reverse % 8) * 8 + reverse / 8;
-    }
-    case 5: {
-      static constexpr int kTable[64] = {
-        7, 6, 15, 5, 14, 23, 4, 13, 22, 31, 3, 12, 21, 30, 39, 2,
-        11, 20, 29, 38, 47, 1, 10, 19, 28, 37, 46, 55, 0, 9, 18, 27,
-        36, 45, 54, 63, 8, 17, 26, 35, 44, 53, 62, 16, 25, 34, 43, 52,
-        61, 24, 33, 42, 51, 60, 32, 41, 50, 59, 40, 49, 58, 48, 57, 56
-      };
-      return kTable[token];
-    }
-    case 6: {
-      static constexpr int kTable[64] = {
-        56, 57, 48, 58, 49, 40, 59, 50, 41, 32, 60, 51, 42, 33, 24, 61,
-        52, 43, 34, 25, 16, 62, 53, 44, 35, 26, 17, 8, 63, 54, 45, 36,
-        27, 18, 9, 0, 55, 46, 37, 28, 19, 10, 1, 47, 38, 29, 20,
-        11, 2, 39, 30, 21, 12, 3, 31, 22, 13, 4, 23, 14, 5, 15, 6, 7
-      };
-      return kTable[token];
-    }
-    case 7: {
-      static constexpr int kTable[64] = {
-        0, 1, 8, 2, 9, 16, 3, 10, 17, 24, 4, 11, 18, 25, 32, 5,
-        12, 19, 26, 33, 40, 6, 13, 20, 27, 34, 41, 48, 7, 14, 21, 28,
-        35, 42, 49, 56, 15, 22, 29, 36, 43, 50, 57, 23, 30, 37, 44, 51,
-        58, 31, 38, 45, 52, 59, 39, 46, 53, 60, 47, 54, 61, 55, 62, 63
-      };
-      return kTable[token];
-    }
-    case 8: {
-      static constexpr int kTable[64] = {
-        63, 62, 55, 61, 54, 47, 60, 53, 46, 39, 59, 52, 45, 38, 31, 58,
-        51, 44, 37, 30, 23, 57, 50, 43, 36, 29, 22, 15, 56, 49, 42, 35,
-        28, 21, 14, 7, 48, 41, 34, 27, 20, 13, 6, 40, 33, 26, 19, 12,
-        5, 32, 25, 18, 11, 4, 24, 17, 10, 3, 16, 9, 2, 8, 1, 0
-      };
-      return kTable[token];
-    }
-    default:
-      throw Exception("Unsupported KDA traversal direction.");
-  }
-}
-
 // Reference implementation of the gated delta rule, written as the plain
 // sequential recurrence the trainer's chunkwise-parallel form is equivalent to.
 template <bool use_eigen>
@@ -411,15 +360,22 @@ void BlasComputation<use_eigen>::ForwardKdaMixer(
   std::vector<float> hidden(tokens * gate_rank);
   std::vector<float> mixed(tokens * value_depth);
 
+  // The trainer's qkv_silu applies SiLU (= Swish, x*sigmoid(x)) to the
+  // q/k/v projections. Matches kda.py F.silu when qkv_silu is set. (Ported
+  // from the sycl-openvino-fix lineage so this branch's BLAS reference
+  // evaluates trained qkv_silu nets correctly.)
+  const ActivationFunction qkv_act =
+      kda.qkv_silu ? ACTIVATION_SWISH : ACTIVATION_NONE;
+
   FullyConnectedLayer<use_eigen>::Forward1D(
       tokens, embedding_size, key_depth, proj_input.data(), kda.q_w.data(),
-      bias(kda.q_b), ACTIVATION_NONE, q.data());
+      bias(kda.q_b), qkv_act, q.data());
   FullyConnectedLayer<use_eigen>::Forward1D(
       tokens, embedding_size, key_depth, proj_input.data(), kda.k_w.data(),
-      bias(kda.k_b), ACTIVATION_NONE, k.data());
+      bias(kda.k_b), qkv_act, k.data());
   FullyConnectedLayer<use_eigen>::Forward1D(
       tokens, embedding_size, value_depth, proj_input.data(), kda.v_w.data(),
-      bias(kda.v_b), ACTIVATION_NONE, v.data());
+      bias(kda.v_b), qkv_act, v.data());
 
   FullyConnectedLayer<use_eigen>::Forward1D(
       tokens, embedding_size, gate_rank, proj_input.data(),
@@ -804,16 +760,46 @@ void BlasComputation<use_eigen>::ComputeBlocking() {
                                policy_head.ip_pol_b.size());
   }
 
+  // The attention policy head writes into buffer1/buffer2/buffer3 with its
+  // OWN widths, which are head quantities and have nothing to do with the
+  // body. max_channels above stays exactly what it is -- a body/Winograd
+  // bound -- because inflating it globally would enlarge unrelated
+  // allocations and hide the coupling. What has to grow is only the width
+  // the three shared buffers are sized from:
+  //
+  //   - the policy embedding writes batch * kSquares * policy_embedding_size
+  //     floats into buffer2 (see the Forward1D below "Policy Embedding");
+  //   - Q and K write batch * kSquares * policy_d_model into buffer1 and
+  //     buffer3, and are then INDEXED with a policy_d_model stride, as is
+  //     the promotion-offset loop.
+  //
+  // Either width exceeding max_channels overruns the allocation. The symptom
+  // is heap corruption reported at some later, unrelated allocation, which
+  // points nowhere near the cause.
+  size_t buffer_width = max_channels;
+  if (attn_policy_) {
+    const size_t policy_embedding_size = policy_head.ip_pol_b.size();
+    // policy_d_model is derived the same way the head derives it, but the
+    // division is guarded here: this runs during allocation, before any of
+    // the head's own validity assumptions have been exercised.
+    const size_t policy_d_model =
+        policy_embedding_size > 0
+            ? policy_head.ip2_pol_w.size() / policy_embedding_size
+            : 0;
+    buffer_width = std::max(buffer_width,
+                            std::max(policy_embedding_size, policy_d_model));
+  }
+
   std::unique_ptr<Buffers> buffers = network_->GetBuffers();
 
   // Allocate data for the whole batch.
   std::vector<float>& buffer1 = buffers->buffer1;
-  vec_adjust(buffer1, largest_batch_size * max_channels * kSquares);
+  vec_adjust(buffer1, largest_batch_size * buffer_width * kSquares);
   std::vector<float>& buffer2 = buffers->buffer2;
-  vec_adjust(buffer2, largest_batch_size * max_channels * kSquares);
+  vec_adjust(buffer2, largest_batch_size * buffer_width * kSquares);
   std::vector<float>& buffer3 = buffers->buffer3;
   vec_adjust(buffer3, largest_batch_size *
-                          std::max(max_channels * kSquares, max_fc_channels));
+                          std::max(buffer_width * kSquares, max_fc_channels));
   std::vector<float>& head_buffer = buffers->buffer4;
   vec_adjust(head_buffer, largest_batch_size * max_head_planes * kSquares);
 
@@ -982,11 +968,27 @@ void BlasComputation<use_eigen>::ComputeBlocking() {
       }
 
       // Attention body encoders.
+      // LC0_DUMP_BODY=<prefix> writes the embedding output and each encoder's
+      // output as raw floats, so another backend's dumps can be diffed
+      // against them to find which layer diverges. Debug aid only.
+      const char* dump_prefix = getenv("LC0_DUMP_BODY");
+      auto dump_stage = [&](const char* stage, const std::vector<float>& buf) {
+        if (!dump_prefix) return;
+        const std::string path =
+            std::string(dump_prefix) + ".blas." + stage + ".bin";
+        const size_t n = std::min<size_t>(buf.size(), 64 * 1024);
+        std::ofstream f(path, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(buf.data()),
+                n * sizeof(float));
+      };
+      dump_stage("emb", buffer1);
+      int dump_index = 0;
       for (auto& layer : weights_.encoder) {
         ForwardEncoderLayer(buffer1, buffer2, buffer3, head_buffer, batch_size,
                             layer, embedding_size, weights_.encoder_head_count,
                             smolgen_activation_, ffn_activation_, alpha,
                             is_pe_dense_embedding_ ? 1e-3 : 1e-6);
+        dump_stage(("enc" + std::to_string(dump_index++)).c_str(), buffer1);
       }
     }
 
@@ -1282,7 +1284,7 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
   kda_directions_.assign(nf.kda_directions().begin(),
                          nf.kda_directions().end());
   for (const int direction : kda_directions_) {
-    if (direction < 1 || direction > 8) {
+    if (direction < 1 || direction > 16) {
       throw Exception("Unsupported KDA traversal direction.");
     }
   }
@@ -1295,6 +1297,11 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
       static_cast<InputEmbedding>(
           file.format().network_format().input_embedding()) ==
       InputEmbedding::INPUT_EMBEDDING_PE_DENSE;
+
+  // Both embedding LayerNorm calls below are selected by this flag and read
+  // their gamma/beta unconditionally, so validate them against the widths
+  // their own consumers use before any of that runs.
+  ValidateEmbeddingNormWeights(weights_, is_pe_dense_embedding_);
 
   if (attn_body_) {
     const auto smol_act = nf.smolgen_activation();

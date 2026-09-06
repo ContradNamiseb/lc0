@@ -27,6 +27,7 @@
 
 #include "tools/benchmark.h"
 
+#include <cstdlib>
 #include <numeric>
 
 #include "neural/memcache.h"
@@ -143,6 +144,12 @@ void Benchmark::Run(bool run_shorter_benchmark) {
               << std::endl;
   } catch (Exception& ex) {
     std::cerr << ex.what() << std::endl;
+    // Exit nonzero. Printing the failure and returning normally left the
+    // process status at 0, so a net that could not be loaded -- a missing
+    // file, or one this build rejects -- looked like a successful benchmark
+    // to anything checking exit codes. The message is left exactly as it
+    // was; only the status changes.
+    std::exit(EXIT_FAILURE);
   }
 }
 
