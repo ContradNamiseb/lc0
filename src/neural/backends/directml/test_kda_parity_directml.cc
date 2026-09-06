@@ -1055,6 +1055,40 @@ TEST(DirectMlKdaParity, MatchesBlasOnWidePolicyEncoderBatch) {
   CompareBackendsBatch(MakeWidePolicyEncoderNet(128), 4);
 }
 
+// Wide policy-encoder FFN. Every other fixture in this file leaves the policy
+// encoder's dff at 64; this drives it to 384, a geometry nothing else here
+// reaches. What it checks is that DirectML's graph creation and binding agree
+// numerically with BLAS's ForwardEncoderLayer at that width, at batch 1 and
+// batch 4.
+//
+// It does NOT guard a buffer-sizing invariant, and an earlier version of this
+// comment wrongly claimed it did. ForwardEncoderLayer sizes its own scratch
+// from dff before the FFN runs (network_blas.cc:513-514,
+// `vec_adjust(encoder_buffer4, batch * kSquares * max(kSquares * heads,
+// dff_size))`), so the FFN write is covered by construction and there is no
+// gap for a test to protect.
+//
+// pol_emb must equal pol_dmodel, for the same reason MakeWidePolicyEncoderNet
+// states: DirectML rejects the graph outright when they differ.
+pblczero::Net MakeWideFfnPolicyEncoderNet(int dff) {
+  NetDims d;
+  d.pol_emb = 128;
+  d.pol_dmodel = 128;
+  std::mt19937 rng(9400 + dff);
+  pblczero::Net file = MakeNetWithDims(d, 9400 + dff);
+  FillPolicyEncoder(&file, rng, d.pol_emb, d.pol_dmodel, /*heads=*/8,
+                    /*dff=*/dff);
+  return file;
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnWideFfnPolicyEncoder) {
+  CompareBackends(MakeWideFfnPolicyEncoderNet(384));
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnWideFfnPolicyEncoderBatch) {
+  CompareBackendsBatch(MakeWideFfnPolicyEncoderNet(384), 4);
+}
+
 // The local 3x3 depthwise convolution before the KDA mixer (added in b3bc1c5)
 // had ZERO parity coverage in either direction: every net in this suite
 // hardcoded local_conv=false, so the feature was live in production and never
