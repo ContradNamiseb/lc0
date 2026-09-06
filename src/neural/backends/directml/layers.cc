@@ -251,6 +251,23 @@ class GraphFactory {
     return AddTensor({}, DmlBindingRef::Kind::kInput, std::move(sizes),
                      std::move(strides));
   }
+  // Explicit FLOAT32 input, bypassing the DataType template -- mirrors
+  // WeightU32 above (same bare-TensorDesc pattern, different dtype). Used by
+  // the KDA recurrence's fp32 boundary (note 2523/2494): the recurrence
+  // kernel always runs in float regardless of the network's DataType, so
+  // its "mixed" output needs a genuinely float32-typed graph input wherever
+  // it re-enters a DataType-typed graph (kda_tail1_compiled_ in a fp16
+  // network) for the immediate dml::Cast back to DataType to have something
+  // real to read.
+  dml::Expression InputF32(Sizes sizes) {
+    const uint64_t bytes = std::accumulate(
+        sizes.begin(), sizes.end(), uint64_t{sizeof(float)},
+        [](uint64_t a, uint32_t b) { return a * b; });
+    dml::TensorDesc desc(DML_TENSOR_DATA_TYPE_FLOAT32, sizes);
+    dml::Expression e = dml::InputTensor(graph_, next_input_++, desc);
+    bindings_.push_back({DmlBindingRef::Kind::kInput, {}, bytes});
+    return e;
+  }
   dml::Expression Input2(Sizes sizes, Sizes strides = {}) {
     return AddTensor({}, DmlBindingRef::Kind::kInput2, std::move(sizes),
                      std::move(strides));
@@ -1640,6 +1657,40 @@ std::vector<BodyDump>& BodyDumps() {
   return dumps;
 }
 
+// Shared by every LC0_DUMP_BODY call site (AttentionBody's per-encoder-layer
+// dump below, and EvalKda's finer sub-stage dumps added for the note
+// 2523/2494 fp16 overflow bisection): copies a fixed, generous byte range
+// from a UAV tensor into a mapped readback buffer for network_directml.cc to
+// write out after the whole eval completes. The fixed size (not scratch- or
+// tensor-shape-derived) is deliberate -- it needs no caller-side plumbing of
+// the real element count, at the cost of the file holding trailing garbage
+// past whatever the real tensor size is; a reader must already know (from
+// the network config, or from the BLAS-side dump of the same stage, which
+// IS exactly sized) how many leading elements are real.
+inline void DumpBodyStage(const std::string& stage, DmlPtr src,
+                          DmlExecScope& scope) {
+  if (!getenv("LC0_DUMP_BODY")) return;
+  const uint64_t bytes = 64 * 1024 * sizeof(float);
+  BodyDump d;
+  d.stage = stage;
+  d.bytes = bytes;
+  d.readback = detail::CreateBuffer(scope.ctx().device(), bytes,
+                                    D3D12_HEAP_TYPE_READBACK,
+                                    D3D12_RESOURCE_STATE_COPY_DEST);
+  D3D12_RESOURCE_BARRIER b = {};
+  b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  b.Transition.pResource = src.res;
+  b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  scope.list()->ResourceBarrier(1, &b);
+  scope.list()->CopyBufferRegion(d.readback.Get(), 0, src.res, src.offset,
+                                 bytes);
+  b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  scope.list()->ResourceBarrier(1, &b);
+  BodyDumps().push_back(std::move(d));
+}
+
 template <typename DataType>
 void AttentionBody<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
                                    DmlPtr input2, DmlPtr scratch,
@@ -1955,8 +2006,15 @@ EncoderBlock<DataType>::EncoderBlock(
     kda_decay_b_b_ = uploader.Add(kda.decay_b_b);
     kda_beta_w_ = uploader.Add(kda.beta_w);
     kda_beta_b_ = uploader.Add(kda.beta_b);
-    kda_a_log_ = uploader.Add(kda.a_log);
-    kda_dt_bias_ = uploader.Add(kda.dt_bias);
+    // AddRaw, not Add: the recurrence shader always reads these two as
+    // native float (see kda_recurrence_'s fp16=false above), so they must
+    // stay genuinely float32 in memory even in a fp16 network -- Add's
+    // standard fp32->DataType conversion at FlushWeights would otherwise
+    // leave them 2-byte half while the shader reads them as 4-byte float.
+    kda_a_log_ =
+        uploader.AddRaw(kda.a_log.data(), kda.a_log.size() * sizeof(float));
+    kda_dt_bias_ = uploader.AddRaw(kda.dt_bias.data(),
+                                   kda.dt_bias.size() * sizeof(float));
     kda_gate_a_w_ = uploader.Add(kda.gate_a_w);
     kda_gate_a_b_ = uploader.Add(kda.gate_a_b);
     kda_gate_b_w_ = uploader.Add(kda.gate_b_w);
@@ -1993,8 +2051,22 @@ EncoderBlock<DataType>::EncoderBlock(
       kda_direction_order_ =
           uploader.AddRaw(order.data(), order.size() * sizeof(uint32_t));
     }
+    // note 2523/2494's fp32 recurrence boundary: the recurrence kernel
+    // always compiles/runs with INPUT_TYPE=float, regardless of the
+    // network's own DataType. Its q/k/v/raw_decay/beta inputs are upcast to
+    // FLOAT32 in kda_proj_compiled_'s graph (see EnsureCompiled/EvalKda
+    // below), kda_a_log_/kda_dt_bias_ are uploaded via AddRaw to stay
+    // genuinely float32 in memory (see above), and its "mixed" output is
+    // cast back to DataType before re-entering kda_tail1_compiled_ (see
+    // BuildKdaTails). This sidesteps whatever FXC/SM5.1 StructuredBuffer<
+    // half> hazard was producing genuine IEEE-754 half infinities here
+    // (confirmed by dumping the recurrence's own inputs clean and its
+    // output already at the fp16 ceiling with real NaNs, agora thread 19
+    // #429) by never letting this one shader touch half-typed buffers at
+    // all, while every GEMM/projection/FFN elsewhere stays fp16 for
+    // throughput.
     kda_recurrence_ = std::make_unique<KdaRecurrenceLayer>(
-        ctx.device(), fp16, kda_key_dim_, kda_value_dim_);
+        ctx.device(), /*fp16=*/false, kda_key_dim_, kda_value_dim_);
     if (kda_local_conv_) {
       kda_local_conv_layer_ =
           std::make_unique<KdaLocalConvLayer>(ctx.device(), fp16);
@@ -2059,10 +2131,21 @@ void EncoderBlock<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
                          DML_MATRIX_TRANSFORM_NONE,
                          DML_MATRIX_TRANSFORM_TRANSPOSE) + b;
       }();
-      std::vector<dml::Expression> outs{qe, ke, ve, raw_decay_e};
+      // note 2523/2494's fp32 recurrence boundary: q/k/v/raw_decay/beta feed
+      // KdaRecurrenceLayer, which always runs in float now (see the
+      // kda_recurrence_ constructor above) -- upcast here so DirectML fuses
+      // the cast into this graph's existing GEMMs instead of adding a
+      // dispatch. gate stays native DataType width: it never touches the
+      // recurrence, only kda_tail1_compiled_ (BuildKdaTails), unchanged.
+      const size_t rec_elem = sizeof(float);
+      auto to_rec = [&](dml::Expression e) {
+        return fp16_ ? dml::Cast(e, DML_TENSOR_DATA_TYPE_FLOAT32) : e;
+      };
+      std::vector<dml::Expression> outs{to_rec(qe), to_rec(ke), to_rec(ve),
+                                        to_rec(raw_decay_e)};
       std::vector<uint64_t> out_bytes{
-          (uint64_t)tokens * KD * elem, (uint64_t)tokens * KD * elem,
-          (uint64_t)tokens * VD * elem, (uint64_t)tokens * KD * elem};
+          (uint64_t)tokens * KD * rec_elem, (uint64_t)tokens * KD * rec_elem,
+          (uint64_t)tokens * VD * rec_elem, (uint64_t)tokens * KD * rec_elem};
       if (kda_output_gate_) {
         dml::Expression gate_hidden_e =
             gemm_bias(kda_gate_a_w_, kda_gate_a_b_, gr, ACTIVATION_NONE);
@@ -2078,8 +2161,8 @@ void EncoderBlock<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
       }
       dml::Expression beta_e =
           gemm_bias(kda_beta_w_, kda_beta_b_, encoder_heads_, ACTIVATION_NONE);
-      outs.push_back(beta_e);
-      out_bytes.push_back((uint64_t)tokens * encoder_heads_ * elem);
+      outs.push_back(to_rec(beta_e));
+      out_bytes.push_back((uint64_t)tokens * encoder_heads_ * rec_elem);
       kda_proj_compiled_.emplace(N, g.Compile(outs, out_bytes));
     }
     BuildKdaTails(N, scope);
@@ -2315,7 +2398,16 @@ void EncoderBlock<DataType>::BuildKdaTails(int N, DmlExecScope& scope) {
   // LayerNorm that follows, so they are absent here.
   if (!kda_tail1_compiled_.count(N)) {
     GraphFactory<DataType> g(scope.ctx());
-    auto mixed_in = g.Input({1, 1, tokens, VD});
+    // note 2523/2494's fp32 recurrence boundary: "mixed" (this graph's
+    // input) is written by the always-fp32 KdaRecurrenceLayer now, so in a
+    // fp16 network it's genuinely float32 in memory -- read it as such via
+    // InputF32 and cast down to DataType immediately. DirectML fuses this
+    // into the top of the same compiled graph, no extra dispatch. In a fp32
+    // network this is a no-op float->float cast (fp16_ is false, RHS taken).
+    dml::Expression mixed_in =
+        fp16_ ? dml::Cast(g.InputF32({1, 1, tokens, VD}),
+                          DmlTensorType<DataType>())
+              : g.Input({1, 1, tokens, VD});
     dml::Expression normed = mixed_in;
     if (kda_output_rms_norm_) {
       auto gammas = g.WeightChannel(kda_out_norm_gammas_, tokens, VD);
@@ -2330,28 +2422,55 @@ void EncoderBlock<DataType>::BuildKdaTails(int N, DmlExecScope& scope) {
     dml::Expression dense =
         dml::Gemm(normed, dw, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
                   DML_MATRIX_TRANSFORM_TRANSPOSE);
+    // Path 1 (note 2523/2494's second bug, agora thread 19 #435-#438): LN1
+    // used to be a separate layer_norm_->Record dispatch through hand-written
+    // HLSL (layer_norm.hlsl) reading/writing StructuredBuffer<half> -- the
+    // kernel a clean, small (0.035) input was traced INTO before it came out
+    // at 64832 with real NaNs. Fusing LayerNormExpr directly into this graph
+    // instead removes that kernel from the KDA tail entirely, in favor of
+    // the native DirectML LayerNorm path EmbeddingLayer already uses without
+    // a single bad value anywhere in this whole investigation (layers.cc's
+    // EmbeddingLayer::Eval, same LayerNormExpr call). Skip is the block
+    // input (in_out_tensor), bound via GraphFactory's Extra/kExtra slot at
+    // dispatch time -- Input and Input2 are already spoken for by mixed_in
+    // and gate_in above.
+    auto dense_b = g.WeightChannel(kda_dense_b_, tokens, emb);
+    auto skip_in = g.Extra({1, 1, tokens, emb});
+    auto ln1_g = g.WeightChannel(ln1_gammas_, tokens, emb);
+    auto ln1_b = g.WeightChannel(ln1_betas_, tokens, emb);
+    dml::Expression ln1_out =
+        LayerNormExpr<DataType>(dense, &dense_b, &skip_in, ln1_g, ln1_b,
+                                alpha_, default_eps_, ACTIVATION_NONE);
     kda_tail1_compiled_.emplace(
-        N, g.Compile({dense}, {(uint64_t)tokens * emb * elem}));
+        N, g.Compile({ln1_out}, {(uint64_t)tokens * emb * elem}));
   }
 
-  // 2: the FFN between the two LayerNorms. ffn_dense2's bias is left to the
-  // second fused LayerNorm.
+  // 2: the FFN between the two LayerNorms, with LN2 fused in for the same
+  // reason as LN1 above. ln1_in is read once and reused as LN2's skip --
+  // it's the exact same value layer_norm_->Record used to take as its own
+  // separate `ln1` skip argument, no separate binding needed for it.
   if (!kda_tail2_compiled_.count(N)) {
     GraphFactory<DataType> g(scope.ctx());
-    auto ln1 = g.Input({1, 1, tokens, emb});
+    dml::Expression ln1_in = g.Input({1, 1, tokens, emb});
     auto f1w = g.Weight(ffn_dense1_w_, {1, 1, (uint32_t)ffn_dense1_size_, emb});
     auto f1b =
         g.WeightChannel(ffn_dense1_b_, tokens, (uint32_t)ffn_dense1_size_);
     dml::Expression ffn1 =
-        dml::Gemm(ln1, f1w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
+        dml::Gemm(ln1_in, f1w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
                   DML_MATRIX_TRANSFORM_TRANSPOSE) + f1b;
     ffn1 = ActivationExpr<DataType>(ffn_activation_, ffn1);
     auto f2w = g.Weight(ffn_dense2_w_, {1, 1, emb, (uint32_t)ffn_dense1_size_});
-    dml::Expression ffn2 =
+    dml::Expression ffn2_raw =
         dml::Gemm(ffn1, f2w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
                   DML_MATRIX_TRANSFORM_TRANSPOSE);
+    auto ffn2_b = g.WeightChannel(ffn_dense2_b_, tokens, emb);
+    auto ln2_g = g.WeightChannel(ln2_gammas_, tokens, emb);
+    auto ln2_b = g.WeightChannel(ln2_betas_, tokens, emb);
+    dml::Expression out =
+        LayerNormExpr<DataType>(ffn2_raw, &ffn2_b, &ln1_in, ln2_g, ln2_b,
+                                alpha_, default_eps_, ACTIVATION_NONE);
     kda_tail2_compiled_.emplace(
-        N, g.Compile({ffn2}, {(uint64_t)tokens * emb * elem}));
+        N, g.Compile({out}, {(uint64_t)tokens * emb * elem}));
   }
 }
 
@@ -2582,16 +2701,26 @@ void EncoderBlock<DataType>::EvalKda(int N, DmlPtr in_out_tensor,
   const uint32_t emb = embedding_op_size_;
   const size_t elem = sizeof(DataType);
 
-  // Scratch layout mirrors sycl EvalKda's, in bytes.
+  // Scratch layout mirrors sycl EvalKda's, in bytes -- except q/k/v/
+  // raw_decay/beta are now sized at elem_rec (always sizeof(float): the
+  // recurrence's fp32 boundary, note 2523/2494) rather than elem, since
+  // kda_proj_compiled_ now upcasts them before they land here. gate_hidden/
+  // proj_input/gate stay at native elem width -- they're untouched by the
+  // recurrence, gate_hidden and proj_input feed the SAME graph as q/k/v
+  // (kda_proj_compiled_) at their ORIGINAL DataType width, and gate feeds
+  // kda_tail1_compiled_ directly, never the recurrence. network_directml.cc's
+  // scratch_bytes_ arena sizing has a matching scale_rec term -- keep both in
+  // sync (agora thread 19 #432-#434).
+  const size_t elem_rec = sizeof(float);
   DmlPtr q = scratch;
-  DmlPtr k = q + max_tokens * KD * elem;
-  DmlPtr v = k + max_tokens * KD * elem;
-  DmlPtr gate_hidden = scratch + max_tokens * (2 * KD + VD) * elem;
-  DmlPtr proj_input = scratch + max_tokens * (2 * KD + VD + gr) * elem;
+  DmlPtr k = q + max_tokens * KD * elem_rec;
+  DmlPtr v = k + max_tokens * KD * elem_rec;
+  DmlPtr gate_hidden = v + max_tokens * VD * elem_rec;
+  DmlPtr proj_input = gate_hidden + max_tokens * gr * elem;
   DmlPtr proj_in = in_out_tensor;
   DmlPtr raw_decay = buffer2;
-  DmlPtr gate = buffer2 + max_tokens * KD * elem;
-  DmlPtr beta = buffer1 + max_tokens * VD * elem;
+  DmlPtr gate = buffer2 + max_tokens * KD * elem_rec;
+  DmlPtr beta = buffer1 + max_tokens * VD * elem_rec;
   DmlPtr mixed = buffer1;
 
 
@@ -2635,10 +2764,17 @@ void EncoderBlock<DataType>::EvalKda(int N, DmlPtr in_out_tensor,
         return dml::Gemm(decay_hidden, w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
                          DML_MATRIX_TRANSFORM_TRANSPOSE) + b;
       }();
-      std::vector<dml::Expression> outs{qe, ke, ve, raw_decay_e};
+      // Keep in sync with EnsureCompiled's copy of this graph above (same
+      // note 2523/2494 fp32 recurrence boundary comment there).
+      const size_t rec_elem = sizeof(float);
+      auto to_rec = [&](dml::Expression e) {
+        return fp16_ ? dml::Cast(e, DML_TENSOR_DATA_TYPE_FLOAT32) : e;
+      };
+      std::vector<dml::Expression> outs{to_rec(qe), to_rec(ke), to_rec(ve),
+                                        to_rec(raw_decay_e)};
       std::vector<uint64_t> out_bytes{
-          (uint64_t)tokens * KD * elem, (uint64_t)tokens * KD * elem,
-          (uint64_t)tokens * VD * elem, (uint64_t)tokens * KD * elem};
+          (uint64_t)tokens * KD * rec_elem, (uint64_t)tokens * KD * rec_elem,
+          (uint64_t)tokens * VD * rec_elem, (uint64_t)tokens * KD * rec_elem};
       if (kda_output_gate_) {
         dml::Expression gate_hidden_e =
             gemm_bias(kda_gate_a_w_, kda_gate_a_b_, gr, ACTIVATION_NONE);
@@ -2655,8 +2791,8 @@ void EncoderBlock<DataType>::EvalKda(int N, DmlPtr in_out_tensor,
       dml::Expression beta_e =
           gemm_bias(kda_beta_w_, kda_beta_b_, encoder_heads_,
                     ACTIVATION_NONE);
-      outs.push_back(beta_e);
-      out_bytes.push_back((uint64_t)tokens * encoder_heads_ * elem);
+      outs.push_back(to_rec(beta_e));
+      out_bytes.push_back((uint64_t)tokens * encoder_heads_ * rec_elem);
       it = kda_proj_compiled_.emplace(N, g.Compile(outs, out_bytes)).first;
     }
     // The proj graph's outputs land in scratch regions; the recurrence
@@ -2666,6 +2802,15 @@ void EncoderBlock<DataType>::EvalKda(int N, DmlPtr in_out_tensor,
     outs.push_back(beta);
     DispatchOp<DataType>(scope, it->second, proj_in, buffer1, buffer2, outs);
   }
+  // Bisection dump, continued: q/raw_decay are the recurrence's RAW INPUTS,
+  // produced entirely by a DirectML-compiled dml::Graph (kda_proj_compiled_)
+  // -- never touched by hand-written HLSL. If these are already bad, the
+  // corruption predates the recurrence shader entirely (implicates the
+  // projection GEMM or the scratch-buffer layout feeding it). If these are
+  // clean and only "mixed" (dumped above) is bad, the recurrence shader's
+  // own read/compute/write is the first place anything goes wrong.
+  DumpBodyStage("enc0_q", q, scope);
+  DumpBodyStage("enc0_rawdecay", raw_decay, scope);
 
   {
     KdaRecurrenceLayer::Params params{};
@@ -2683,36 +2828,32 @@ void EncoderBlock<DataType>::EvalKda(int N, DmlPtr in_out_tensor,
                             raw_decay, kda_dt_bias_, kda_a_log_, beta,
                             kda_direction_order_, mixed);
   }
+  // Bisection dump for the note 2523/2494 fp16 overflow: this and the LN1
+  // dump below split the encoder block's existing "encN" dump (post-embedding
+  // and post-block only) into recurrence-output / gate+dense+LN1 /
+  // FFN+LN2 thirds. Temporary -- remove once the overflow site is found and
+  // fixed, same as the existing stage_dump this reuses infrastructure from.
+  DumpBodyStage("enc0_kdarec", mixed, scope);
 
-  // Output norm + gate + dense projection, LN1, FFN, LN2: two GEMM graphs
-  // with a fused LayerNorm dispatch after each (see BuildKdaTails). `dense`
-  // dies at LN1, so the FFN output reuses its buffer.
+  // Output norm + gate + dense projection with LN1 fused in, then FFN with
+  // LN2 fused in (see BuildKdaTails, Path 1 / note 2523/2494's second bug).
+  // `dense` and the raw FFN output are now pure graph-internal intermediates
+  // -- neither needs a persistent buffer any more, so ln_scratch only needs
+  // to hold `ln1` (its allocation is untouched/unchanged: this just uses
+  // less of it than before, never more, so no arena-sizing implications).
   {
     BuildKdaTails(N, scope);
-    const DmlPtr dense = ln_scratch;
     const DmlPtr ln1 = ln_scratch + (uint64_t)max_tokens * emb * elem;
-    const DmlPtr ffn2 = dense;
 
+    // Skip is the block input, still in in_out_tensor at this point.
     DispatchOp<DataType>(scope, kda_tail1_compiled_.at(N), mixed, gate,
-                         buffer2, {dense});
+                         buffer2, {ln1}, in_out_tensor);
+    DumpBodyStage("enc0_ln1", ln1, scope);
 
-    LayerNormLayer::Params ln{};
-    ln.rows = tokens;
-    ln.channels = emb;
-    ln.has_bias = true;
-    ln.has_skip = true;
-    ln.act = ACTIVATION_NONE;
-    ln.alpha = alpha_;
-    ln.eps = default_eps_;
-    // LN1's skip is the block input, still in in_out_tensor at this point.
-    layer_norm_->Record(scope.list(), ln, dense, kda_dense_b_, in_out_tensor,
-                        ln1_gammas_, ln1_betas_, ln1);
-
+    // Writes directly into in_out_tensor, same destination as the old
+    // separate LN2 dispatch did.
     DispatchOp<DataType>(scope, kda_tail2_compiled_.at(N), ln1, buffer2,
-                         buffer2, {ffn2});
-
-    layer_norm_->Record(scope.list(), ln, ffn2, ffn_dense2_b_, ln1,
-                        ln2_gammas_, ln2_betas_, in_out_tensor);
+                         buffer2, {in_out_tensor});
   }
 }
 

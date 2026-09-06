@@ -510,9 +510,21 @@ struct Outputs {
   std::vector<float> policy;
 };
 
+// LC0_TEST_BACKEND_OPTS mirrors the CLI's --backend-opts=... string (see
+// factory.cc's AddSubdictFromString call) so a test can opt a backend into
+// something normally gated off by default -- e.g. directml-fp16's
+// allow_broken_fp16 exception gate at network_directml.cc, which an empty
+// OptionsDict here would otherwise trip on every call.
+void ApplyTestBackendOpts(OptionsDict* options) {
+  if (const char* opts = getenv("LC0_TEST_BACKEND_OPTS")) {
+    options->AddSubdictFromString(opts);
+  }
+}
+
 Outputs RunNetwork(const std::string& backend, const WeightsFile& weights,
                    const InputPlanes& planes) {
   OptionsDict options;
+  ApplyTestBackendOpts(&options);
   auto network = NetworkFactory::Get()->Create(backend, weights, options);
   auto computation = network->NewComputation();
   computation->AddInput(InputPlanes(planes));
@@ -533,6 +545,7 @@ std::vector<Outputs> RunNetworkBatch(const std::string& backend,
                                      const WeightsFile& weights,
                                      const std::vector<InputPlanes>& planes) {
   OptionsDict options;
+  ApplyTestBackendOpts(&options);
   auto network = NetworkFactory::Get()->Create(backend, weights, options);
   auto computation = network->NewComputation();
   for (const auto& p : planes) computation->AddInput(InputPlanes(p));

@@ -338,8 +338,27 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
           (uint64_t)weights_.encoder_head_count * enc.kda.key_dim;
       const uint64_t VD =
           (uint64_t)weights_.encoder_head_count * enc.kda.value_dim;
-      need = 2 * KD + VD + enc.kda.gate_rank + emb_size +
-             std::max<uint64_t>(2 * KD, VD + 3 * enc.kda.key_dim);
+      // note 2523/2494's fp32 recurrence boundary: q/k/v/raw_decay/beta (and
+      // whatever the max(...) term below protects -- undocumented at
+      // introduction, 1112af3, and the SYCL analogue this was adapted from,
+      // getMaxKdaBodySize, doesn't reduce to the same expression either, so
+      // its exact meaning isn't confirmed) are now sizeof(float) wide in a
+      // fp16 network rather than elem, since EvalKda's scratch offsets
+      // upcast them (see layers.cc). scale_rec is 1 in the fp32 network
+      // (elem==sizeof(float)), so this is algebraically identical to the
+      // formula it replaces there -- verified on MakeKdaMlhNet's dims
+      // (KD=VD=32, key_dim=4, gate_rank=4, emb=32): both give 196. Scaling
+      // the whole KDA-geometry term uniformly, including the unexplained
+      // max(...) piece, is deliberately conservative rather than trying to
+      // cleave exactly which sub-term needs it -- see agora thread 19
+      // #431/#433 for the discarded formula that under-sized this by 64
+      // elements at scale_rec=1, which would have been a silent
+      // out-of-bounds UAV write, not merely a failed allocation.
+      const uint64_t scale_rec = sizeof(float) / elem;
+      need = (2 * KD + VD +
+             std::max<uint64_t>(2 * KD, VD + 3 * enc.kda.key_dim)) *
+                 scale_rec +
+             enc.kda.gate_rank + emb_size;
     } else {
       const uint64_t d_model =
           !enc.mha.q_w.empty() ? enc.mha.q_w.size() / emb_size : emb_size;
@@ -674,7 +693,8 @@ std::unique_ptr<InputsOutputs> DirectMlNetwork<DataType>::GetInputsOutputs() {
   std::lock_guard<std::mutex> lock(io_lock_);
   if (free_inputs_outputs_.empty()) {
     return std::make_unique<InputsOutputs>(ctx_.device(), max_batch_size_,
-                                           wdl_, moves_left_);
+                                           wdl_, moves_left_,
+                                           sizeof(DataType));
   }
   auto io = std::move(free_inputs_outputs_.front());
   free_inputs_outputs_.pop_front();
@@ -824,7 +844,7 @@ void DirectMlNetwork<DataType>::forwardEval(
     list->ResourceBarrier(1, &vcopy);
     list->CopyBufferRegion(io->value_gpu_.Get(), 0, scratch_arena_.resource(),
                            0,
-                           (uint64_t)batch * (wdl_ ? 3 : 1) * sizeof(float));
+                           (uint64_t)batch * (wdl_ ? 3 : 1) * sizeof(DataType));
     vcopy.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     vcopy.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     list->ResourceBarrier(1, &vcopy);
@@ -860,12 +880,12 @@ void DirectMlNetwork<DataType>::forwardEval(
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   };
   readback(io->policy_gpu_.Get(), io->policy_readback_.Get(),
-           (uint64_t)batch * kNumOutputPolicy * sizeof(float));
+           (uint64_t)batch * kNumOutputPolicy * sizeof(DataType));
   readback(io->value_gpu_.Get(), io->value_readback_.Get(),
-           (uint64_t)batch * (wdl_ ? 3 : 1) * sizeof(float));
+           (uint64_t)batch * (wdl_ ? 3 : 1) * sizeof(DataType));
   if (moves_left_) {
     readback(io->moves_left_gpu_.Get(), io->moves_left_readback_.Get(),
-             (uint64_t)batch * sizeof(float));
+             (uint64_t)batch * sizeof(DataType));
   }
 
   ReportD3DErrors(list->Close(), "Close");
@@ -886,6 +906,26 @@ void DirectMlNetwork<DataType>::forwardEval(
       d.readback->Unmap(0, nullptr);
     }
     BodyDumps().clear();
+  }
+  // fp16 output conversion: the readback buffers above just landed raw
+  // DataType bits (DmlHalf when fp16); *_mapped_ is defined to always be a
+  // float view (see inputs_outputs.h), so convert host-side before anything
+  // below reads through it. A no-op for the fp32 network, where *_mapped_
+  // already aliases the readback mapping directly.
+  if (std::is_same<DataType, DmlHalf>::value) {
+    auto convert = [](const void* raw, const float* dst, size_t n) {
+      const DmlHalf* h = reinterpret_cast<const DmlHalf*>(raw);
+      float* out = const_cast<float*>(dst);
+      for (size_t i = 0; i < n; ++i) out[i] = static_cast<float>(h[i]);
+    };
+    convert(io->policy_readback_mapped_, io->policy_mapped_,
+            (size_t)batch * kNumOutputPolicy);
+    convert(io->value_readback_mapped_, io->value_mapped_,
+            (size_t)batch * (wdl_ ? 3 : 1));
+    if (moves_left_) {
+      convert(io->moves_left_readback_mapped_, io->moves_left_mapped_,
+              (size_t)batch);
+    }
   }
   if (wdl_) {
     // Value softmax done CPU-side, exactly like the CUDA/SYCL finishEval.
