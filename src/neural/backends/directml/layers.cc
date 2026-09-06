@@ -1417,11 +1417,23 @@ template <typename DataType>
 void PolicyMapLayer<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
   if (compiled_.count(N)) return;
   GraphFactory<DataType> g(scope.ctx());
-  auto x = g.Input({1, 1, static_cast<uint32_t>(N),
-                    static_cast<uint32_t>(used_size_)});
+  // note 2523/2494's fourth fp16 defect candidate (agora thread 19 #453):
+  // policy_finalize.hlsl (the only producer of this layer's input in this
+  // backend -- attention is the only policy-head kind implemented here,
+  // see the "residual conv blocks" exception elsewhere in this file) now
+  // always writes FLOAT32 regardless of the network's own DataType, so
+  // this gather must read FLOAT32 too, then cast the result down when the
+  // network is fp16. In a fp32 network this cast is a no-op (score_fp16
+  // false, RHS taken) and InputF32 reads exactly what Input would have.
+  constexpr bool score_fp16 = std::is_same<DataType, DmlHalf>::value;
+  dml::Expression x = g.InputF32({1, 1, static_cast<uint32_t>(N),
+                                  static_cast<uint32_t>(used_size_)});
   auto indices = g.WeightU32(
       indices_, {1, 1, 1, static_cast<uint32_t>(kNumOutputPolicy)});
-  dml::Expression y = dml::Gather(x, indices, 3, 1);
+  dml::Expression gathered = dml::Gather(x, indices, 3, 1);
+  dml::Expression y = score_fp16
+                          ? dml::Cast(gathered, DmlTensorType<DataType>())
+                          : gathered;
   compiled_.emplace(
       N, g.Compile({y}, {(uint64_t)N * kNumOutputPolicy * sizeof(DataType)}));
 }
@@ -2880,13 +2892,21 @@ AttentionPolicyHead<DataType>::AttentionPolicyHead(
   ip2_pol_b_ = uploader.Add(weights.ip2_pol_b);
   ip3_pol_w_ = uploader.Add(weights.ip3_pol_w);
   ip3_pol_b_ = uploader.Add(weights.ip3_pol_b);
-  ip4_pol_w_ = uploader.Add(weights.ip4_pol_w);
+  // note 2523/2494's fourth fp16 defect candidate (agora thread 19 #453):
+  // policy_finalize.hlsl now always compiles at fp16=false and its
+  // scores_buf/keys_buf/ip4_pol_w_/output_buf are all genuine FLOAT32
+  // regardless of the network's own DataType -- ip4_pol_w_ must stay
+  // native float32 in memory to match, so AddRaw instead of Add (which
+  // would otherwise convert it to half at FlushWeights), same escape
+  // hatch used for kda_a_log_/kda_dt_bias_ in 5c7622c.
+  ip4_pol_w_ = uploader.AddRaw(weights.ip4_pol_w.data(),
+                               weights.ip4_pol_w.size() * sizeof(float));
   encoder_heads_ = weights.pol_encoder_head_count;
 
   ComPtr<ID3DBlob> shader =
       CompileHlsl(kPolicyFinalizeShaderSource,
                   sizeof(kPolicyFinalizeShaderSource) - 1,
-                  "policy_finalize.hlsl", "PolicyFinalize", fp16);
+                  "policy_finalize.hlsl", "PolicyFinalize", /*fp16=*/false);
   finalize_root_signature_ = CreateShaderRootSignature(
       ctx.device(), sizeof(PolicyFinalizeConstants) / 4, 3, 1);
   finalize_pso_ = CreateComputePso(ctx.device(), finalize_root_signature_.Get(),
@@ -2949,21 +2969,34 @@ void AttentionPolicyHead<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
     // maps land the same Q_i.K_j in row-major (i,j); dot products
     // commute, so K_j.Q_i there is the same value). Batch over N with
     // strided views of the dense [T, d] buffers ([N,1,64,d] per batch).
+    //
+    // policy_finalize.hlsl now always reads keys_buf/scores_buf as FLOAT32
+    // (see the constructor above) -- wk and logits (scores) must leave
+    // this graph as genuine FLOAT32 to match, regardless of DataType. wq
+    // is never read outside this graph, left at native width. The score
+    // Gemm's own math is unaffected either way -- already verified correct
+    // against a CPU reference to 7 decimal places (agora thread 19 #446-
+    // #447); this is purely about the TYPE policy_finalize.hlsl now reads.
+    constexpr bool score_fp16 = std::is_same<DataType, DmlHalf>::value;
+    dml::Expression wq_for_score =
+        score_fp16 ? dml::Cast(wq_e, DML_TENSOR_DATA_TYPE_FLOAT32) : wq_e;
+    dml::Expression wk_f32 =
+        score_fp16 ? dml::Cast(wk_e, DML_TENSOR_DATA_TYPE_FLOAT32) : wk_e;
     dml::Expression logits = dml::Gemm(
-        GraphFactory<DataType>::ReinterpretView(wq_e, {(uint32_t)N, 1, 64,
+        GraphFactory<DataType>::ReinterpretView(wq_for_score, {(uint32_t)N, 1, 64,
                                 (uint32_t)policy_d_model_},
                          {64u * policy_d_model_, policy_d_model_, policy_d_model_, 1u}),
-        GraphFactory<DataType>::ReinterpretView(wk_e, {(uint32_t)N, 1, 64,
+        GraphFactory<DataType>::ReinterpretView(wk_f32, {(uint32_t)N, 1, 64,
                                 (uint32_t)policy_d_model_},
                          {64u * policy_d_model_, policy_d_model_, policy_d_model_, 1u}),
         dml::NullOpt, DML_MATRIX_TRANSFORM_NONE, DML_MATRIX_TRANSFORM_TRANSPOSE,
         1.0f / std::sqrt((float)policy_d_model_));
     compiled_.emplace(
         -N - 1,
-        g.Compile({wq_e, wk_e, logits},
+        g.Compile({wq_e, wk_f32, logits},
                   {(uint64_t)tokens * policy_d_model_ * elem,
-                   (uint64_t)tokens * policy_d_model_ * elem,
-                   (uint64_t)N * 4096 * elem}));
+                   (uint64_t)tokens * policy_d_model_ * sizeof(float),
+                   (uint64_t)N * 4096 * sizeof(float)}));
   }
   for (const auto& enc : encoder_weights_) {
     enc->EnsureCompiled(N, scope);
@@ -2998,9 +3031,13 @@ void AttentionPolicyHead<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
     enc->Eval(N, embedding, scratch, buffer1, buffer2, ln_scratch, scope);
   }
 
+  // wk and scores are FLOAT32-wide now (policy_finalize.hlsl reads them as
+  // such unconditionally, see EnsureCompiled) -- wq stays at native elem
+  // width, so only its own region uses elem; wk's offset-after and
+  // scores' offset-after both use sizeof(float) to match its real size.
   DmlPtr wq = scratch;
   DmlPtr wk = scratch + (uint64_t)tokens * policy_d_model_ * elem;
-  DmlPtr scores = scratch + 2 * (uint64_t)tokens * policy_d_model_ * elem;
+  DmlPtr scores = wk + (uint64_t)tokens * policy_d_model_ * sizeof(float);
 
   {
     auto it = compiled_.find(-N - 1);  // separate slot for the wqk/scores graph

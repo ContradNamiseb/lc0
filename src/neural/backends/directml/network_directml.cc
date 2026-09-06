@@ -411,8 +411,17 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
   uint64_t max_layer_bytes = max_tokens * 64 * elem;  // raw NCHW input size
   // (layer outputs are all <= tokens*max(embed, pol_map); compute exactly)
   const uint64_t emb = weights_.ip_emb_b.size();
-  max_layer_bytes =
-      std::max(max_layer_bytes, max_tokens * std::max<uint64_t>(emb, 4288) * elem);
+  // note 2523/2494's fourth fp16 defect candidate (agora thread 19 #453):
+  // policy_finalize.hlsl now always writes the 4288-wide policy row as
+  // FLOAT32 into this same tensor slot, regardless of the network's own
+  // DataType -- size that term at sizeof(float) specifically rather than
+  // folding it into the uniform max(emb,4288)*elem multiplication, which
+  // would under-size it by half whenever elem==2 (fp16). At elem==4 (fp32)
+  // this is algebraically identical to the formula it replaces: both
+  // reduce to max(emb, 4288)*4.
+  max_layer_bytes = std::max(
+      {max_layer_bytes, max_tokens * emb * elem,
+       max_tokens * (uint64_t)4288 * sizeof(float)});
   tensor_slot_bytes_ = std::max(max_layer_bytes, scratch_bytes_);
 
   // Belt-and-braces on the policy encoder carve-up, in exact bytes.
