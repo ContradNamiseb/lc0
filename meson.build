@@ -662,6 +662,15 @@ if get_option('build_backends')
       endif
       deps += dml_deps
       includes += include_directories('third_party/directml')
+      # DirectML.h picks DML_TARGET_VERSION from NTDDI_VERSION unless this is
+      # defined, and the NTDDI this SDK defaults to selects 0x5000 -- below the
+      # 0x5100 gate on ACTIVATION_SOFTMAX1, which the MHA softmax uses. It has
+      # to be a project argument, not a #define in one .cc: the header is
+      # reached through layers.h/dml_common.h, so a per-file define lands after
+      # the include guard has already fired, and a per-header one would let two
+      # translation units disagree about which DML structs and enum values
+      # exist -- an ODR mismatch that compiles clean and breaks at runtime.
+      add_project_arguments('-DDML_TARGET_VERSION_USE_LATEST=1', language : 'cpp')
       files += [
         'src/neural/backends/directml/network_directml.cc',
         'src/neural/backends/directml/layers.cc',

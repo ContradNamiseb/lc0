@@ -26,6 +26,12 @@
 // leaves later std::span uses broken under this toolchain.
 #include <span>
 #include <version>
+// SOFTMAX1 (dml::ActivationSoftmax with an axes span) is gated behind
+// DML_TARGET_VERSION >= 0x5100. Do NOT try to unlock it with a #define here:
+// layers.h has already pulled in <directml.h> by this point, so the guard has
+// fired and the define is dead text. It is set for the whole project in
+// meson.build (-DDML_TARGET_VERSION_USE_LATEST=1), which is also what keeps
+// every translation unit agreeing on which DML structs exist.
 #include <DirectMLX.h>
 #include <d3dcompiler.h>
 
@@ -2261,32 +2267,22 @@ void EncoderBlock<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
     }
     const uint32_t softmax_axes[] = {3};
     const dml::Span<const uint32_t> softmax_axis(softmax_axes, 1);
-    const auto sm_sizes = logits.Impl()->GetOutputDesc().sizes;
-    // Broadcast the per-row reduction back over the row.
+    // Native DML softmax over axis 3 (ACTIVATION_SOFTMAX1), replacing an
+    // eight-operator hand decomposition: reduce-max, broadcast, subtract,
+    // exp, reduce-sum, broadcast, reciprocal, multiply. Every intermediate
+    // was a full [B, 1, 64, 64] tensor round-tripped through GPU memory;
+    // the native operator does the row reduction in a single pass.
     //
-    // logits is [B, 1, 64, 64] and the reduce over axis 3 gives [B, 1, 64, 1],
-    // laid out densely as B * 64 scalars with element (b, 0, r, 0) at
-    // b * 64 + r. Viewing that as [B, 1, 64, 64] therefore needs stride 64 on
-    // the batch axis, 1 on the row axis and 0 on the reduced axis.
-    //
-    // This was {0, 0, 0, 1}: stride 1 on the axis that was just reduced away
-    // and 0 on both the row and the batch axis, so every row of every batch
-    // subtracted the same 64 values indexed by column. It survived because
-    // the synthetic parity nets use weights around 0.05, which leaves the
-    // attention logits small enough that softmax is nearly uniform and a
-    // wrong max/sum moves the result by less than the 2e-4 bar. At trained
-    // weight magnitudes the softmax is peaked and it does not survive: this
-    // is what made every real net diverge while every MHA parity net passed.
-    const std::vector<uint32_t> sm_bcast{64, 64, 1, 0};
-    dml::Expression max_b = GraphFactory<DataType>::ReinterpretView(
-        dml::Reduce(logits, DML_REDUCE_FUNCTION_MAX, softmax_axis), sm_sizes,
-        sm_bcast);
-    dml::Expression shifted = logits - max_b;
-    dml::Expression exp_shifted = dml::Exp(shifted);
-    dml::Expression sum_b = GraphFactory<DataType>::ReinterpretView(
-        dml::Reduce(exp_shifted, DML_REDUCE_FUNCTION_SUM, softmax_axis),
-        sm_sizes, sm_bcast);
-    dml::Expression attn = exp_shifted * dml::Recip(sum_b);
+    // WHY THE HAND VERSION EXISTED, kept because the hazard outlives it:
+    // broadcasting the per-row reduction back over the row needs strides
+    // {64, 64, 1, 0} for a [B,1,64,1] result viewed as [B,1,64,64]. It was
+    // once {0, 0, 0, 1} -- stride 1 on the axis just reduced away -- so every
+    // row subtracted the same 64 values. That bug passed EVERY synthetic MHA
+    // parity net and broke EVERY real net: synthetic weights near 0.05 leave
+    // the logits small enough that softmax is nearly uniform, and a wrong
+    // max/sum stays under the 2e-4 bar. Anything replacing this block must
+    // therefore be validated on TRAINED nets, not the parity suite alone.
+    dml::Expression attn = dml::ActivationSoftmax(logits, softmax_axis);
     dml::Expression context =
         dml::Gemm(attn, vt_in, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
                   DML_MATRIX_TRANSFORM_NONE);
