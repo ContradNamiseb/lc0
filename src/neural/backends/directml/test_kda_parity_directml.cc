@@ -1635,6 +1635,60 @@ TEST(DirectMlKdaParity, MatchesBlasOnRealNetFromEnv) {
   CompareBackends(net);
 }
 
+// Diagnostic dump, NOT a correctness test: writes the first KDA encoder's
+// decay geometry (heads, key_dim, value_dim, directions) and its real
+// trained a_log/dt_bias to a small binary file, for
+// kda_recurrence_test_directml's MatchesCpuReferenceWithRealNetDecay to
+// consume (agora thread 19 #462/#463's real-net decay ground-truth check).
+// This binary already has full net-loading machinery that the standalone
+// recurrence-test binary deliberately does not (its own comment: "no
+// factory, no backend registration") -- dumping here and reading a plain
+// file there avoids growing that binary's dependency footprint just to
+// parse one net file. Skipped unless LC0_DUMP_KDA_DECAY names an output
+// path.
+TEST(DirectMlKdaParity, DumpRealNetKdaDecayForRecurrenceTest) {
+  const char* net_path = getenv("LC0_TEST_REAL_NET");
+  const char* out_path = getenv("LC0_DUMP_KDA_DECAY");
+  if (!net_path || !out_path) {
+    GTEST_SKIP() << "set LC0_TEST_REAL_NET and LC0_DUMP_KDA_DECAY to run";
+  }
+  pblczero::Net net = LoadWeightsFromFile(net_path);
+  const MultiHeadWeights decoded{net.weights()};
+  const MultiHeadWeights::KDA* kda = nullptr;
+  for (const auto& enc : decoded.encoder) {
+    if (enc.is_kda) {
+      kda = &enc.kda;
+      break;
+    }
+  }
+  ASSERT_NE(kda, nullptr) << "net has no KDA encoder";
+  const int32_t heads = static_cast<int32_t>(kda->a_log.size());
+  ASSERT_EQ(kda->dt_bias.size(), static_cast<size_t>(heads) * kda->key_dim)
+      << "a_log/dt_bias/key_dim disagree on head count";
+  const auto& directions_pb = net.format().network_format().kda_directions();
+  const std::vector<int32_t> directions(directions_pb.begin(),
+                                        directions_pb.end());
+
+  std::ofstream f(out_path, std::ios::binary);
+  ASSERT_TRUE(f.good()) << "could not open " << out_path;
+  auto write_i32 = [&](int32_t v) {
+    f.write(reinterpret_cast<const char*>(&v), sizeof(v));
+  };
+  write_i32(heads);
+  write_i32(kda->key_dim);
+  write_i32(kda->value_dim);
+  write_i32(static_cast<int32_t>(directions.size()));
+  for (int32_t d : directions) write_i32(d);
+  f.write(reinterpret_cast<const char*>(kda->a_log.data()),
+         kda->a_log.size() * sizeof(float));
+  f.write(reinterpret_cast<const char*>(kda->dt_bias.data()),
+         kda->dt_bias.size() * sizeof(float));
+  ASSERT_TRUE(f.good()) << "write failed";
+  CERR << "[decay-dump] heads=" << heads << " key_dim=" << kda->key_dim
+       << " value_dim=" << kda->value_dim
+       << " direction_count=" << directions.size() << " -> " << out_path;
+}
+
 // MHA + moves-left head, no KDA encoder: covers the MHA encoder and
 // MLH paths together against the BLAS reference.
 pblczero::Net MakeMhaMlhNet() {
