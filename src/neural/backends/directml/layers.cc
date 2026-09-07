@@ -627,6 +627,31 @@ void DispatchOp(DmlExecScope& scope, DmlCompiledOp& op, DmlPtr input,
 
 }  // namespace
 
+// agora thread 19 #620 package B3: D3D12 caps the thread-group count in any
+// one Dispatch() dimension at D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_
+// DIMENSION (65535, per d3d12.h). Several custom-shader Record() calls here
+// dispatch one group per (batch * some per-sample factor) with everything
+// packed into the X dimension alone -- correct at this session's default
+// max_batch_size_ (256), but silently exceedable at larger configured
+// max_batch (up to 1024) or wide head/embedding geometries. Exceeding the
+// limit is invalid-parameter territory D3D12 doesn't define clean behavior
+// for outside the debug layer (validation error there; driver-defined,
+// possibly a silent wraparound or device removal, without it) -- a
+// Record-time throw here is the minimum fix: fail loudly and immediately
+// with the actual numbers, rather than let a wide-enough net hit undefined
+// GPU-side behavior at dispatch time.
+void CheckDispatchGroupCount(uint64_t groups, const char* what) {
+  if (groups > D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION) {
+    throw Exception(
+        "directml backend: " + std::string(what) + " dispatch needs " +
+        std::to_string(groups) + " thread groups in one dimension, "
+        "exceeding D3D12's " +
+        std::to_string(D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION) +
+        "-per-dimension limit -- this batch/geometry combination cannot be "
+        "dispatched as a single 1-D Dispatch() call.");
+  }
+}
+
 // Shader-cache counters. Guarded by the same mutex as the map itself, so the
 // accessors below report a consistent snapshot rather than torn reads.
 namespace {
@@ -1145,8 +1170,17 @@ void ThrowIfDeviceRemoved(ID3D12Device* device, uint64_t completed_value) {
 }  // namespace
 
 void DmlDeviceContext::WaitForFence(ID3D12Fence* fence, uint64_t value) {
-  ThrowIfDeviceRemoved(device_.Get(), fence->GetCompletedValue());
-  if (fence->GetCompletedValue() >= value) return;
+  // agora thread 19 #620 package B1 (R3): these used to be two SEPARATE
+  // GetCompletedValue() calls -- one sampled for the sentinel check, a
+  // second, independent call sampled for the >= value fast-path compare.
+  // A device removal landing between the two calls meant the sentinel
+  // check saw the old (pre-removal) value and passed, while the second
+  // call's fresh UINT64_MAX then satisfied `>= value` for any real value
+  // and returned as if the batch had genuinely completed. Sample once,
+  // check and compare against that single captured value.
+  const uint64_t completed = fence->GetCompletedValue();
+  ThrowIfDeviceRemoved(device_.Get(), completed);
+  if (completed >= value) return;
   ReportD3DErrors(fence->SetEventOnCompletion(value, fence_event_),
                   "SetEventOnCompletion");
   // WaitForSingleObject's return was previously unchecked: a WAIT_FAILED
@@ -1343,6 +1377,7 @@ void KdaRecurrenceLayer::Record(ID3D12GraphicsCommandList* command_list,
                                                   mixed_out.GpuVA());
 
   const UINT group_count = params.batch_size * params.heads;
+  CheckDispatchGroupCount(group_count, "KdaRecurrenceLayer");
   command_list->Dispatch(group_count, 1, 1);
 
   D3D12_RESOURCE_BARRIER barrier = {};
@@ -1378,7 +1413,9 @@ void MhaTransposeLayer::Record(ID3D12GraphicsCommandList* command_list,
   command_list->SetComputeRootUnorderedAccessView(2, output.GpuVA());
   const uint64_t total =
       (uint64_t)params.batch_size * params.heads * 64 * params.head_dim;
-  command_list->Dispatch(static_cast<UINT>((total + 63) / 64), 1, 1);
+  const uint64_t transpose_groups = (total + 63) / 64;
+  CheckDispatchGroupCount(transpose_groups, "MhaTransposeLayer");
+  command_list->Dispatch(static_cast<UINT>(transpose_groups), 1, 1);
 
   D3D12_RESOURCE_BARRIER barrier = {};
   barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
@@ -1436,6 +1473,7 @@ void LayerNormLayer::Record(ID3D12GraphicsCommandList* command_list,
   command_list->SetComputeRootUnorderedAccessView(6, output.GpuVA());
   // One thread group per token row (LN_GROUP_SIZE threads cooperate on the
   // channel reduction), so the group count is the row count.
+  CheckDispatchGroupCount(params.rows, "LayerNormLayer");
   command_list->Dispatch(static_cast<UINT>(params.rows), 1, 1);
 
   D3D12_RESOURCE_BARRIER barrier = {};
@@ -1478,7 +1516,9 @@ void KdaLocalConvLayer::Record(ID3D12GraphicsCommandList* command_list,
   command_list->SetComputeRootShaderResourceView(3, bias.GpuVA());
   command_list->SetComputeRootUnorderedAccessView(4, output.GpuVA());
   const uint64_t total = (uint64_t)params.tokens * params.emb;
-  command_list->Dispatch(static_cast<UINT>((total + 63) / 64), 1, 1);
+  const uint64_t local_conv_groups = (total + 63) / 64;
+  CheckDispatchGroupCount(local_conv_groups, "KdaLocalConvLayer");
+  command_list->Dispatch(static_cast<UINT>(local_conv_groups), 1, 1);
 
   D3D12_RESOURCE_BARRIER barrier = {};
   barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
@@ -2013,6 +2053,7 @@ void AttentionBody<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
     list->SetComputeRootUnorderedAccessView(3, out.GpuVA());
     const UINT groups =
         mode == 2 ? static_cast<UINT>(N * 64) : static_cast<UINT>(N * 64);
+    CheckDispatchGroupCount(groups, "record_preprocess");
     list->Dispatch(groups, 1, 1);
     D3D12_RESOURCE_BARRIER barrier = {};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
@@ -2348,6 +2389,27 @@ EncoderBlock<DataType>::EncoderBlock(
         kda.local_conv && !kda.local_conv_w.empty() && !kda.local_conv_b.empty();
     kda_qkv_silu_ = kda.qkv_silu;
     kda_direction_count_ = std::min<int>(16, (int)kda_directions.size());
+    // agora thread 19 #620 package B4: kda_recurrence.hlsl computes
+    // `direction_index = head / (heads / direction_count)` on the GPU.
+    // network_directml.cc's per-element direction check (1-16 range) is
+    // vacuously true on an EMPTY kda_directions list, leaving
+    // kda_direction_count_ == 0 here -- `heads / 0` is a GPU-side integer
+    // divide-by-zero. A count that doesn't evenly divide encoder_heads_
+    // fares no better: `heads / count` truncates, and the largest head
+    // index can then divide out to an out-of-range direction_index (e.g.
+    // heads=10, count=3 -> heads/count=3, head=9 -> index 3, but only
+    // indices 0..2 are valid for a 3-direction table). Both are silent
+    // GPU-side corruption, not a host-side crash, so catch them here
+    // instead where a clear exception is possible.
+    if (kda_direction_count_ < 1 ||
+        encoder_heads_ % kda_direction_count_ != 0) {
+      throw Exception(
+          "directml backend: KDA encoder has " +
+          std::to_string(encoder_heads_) + " heads but " +
+          std::to_string(kda_direction_count_) +
+          " scan directions -- heads must be evenly divisible by the "
+          "direction count (net configuration error).");
+    }
     for (int i = 0; i < 16; ++i) {
       kda_directions_[i] = i < kda_direction_count_
                                ? kda_directions[i]

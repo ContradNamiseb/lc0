@@ -77,6 +77,12 @@ ComPtr<ID3DBlob> CompileHlsl(
     const char* entry_point, bool fp16,
     const std::vector<std::pair<std::string, std::string>>& extra_defines = {});
 
+// Throws if `groups` exceeds D3D12's per-dimension thread-group dispatch
+// limit (agora thread 19 #620 package B3). Declared here, same reasoning as
+// CompileHlsl above, so the guard's threshold can be asserted directly by
+// tests instead of only indirectly through an exotic real-net fixture.
+void CheckDispatchGroupCount(uint64_t groups, const char* what);
+
 // Observability for the shader cache above. Counters are process-wide and
 // monotonic; Size()/Capacity() describe the bound.
 namespace shader_cache {

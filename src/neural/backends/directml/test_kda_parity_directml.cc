@@ -2737,6 +2737,197 @@ TEST(DirectMlRegressionCoverage, Fp16ConverterEdgeCases) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// B1/R3 regression (agora thread 19 #620/#622): DmlDeviceContext::WaitForFence
+// used to sample ID3D12Fence::GetCompletedValue() TWICE for what should be
+// one logical checkpoint -- once for the device-removal sentinel check, a
+// second, independent time for the `>= value` fast-path compare. A device
+// removal landing between the two calls let the sentinel check see the
+// pre-removal value (fine) while the second call's fresh UINT64_MAX
+// satisfied `>= value` for any real value, returning success on a batch
+// that never completed. Fixed to sample once and reuse that value for both
+// decisions.
+//
+// This calls the REAL, unmodified DmlDeviceContext::WaitForFence (not a
+// copy) via a minimal ID3D12Fence COM double whose GetCompletedValue()
+// returns a scripted sequence, and whose SetEventOnCompletion immediately
+// signals the real event handle it's given (simulating "the GPU completed
+// right away") so the real WaitForSingleObject call in the slow path
+// returns immediately instead of hanging on an event nothing would ever
+// signal. Adapted from codex-sol's standalone harness shape
+// (docs/review-evidence/directml-host-review-2026-09-07.cc), promoted to
+// a real in-tree gtest exercising the production code directly.
+namespace {
+class ScriptedFence : public ID3D12Fence {
+ public:
+  explicit ScriptedFence(std::vector<UINT64> values)
+      : values_(std::move(values)) {}
+
+  // IUnknown -- not testing COM lifetime, stack-allocated test double.
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void**) override {
+    return E_NOINTERFACE;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
+  ULONG STDMETHODCALLTYPE Release() override { return 1; }
+
+  // ID3D12Object
+  HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, UINT*, void*) override {
+    return E_NOTIMPL;
+  }
+  HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT,
+                                           const void*) override {
+    return E_NOTIMPL;
+  }
+  HRESULT STDMETHODCALLTYPE
+  SetPrivateDataInterface(REFGUID, const IUnknown*) override {
+    return E_NOTIMPL;
+  }
+  HRESULT STDMETHODCALLTYPE SetName(LPCWSTR) override { return E_NOTIMPL; }
+
+  // ID3D12DeviceChild
+  HRESULT STDMETHODCALLTYPE GetDevice(REFIID, void**) override {
+    return E_NOTIMPL;
+  }
+
+  // ID3D12Fence -- the methods WaitForFence actually calls.
+  UINT64 STDMETHODCALLTYPE GetCompletedValue() override {
+    // .at() throws std::out_of_range (loudly) if WaitForFence samples more
+    // times than the scripted scenario expects, rather than silently
+    // repeating the last value -- a call-count regression fails visibly.
+    return values_.at(call_count_++);
+  }
+  HRESULT STDMETHODCALLTYPE SetEventOnCompletion(UINT64,
+                                                 HANDLE event) override {
+    // Simulate the GPU completing immediately: signal the real event handle
+    // WaitForFence passed in, so its real WaitForSingleObject(event,
+    // INFINITE) call returns right away instead of blocking forever on an
+    // event nothing else would ever signal in this test.
+    if (event) ::SetEvent(event);
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE Signal(UINT64) override { return S_OK; }
+
+  size_t CallCount() const { return call_count_; }
+
+ private:
+  std::vector<UINT64> values_;
+  size_t call_count_ = 0;
+};
+}  // namespace
+
+TEST(DirectMlRegressionCoverage, FenceRaceDoesNotMaskDeviceRemoval) {
+  if (!DirectMlAvailability().available) {
+    GTEST_SKIP() << "no usable directml device: "
+                 << DirectMlAvailability().reason;
+  }
+  directml_backend::DmlDeviceContext ctx;
+  ctx.Init(OptionsDict());
+
+  // Scenario 1, the actual bug: removal lands between what used to be two
+  // separate GetCompletedValue() calls. The fixed code samples once (call 0
+  // returns 0, which is < the target of 1), falls through to the slow path,
+  // and must throw on its second sample (call 1 returns UINT64_MAX).
+  {
+    ScriptedFence racing({0, UINT64_MAX});
+    EXPECT_THROW(ctx.WaitForFence(&racing, 1), Exception)
+        << "a device removal between fence samples must not be masked as "
+           "success";
+    EXPECT_EQ(racing.CallCount(), 2u)
+        << "expected exactly one fast-path sample plus one post-wait sample";
+  }
+
+  // Scenario 2 (control): immediate removal must always throw, and must be
+  // caught on the very first sample without ever reaching the slow path.
+  {
+    ScriptedFence removed({UINT64_MAX});
+    EXPECT_THROW(ctx.WaitForFence(&removed, 1), Exception)
+        << "immediate device removal must throw";
+    EXPECT_EQ(removed.CallCount(), 1u)
+        << "immediate removal must be caught on the first sample, before "
+           "any wait";
+  }
+
+  // Scenario 3 (control): genuine completion must return normally via the
+  // fast path, consuming exactly one sample.
+  {
+    ScriptedFence completed({1});
+    EXPECT_NO_THROW(ctx.WaitForFence(&completed, 1))
+        << "a fence that has already reached the target value must not "
+           "throw";
+    EXPECT_EQ(completed.CallCount(), 1u)
+        << "a genuinely-completed fence must take the fast path (one "
+           "sample), not fall through to the slow path";
+  }
+}
+
+// B3 (agora thread 19 #620/#622): the dispatch-group-count guard's own
+// threshold logic, tested directly (no GPU or real net needed -- it's pure
+// host-side arithmetic) rather than only indirectly through an exotic wide
+// real-net fixture. D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION is
+// 65535; confirms the guard throws exactly above it and not at or below.
+TEST(DirectMlRegressionCoverage, DispatchGroupCountGuardThreshold) {
+  using directml_backend::CheckDispatchGroupCount;
+  EXPECT_NO_THROW(CheckDispatchGroupCount(65535, "test"))
+      << "exactly at the D3D12 limit must not throw";
+  EXPECT_NO_THROW(CheckDispatchGroupCount(1, "test"))
+      << "a trivially small group count must not throw";
+  EXPECT_THROW(CheckDispatchGroupCount(65536, "test"), Exception)
+      << "one over the D3D12 limit must throw";
+  EXPECT_THROW(CheckDispatchGroupCount(256ull * 256ull, "test"), Exception)
+      << "the concrete 256x256 wide-MHA-at-max-batch-256 case from #620 "
+         "package B3 must throw (65536 groups)";
+}
+
+// B4 (agora thread 19 #620/#622): kda_recurrence.hlsl computes
+// `direction_index = head / (heads / direction_count)` on the GPU --
+// direction_count 0 (empty kda_directions list) is a GPU-side divide by
+// zero, and a count that does not evenly divide heads produces an
+// out-of-range direction_index for the largest head indices. Both used to
+// be uncaught (the per-element 1-16 range check in network_directml.cc is
+// vacuously true on an empty list, and never checked the count against
+// heads at all); EncoderBlock's KDA branch now throws at construction
+// instead of letting either reach the GPU.
+TEST(DirectMlKdaParity, KdaEmptyDirectionsRejected) {
+  // ctx_.Init() (real device creation) runs before this validation in the
+  // constructor, so on a machine with no usable DirectML device Create()
+  // would throw for that unrelated reason first and this test would pass
+  // for the wrong reason -- skip rather than give a false positive.
+  if (!DirectMlAvailability().available) {
+    GTEST_SKIP() << "no usable directml device: "
+                 << DirectMlAvailability().reason;
+  }
+  pblczero::Net file = MakeKdaSerpentineNet();
+  file.mutable_format()->mutable_network_format()->mutable_kda_directions()->clear();
+  OptionsDict options;
+  EXPECT_THROW(NetworkFactory::Get()->Create("directml", file, options),
+               Exception)
+      << "an empty kda_directions list (direction_count 0) must be "
+         "rejected at load, not reach a GPU-side divide by zero";
+}
+
+TEST(DirectMlKdaParity, KdaDirectionCountMustDivideHeads) {
+  if (!DirectMlAvailability().available) {
+    GTEST_SKIP() << "no usable directml device: "
+                 << DirectMlAvailability().reason;
+  }
+  // MakeKdaSerpentineNet's default NetDims has heads=8; 3 directions do not
+  // evenly divide it (8 % 3 == 2), which used to silently mismap the
+  // largest head indices to an out-of-range direction_index on the GPU.
+  pblczero::Net file = MakeKdaSerpentineNet();
+  auto* nf = file.mutable_format()->mutable_network_format();
+  nf->mutable_kda_directions()->clear();
+  using NF = pblczero::NetworkFormat;
+  for (int dir : {1, 2, 3}) {
+    nf->add_kda_directions(static_cast<NF::KdaDirection>(dir));
+  }
+  OptionsDict options;
+  EXPECT_THROW(NetworkFactory::Get()->Create("directml", file, options),
+               Exception)
+      << "heads=8 is not evenly divisible by 3 scan directions; this must "
+         "be rejected at load, not silently mismap head-to-direction "
+         "indices on the GPU";
+}
+
 }  // namespace lczero
 
 int main(int argc, char** argv) {
