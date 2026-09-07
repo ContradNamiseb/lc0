@@ -944,8 +944,15 @@ IDMLBindingTable* DmlDeviceContext::GetOrCreateBindingTable(
 
 void DmlDeviceContext::InitializeCompiledOperators(
     ID3D12GraphicsCommandList* list) {
+  // agora thread 19 #620 package A4: operators_initialized_ used to be set
+  // true here, before anything below that can throw (CreateOperatorInitializer,
+  // the PersistentResourceSize check, CreateBindingTable, CreateBuffer). If
+  // any of those threw, every compiled operator was left genuinely
+  // uninitialized, but the flag already said "done" -- this function's own
+  // early-return guard above would then skip it forever, silently, on any
+  // later call. Set only after RecordDispatch actually records the
+  // initialization dispatch, at the bottom of this function.
   if (operators_initialized_ || all_ops_.empty()) return;
-  operators_initialized_ = true;
 
   // Stored in init_initializer_ (a context member, not a local): per
   // Microsoft's DirectML resource-lifetime docs, a compiled operator or
@@ -986,10 +993,19 @@ void DmlDeviceContext::InitializeCompiledOperators(
   table_desc.CPUDescriptorHandle = cpu;
   table_desc.GPUDescriptorHandle = descriptors_.CpuToGpu(cpu);
   table_desc.SizeInDescriptors = slots;
-  ComPtr<IDMLBindingTable> init_table;
-  ReportDmlErrors(
-      dml_device_->CreateBindingTable(&table_desc, IID_PPV_ARGS(&init_table)),
-      "CreateBindingTable (operator initializer)");
+  // agora thread 19 #620 package A5: stored in init_table_ (a member) rather
+  // than a local. Microsoft's dml-resource-lifetime docs, fetched and read
+  // directly for #612, are explicit that a binding table owns no GPU
+  // resource itself (only the descriptor heap backing it does, and that
+  // heap -- descriptors_ -- is already a permanent member), so a local was
+  // already correct on the documented contract. Promoting it to a member
+  // anyway is a one-time, zero-cost hardening: it removes any future
+  // maintenance dependence on a reader re-verifying that specific claim
+  // correctly, the same belt-and-suspenders reasoning already applied to
+  // init_initializer_/init_temp_resource_ above.
+  ReportDmlErrors(dml_device_->CreateBindingTable(&table_desc,
+                                                  IID_PPV_ARGS(&init_table_)),
+                  "CreateBindingTable (operator initializer)");
 
   // One output-binding slot per operator, in the same order passed to
   // CreateOperatorInitializer above; DML_BINDING_TYPE_NONE for all of them
@@ -999,8 +1015,8 @@ void DmlDeviceContext::InitializeCompiledOperators(
     b.Type = DML_BINDING_TYPE_NONE;
     b.Desc = nullptr;
   }
-  init_table->BindOutputs(static_cast<UINT>(output_bindings.size()),
-                          output_bindings.data());
+  init_table_->BindOutputs(static_cast<UINT>(output_bindings.size()),
+                           output_bindings.data());
 
   // The initializer's own temporary-resource requirement is independent of
   // (and can be nonzero even when) every operator's per-dispatch
@@ -1019,12 +1035,15 @@ void DmlDeviceContext::InitializeCompiledOperators(
     DML_BUFFER_BINDING tb{init_temp_resource_.Get(), 0,
                           props.TemporaryResourceSize};
     DML_BINDING_DESC td{DML_BINDING_TYPE_BUFFER, &tb};
-    init_table->BindTemporaryResource(&td);
+    init_table_->BindTemporaryResource(&td);
   }
 
   ID3D12DescriptorHeap* heap = descriptors_.heap();
   list->SetDescriptorHeaps(1, &heap);
-  recorder_->RecordDispatch(list, init_initializer_.Get(), init_table.Get());
+  recorder_->RecordDispatch(list, init_initializer_.Get(), init_table_.Get());
+  // A4: only now, after the dispatch is actually recorded with nothing left
+  // that can throw.
+  operators_initialized_ = true;
 }
 
 void DmlDeviceContext::DispatchOperator(

@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "neural/backends/directml/dml_common.h"
 #include "neural/network.h"
 #include "utils/exception.h"
 
@@ -90,20 +91,37 @@ struct InputsOutputs {
       : output_elem_bytes_(output_elem_bytes),
         has_wdl_(wdl),
         has_mlh_(moves_left) {
-    device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                   IID_PPV_ARGS(&command_allocator_));
-    device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                              command_allocator_.Get(), nullptr,
-                              IID_PPV_ARGS(&command_list_));
-    command_list_->Close();
-    device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_));
+    // agora thread 19 #620 package A1: every HRESULT here used to be
+    // discarded. A failed CreateCommandList (say) left command_list_ null,
+    // and the very next line called ->Close() on it -- a null-pointer AV in
+    // the constructor, not a structured error. Mirrors DmlDeviceContext::
+    // Init's ReportD3DErrors pattern (network_directml.cc).
+    ReportD3DErrors(
+        device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                       IID_PPV_ARGS(&command_allocator_)),
+        "CreateCommandAllocator (InputsOutputs)");
+    ReportD3DErrors(
+        device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                  command_allocator_.Get(), nullptr,
+                                  IID_PPV_ARGS(&command_list_)),
+        "CreateCommandList (InputsOutputs)");
+    ReportD3DErrors(command_list_->Close(), "Close (InputsOutputs)");
+    ReportD3DErrors(
+        device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)),
+        "CreateFence (InputsOutputs)");
 
     const uint64_t input_bytes =
         static_cast<uint64_t>(max_batch_size) * kInputPlanes * 64 * sizeof(float);
     input_upload_ = detail::CreateBuffer(device, input_bytes,
                                          D3D12_HEAP_TYPE_UPLOAD,
                                          D3D12_RESOURCE_STATE_GENERIC_READ);
-    input_upload_->Map(0, nullptr, reinterpret_cast<void**>(&input_mapped_));
+    // A2: an unchecked Map leaves input_mapped_ indeterminate on failure,
+    // and every later write through it (every AddInput call) is then a
+    // write through a garbage pointer instead of a clean, early failure.
+    ReportD3DErrors(
+        input_upload_->Map(0, nullptr,
+                           reinterpret_cast<void**>(&input_mapped_)),
+        "Map (input_upload_)");
 
     constexpr int kPolicySize = 1858;
     const uint64_t policy_bytes = static_cast<uint64_t>(max_batch_size) *
@@ -113,7 +131,9 @@ struct InputsOutputs {
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     policy_readback_ = detail::CreateBuffer(
         device, policy_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-    policy_readback_->Map(0, nullptr, &policy_readback_mapped_);
+    ReportD3DErrors(
+        policy_readback_->Map(0, nullptr, &policy_readback_mapped_),
+        "Map (policy_readback_)");
     if (output_elem_bytes_ == sizeof(float)) {
       policy_mapped_ = reinterpret_cast<const float*>(policy_readback_mapped_);
     } else {
@@ -133,7 +153,9 @@ struct InputsOutputs {
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     value_readback_ = detail::CreateBuffer(
         device, value_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-    value_readback_->Map(0, nullptr, &value_readback_mapped_);
+    ReportD3DErrors(
+        value_readback_->Map(0, nullptr, &value_readback_mapped_),
+        "Map (value_readback_)");
     if (output_elem_bytes_ == sizeof(float)) {
       value_mapped_ = reinterpret_cast<const float*>(value_readback_mapped_);
     } else {
@@ -150,7 +172,10 @@ struct InputsOutputs {
           D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
       moves_left_readback_ = detail::CreateBuffer(
           device, mlh_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-      moves_left_readback_->Map(0, nullptr, &moves_left_readback_mapped_);
+      ReportD3DErrors(
+          moves_left_readback_->Map(0, nullptr,
+                                    &moves_left_readback_mapped_),
+          "Map (moves_left_readback_)");
       if (output_elem_bytes_ == sizeof(float)) {
         moves_left_mapped_ =
             reinterpret_cast<const float*>(moves_left_readback_mapped_);

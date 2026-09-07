@@ -141,9 +141,20 @@ void DmlDeviceContext::Init(const OptionsDict& options) {
                   "CreateDXGIFactory1");
   UINT adapter_index = 0;
   UINT found = 0;
-  for (UINT i = 0;
-       dxgi_factory_->EnumAdapters1(i, &adapter_) != DXGI_ERROR_NOT_FOUND;
-       ++i) {
+  // agora thread 19 #620 package A3: EnumAdapters1(i, &adapter_) wrote
+  // straight into the member ComPtr every iteration, including right after
+  // a SOFTWARE-adapter `continue` that skipped the old adapter_.Reset()
+  // below -- the next call took &adapter_ while it still held a live,
+  // non-null COM pointer from the skipped iteration (a WRL debug-build
+  // assert, and ill-defined behavior in release). Reset() unconditionally
+  // at the top of every iteration instead, so &adapter_ is always null
+  // going into EnumAdapters1 regardless of which branch the previous
+  // iteration took.
+  for (UINT i = 0;; ++i) {
+    adapter_.Reset();
+    if (dxgi_factory_->EnumAdapters1(i, &adapter_) == DXGI_ERROR_NOT_FOUND) {
+      break;
+    }
     DXGI_ADAPTER_DESC1 desc;
     adapter_->GetDesc1(&desc);
     if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
@@ -153,7 +164,6 @@ void DmlDeviceContext::Init(const OptionsDict& options) {
            << std::string(name.begin(), name.end());
       break;
     }
-    adapter_.Reset();
     ++found;
   }
   if (!adapter_) {

@@ -404,12 +404,20 @@ class DmlDeviceContext {
   // the caller's Execute+Wait -- real undefined behavior per spec, not
   // just theoretical (the same class of bug as init_temp_resource_ above,
   // caught before the build; this one was missed until codex-sol's
-  // review). The binding table does NOT need this treatment -- Microsoft's
-  // docs explicitly say a binding table owns no GPU resources itself, only
-  // the descriptor heap backing it does, and that heap is already a
-  // permanent member (descriptors_) -- so init_table stays a safe local in
-  // InitializeCompiledOperators.
+  // review). The binding table does NOT need this treatment on the
+  // documented contract -- Microsoft's docs explicitly say a binding table
+  // owns no GPU resources itself, only the descriptor heap backing it does,
+  // and that heap is already a permanent member (descriptors_) -- but see
+  // init_table_ below: it's a member anyway now, as a zero-cost hardening
+  // against a future reader mis-recalling that specific distinction.
   ComPtr<IDMLOperatorInitializer> init_initializer_;
+  // agora thread 19 #620 package A5: was a local in InitializeCompiledOperators.
+  // Already correct on the documented contract (see init_initializer_'s
+  // comment above), but promoted to a member anyway -- one-time, zero
+  // ongoing cost, and removes any dependency on a future maintainer
+  // re-verifying the "binding tables own no GPU resource" claim correctly
+  // before trusting a local here again.
+  ComPtr<IDMLBindingTable> init_table_;
   friend class DmlUploadScope;
 };
 
