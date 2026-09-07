@@ -56,6 +56,7 @@
 #include <span>
 #include <version>
 #include <DirectMLX.h>
+#include <d3d12sdklayers.h>  // ID3D12Debug (LC0_DML_DEBUG_LAYER, opt-in)
 
 #include "neural/backends/directml/dml_common.h"
 #include "neural/backends/directml/inputs_outputs.h"
@@ -93,6 +94,27 @@ void DmlDeviceContext::Init(const OptionsDict& options) {
   const int gpu_id = options.GetOrDefault<int>("gpu", 0);
   meta_commands_ = options.GetOrDefault<bool>("meta_commands", true);
 
+  // Opt-in D3D12 debug layer (LC0_DML_DEBUG_LAYER=1; agora thread 19 #560,
+  // verifying codex-sol's F2 resource-state claims with real validation
+  // output rather than reasoning about the D3D12 spec from source alone).
+  // Must be enabled before D3D12CreateDevice for it to take effect at all;
+  // requires the Windows SDK's Graphics Tools optional feature installed,
+  // so this fails soft (logs and continues without validation) rather than
+  // throwing -- it is a diagnostic aid, not something normal operation
+  // should ever depend on being available.
+  if (getenv("LC0_DML_DEBUG_LAYER")) {
+    ComPtr<ID3D12Debug> debug;
+    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
+      debug->EnableDebugLayer();
+      CERR << "directml backend: D3D12 debug layer enabled "
+              "(LC0_DML_DEBUG_LAYER)";
+    } else {
+      CERR << "directml backend: LC0_DML_DEBUG_LAYER set but "
+              "D3D12GetDebugInterface failed (Graphics Tools optional "
+              "feature not installed?) -- continuing without validation";
+    }
+  }
+
   ReportD3DErrors(CreateDXGIFactory1(IID_PPV_ARGS(&dxgi_factory_)),
                   "CreateDXGIFactory1");
   UINT adapter_index = 0;
@@ -122,6 +144,34 @@ void DmlDeviceContext::Init(const OptionsDict& options) {
       D3D12CreateDevice(adapter_.Get(), D3D_FEATURE_LEVEL_11_0,
                         IID_PPV_ARGS(&device_)),
       "D3D12CreateDevice");
+
+  // LC0_DML_DEBUG_LAYER, continued: the debug layer's own messages go to
+  // OutputDebugString by default, invisible to a console/test-runner
+  // capture -- register a real-time callback so validation errors (e.g.
+  // codex-sol's F2 resource-state claims, agora thread 19 #560) actually
+  // reach CERR instead of requiring an attached debugger to see. Needs
+  // ID3D12InfoQueue1 (Windows 10 2004+ / SDK 19041+); fails soft if the
+  // interface isn't there, same diagnostic-not-required posture as above.
+  if (getenv("LC0_DML_DEBUG_LAYER")) {
+    ComPtr<ID3D12InfoQueue1> info_queue;
+    if (SUCCEEDED(device_->QueryInterface(IID_PPV_ARGS(&info_queue)))) {
+      auto callback = [](D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY sev,
+                         D3D12_MESSAGE_ID, LPCSTR description, void*) {
+        CERR << "D3D12 debug layer [" << sev << "]: " << description;
+      };
+      DWORD cookie = 0;
+      if (SUCCEEDED(info_queue->RegisterMessageCallback(
+              callback, D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr,
+              &cookie))) {
+        CERR << "directml backend: D3D12 debug layer message callback "
+                "registered";
+      }
+    } else {
+      CERR << "directml backend: LC0_DML_DEBUG_LAYER set but "
+              "ID3D12InfoQueue1 unavailable -- validation messages will "
+              "only reach an attached debugger, not this log";
+    }
+  }
 
   D3D12_COMMAND_QUEUE_DESC queue_desc = {};
   queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
