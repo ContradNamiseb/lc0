@@ -940,18 +940,38 @@ void DirectMlNetwork<DataType>::forwardEval(
   network_[l++]->Eval(batch, op_val_scratch, flow, spare2, scratch,
                       scratch_bytes_, scope);
   {
-    D3D12_RESOURCE_BARRIER vcopy = {};
-    vcopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    vcopy.Transition.pResource = io->value_gpu_.Get();
-    vcopy.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    vcopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-    list->ResourceBarrier(1, &vcopy);
+    // Both sides of the copy need a state transition, not just the
+    // destination (agora thread 19 #560, codex-sol's F1: the scratch
+    // source stayed in UNORDERED_ACCESS through this CopyBufferRegion,
+    // invalid D3D12 usage per the resource-state contract regardless of
+    // whether this driver happens to tolerate it silently today). scratch
+    // is a shared arena other dispatches read/write throughout forwardEval
+    // (the moves-left head's own Eval calls immediately below, for one),
+    // so it must be back in UNORDERED_ACCESS before anything else touches
+    // it -- not left in COPY_SOURCE.
+    D3D12_RESOURCE_BARRIER vpre[2] = {};
+    vpre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    vpre[0].Transition.pResource = io->value_gpu_.Get();
+    vpre[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    vpre[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    vpre[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    vpre[1].Transition.pResource = scratch_arena_.resource();
+    vpre[1].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    vpre[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    list->ResourceBarrier(2, vpre);
     list->CopyBufferRegion(io->value_gpu_.Get(), 0, scratch_arena_.resource(),
                            0,
                            (uint64_t)batch * (wdl_ ? 3 : 1) * sizeof(DataType));
-    vcopy.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    vcopy.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    list->ResourceBarrier(1, &vcopy);
+    D3D12_RESOURCE_BARRIER vpost[2] = {};
+    vpost[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    vpost[0].Transition.pResource = io->value_gpu_.Get();
+    vpost[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    vpost[0].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    vpost[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    vpost[1].Transition.pResource = scratch_arena_.resource();
+    vpost[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    vpost[1].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    list->ResourceBarrier(2, vpost);
   }
   ProfileStage("value_head", scope);
 
@@ -967,18 +987,31 @@ void DirectMlNetwork<DataType>::forwardEval(
     DmlPtr op_mov_scratch(scratch_arena_.resource(), 0);
     network_[l++]->Eval(batch, op_mov_scratch, spare2, spare2, scratch,
                         scratch_bytes_, scope);
-    D3D12_RESOURCE_BARRIER mcopy = {};
-    mcopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    mcopy.Transition.pResource = io->moves_left_gpu_.Get();
-    mcopy.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    mcopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-    list->ResourceBarrier(1, &mcopy);
+    // Same F1 fix as the value head's copy above -- both sides transition,
+    // scratch restored to UNORDERED_ACCESS after (agora thread 19 #560).
+    D3D12_RESOURCE_BARRIER mpre[2] = {};
+    mpre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    mpre[0].Transition.pResource = io->moves_left_gpu_.Get();
+    mpre[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    mpre[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    mpre[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    mpre[1].Transition.pResource = scratch_arena_.resource();
+    mpre[1].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    mpre[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    list->ResourceBarrier(2, mpre);
     list->CopyBufferRegion(io->moves_left_gpu_.Get(), 0,
                            scratch_arena_.resource(), 0,
                            (uint64_t)batch * sizeof(DataType));
-    mcopy.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    mcopy.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    list->ResourceBarrier(1, &mcopy);
+    D3D12_RESOURCE_BARRIER mpost[2] = {};
+    mpost[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    mpost[0].Transition.pResource = io->moves_left_gpu_.Get();
+    mpost[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    mpost[0].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    mpost[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    mpost[1].Transition.pResource = scratch_arena_.resource();
+    mpost[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    mpost[1].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    list->ResourceBarrier(2, mpost);
     ProfileStage("movesleft_head", scope);
   }
 
