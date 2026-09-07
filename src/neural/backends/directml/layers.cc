@@ -232,7 +232,14 @@ ComPtr<ID3D12PipelineState> CreateComputePso(ID3D12Device* device,
 // view would be the alternative; root constants set directly on the command
 // list are simpler and avoid the extra copy, so this is only used where the
 // constant payload exceeds what SetComputeRoot32BitConstants conveniently
-// expresses (nothing today -- kept for symmetry with inputs_outputs.h).
+// expresses. agora thread 19 #620 package D4: this constant itself is
+// unused (no call site references it) and its "nothing today" claim is
+// stale -- KdaShaderConstants is 24 32-bit words, already past 16, but
+// takes the direct SetComputeRoot32BitConstants path this comment
+// describes as the alternative, not the buffer-backed approach this
+// constant would gate. Left in place (unused, harmless) rather than
+// removed in a comment-only pass; a future user of this threshold should
+// size it against the shaders that actually exist, not the number below.
 constexpr UINT kMaxRootConstants = 16;
 
 // ===========================================================================
@@ -2004,6 +2011,28 @@ void AttentionBody<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
   }
 }
 
+// agora thread 19 #620 package D2 (R5): BodyDumps()/ProfileMarks() are
+// process-wide statics, and each DirectMlNetwork's eval_lock_ only
+// serializes access WITHIN that one network -- two DIFFERENT network
+// instances evaluating concurrently (directml and directml-fp16 both
+// loaded and interleaved, as network_check.cc's dual-backend comparison
+// does) can race on these shared vectors: concurrent push_back is a real
+// data race (vector reallocation under concurrent readers/writers is
+// undefined behavior, not just "wrong data"), and ProfileStage's
+// size()-then-push_back is a compound read-modify-write that can hand two
+// different networks' calls the same EndQuery slot index if they
+// interleave. A single shared mutex, held across each function's whole
+// compound operation, is the minimum fix that closes the memory-safety
+// risk; per-context storage (threaded through DmlExecScope, so each
+// network gets its own vectors with no cross-network interaction at all)
+// would close the index-attribution question too, but is the larger,
+// more invasive redesign muse-spark's report named as the fuller
+// alternative -- not attempted in this pass.
+std::mutex& DumpProfileMutex() {
+  static std::mutex m;
+  return m;
+}
+
 std::vector<BodyDump>& BodyDumps() {
   static std::vector<BodyDump> dumps;
   return dumps;
@@ -2028,6 +2057,10 @@ inline void ProfileStage(const std::string& stage, DmlExecScope& scope) {
   if (!getenv("LC0_DML_PROFILE")) return;
   ID3D12QueryHeap* heap = scope.ctx().profile_heap();
   if (!heap) return;  // requested but heap creation was skipped/failed
+  // D2: index-then-push_back is a compound operation on the shared
+  // process-wide ProfileMarks() -- lock across both so two networks'
+  // concurrent calls can't interleave and hand out the same slot index.
+  std::lock_guard<std::mutex> lock(DumpProfileMutex());
   const UINT index = static_cast<UINT>(ProfileMarks().size());
   if (index >= kProfileQuerySlots) return;  // degrade silently past capacity
   scope.list()->EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, index);
@@ -2047,7 +2080,24 @@ inline void ProfileStage(const std::string& stage, DmlExecScope& scope) {
 inline void DumpBodyStage(const std::string& stage, DmlPtr src,
                           DmlExecScope& scope) {
   if (!getenv("LC0_DUMP_BODY")) return;
-  const uint64_t bytes = 64 * 1024 * sizeof(float);
+  // agora thread 19 #620 package D1 (R4): this used to be an unconditional
+  // fixed-size copy with no check that `src` actually has this many bytes
+  // left in it -- a small fixture (e.g. max_batch=1, well under the
+  // 64*1024*4 = 256KB this dump wants) would have this CopyBufferRegion
+  // read past the end of src.res, an out-of-bounds GPU read. Clamp to
+  // whatever's actually left in the resource from src.offset; the dump's
+  // own doc comment above already tells a reader the file can hold
+  // trailing garbage past the real tensor size, so a smaller-than-usual
+  // dump here is consistent with that contract, not a new one.
+  const uint64_t requested_bytes = 64 * 1024 * sizeof(float);
+  uint64_t bytes = requested_bytes;
+  if (src.res) {
+    const uint64_t resource_bytes = src.res->GetDesc().Width;
+    const uint64_t available =
+        src.offset < resource_bytes ? resource_bytes - src.offset : 0;
+    bytes = std::min(bytes, available);
+  }
+  if (bytes == 0) return;
   BodyDump d;
   d.stage = stage;
   d.bytes = bytes;
@@ -2065,7 +2115,13 @@ inline void DumpBodyStage(const std::string& stage, DmlPtr src,
   b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
   b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
   scope.list()->ResourceBarrier(1, &b);
-  BodyDumps().push_back(std::move(d));
+  // D2: push_back on the shared process-wide BodyDumps() -- lock it against
+  // a concurrent push from another network instance (see DumpProfileMutex's
+  // comment above ProfileStage).
+  {
+    std::lock_guard<std::mutex> lock(DumpProfileMutex());
+    BodyDumps().push_back(std::move(d));
+  }
 }
 
 template <typename DataType>
@@ -2287,33 +2343,17 @@ void AttentionBody<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
   }
   ProfileStage("embedding", scope);
 
-  auto stage_dump = [&](const std::string& stage, DmlPtr src) {
-    if (!getenv("LC0_DUMP_BODY")) return;
-    const uint64_t bytes = 64 * 1024 * sizeof(float);
-    BodyDump d;
-    d.stage = stage;
-    d.bytes = bytes;
-    d.readback = detail::CreateBuffer(scope.ctx().device(), bytes,
-                                      D3D12_HEAP_TYPE_READBACK,
-                                      D3D12_RESOURCE_STATE_COPY_DEST);
-    D3D12_RESOURCE_BARRIER b = {};
-    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b.Transition.pResource = src.res;
-    b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    list->ResourceBarrier(1, &b);
-    list->CopyBufferRegion(d.readback.Get(), 0, src.res, src.offset, bytes);
-    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    list->ResourceBarrier(1, &b);
-    BodyDumps().push_back(std::move(d));
-  };
-
-  stage_dump("emb", output);
+  // agora thread 19 #620 package D1: this was a byte-for-byte duplicate of
+  // DumpBodyStage above (same fixed-size, unclamped copy) as a local
+  // lambda differing only in capturing `list` instead of taking `scope` --
+  // consolidated onto the one definition, which now also carries D1's
+  // clamp fix.
+  DumpBodyStage("emb", output, scope);
   int dump_index = 0;
   for (const auto& enc : encoder_weights_) {
-    enc->Eval(N, output, scratch, buffer1, buffer2, ln_scratch, scope);
-    stage_dump("enc" + std::to_string(dump_index++), output);
+    enc->Eval(N, output, scratch, buffer1, buffer2, ln_scratch, scope,
+             dump_index);
+    DumpBodyStage("enc" + std::to_string(dump_index++), output, scope);
   }
 }
 
@@ -2529,9 +2569,11 @@ EncoderBlock<DataType>::EncoderBlock(
 template <typename DataType>
 void EncoderBlock<DataType>::Eval(int N, DmlPtr in_out_tensor, DmlPtr scratch,
                                   DmlPtr buffer1, DmlPtr buffer2,
-                                  DmlPtr ln_scratch, DmlExecScope& scope) {
+                                  DmlPtr ln_scratch, DmlExecScope& scope,
+                                  int encoder_index) {
   if (is_kda_) {
-    EvalKda(N, in_out_tensor, scratch, buffer1, buffer2, ln_scratch, scope);
+    EvalKda(N, in_out_tensor, scratch, buffer1, buffer2, ln_scratch, scope,
+           encoder_index);
   } else {
     EvalMha(N, in_out_tensor, scratch, buffer1, buffer2, ln_scratch, scope);
   }
@@ -3211,7 +3253,14 @@ template <typename DataType>
 void EncoderBlock<DataType>::EvalKda(int N, DmlPtr in_out_tensor,
                                      DmlPtr scratch, DmlPtr buffer1,
                                      DmlPtr buffer2, DmlPtr ln_scratch,
-                                     DmlExecScope& scope) {
+                                     DmlExecScope& scope, int encoder_index) {
+  // agora thread 19 #620 package D3: every dump name below used to
+  // hardcode "enc0_" regardless of which encoder was actually running --
+  // in a multi-encoder net, encoder 1's dump silently overwrote encoder
+  // 0's file under the same name, and so on. Prefixed with the real index
+  // instead, matching AttentionBody::Eval's own per-encoder "enc0"/"enc1"/
+  // ... dump names.
+  const std::string kdaDumpPrefix = "enc" + std::to_string(encoder_index);
   constexpr float kKdaLogDecayFloor = -10.0f;
   const uint32_t tokens = N * 64;
   const uint32_t max_tokens = max_batch_size_ * 64;
@@ -3383,8 +3432,8 @@ void EncoderBlock<DataType>::EvalKda(int N, DmlPtr in_out_tensor,
   // projection GEMM or the scratch-buffer layout feeding it). If these are
   // clean and only "mixed" (dumped above) is bad, the recurrence shader's
   // own read/compute/write is the first place anything goes wrong.
-  DumpBodyStage("enc0_q", q, scope);
-  DumpBodyStage("enc0_rawdecay", raw_decay, scope);
+  DumpBodyStage(kdaDumpPrefix + "_q", q, scope);
+  DumpBodyStage(kdaDumpPrefix + "_rawdecay", raw_decay, scope);
   // agora #465's action item 2: gate is native DataType width (half when
   // fp16_, unlike q/k/v/raw_decay above which are upcast to float32) --
   // dumping it lets an FP32-run-vs-FP16-run diff (same env/net/bisection,
@@ -3393,7 +3442,7 @@ void EncoderBlock<DataType>::EvalKda(int N, DmlPtr in_out_tensor,
   // LN1) without touching kda_tail1_compiled_'s output list or arena
   // sizing at all -- gate already has its own dedicated scratch buffer,
   // same as q/raw_decay above.
-  if (kda_output_gate_) DumpBodyStage("enc0_gate", gate, scope);
+  if (kda_output_gate_) DumpBodyStage(kdaDumpPrefix + "_gate", gate, scope);
 
   {
     KdaRecurrenceLayer::Params params{};
@@ -3417,7 +3466,7 @@ void EncoderBlock<DataType>::EvalKda(int N, DmlPtr in_out_tensor,
   // and post-block only) into recurrence-output / gate+dense+LN1 /
   // FFN+LN2 thirds. Temporary -- remove once the overflow site is found and
   // fixed, same as the existing stage_dump this reuses infrastructure from.
-  DumpBodyStage("enc0_kdarec", mixed, scope);
+  DumpBodyStage(kdaDumpPrefix + "_kdarec", mixed, scope);
 
   // Output norm + gate + dense projection with LN1 fused in, then FFN with
   // LN2 fused in (see BuildKdaTails, Path 1 / note 2523/2494's second bug).
@@ -3435,7 +3484,7 @@ void EncoderBlock<DataType>::EvalKda(int N, DmlPtr in_out_tensor,
     // Skip is the block input, still in in_out_tensor at this point.
     DispatchOp<DataType>(scope, kda_tail1_compiled_.at(N), mixed, gate,
                          buffer2, {ln1}, in_out_tensor);
-    DumpBodyStage("enc0_ln1", ln1, scope);
+    DumpBodyStage(kdaDumpPrefix + "_ln1", ln1, scope);
 
     // Writes directly into in_out_tensor, same destination as the old
     // separate LN2 dispatch did.
@@ -3449,7 +3498,7 @@ void EncoderBlock<DataType>::EvalKda(int N, DmlPtr in_out_tensor,
     // garbage, not a real overflow (verified: reinterpreted as fp16, ln1 is
     // clean, absmax ~26, no NaN/Inf). Remove once the real corruption site
     // is found.
-    DumpBodyStage("enc0_out", in_out_tensor, scope);
+    DumpBodyStage(kdaDumpPrefix + "_out", in_out_tensor, scope);
   }
   ProfileStage("kda_tail", scope);
 }
@@ -3650,8 +3699,13 @@ void AttentionPolicyHead<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
   }
   DumpBodyStage("pol_emb", embedding, scope);
 
+  // agora thread 19 #620 package D3: index threaded through for the same
+  // reason as AttentionBody::Eval's encoder loop -- without it, every
+  // policy encoder past the first would collide on EvalKda's dump names.
+  int policy_enc_dump_index = 0;
   for (const auto& enc : encoder_weights_) {
-    enc->Eval(N, embedding, scratch, buffer1, buffer2, ln_scratch, scope);
+    enc->Eval(N, embedding, scratch, buffer1, buffer2, ln_scratch, scope,
+             policy_enc_dump_index++);
   }
 
   // wq, wk, and scores are ALL genuine FLOAT32 now (agora #483/#484: wq
@@ -3675,10 +3729,11 @@ void AttentionPolicyHead<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
   }
   // agora thread 19 #482: bisection dumps to localize the residual 0.605
   // policy-logit diff at move 1703 (post Phase 2's KDA sign-inversion fix).
-  // wq is native DataType width (half when fp16_) per the comment above --
-  // NOT float32 like wk/scores -- a reader must reinterpret accordingly or
-  // repeat the same misread class already caught once this session (ln1).
-  // Temporary; remove once the diff is localized.
+  // agora thread 19 #620 package D4: this comment used to claim wq stays
+  // native DataType width, NOT float32 like wk/scores -- stale since
+  // #483/#484 (see the comment a few lines above) made all three genuine
+  // float32. All three dumps below are float32; no reinterpretation
+  // needed for any of them. Temporary; remove once the diff is localized.
   DumpBodyStage("pol_wq", wq, scope);
   DumpBodyStage("pol_wk", wk, scope);
   DumpBodyStage("pol_scores", scores, scope);

@@ -133,6 +133,16 @@ struct BodyDump {
 };
 std::vector<BodyDump>& BodyDumps();
 
+// agora thread 19 #620 package D2: guards BodyDumps()/ProfileMarks()
+// against concurrent access from more than one DirectMlNetwork instance
+// (each network's own eval_lock_ only serializes within that network).
+// Every producer (ProfileStage/DumpBodyStage in layers.cc) and consumer
+// (network_directml.cc's drain-and-print-and-clear after a fence wait)
+// must hold this for its whole read/modify/clear, not just individual
+// vector calls -- declared here so both translation units share the one
+// mutex instance.
+std::mutex& DumpProfileMutex();
+
 // Debug aid (LC0_DML_PROFILE): GPU-timestamp stage marks for Phase 3's speed
 // campaign (agora thread 19 #545/#549) -- records the ordered stage names
 // EndQuery was called for, so network_directml.cc can pair each with its
@@ -398,8 +408,13 @@ class EncoderBlock {
 
   // in_out_tensor is updated in place (input on entry, output on exit), like
   // the SYCL EncoderBlock::Eval; scratch/buffer1/buffer2 are scratch.
+  // encoder_index (agora thread 19 #620 package D3) names this encoder's
+  // LC0_DUMP_BODY bisection dumps -- EvalKda's used to hardcode "enc0_",
+  // so every encoder in a multi-encoder net overwrote the previous one's
+  // dump files under the same names.
   void Eval(int N, DmlPtr in_out_tensor, DmlPtr scratch, DmlPtr buffer1,
-            DmlPtr buffer2, DmlPtr ln_scratch, DmlExecScope& scope);
+            DmlPtr buffer2, DmlPtr ln_scratch, DmlExecScope& scope,
+            int encoder_index);
 
   // Two-phase compile support: builds this block's per-N graphs without
   // recording (see BaseLayer::EnsureCompiled).
@@ -412,7 +427,8 @@ class EncoderBlock {
   void BuildMhaTails(int N, DmlExecScope& scope);
 
   void EvalKda(int N, DmlPtr in_out_tensor, DmlPtr scratch, DmlPtr buffer1,
-               DmlPtr buffer2, DmlPtr ln_scratch, DmlExecScope& scope);
+               DmlPtr buffer2, DmlPtr ln_scratch, DmlExecScope& scope,
+               int encoder_index);
   void EvalMha(int N, DmlPtr in_out_tensor, DmlPtr scratch, DmlPtr buffer1,
                DmlPtr buffer2, DmlPtr ln_scratch, DmlExecScope& scope);
 

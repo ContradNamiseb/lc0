@@ -1174,8 +1174,23 @@ void DirectMlNetwork<DataType>::forwardEval(
   // ResolveQueryData is itself a command list op -- it must be recorded
   // before Close(), unlike the CPU-side readback of its destination buffer
   // below, which has to wait for the fence like everything else GPU-written.
+  // agora thread 19 #620 package D2: BodyDumps()/ProfileMarks() are
+  // process-wide, not per-network -- see DumpProfileMutex's declaration
+  // (layers.h) for why every read/modify of them needs to hold this lock
+  // for its whole compound operation, not just each individual vector
+  // call. This early size() read and the later drain-and-clear block
+  // below are separate critical sections (a lock spanning the fence wait
+  // in between would serialize every network's evaluation on this one
+  // mutex, a bigger behavioral change than intended here); the residual
+  // cross-network mark-attribution question that gap leaves is the R5
+  // "original F10 remains" scope muse-spark's report named as needing the
+  // fuller per-context redesign, not closed by this mutex alone.
   ComPtr<ID3D12Resource> profile_readback;
-  const size_t profile_marks = ProfileMarks().size();
+  size_t profile_marks;
+  {
+    std::lock_guard<std::mutex> lock(DumpProfileMutex());
+    profile_marks = ProfileMarks().size();
+  }
   if (profile_marks > 0 && ctx_.profile_heap()) {
     profile_readback = detail::CreateBuffer(
         ctx_.device(), profile_marks * sizeof(UINT64),
@@ -1192,34 +1207,41 @@ void DirectMlNetwork<DataType>::forwardEval(
   ReportD3DErrors(ctx_.queue()->Signal(io->fence_.Get(), io->fence_value_),
                   "Signal");
   ctx_.WaitForFence(io->fence_.Get(), io->fence_value_);
-  if (profile_readback) {
-    const UINT64* stamps = nullptr;
-    profile_readback->Map(
-        0, nullptr, const_cast<void**>(reinterpret_cast<const void**>(&stamps)));
-    const double freq = static_cast<double>(ctx_.profile_frequency());
-    CERR << "LC0_DML_PROFILE batch=" << batch << " (" << profile_marks
-        << " stage marks, us since previous mark):";
-    for (size_t i = 0; i < profile_marks; ++i) {
-      const double us = i == 0
-                            ? 0.0
-                            : (static_cast<double>(stamps[i] - stamps[i - 1]) /
-                               freq) * 1e6;
-      CERR << "  " << ProfileMarks()[i] << ": " << us << " us";
+  {
+    // D2: one lock across both drains -- see the comment above
+    // profile_marks's read for why this and that are separate critical
+    // sections rather than one spanning the fence wait.
+    std::lock_guard<std::mutex> lock(DumpProfileMutex());
+    if (profile_readback) {
+      const UINT64* stamps = nullptr;
+      profile_readback->Map(
+          0, nullptr,
+          const_cast<void**>(reinterpret_cast<const void**>(&stamps)));
+      const double freq = static_cast<double>(ctx_.profile_frequency());
+      CERR << "LC0_DML_PROFILE batch=" << batch << " (" << profile_marks
+          << " stage marks, us since previous mark):";
+      for (size_t i = 0; i < profile_marks; ++i) {
+        const double us =
+            i == 0 ? 0.0
+                   : (static_cast<double>(stamps[i] - stamps[i - 1]) / freq) *
+                         1e6;
+        CERR << "  " << ProfileMarks()[i] << ": " << us << " us";
+      }
+      profile_readback->Unmap(0, nullptr);
+      ProfileMarks().clear();
     }
-    profile_readback->Unmap(0, nullptr);
-    ProfileMarks().clear();
-  }
-  if (const char* prefix = getenv("LC0_DUMP_BODY")) {
-    for (auto& d : BodyDumps()) {
-      const float* p = nullptr;
-      d.readback->Map(0, nullptr,
-                      const_cast<void**>(reinterpret_cast<const void**>(&p)));
-      std::ofstream f(std::string(prefix) + ".dml." + d.stage + ".bin",
-                      std::ios::binary);
-      f.write(reinterpret_cast<const char*>(p), d.bytes);
-      d.readback->Unmap(0, nullptr);
+    if (const char* prefix = getenv("LC0_DUMP_BODY")) {
+      for (auto& d : BodyDumps()) {
+        const float* p = nullptr;
+        d.readback->Map(
+            0, nullptr, const_cast<void**>(reinterpret_cast<const void**>(&p)));
+        std::ofstream f(std::string(prefix) + ".dml." + d.stage + ".bin",
+                        std::ios::binary);
+        f.write(reinterpret_cast<const char*>(p), d.bytes);
+        d.readback->Unmap(0, nullptr);
+      }
+      BodyDumps().clear();
     }
-    BodyDumps().clear();
   }
   // fp16 output conversion: the readback buffers above just landed raw
   // DataType bits (DmlHalf when fp16); *_mapped_ is defined to always be a

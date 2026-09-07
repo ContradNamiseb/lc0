@@ -189,9 +189,12 @@ class DmlArena {
 };
 
 // Shader-visible CBV/UAV/SRV heap with a bump allocator. Every DirectML
-// binding table grabs a contiguous run of descriptors from it; the whole pool
-// is reset once per batch, after the batch's fence wait guarantees the GPU is
-// done reading them.
+// binding table grabs a contiguous run of descriptors from it. agora thread
+// 19 #620 package D4: this used to say the whole pool is reset once per
+// batch -- stale, and contradicted the accurate note on TakeCpu below.
+// There is no Reset() anywhere in this class: binding tables are cached
+// permanently per compiled operator (DmlDeviceContext::tables_), so their
+// descriptor slots are never reclaimed once taken.
 class DmlDescriptorPool {
  public:
   void Create(ID3D12Device* device, uint32_t capacity) {
