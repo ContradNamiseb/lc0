@@ -35,6 +35,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -2648,6 +2649,92 @@ TEST(BackendBenchExitStatus, ZeroOnSuccessfulRun) {
                    &output),
             0)
       << "a backendbench run that loads must exit zero: " << output;
+}
+
+// ---------------------------------------------------------------------------
+// F8 & F6 regression coverage (agora thread 19 #578/#579): codex-sol's
+// secondary review flagged that F8 (empty-batch guard) and F6 (fp16
+// converter NaN/subnormal fix) landed in commit 1b32741 with only a
+// standalone, out-of-tree bite-test as evidence -- durable in-tree coverage
+// was a CHANGES_REQUIRED condition, endorsed by gemini-antigravity in #579.
+// These two tests are that coverage.
+// ---------------------------------------------------------------------------
+
+// F8: ComputeBlocking() on a computation with zero AddInput calls used to
+// underflow planes_.size() - 1 in the per-sample readback loop (size_t 0 - 1
+// wraps to SIZE_MAX) after forwardEval() silently raised the batch size to
+// min_batch_size_ while planes_ itself stayed empty. The fix is the early
+// `if (planes_.empty()) return;` in network_directml.cc's ComputeBlocking().
+// This reproduces the underflow's precondition directly rather than
+// inferring it from the surrounding parity suite, which never constructs an
+// empty-input computation.
+TEST(DirectMlRegressionCoverage, EmptyBatchNoCrash) {
+  if (!HasBackend("directml"))
+    GTEST_SKIP() << "directml backend not compiled in";
+  if (!DirectMlAvailability().available) {
+    GTEST_SKIP() << "no usable directml device: "
+                 << DirectMlAvailability().reason;
+  }
+  OptionsDict options;
+  ApplyTestBackendOpts(&options);
+  auto network =
+      NetworkFactory::Get()->Create("directml", MakeKdaMlhNet(), options);
+  auto computation = network->NewComputation();
+  // Deliberately no AddInput() call: planes_ stays empty, batch size 0.
+  ASSERT_NO_THROW(computation->ComputeBlocking())
+      << "ComputeBlocking on an empty batch must return cleanly, not crash "
+         "or throw (F8, agora thread 19 #560/#573/#578)";
+}
+
+// F6: F32toF16Bits (reached only through DmlHalf's public float constructor
+// -- the function itself is file-local) used to consume a pre-truncated
+// 10-bit mantissa in its Inf/NaN and subnormal-rounding paths, discarding
+// the sticky/payload bits those two paths specifically needed. Reproduces
+// codex-sol's exact two counterexamples in-tree, matching the standalone
+// bite-test run before commit 1b32741.
+TEST(DirectMlRegressionCoverage, Fp16ConverterEdgeCases) {
+  using directml_backend::DmlHalf;
+  auto bits_to_float = [](uint32_t bits) {
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+  };
+
+  // FP32 0x33000001: just above the midpoint between half zero and the
+  // smallest positive subnormal -- round-to-nearest-even must round UP to
+  // 0x0001. The pre-fix code lost the sticky bit and rounded down to 0x0000.
+  {
+    const DmlHalf h(bits_to_float(0x33000001u));
+    EXPECT_EQ(h.bits, 0x0001u)
+        << "subnormal round-to-nearest-even lost the sticky bit (F6)";
+  }
+
+  // FP32 0x7f800001: a NaN with its payload bit at position 0, below the old
+  // >>13 truncation. Must stay a NaN (exponent field all-ones, mantissa
+  // nonzero), not collapse to +Infinity (exponent all-ones, mantissa zero).
+  {
+    const DmlHalf h(bits_to_float(0x7f800001u));
+    EXPECT_EQ(h.bits & 0x7c00u, 0x7c00u)
+        << "expected the Inf/NaN exponent pattern";
+    EXPECT_NE(h.bits, 0x7c00u)
+        << "NaN payload was silently truncated to +Infinity (F6)";
+  }
+
+  // Ordinary values never reach the two paths touched by F6 (they land on
+  // the ordinary-range rounding path, which was already correct) -- confirm
+  // that by round-tripping float -> half -> float and checking the result
+  // is finite and within fp16's representable precision of the original,
+  // rather than merely "didn't crash".
+  const float kOrdinary[] = {0.0f,      -0.0f,     1.0f,  -1.0f, 0.5f,
+                             0.001f,    -3.14159f, 1e-5f, 65504.0f};
+  for (float v : kOrdinary) {
+    const float round_tripped = static_cast<float>(DmlHalf(v));
+    ASSERT_TRUE(std::isfinite(round_tripped))
+        << "ordinary value " << v << " round-tripped to a non-finite half";
+    const float tolerance = std::max(std::fabs(v) * 1e-2f, 1e-6f);
+    EXPECT_NEAR(round_tripped, v, tolerance)
+        << "ordinary value " << v << " diverged beyond fp16 precision";
+  }
 }
 
 }  // namespace lczero
