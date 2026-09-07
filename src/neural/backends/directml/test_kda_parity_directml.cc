@@ -657,14 +657,31 @@ const DmlAvailability& DirectMlAvailability() {
 constexpr float kAbsTol = 5e-5f;
 constexpr float kScaleTol = 5e-5f;
 
+// FP16-calibrated bar (agora thread 19 #501, memory-bank note 2538, user-
+// ratified in chat 2026-09-07 "after a parity pass, and only if the nets
+// pass parity"). The bar above was calibrated for FP32 accumulation noise
+// (eps ~= 1.19e-7); IEEE 754 half has eps ~= 9.77e-4, so holding a genuinely
+// fp16 backend to 5e-5 (< 0.05 ULP of its own representation) is not an
+// achievable bar regardless of correctness. 5e-3 (0.5%) is the floor for
+// directml-fp16 specifically -- every other backend (directml, eigen, blas)
+// keeps the original 5e-5 bar unchanged; callers opt in explicitly via the
+// fp16 parameter, default false, so a call site that forgets to pass it
+// silently keeps the tighter FP32 bar rather than silently loosening.
+constexpr float kAbsTolFp16 = 5e-3f;
+constexpr float kScaleTolFp16 = 3e-2f;
+
 // q and d: bounded in [-1,1], so absolute only. Deliberately takes no
 // reference value -- passing one would invite reintroducing relative scaling.
-inline float BoundedOutputBound() { return kAbsTol; }
+inline float BoundedOutputBound(bool fp16 = false) {
+  return fp16 ? kAbsTolFp16 : kAbsTol;
+}
 
 // m and policy: unbounded, so the bar scales with the reference's own
 // magnitude and never drops below the absolute floor.
-inline float ScaledOutputBound(float reference_scale) {
-  return std::max(kAbsTol, kScaleTol * std::fabs(reference_scale));
+inline float ScaledOutputBound(float reference_scale, bool fp16 = false) {
+  const float abs_tol = fp16 ? kAbsTolFp16 : kAbsTol;
+  const float scale_tol = fp16 ? kScaleTolFp16 : kScaleTol;
+  return std::max(abs_tol, scale_tol * std::fabs(reference_scale));
 }
 
 // Every sample of a multi-position batch, against BLAS.
@@ -698,13 +715,15 @@ void CompareBackendsBatch(const pblczero::Net& net, int batch) {
   }
   const std::vector<Outputs> dml =
       RunNetworkBatch(test_backend, net, planes);
+  const bool fp16_bound = test_backend == "directml-fp16";
 
   for (int n = 0; n < batch; ++n) {
-    EXPECT_NEAR(dml[n].q, reference[n].q, BoundedOutputBound())
+    EXPECT_NEAR(dml[n].q, reference[n].q, BoundedOutputBound(fp16_bound))
         << "sample " << n << ": WDL value Q diverges";
-    EXPECT_NEAR(dml[n].d, reference[n].d, BoundedOutputBound())
+    EXPECT_NEAR(dml[n].d, reference[n].d, BoundedOutputBound(fp16_bound))
         << "sample " << n << ": WDL draw probability diverges";
-    EXPECT_NEAR(dml[n].m, reference[n].m, ScaledOutputBound(reference[n].m))
+    EXPECT_NEAR(dml[n].m, reference[n].m,
+               ScaledOutputBound(reference[n].m, fp16_bound))
         << "sample " << n << ": moves-left diverges";
 
     float ref_absmax = 0.0f, worst = 0.0f;
@@ -718,7 +737,7 @@ void CompareBackendsBatch(const pblczero::Net& net, int batch) {
         worst_move = i;
       }
     }
-    EXPECT_LT(worst, ScaledOutputBound(ref_absmax))
+    EXPECT_LT(worst, ScaledOutputBound(ref_absmax, fp16_bound))
         << "sample " << n << ": policy diverges (worst move " << worst_move
         << ", diff " << worst << ")";
 
@@ -765,13 +784,14 @@ void CompareBackends(const pblczero::Net& net) {
                  << DirectMlAvailability().reason;
   }
   const Outputs dml = RunNetwork(test_backend, net, planes);
+  const bool fp16_bound = test_backend == "directml-fp16";
 
   // Bounds and their calibration live with the constants above.
-  EXPECT_NEAR(dml.q, reference.q, BoundedOutputBound())
+  EXPECT_NEAR(dml.q, reference.q, BoundedOutputBound(fp16_bound))
       << "WDL value Q diverges between directml and blas";
-  EXPECT_NEAR(dml.d, reference.d, BoundedOutputBound())
+  EXPECT_NEAR(dml.d, reference.d, BoundedOutputBound(fp16_bound))
       << "WDL draw probability diverges between directml and blas";
-  EXPECT_NEAR(dml.m, reference.m, ScaledOutputBound(reference.m))
+  EXPECT_NEAR(dml.m, reference.m, ScaledOutputBound(reference.m, fp16_bound))
       << "moves-left diverges between directml and blas";
 
   if (getenv("LC0_DIAG_OUTPUTS")) {
@@ -821,7 +841,7 @@ void CompareBackends(const pblczero::Net& net) {
       worst_move = i;
     }
   }
-  EXPECT_LT(worst, ScaledOutputBound(ref_absmax))
+  EXPECT_LT(worst, ScaledOutputBound(ref_absmax, fp16_bound))
       << "policy diverges between directml and blas (worst move "
       << worst_move << ", diff " << worst << ")";
 
