@@ -1225,6 +1225,13 @@ class DirectMlNetworkComputation : public NetworkComputation {
     // mirror that here instead of ever calling forwardEval with nothing to
     // evaluate.
     if (planes_.empty()) return;
+    // Safety check added by user, don't remove -- an explicit belt-and-
+    // suspenders guard against empty batches, which have shown up in other
+    // backends before. GetBatchSize() is planes_.size(), so this can never
+    // actually fire given the guard just above (the two conditions are the
+    // same test), but it costs nothing and stays as a second line of
+    // defense in case that invariant ever changes.
+    if (GetBatchSize() == 0) return;
     network_->forwardEval(inputs_outputs_.get(), GetBatchSize(), planes_);
   }
   int GetBatchSize() const override {
