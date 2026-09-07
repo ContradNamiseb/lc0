@@ -304,9 +304,34 @@ class GraphFactory {
     return AddTensor({}, DmlBindingRef::Kind::kInput2, std::move(sizes),
                      std::move(strides));
   }
+  // Explicit FLOAT32 counterparts of Input2/Scratch, same bare-TensorDesc
+  // pattern as InputF32 above -- binding SLOT is still kInput2/kScratch
+  // (DispatchOp maps purely on that enum, see its switch below; the dtype is
+  // independent of which argument position a tensor binds to), only the
+  // element type differs. Used by the MHA always-FP32 core (agora thread 19
+  // #488-#493): qt/kt/vt genuinely hold float32 bytes in a fp16 network once
+  // mha_qkv_compiled_ casts up, so mha_attn_compiled_ must read them as such.
+  dml::Expression Input2F32(Sizes sizes) {
+    const uint64_t bytes = std::accumulate(
+        sizes.begin(), sizes.end(), uint64_t{sizeof(float)},
+        [](uint64_t a, uint32_t b) { return a * b; });
+    dml::TensorDesc desc(DML_TENSOR_DATA_TYPE_FLOAT32, sizes);
+    dml::Expression e = dml::InputTensor(graph_, next_input_++, desc);
+    bindings_.push_back({DmlBindingRef::Kind::kInput2, {}, bytes});
+    return e;
+  }
   dml::Expression Scratch(Sizes sizes, Sizes strides = {}) {
     return AddTensor({}, DmlBindingRef::Kind::kScratch, std::move(sizes),
                      std::move(strides));
+  }
+  dml::Expression ScratchF32(Sizes sizes) {
+    const uint64_t bytes = std::accumulate(
+        sizes.begin(), sizes.end(), uint64_t{sizeof(float)},
+        [](uint64_t a, uint32_t b) { return a * b; });
+    dml::TensorDesc desc(DML_TENSOR_DATA_TYPE_FLOAT32, sizes);
+    dml::Expression e = dml::InputTensor(graph_, next_input_++, desc);
+    bindings_.push_back({DmlBindingRef::Kind::kScratch, {}, bytes});
+    return e;
   }
   dml::Expression Extra(Sizes sizes, Sizes strides = {}) {
     return AddTensor({}, DmlBindingRef::Kind::kExtra, std::move(sizes),
@@ -2184,8 +2209,13 @@ EncoderBlock<DataType>::EncoderBlock(
           std::make_unique<KdaLocalConvLayer>(ctx.device(), fp16);
     }
   } else {
-    // MHA head transpose (see mha_transpose.hlsl).
-    mha_transpose_ = std::make_unique<MhaTransposeLayer>(ctx.device(), fp16);
+    // MHA head transpose (see mha_transpose.hlsl). Always fp32 now (agora
+    // thread 19 #488-#493): the shader's in_buf/out_buf share one INPUT_TYPE
+    // macro, so both sides of every dispatch must agree, and mha_qkv_compiled_
+    // /mha_attn_compiled_ now feed/consume genuine float32 buffers -- mirrors
+    // kda_recurrence_'s existing unconditional /*fp16=*/false a few lines up.
+    // A no-op for fp32 networks (fp16 is already false there).
+    mha_transpose_ = std::make_unique<MhaTransposeLayer>(ctx.device(), false);
   }
   // Both block kinds have the same two LayerNorms in their tail.
   layer_norm_ = std::make_unique<LayerNormLayer>(ctx.device(), fp16);
@@ -2300,17 +2330,35 @@ void EncoderBlock<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
     dml::Expression qe = gemm_bias(mha_q_w_, mha_q_b_, d_model);
     dml::Expression ke = gemm_bias(mha_k_w_, mha_k_b_, d_model);
     dml::Expression ve = gemm_bias(mha_v_w_, mha_v_b_, d_model);
+    // Always-FP32 MHA core (agora thread 19 #488-#493): q/k/v feed
+    // mha_transpose_ next, which is now compiled fp16=false unconditionally
+    // (see its construction below) to sidestep the FXC SM5.1
+    // StructuredBuffer<half>-via-root-descriptor stride hazard already fixed
+    // 4 times elsewhere this campaign (kda_recurrence, layer_norm,
+    // policy_finalize, PE_DENSE embedding). Casting here fuses into this
+    // graph's existing GEMMs -- zero extra dispatch, same pattern as
+    // EvalKda's kda_proj_compiled_ `to_rec`. In a fp32 network DataType is
+    // already float, so this is a no-op float->float cast.
+    const size_t rec_elem = sizeof(float);
+    auto to_rec = [&](dml::Expression e) {
+      return fp16_ ? dml::Cast(e, DML_TENSOR_DATA_TYPE_FLOAT32) : e;
+    };
     mha_qkv_compiled_.emplace(
-        N, g.Compile({qe, ke, ve},
-                     {(uint64_t)tokens * d_model * elem,
-                      (uint64_t)tokens * d_model * elem,
-                      (uint64_t)tokens * d_model * elem}));
+        N, g.Compile({to_rec(qe), to_rec(ke), to_rec(ve)},
+                     {(uint64_t)tokens * d_model * rec_elem,
+                      (uint64_t)tokens * d_model * rec_elem,
+                      (uint64_t)tokens * d_model * rec_elem}));
   }
   if (!mha_attn_compiled_.count(N)) {
     GraphFactory<DataType> g(scope.ctx());
-    auto qt_in = g.Input({B, 1, 64, D});
-    auto kt_in = g.Input2({B, 1, 64, D});
-    auto vt_in = g.Scratch({B, 1, 64, D});
+    // qt/kt/vt are genuinely float32 in memory now (see mha_qkv_compiled_'s
+    // to_rec cast above and mha_transpose_'s always-fp32 shader) -- read
+    // them as such. In a fp32 network InputF32/Input2F32/ScratchF32 are
+    // identical to Input/Input2/Scratch (DataType is already float), so this
+    // is not conditional on fp16_.
+    auto qt_in = g.InputF32({B, 1, 64, D});
+    auto kt_in = g.Input2F32({B, 1, 64, D});
+    auto vt_in = g.ScratchF32({B, 1, 64, D});
     if (has_smolgen_) {
       // Smolgen MLP in three stage graphs with no mid-graph reshapes (this
       // driver fails CompileGraph on reshape-carrying graphs): M1 compress
@@ -2457,8 +2505,13 @@ void EncoderBlock<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
     // KdaMha parity nets showed: both build their MHA encoder without
     // smolgen weights, while every real net that reaches this path has them.
     if (has_smolgen_) {
+      // bias_in stays native DataType width -- it comes from
+      // mha_smolbias_compiled_, a separate graph untouched by this change --
+      // but logits is now float32 (qt_in/kt_in are), so the two dtypes must
+      // match before the add. Upcast fuses into this same graph.
       auto bias_in = g.Extra({(uint32_t)B, 1, 64, 64});
-      logits = logits + bias_in;
+      logits = logits + (fp16_ ? dml::Cast(bias_in, DML_TENSOR_DATA_TYPE_FLOAT32)
+                                : bias_in);
     }
     const uint32_t softmax_axes[] = {3};
     const dml::Span<const uint32_t> softmax_axis(softmax_axes, 1);
@@ -2478,11 +2531,15 @@ void EncoderBlock<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
     // max/sum stays under the 2e-4 bar. Anything replacing this block must
     // therefore be validated on TRAINED nets, not the parity suite alone.
     dml::Expression attn = dml::ActivationSoftmax(logits, softmax_axis);
+    // context stays float32 (attn/vt_in both are) all the way through the
+    // merge-transpose; the one downcast to native DataType happens at
+    // BuildMhaTails' mha_tail1_compiled_ entry, mirroring BuildKdaTails'
+    // existing mixed_in pattern.
     dml::Expression context =
         dml::Gemm(attn, vt_in, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
                   DML_MATRIX_TRANSFORM_NONE);
-    mha_attn_compiled_.emplace(N, g.Compile({context},
-                                            {(uint64_t)B * 64 * D * elem}));
+    mha_attn_compiled_.emplace(
+        N, g.Compile({context}, {(uint64_t)B * 64 * D * sizeof(float)}));
   }
   BuildMhaTails(N, scope);
 }
@@ -2602,7 +2659,18 @@ void EncoderBlock<DataType>::BuildMhaTails(int N, DmlExecScope& scope) {
   // same defect here).
   if (!mha_tail1_compiled_.count(N)) {
     GraphFactory<DataType> g(scope.ctx());
-    auto mg = g.Input({1, 1, tokens, d_model});
+    // merged (this graph's input) is written by the always-fp32 MHA core
+    // above (mha_qkv_compiled_ -> mha_transpose_ -> mha_attn_compiled_ ->
+    // mha_transpose_ merge) -- in a fp16 network it's genuinely float32 in
+    // memory, so read it as such via InputF32 and cast down to DataType
+    // immediately. DirectML fuses this into the top of this compiled graph,
+    // no extra dispatch. Exact mirror of BuildKdaTails' mixed_in pattern. In
+    // a fp32 network this is a no-op float->float cast (fp16_ is false, RHS
+    // taken).
+    dml::Expression mg =
+        fp16_ ? dml::Cast(g.InputF32({1, 1, tokens, d_model}),
+                          DmlTensorType<DataType>())
+              : g.Input({1, 1, tokens, d_model});
     auto dw = g.Weight(mha_dense_w_, {1, 1, emb, d_model});
     dml::Expression dense =
         dml::Gemm(mg, dw, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
@@ -2678,7 +2746,11 @@ void EncoderBlock<DataType>::EvalMha(int N, DmlPtr in_out_tensor,
   const float softmax_scale = 1.0f / std::sqrt(static_cast<float>(D));
 
   const uint64_t max_tokens = (uint64_t)max_batch_size_ * 64;
-  const uint64_t S = max_tokens * d_model * elem;
+  // Always-FP32 MHA core (agora thread 19 #488-#493): q/k/v/qt/kt/vt/ctxb/
+  // merged are all genuinely float32 in the arena now (see mha_qkv_compiled_
+  // and mha_attn_compiled_ below), so their stride is sizeof(float), not
+  // elem -- a no-op change for a fp32 network (elem is already 4 there).
+  const uint64_t S = max_tokens * d_model * sizeof(float);
   DmlPtr q = scratch;
   DmlPtr k = q + S;
   DmlPtr v = k + S;
@@ -2707,11 +2779,16 @@ void EncoderBlock<DataType>::EvalMha(int N, DmlPtr in_out_tensor,
           gemm_bias(mha_k_w_, mha_k_b_, d_model);
       dml::Expression ve =
           gemm_bias(mha_v_w_, mha_v_b_, d_model);
+      // Keep in sync with EnsureCompiled's copy of this graph above.
+      const size_t rec_elem = sizeof(float);
+      auto to_rec = [&](dml::Expression e) {
+        return fp16_ ? dml::Cast(e, DML_TENSOR_DATA_TYPE_FLOAT32) : e;
+      };
       it = mha_qkv_compiled_
-               .emplace(N, g.Compile({qe, ke, ve},
-                                     {(uint64_t)tokens * d_model * elem,
-                                      (uint64_t)tokens * d_model * elem,
-                                      (uint64_t)tokens * d_model * elem}))
+               .emplace(N, g.Compile({to_rec(qe), to_rec(ke), to_rec(ve)},
+                                     {(uint64_t)tokens * d_model * rec_elem,
+                                      (uint64_t)tokens * d_model * rec_elem,
+                                      (uint64_t)tokens * d_model * rec_elem}))
                .first;
     }
     DispatchOp<DataType>(scope, it->second, in_out_tensor, buffer1, buffer2,

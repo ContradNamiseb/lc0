@@ -394,7 +394,13 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
       // covers both arenas. An underestimate here is not a failed
       // allocation but an out-of-bounds UAV write and a removed device
       // (DXGI_ERROR_DEVICE_REMOVED surfacing at the next DML call).
-      need = 8 * d_model;
+      //
+      // agora thread 19 #488-#493: the always-FP32 MHA core makes q/k/v/qt/
+      // kt/vt/ctx/merged all genuine float32 in a fp16 network now (see
+      // EvalMha/mha_qkv_compiled_/mha_attn_compiled_ in layers.cc), not
+      // native elem -- scale by scale_rec like every other FP32-boundary
+      // term above. A no-op in the fp32 network (scale_rec == 1 there).
+      need = 8 * d_model * scale_rec;
     }
     scratch_elems = std::max(scratch_elems, need);
   }
@@ -413,7 +419,9 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
     const uint64_t pol_d = (!enc.mha.q_w.empty() && pol_emb != 0)
                                ? enc.mha.q_w.size() / pol_emb
                                : pol_emb;
-    scratch_elems = std::max(scratch_elems, 10 * pol_d);
+    // Same always-FP32 MHA core scaling as the body loop's MHA term above --
+    // pol_encoder blocks are EncoderBlock<DataType>::EvalMha too.
+    scratch_elems = std::max(scratch_elems, 10 * pol_d * scale_rec);
   }
   scratch_elems = std::max(
       {scratch_elems,
