@@ -1214,6 +1214,17 @@ class DirectMlNetworkComputation : public NetworkComputation {
     planes_.emplace_back(std::move(input));
   }
   void ComputeBlocking() override {
+    // F8 (agora thread 19 #560/#573, codex-sol's independent review): an
+    // empty computation (NewComputation followed by ComputeBlocking with
+    // no AddInput calls) used to reach forwardEval with batch=0 and an
+    // empty planes_ vector. forwardEval raises batch up to min_batch_size_
+    // internally, but planes_ stays empty, so its per-sample loop's
+    // `planes[std::min(n, planes.size() - 1)]` underflows
+    // (planes.size() - 1 wraps to SIZE_MAX for an empty vector) and reads
+    // out of bounds. ONNX already treats an empty computation as a no-op;
+    // mirror that here instead of ever calling forwardEval with nothing to
+    // evaluate.
+    if (planes_.empty()) return;
     network_->forwardEval(inputs_outputs_.get(), GetBatchSize(), planes_);
   }
   int GetBatchSize() const override {

@@ -78,24 +78,55 @@ inline uint16_t F32toF16Bits(float value) {
   std::memcpy(&f, &value, sizeof(f));
   const uint32_t sign = (f >> 16) & 0x8000u;
   int32_t exp = static_cast<int32_t>((f >> 23) & 0xffu) - 127 + 15;
-  uint32_t mant = (f >> 13) & 0x3ffu;
+  // F6 (agora thread 19 #560/#573, codex-sol's independent review): the
+  // full 23-bit mantissa, kept intact until each path below decides how
+  // much of it actually matters. The old code computed a pre-truncated
+  // `mant = (f >> 13) & 0x3ffu` up front and fed that truncated value into
+  // both the Inf/NaN check and the subnormal path -- silently discarding
+  // the low 13 bits (the sticky-bit information a correct round-to-
+  // nearest-even needs, and the only bits a low NaN payload might set)
+  // before either of those decisions ever saw them. The normal-range
+  // rounding path below was always correct: it rounds a truncated target
+  // mantissa using the FULL `rem = f & 0x1fffu` as the rounding remainder,
+  // never the pre-truncated value. Only Inf/NaN and subnormal were wrong.
+  const uint32_t full_mant = f & 0x7fffffu;
   if (((f >> 23) & 0xffu) == 0xffu) {  // Inf/NaN
-    return static_cast<uint16_t>(sign | 0x7c00u | (mant ? 0x200u : 0u));
+    // A NaN's payload can live anywhere in the 23 mantissa bits; testing
+    // the pre-truncated (>>13) value missed any payload confined to the
+    // low 13 bits entirely, turning that NaN into +/-Infinity instead
+    // (reproduced by codex-sol: FP32 0x7f800001 -> half 0x7c00, not a
+    // NaN). full_mant != 0 is the correct, complete test.
+    return static_cast<uint16_t>(
+        sign | 0x7c00u | (full_mant ? 0x200u : 0u));
   }
   if (exp >= 0x1f) {
     return static_cast<uint16_t>(sign | 0x7c00u);  // overflow -> Inf
   }
   if (exp <= 0) {  // subnormal or zero
     if (exp < -10) return static_cast<uint16_t>(sign);
-    mant |= 0x400u;
-    const uint32_t shift = static_cast<uint32_t>(1 - exp);
-    const uint32_t half = static_cast<uint32_t>(mant >> shift);
-    const uint32_t rem = mant & ((1u << shift) - 1);
+    // exp > -10 here is only reachable for a normal fp32 value (any fp32
+    // subnormal/zero has raw exponent 0, giving exp = -112, always caught
+    // by the early return above) -- safe to assume the implicit leading
+    // 1 unconditionally. Reconstruct the full 24-bit significand instead
+    // of rounding the already-10-bit-truncated `mant` (the old code's
+    // `mant |= 0x400u; ... mant >> shift`): shifting an already-truncated
+    // value can never recover the sticky bits the old code discarded at
+    // the top of the function, which is exactly how codex-sol's example
+    // (FP32 0x33000001, just above the half-zero/smallest-subnormal
+    // midpoint) rounded down to 0x0000 instead of correctly up to 0x0001.
+    const uint32_t full_significand = (1u << 23) | full_mant;
+    const uint32_t shift = static_cast<uint32_t>(13 + (1 - exp));
+    const uint32_t half = full_significand >> shift;
+    const uint32_t rem = full_significand & ((1u << shift) - 1);
     const uint32_t mid = 1u << (shift - 1);
     uint32_t sub = half + ((rem > mid || (rem == mid && (half & 1u))) ? 1u : 0u);
     return static_cast<uint16_t>(sign | sub);
   }
-  // Round mantissa to nearest even.
+  // Round mantissa to nearest even. Already correct: `mant` here is the
+  // truncated 10-bit target, `rem` is the full low-13-bit remainder that
+  // decides which way to round it -- the two roles the subnormal path
+  // above was conflating into one (already-truncated) variable.
+  uint32_t mant = full_mant >> 13;
   const uint32_t rem = f & 0x1fffu;
   mant += (rem > 0x1000u || (rem == 0x1000u && (mant & 1u))) ? 1u : 0u;
   if (mant > 0x3ffu) {
