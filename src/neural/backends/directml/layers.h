@@ -455,6 +455,11 @@ class EncoderBlock {
   std::unordered_map<int, DmlCompiledOp> kda_proj_compiled_;
   std::unordered_map<int, DmlCompiledOp> kda_tail1_compiled_;
   std::unordered_map<int, DmlCompiledOp> kda_tail2_compiled_;
+  // Casts in_out_tensor up to genuine float32 before kda_local_conv_layer_'s
+  // now-always-fp32 shader reads it (agora thread 19 note 2530/#57 -- the
+  // 7th FXC SM5.1 StructuredBuffer<half> root-descriptor hazard). Only built
+  // and dispatched when kda_local_conv_ && fp16_.
+  std::unordered_map<int, DmlCompiledOp> kda_local_conv_cast_compiled_;
 
   // The KDA recurrence compute layer (compiled once at construction).
   std::unique_ptr<class KdaRecurrenceLayer> kda_recurrence_;

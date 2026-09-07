@@ -2159,8 +2159,16 @@ EncoderBlock<DataType>::EncoderBlock(
     kda_out_norm_gammas_ = uploader.Add(kda.out_norm_gammas);
     kda_dense_w_ = uploader.Add(kda.dense_w);
     kda_dense_b_ = uploader.Add(kda.dense_b);
-    kda_local_conv_w_ = uploader.Add(kda.local_conv_w);
-    kda_local_conv_b_ = uploader.Add(kda.local_conv_b);
+    // AddRaw, not Add: kda_local_conv_layer_ is now always fp16=false (see
+    // its construction below), so these must stay genuinely float32 in
+    // memory for the shader's StructuredBuffer<float> to read correctly.
+    // Add() already allocates sizeof(float)-per-element bytes regardless of
+    // DataType (established this campaign), so this is zero extra arena
+    // cost.
+    kda_local_conv_w_ = uploader.AddRaw(kda.local_conv_w.data(),
+                                        kda.local_conv_w.size() * sizeof(float));
+    kda_local_conv_b_ = uploader.AddRaw(kda.local_conv_b.data(),
+                                        kda.local_conv_b.size() * sizeof(float));
 
     kda_key_dim_ = kda.key_dim;
     kda_value_dim_ = kda.value_dim;
@@ -2205,8 +2213,13 @@ EncoderBlock<DataType>::EncoderBlock(
     kda_recurrence_ = std::make_unique<KdaRecurrenceLayer>(
         ctx.device(), /*fp16=*/false, kda_key_dim_, kda_value_dim_);
     if (kda_local_conv_) {
+      // Always fp32 now (agora thread 19 note 2530/#57 -- the 7th FXC SM5.1
+      // StructuredBuffer<half> root-descriptor hazard, same shape as
+      // kda_recurrence/layer_norm/policy_finalize/PE_DENSE embedding/policy
+      // projections/mha_transpose before it). A no-op in the fp32 network
+      // (fp16 is already false there).
       kda_local_conv_layer_ =
-          std::make_unique<KdaLocalConvLayer>(ctx.device(), fp16);
+          std::make_unique<KdaLocalConvLayer>(ctx.device(), false);
     }
   } else {
     // MHA head transpose (see mha_transpose.hlsl). Always fp32 now (agora
@@ -2248,7 +2261,18 @@ void EncoderBlock<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
     const size_t elem = sizeof(DataType);
     if (!kda_proj_compiled_.count(N)) {
       GraphFactory<DataType> g(scope.ctx());
-      auto x = g.Input({1, 1, tokens, emb});
+      // x is proj_in: in_out_tensor when kda_local_conv_ is off (native
+      // DataType, as always), or kda_local_conv_layer_'s output when it's
+      // on. That output is genuinely float32 now (agora thread 19 note
+      // 2530/#57 -- the shader is always fp32), so read it as such and cast
+      // down, exact mirror of BuildKdaTails' mixed_in / BuildMhaTails' mg.
+      // In a fp32 network this is a no-op float->float cast (fp16_ false,
+      // RHS taken) -- local_conv already wrote genuine float32 there.
+      dml::Expression x =
+          (kda_local_conv_ && fp16_)
+              ? dml::Cast(g.InputF32({1, 1, tokens, emb}),
+                         DmlTensorType<DataType>())
+              : g.Input({1, 1, tokens, emb});
       auto gemm_bias =
           [&](const DmlPtr& w, const DmlPtr& b, uint32_t out_c,
               ActivationFunction act) {
@@ -2912,7 +2936,14 @@ void EncoderBlock<DataType>::EvalKda(int N, DmlPtr in_out_tensor,
   DmlPtr k = q + max_tokens * KD * elem_rec;
   DmlPtr v = k + max_tokens * KD * elem_rec;
   DmlPtr gate_hidden = v + max_tokens * VD * elem_rec;
+  // proj_input now holds kda_local_conv_layer_'s output at elem_rec width
+  // (always float32) rather than native elem, since the shader is always
+  // fp32 now (note 2530/#57) -- a no-op size change in the fp32 network
+  // (elem_rec==elem there). in_up is the cast-up staging buffer feeding the
+  // shader's input side, only ever written/read when kda_local_conv_ &&
+  // fp16_; network_directml.cc's KDA arena term budgets both.
   DmlPtr proj_input = gate_hidden + max_tokens * gr * elem;
+  DmlPtr in_up = proj_input + max_tokens * emb * elem_rec;
   DmlPtr proj_in = in_out_tensor;
   DmlPtr raw_decay = buffer2;
   DmlPtr gate = buffer2 + max_tokens * KD * elem_rec;
@@ -2924,11 +2955,33 @@ void EncoderBlock<DataType>::EvalKda(int N, DmlPtr in_out_tensor,
     if (kda_local_conv_) {
       // 3x3 depthwise board conv + residual as an HLSL kernel (see
       // shaders/kda_local_conv.hlsl); the projection graph consumes
-      // proj_input.
+      // proj_input. Always fp32 now (note 2530/#57 -- the 7th FXC SM5.1
+      // StructuredBuffer<half> root-descriptor hazard): in a fp16 network,
+      // in_out_tensor is native half and must be cast up to genuine float32
+      // first (fused into a tiny 1-node graph, same DispatchOp mechanism as
+      // every other compiled op here) before the shader can read it
+      // correctly; in a fp32 network in_out_tensor is already float32, so
+      // the cast is skipped entirely and the shader reads it directly.
+      DmlPtr conv_in = in_out_tensor;
+      if (fp16_) {
+        auto cast_it = kda_local_conv_cast_compiled_.find(N);
+        if (cast_it == kda_local_conv_cast_compiled_.end()) {
+          GraphFactory<DataType> g(scope.ctx());
+          auto xin = g.Input({1, 1, tokens, emb});
+          dml::Expression up = dml::Cast(xin, DML_TENSOR_DATA_TYPE_FLOAT32);
+          cast_it = kda_local_conv_cast_compiled_
+                       .emplace(N, g.Compile({up}, {(uint64_t)tokens * emb *
+                                                    sizeof(float)}))
+                       .first;
+        }
+        DispatchOp<DataType>(scope, cast_it->second, in_out_tensor, DmlPtr(),
+                             DmlPtr(), {in_up});
+        conv_in = in_up;
+      }
       KdaLocalConvLayer::Params params{};
       params.tokens = tokens;
       params.emb = emb;
-      kda_local_conv_layer_->Record(scope.list(), params, in_out_tensor,
+      kda_local_conv_layer_->Record(scope.list(), params, conv_in,
                               kda_local_conv_w_, kda_local_conv_b_,
                               proj_input);
       proj_in = proj_input;
@@ -2936,7 +2989,18 @@ void EncoderBlock<DataType>::EvalKda(int N, DmlPtr in_out_tensor,
     auto it = kda_proj_compiled_.find(N);
     if (it == kda_proj_compiled_.end()) {
       GraphFactory<DataType> g(scope.ctx());
-      auto x = g.Input({1, 1, tokens, emb});
+      // x is proj_in: in_out_tensor when kda_local_conv_ is off (native
+      // DataType, as always), or kda_local_conv_layer_'s output when it's
+      // on. That output is genuinely float32 now (agora thread 19 note
+      // 2530/#57 -- the shader is always fp32), so read it as such and cast
+      // down, exact mirror of BuildKdaTails' mixed_in / BuildMhaTails' mg.
+      // In a fp32 network this is a no-op float->float cast (fp16_ false,
+      // RHS taken) -- local_conv already wrote genuine float32 there.
+      dml::Expression x =
+          (kda_local_conv_ && fp16_)
+              ? dml::Cast(g.InputF32({1, 1, tokens, emb}),
+                         DmlTensorType<DataType>())
+              : g.Input({1, 1, tokens, emb});
       auto gemm_bias =
           [&](const DmlPtr& w, const DmlPtr& b, uint32_t out_c,
               ActivationFunction act) {

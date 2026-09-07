@@ -380,10 +380,18 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
       // #431/#433 for the discarded formula that under-sized this by 64
       // elements at scale_rec=1, which would have been a silent
       // out-of-bounds UAV write, not merely a failed allocation.
+      // agora thread 19 note 2530/#57: proj_input (the emb_size term) is now
+      // float32-width whenever this net is fp16, whether or not THIS
+      // encoder uses local_conv (the offset is always reserved, mirroring
+      // the pre-existing unconditional-emb_size comment below it), so scale
+      // it uniformly like every other term here. local_conv encoders
+      // additionally need in_up, a second full emb_size-at-scale_rec
+      // staging buffer that non-local-conv KDA encoders never allocate.
       need = (2 * KD + VD +
              std::max<uint64_t>(2 * KD, VD + 3 * enc.kda.key_dim)) *
                  scale_rec +
-             enc.kda.gate_rank + emb_size;
+             enc.kda.gate_rank + emb_size * scale_rec +
+             (enc.kda.local_conv ? emb_size * scale_rec : 0);
     } else {
       const uint64_t d_model =
           !enc.mha.q_w.empty() ? enc.mha.q_w.size() / emb_size : emb_size;
