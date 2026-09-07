@@ -325,12 +325,38 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
 
   const size_t elem = sizeof(DataType);
   const uint64_t max_tokens = (uint64_t)max_batch_size_ * 64;
+  // sizeof(float)/elem: 1 in an fp32 network (elem==sizeof(float)), 2 in
+  // fp16. Shared by every scratch term below whose underlying buffer is
+  // forced to genuine float32 regardless of the network's own DataType
+  // (KDA geometry, and now PE_DENSE's nhwc) -- hoisted here (was local to
+  // the per-encoder loop below) so the PE_DENSE term added in #476/#478
+  // can reuse it too, rather than risk a second, possibly-inconsistent
+  // definition.
+  const uint64_t scale_rec = sizeof(float) / elem;
 
   // Scratch estimate: the largest of what the body/policy/encoder phases
   // keep alive simultaneously (mirror of the SYCL backend's
   // getMaxAttentionBodySize/getMaxKdaBodySize reasoning).
   const uint64_t emb_size = weights_.ip_emb_b.size();
   uint64_t scratch_elems = 112 + kNumPosEncodingChannels;
+  // agora thread 19 #476/#478 Phase 2: attention_preprocess.hlsl now
+  // always writes genuine float32 for a PE_DENSE net's mode-1 output
+  // (nhwc), regardless of elem -- this floor is exactly that per-token
+  // width (112 = kNumInputPlanes + embedding_dense_size_, mirroring
+  // AttentionBody's own derivation, ip_emb_preproc_b.size()/64, since that
+  // member isn't available here). Confirmed NOT already covered by the
+  // pre-existing floor above (112+kNumPosEncodingChannels=176 elements at
+  // native elem width) once nhwc needs scale_rec=2x headroom on an fp16
+  // PE_DENSE net -- e.g. MakePeDenseNet's dense_size=32 needs
+  // (112+32)*2=288, which 176 does not cover. pos_info (mode 2) is not
+  // separately scaled: its own per-token width is only 12 elements
+  // (encoding_size argument to record_preprocess), comfortably under every
+  // existing floor even doubled.
+  if (nf.input_embedding() == NF::INPUT_EMBEDDING_PE_DENSE) {
+    const uint64_t dense_size = weights_.ip_emb_preproc_b.size() / 64;
+    scratch_elems =
+        std::max(scratch_elems, (112 + dense_size) * scale_rec);
+  }
   for (const auto& enc : weights_.encoder) {
     uint64_t need;
     if (enc.is_kda) {
@@ -354,7 +380,6 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
       // #431/#433 for the discarded formula that under-sized this by 64
       // elements at scale_rec=1, which would have been a silent
       // out-of-bounds UAV write, not merely a failed allocation.
-      const uint64_t scale_rec = sizeof(float) / elem;
       need = (2 * KD + VD +
              std::max<uint64_t>(2 * KD, VD + 3 * enc.kda.key_dim)) *
                  scale_rec +

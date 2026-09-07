@@ -234,6 +234,38 @@ class GraphFactory {
     bindings_.push_back({DmlBindingRef::Kind::kWeight, w, bytes});
     return e;
   }
+  // Explicit FLOAT32 weight, bypassing the DataType template -- same
+  // bare-TensorDesc pattern as WeightU32 above. Used by the PE_DENSE
+  // embedding FP32 boundary (agora thread 19 #476/#478): the weight itself
+  // is uploaded raw via AddRaw and stays float32 in memory even in an fp16
+  // network, so it must be read back as float32, not cast from a half
+  // reinterpretation of the same bytes.
+  dml::Expression WeightF32(const DmlPtr& w, Sizes sizes) {
+    const uint64_t bytes = std::accumulate(
+        sizes.begin(), sizes.end(), uint64_t{sizeof(float)},
+        [](uint64_t a, uint32_t b) { return a * b; });
+    dml::TensorDesc desc(DML_TENSOR_DATA_TYPE_FLOAT32, sizes);
+    dml::Expression e = dml::InputTensor(graph_, next_input_++, desc);
+    bindings_.push_back({DmlBindingRef::Kind::kWeight, w, bytes});
+    return e;
+  }
+  // Per-channel FLOAT32 weight broadcast, mirroring WeightChannel.
+  dml::Expression WeightChannelF32(const DmlPtr& w, uint32_t rows,
+                                   uint32_t C) {
+    const uint64_t bytes = (uint64_t)C * sizeof(float);
+    const Sizes sizes{1, 1, rows, C};
+    const Sizes strides{0, 0, 0, 1};
+    dml::TensorDesc desc;
+    desc.dataType = DML_TENSOR_DATA_TYPE_FLOAT32;
+    desc.flags = DML_TENSOR_FLAG_NONE;
+    desc.sizes.assign(sizes.begin(), sizes.end());
+    desc.strides.emplace(strides.begin(), strides.end());
+    desc.totalTensorSizeInBytes = bytes;
+    desc.guaranteedBaseOffsetAlignment = 0;
+    dml::Expression e = dml::InputTensor(graph_, next_input_++, desc);
+    bindings_.push_back({DmlBindingRef::Kind::kWeight, w, bytes});
+    return e;
+  }
   // Strided weight view (e.g. zero-stride batch broadcast of the shared
   // smolgen table); strides are in elements.
   dml::Expression WeightStrided(const DmlPtr& w, Sizes sizes, Sizes strides) {
@@ -1471,20 +1503,38 @@ AttentionBody<DataType>::AttentionBody(
         "conv blocks yet (embedding -> encoder stacks only).");
   }
 
-  ip_emb_w_ = uploader.Add(weights.ip_emb_w);
-  ip_emb_b_ = uploader.Add(weights.ip_emb_b);
+  // agora thread 19 #476/#478's Phase 2: the PE_DENSE embedding graph
+  // (below) now runs entirely in genuine FLOAT32, downcasting only at its
+  // final output -- ip_emb_w_/ip_emb_b_ are shared with the non-PE_DENSE
+  // embedding graph (the `else` branch far below, which reads them via
+  // plain g.Weight/WeightChannel at native DataType width), so they must
+  // stay AddRaw'd (float32) ONLY for PE_DENSE nets; switching them
+  // unconditionally would misinterpret bytes for every non-PE_DENSE net in
+  // the suite (the majority of it).
+  if (is_pe_dense_embedding_) {
+    ip_emb_w_ = uploader.AddRaw(weights.ip_emb_w.data(),
+                                weights.ip_emb_w.size() * sizeof(float));
+    ip_emb_b_ = uploader.AddRaw(weights.ip_emb_b.data(),
+                                weights.ip_emb_b.size() * sizeof(float));
+  } else {
+    ip_emb_w_ = uploader.Add(weights.ip_emb_w);
+    ip_emb_b_ = uploader.Add(weights.ip_emb_b);
+  }
 
   if (is_pe_dense_embedding_) {
-    ip_emb_pre_w_ = uploader.Add(weights.ip_emb_preproc_w);
-    ip_emb_pre_b_ = uploader.Add(weights.ip_emb_preproc_b);
-    ip_emb_ln_g_ = uploader.Add(weights.ip_emb_ln_gammas);
-    ip_emb_ln_b_ = uploader.Add(weights.ip_emb_ln_betas);
-    ip_emb_ffn_d1_w_ = uploader.Add(weights.ip_emb_ffn.dense1_w);
-    ip_emb_ffn_d1_b_ = uploader.Add(weights.ip_emb_ffn.dense1_b);
-    ip_emb_ffn_d2_w_ = uploader.Add(weights.ip_emb_ffn.dense2_w);
-    ip_emb_ffn_d2_b_ = uploader.Add(weights.ip_emb_ffn.dense2_b);
-    ip_emb_ffn_ln_g_ = uploader.Add(weights.ip_emb_ffn_ln_gammas);
-    ip_emb_ffn_ln_b_ = uploader.Add(weights.ip_emb_ffn_ln_betas);
+    auto add_raw = [&](const std::vector<float>& v) {
+      return uploader.AddRaw(v.data(), v.size() * sizeof(float));
+    };
+    ip_emb_pre_w_ = add_raw(weights.ip_emb_preproc_w);
+    ip_emb_pre_b_ = add_raw(weights.ip_emb_preproc_b);
+    ip_emb_ln_g_ = add_raw(weights.ip_emb_ln_gammas);
+    ip_emb_ln_b_ = add_raw(weights.ip_emb_ln_betas);
+    ip_emb_ffn_d1_w_ = add_raw(weights.ip_emb_ffn.dense1_w);
+    ip_emb_ffn_d1_b_ = add_raw(weights.ip_emb_ffn.dense1_b);
+    ip_emb_ffn_d2_w_ = add_raw(weights.ip_emb_ffn.dense2_w);
+    ip_emb_ffn_d2_b_ = add_raw(weights.ip_emb_ffn.dense2_b);
+    ip_emb_ffn_ln_g_ = add_raw(weights.ip_emb_ffn_ln_gammas);
+    ip_emb_ffn_ln_b_ = add_raw(weights.ip_emb_ffn_ln_betas);
     embedding_dense_size_ =
         static_cast<int>(weights.ip_emb_preproc_b.size()) / 64;
     embedding_ffn_size_ = static_cast<int>(weights.ip_emb_ffn.dense2_b.size());
@@ -1501,11 +1551,22 @@ AttentionBody<DataType>::AttentionBody(
     ip_add_gate_ = uploader.Add(weights.ip_add_gate);
   }
 
-  // The preprocess compute shader: one PSO, compiled once.
+  // The preprocess compute shader: one PSO, compiled once. agora thread 19
+  // #476/#478's Phase 2: for a PE_DENSE net, force this compile to fp16=
+  // false unconditionally (regardless of the network's own fp16), since
+  // Phase 2 runs the whole PE_DENSE embedding graph in float32 and needs
+  // nhwc/pre_out genuinely float32 to match. Scoped to
+  // is_pe_dense_embedding_ only -- mode 0 (the non-PE_DENSE preprocess
+  // path, record_preprocess(0, ...) below) is never invoked for a
+  // PE_DENSE net, so non-PE_DENSE nets (the majority of the suite) see
+  // zero behavior change here; this is narrower than #467/#468's attempt,
+  // which forced fp16=false for every net sharing this one PSO.
+  const bool preprocess_fp16 = fp16 && !is_pe_dense_embedding_;
   ComPtr<ID3DBlob> shader =
       CompileHlsl(kAttentionPreprocessShaderSource,
                   sizeof(kAttentionPreprocessShaderSource) - 1,
-                  "attention_preprocess.hlsl", "AttentionPreprocess", fp16);
+                  "attention_preprocess.hlsl", "AttentionPreprocess",
+                  preprocess_fp16);
   preprocess_root_signature_ =
       CreateShaderRootSignature(ctx.device(), sizeof(PreprocessConstants) / 4,
                                 2, 1);
@@ -1538,29 +1599,47 @@ void AttentionBody<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
                                ? input_size + embedding_dense_size_
                                : input_size + kNumPosEncodingChannels;
   if (is_pe_dense_embedding_) {
+    // agora thread 19 #476/#478 Phase 2: the entire PE_DENSE embedding
+    // computation (this pre_compiled_ GEMM and the main compiled_ graph
+    // below) now runs in genuine FLOAT32 throughout -- inputs via InputF32
+    // (pos_info/nhwc are unconditionally float32 for a PE_DENSE net now,
+    // see preprocess_fp16 above), weights via WeightF32/WeightChannelF32
+    // (AddRaw'd in the constructor), only the very final `out` cast down
+    // to DataType. Correlation with true FP32 at this stage was measured
+    // ~0.53 before this change (#466/#472); Phase 1 (#477) proved nothing
+    // downstream of this embedding adds further noise, making this the
+    // last remaining untested link.
     if (!pre_compiled_.count(N)) {
       GraphFactory<DataType> g(scope.ctx());
-      auto x = g.Input({1, 1, static_cast<uint32_t>(N), 64 * 12});
-      auto w = g.Weight(ip_emb_pre_w_,
-                        {1, 1, static_cast<uint32_t>(64 * embedding_dense_size_),
-                         64 * 12});
-      auto b = g.WeightChannel(ip_emb_pre_b_, static_cast<uint32_t>(N),
-                               static_cast<uint32_t>(64 * embedding_dense_size_));
+      auto x = g.InputF32({1, 1, static_cast<uint32_t>(N), 64 * 12});
+      auto w = g.WeightF32(
+          ip_emb_pre_w_,
+          {1, 1, static_cast<uint32_t>(64 * embedding_dense_size_), 64 * 12});
+      auto b = g.WeightChannelF32(
+          ip_emb_pre_b_, static_cast<uint32_t>(N),
+          static_cast<uint32_t>(64 * embedding_dense_size_));
       dml::Expression y = dml::Gemm(x, w, dml::NullOpt,
                                     DML_MATRIX_TRANSFORM_NONE,
                                     DML_MATRIX_TRANSFORM_TRANSPOSE) + b;
+      // pre_out feeds record_preprocess mode 1 as its "encoding" buffer,
+      // which the (unconditionally fp32-for-PE_DENSE) shader reads as
+      // float32 -- stays float32 here, no downcast.
       pre_compiled_.emplace(
           N, g.Compile({y}, {(uint64_t)N * 64 * embedding_dense_size_ *
-                                 sizeof(DataType)}));
+                                 sizeof(float)}));
     }
     if (!compiled_.count(N)) {
       GraphFactory<DataType> g(scope.ctx());
-      auto x = g.Input({1, 1, tokens, static_cast<uint32_t>(body_input_c)});
-      auto w = g.Weight(ip_emb_w_, {1, 1, static_cast<uint32_t>(embedding_op_size_),
-                                    static_cast<uint32_t>(body_input_c)});
-      auto b = g.WeightChannel(ip_emb_b_, tokens, static_cast<uint32_t>(embedding_op_size_));
-      auto ln_g = g.WeightChannel(ip_emb_ln_g_, tokens, static_cast<uint32_t>(embedding_op_size_));
-      auto ln_b = g.WeightChannel(ip_emb_ln_b_, tokens, static_cast<uint32_t>(embedding_op_size_));
+      auto x = g.InputF32({1, 1, tokens, static_cast<uint32_t>(body_input_c)});
+      auto w = g.WeightF32(ip_emb_w_,
+                           {1, 1, static_cast<uint32_t>(embedding_op_size_),
+                            static_cast<uint32_t>(body_input_c)});
+      auto b = g.WeightChannelF32(ip_emb_b_, tokens,
+                                  static_cast<uint32_t>(embedding_op_size_));
+      auto ln_g = g.WeightChannelF32(ip_emb_ln_g_, tokens,
+                                     static_cast<uint32_t>(embedding_op_size_));
+      auto ln_b = g.WeightChannelF32(ip_emb_ln_b_, tokens,
+                                     static_cast<uint32_t>(embedding_op_size_));
       dml::Expression emb =
           dml::Gemm(x, w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
                     DML_MATRIX_TRANSFORM_TRANSPOSE);
@@ -1570,40 +1649,44 @@ void AttentionBody<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
       dml::Expression pre_ln = LayerNormExpr<DataType>(emb, &bias_b, nullptr, ln_g, ln_b, 1.0f, 1e-3f,
           activations_.default_activation);
       if (has_gating_) {
-        // ip_mult_gate/ip_add_gate are a [channels][64] matrix, not a
-        // per-channel vector: BLAS reads ip_mult_gate[channel * 64 + square].
-        // WeightChannel's {0, 0, 0, 1} strides map element (row, c) to offset
-        // c, so every square got the same channel value -- the first C of
-        // C * 64 weights -- and a real net's embedding came out 39% wrong
-        // before any encoder ran. Viewing both operands as [N, 1, 64, C] and
-        // striding the gate {0, 0, 1, 64} lands (n, s, c) on c * 64 + s, and
-        // repeats the same gate for every position in the batch.
-        //
-        // No synthetic parity net populates these tensors, so has_gating_ was
-        // false throughout the suite and this path never executed in a test.
+        // ip_mult_gate/ip_add_gate stay native DataType storage (Add, not
+        // AddRaw): they're shared with the non-PE_DENSE gating branch
+        // below, which reads them at native width -- cast up to float32
+        // here instead of changing their storage, so that branch is
+        // unaffected. No synthetic parity net populates these tensors
+        // (has_gating_ is false throughout the suite), so this specific
+        // path is implemented for correctness but unverified by any test.
         const uint32_t gate_c = static_cast<uint32_t>(embedding_op_size_);
         const uint32_t gate_n = static_cast<uint32_t>(N);
-        auto mult = g.WeightStrided(ip_mult_gate_, {gate_n, 1, 64, gate_c},
-                                    {0, 0, 1, 64});
-        auto add = g.WeightStrided(ip_add_gate_, {gate_n, 1, 64, gate_c},
-                                   {0, 0, 1, 64});
+        auto mult = dml::Cast(
+            g.WeightStrided(ip_mult_gate_, {gate_n, 1, 64, gate_c},
+                            {0, 0, 1, 64}),
+            DML_TENSOR_DATA_TYPE_FLOAT32);
+        auto add = dml::Cast(
+            g.WeightStrided(ip_add_gate_, {gate_n, 1, 64, gate_c},
+                            {0, 0, 1, 64}),
+            DML_TENSOR_DATA_TYPE_FLOAT32);
         auto gated = GraphFactory<DataType>::ReinterpretView(
                          pre_ln, {gate_n, 1, 64, gate_c}) * mult + add;
         pre_ln = GraphFactory<DataType>::ReinterpretView(
             gated, {1, 1, tokens, gate_c});
       }
-      auto ffn1_w = g.Weight(
+      auto ffn1_w = g.WeightF32(
           ip_emb_ffn_d1_w_,
           {1, 1, static_cast<uint32_t>(embedding_ffn_dff_),
            static_cast<uint32_t>(embedding_op_size_)});
-      auto ffn1_b = g.WeightChannel(ip_emb_ffn_d1_b_, tokens, static_cast<uint32_t>(embedding_ffn_dff_));
-      auto ffn2_w = g.Weight(
+      auto ffn1_b = g.WeightChannelF32(ip_emb_ffn_d1_b_, tokens,
+                                       static_cast<uint32_t>(embedding_ffn_dff_));
+      auto ffn2_w = g.WeightF32(
           ip_emb_ffn_d2_w_,
           {1, 1, static_cast<uint32_t>(embedding_op_size_),
            static_cast<uint32_t>(embedding_ffn_dff_)});
-      auto ffn2_b = g.WeightChannel(ip_emb_ffn_d2_b_, tokens, static_cast<uint32_t>(embedding_op_size_));
-      auto ffn_ln_g = g.WeightChannel(ip_emb_ffn_ln_g_, tokens, static_cast<uint32_t>(embedding_op_size_));
-      auto ffn_ln_b = g.WeightChannel(ip_emb_ffn_ln_b_, tokens, static_cast<uint32_t>(embedding_op_size_));
+      auto ffn2_b = g.WeightChannelF32(ip_emb_ffn_d2_b_, tokens,
+                                       static_cast<uint32_t>(embedding_op_size_));
+      auto ffn_ln_g = g.WeightChannelF32(ip_emb_ffn_ln_g_, tokens,
+                                         static_cast<uint32_t>(embedding_op_size_));
+      auto ffn_ln_b = g.WeightChannelF32(ip_emb_ffn_ln_b_, tokens,
+                                         static_cast<uint32_t>(embedding_op_size_));
       dml::Expression ffn1 =
           dml::Gemm(pre_ln, ffn1_w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
                     DML_MATRIX_TRANSFORM_TRANSPOSE) + ffn1_b;
@@ -1613,8 +1696,13 @@ void AttentionBody<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
                     DML_MATRIX_TRANSFORM_TRANSPOSE);
       const float alpha =
           static_cast<float>(pow(2.0 * encoder_weights_.size(), -0.25));
-      dml::Expression out = LayerNormExpr<DataType>(ffn2, &ffn2_b, &pre_ln, ffn_ln_g, ffn_ln_b, alpha, 1e-3f,
+      dml::Expression out_f32 = LayerNormExpr<DataType>(
+          ffn2, &ffn2_b, &pre_ln, ffn_ln_g, ffn_ln_b, alpha, 1e-3f,
           ACTIVATION_NONE);
+      // Only place this graph ever leaves float32: downstream (encoders,
+      // the "emb" bisection dump, everything else) expects native
+      // DataType width. A no-op cast when DataType is already float.
+      dml::Expression out = dml::Cast(out_f32, DmlTensorType<DataType>());
       compiled_.emplace(
           N, g.Compile({out}, {(uint64_t)tokens * embedding_op_size_ *
                                    sizeof(DataType)}));
@@ -1812,18 +1900,21 @@ void AttentionBody<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
     {
       auto it = pre_compiled_.find(N);
       if (it == pre_compiled_.end()) {
+        // agora #476/#478 Phase 2: keep in sync with EnsureCompiled's copy
+        // above (same comments there).
         GraphFactory<DataType> g(scope.ctx());
-        auto x = g.Input({1, 1, static_cast<uint32_t>(N), 64 * 12});
-        auto w = g.Weight(ip_emb_pre_w_,
-                          {1, 1, static_cast<uint32_t>(64 * embedding_dense_size_),
-                           64 * 12});
-        auto b = g.WeightChannel(ip_emb_pre_b_, static_cast<uint32_t>(N),
-                         static_cast<uint32_t>(64 * embedding_dense_size_));
+        auto x = g.InputF32({1, 1, static_cast<uint32_t>(N), 64 * 12});
+        auto w = g.WeightF32(
+            ip_emb_pre_w_,
+            {1, 1, static_cast<uint32_t>(64 * embedding_dense_size_), 64 * 12});
+        auto b = g.WeightChannelF32(
+            ip_emb_pre_b_, static_cast<uint32_t>(N),
+            static_cast<uint32_t>(64 * embedding_dense_size_));
         dml::Expression y = dml::Gemm(x, w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
                                       DML_MATRIX_TRANSFORM_TRANSPOSE) + b;
         it = pre_compiled_.emplace(
                  N, g.Compile({y}, {(uint64_t)N * 64 * embedding_dense_size_ *
-                                        sizeof(DataType)}))
+                                        sizeof(float)}))
                  .first;
       }
       DispatchOp<DataType>(scope, it->second, pos_info, buffer2, buffer2,
@@ -1838,13 +1929,19 @@ void AttentionBody<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
     {
       auto it = compiled_.find(N);
       if (it == compiled_.end()) {
+        // agora #476/#478 Phase 2: keep in sync with EnsureCompiled's copy
+        // above (same comments there).
         GraphFactory<DataType> g(scope.ctx());
-        auto x = g.Input({1, 1, tokens, static_cast<uint32_t>(body_input_c)});
-        auto w = g.Weight(ip_emb_w_, {1, 1, static_cast<uint32_t>(embedding_op_size_),
-                                      static_cast<uint32_t>(body_input_c)});
-        auto b = g.WeightChannel(ip_emb_b_, tokens, static_cast<uint32_t>(embedding_op_size_));
-        auto ln_g = g.WeightChannel(ip_emb_ln_g_, tokens, static_cast<uint32_t>(embedding_op_size_));
-        auto ln_b = g.WeightChannel(ip_emb_ln_b_, tokens, static_cast<uint32_t>(embedding_op_size_));
+        auto x = g.InputF32({1, 1, tokens, static_cast<uint32_t>(body_input_c)});
+        auto w = g.WeightF32(ip_emb_w_,
+                             {1, 1, static_cast<uint32_t>(embedding_op_size_),
+                              static_cast<uint32_t>(body_input_c)});
+        auto b = g.WeightChannelF32(ip_emb_b_, tokens,
+                                    static_cast<uint32_t>(embedding_op_size_));
+        auto ln_g = g.WeightChannelF32(ip_emb_ln_g_, tokens,
+                                       static_cast<uint32_t>(embedding_op_size_));
+        auto ln_b = g.WeightChannelF32(ip_emb_ln_b_, tokens,
+                                       static_cast<uint32_t>(embedding_op_size_));
         dml::Expression emb =
             dml::Gemm(x, w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
                       DML_MATRIX_TRANSFORM_TRANSPOSE);
@@ -1854,40 +1951,41 @@ void AttentionBody<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
         dml::Expression pre_ln = LayerNormExpr<DataType>(emb, &bias_b, nullptr, ln_g, ln_b, 1.0f, 1e-3f,
             activations_.default_activation);
         if (has_gating_) {
-          // ip_mult_gate/ip_add_gate are a [channels][64] matrix, not a
-          // per-channel vector: BLAS reads ip_mult_gate[channel * 64 + square].
-          // WeightChannel's {0, 0, 0, 1} strides map element (row, c) to offset
-          // c, so every square got the same channel value -- the first C of
-          // C * 64 weights -- and a real net's embedding came out 39% wrong
-          // before any encoder ran. Viewing both operands as [N, 1, 64, C] and
-          // striding the gate {0, 0, 1, 64} lands (n, s, c) on c * 64 + s, and
-          // repeats the same gate for every position in the batch.
-          //
-          // No synthetic parity net populates these tensors, so has_gating_ was
-          // false throughout the suite and this path never executed in a test.
+          // ip_mult_gate/ip_add_gate stay native DataType storage, shared
+          // with the non-PE_DENSE gating branch -- cast up here instead of
+          // changing their storage. Unverified by any test (has_gating_ is
+          // false throughout the suite).
           const uint32_t gate_c = static_cast<uint32_t>(embedding_op_size_);
           const uint32_t gate_n = static_cast<uint32_t>(N);
-          auto mult = g.WeightStrided(ip_mult_gate_, {gate_n, 1, 64, gate_c},
-                                      {0, 0, 1, 64});
-          auto add = g.WeightStrided(ip_add_gate_, {gate_n, 1, 64, gate_c},
-                                     {0, 0, 1, 64});
+          auto mult = dml::Cast(
+              g.WeightStrided(ip_mult_gate_, {gate_n, 1, 64, gate_c},
+                              {0, 0, 1, 64}),
+              DML_TENSOR_DATA_TYPE_FLOAT32);
+          auto add = dml::Cast(
+              g.WeightStrided(ip_add_gate_, {gate_n, 1, 64, gate_c},
+                              {0, 0, 1, 64}),
+              DML_TENSOR_DATA_TYPE_FLOAT32);
           auto gated = GraphFactory<DataType>::ReinterpretView(
                            pre_ln, {gate_n, 1, 64, gate_c}) * mult + add;
           pre_ln = GraphFactory<DataType>::ReinterpretView(
               gated, {1, 1, tokens, gate_c});
         }
-        auto ffn1_w = g.Weight(
+        auto ffn1_w = g.WeightF32(
             ip_emb_ffn_d1_w_,
             {1, 1, static_cast<uint32_t>(embedding_ffn_dff_),
              static_cast<uint32_t>(embedding_op_size_)});
-        auto ffn1_b = g.WeightChannel(ip_emb_ffn_d1_b_, tokens, static_cast<uint32_t>(embedding_ffn_dff_));
-        auto ffn2_w = g.Weight(
+        auto ffn1_b = g.WeightChannelF32(ip_emb_ffn_d1_b_, tokens,
+                                         static_cast<uint32_t>(embedding_ffn_dff_));
+        auto ffn2_w = g.WeightF32(
             ip_emb_ffn_d2_w_,
             {1, 1, static_cast<uint32_t>(embedding_op_size_),
              static_cast<uint32_t>(embedding_ffn_dff_)});
-        auto ffn2_b = g.WeightChannel(ip_emb_ffn_d2_b_, tokens, static_cast<uint32_t>(embedding_op_size_));
-        auto ffn_ln_g = g.WeightChannel(ip_emb_ffn_ln_g_, tokens, static_cast<uint32_t>(embedding_op_size_));
-        auto ffn_ln_b = g.WeightChannel(ip_emb_ffn_ln_b_, tokens, static_cast<uint32_t>(embedding_op_size_));
+        auto ffn2_b = g.WeightChannelF32(ip_emb_ffn_d2_b_, tokens,
+                                         static_cast<uint32_t>(embedding_op_size_));
+        auto ffn_ln_g = g.WeightChannelF32(ip_emb_ffn_ln_g_, tokens,
+                                           static_cast<uint32_t>(embedding_op_size_));
+        auto ffn_ln_b = g.WeightChannelF32(ip_emb_ffn_ln_b_, tokens,
+                                           static_cast<uint32_t>(embedding_op_size_));
         dml::Expression ffn1 =
             dml::Gemm(pre_ln, ffn1_w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
                       DML_MATRIX_TRANSFORM_TRANSPOSE) + ffn1_b;
@@ -1897,8 +1995,10 @@ void AttentionBody<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
                       DML_MATRIX_TRANSFORM_TRANSPOSE);
         const float alpha =
             static_cast<float>(pow(2.0 * encoder_weights_.size(), -0.25));
-        dml::Expression out = LayerNormExpr<DataType>(ffn2, &ffn2_b, &pre_ln, ffn_ln_g, ffn_ln_b, alpha, 1e-3f,
+        dml::Expression out_f32 = LayerNormExpr<DataType>(
+            ffn2, &ffn2_b, &pre_ln, ffn_ln_g, ffn_ln_b, alpha, 1e-3f,
             ACTIVATION_NONE);
+        dml::Expression out = dml::Cast(out_f32, DmlTensorType<DataType>());
         it = compiled_.emplace(
             N, g.Compile({out}, {(uint64_t)tokens * embedding_op_size_ *
                                      sizeof(DataType)})).first;
@@ -2830,6 +2930,15 @@ void EncoderBlock<DataType>::EvalKda(int N, DmlPtr in_out_tensor,
   // own read/compute/write is the first place anything goes wrong.
   DumpBodyStage("enc0_q", q, scope);
   DumpBodyStage("enc0_rawdecay", raw_decay, scope);
+  // agora #465's action item 2: gate is native DataType width (half when
+  // fp16_, unlike q/k/v/raw_decay above which are upcast to float32) --
+  // dumping it lets an FP32-run-vs-FP16-run diff (same env/net/bisection,
+  // different backend) tell option A (kda_proj_compiled_'s native-fp16
+  // GEMM+SiLU for q/k/v) from option B (kda_tail1_compiled_'s gate/dense/
+  // LN1) without touching kda_tail1_compiled_'s output list or arena
+  // sizing at all -- gate already has its own dedicated scratch buffer,
+  // same as q/raw_decay above.
+  if (kda_output_gate_) DumpBodyStage("enc0_gate", gate, scope);
 
   {
     KdaRecurrenceLayer::Params params{};
@@ -2873,6 +2982,15 @@ void EncoderBlock<DataType>::EvalKda(int N, DmlPtr in_out_tensor,
     // separate LN2 dispatch did.
     DispatchOp<DataType>(scope, kda_tail2_compiled_.at(N), ln1, buffer2,
                          buffer2, {in_out_tensor});
+    // Temporary bisection dump (note 2523/2494, agora #461 sign-inversion
+    // follow-up): block output after FFN+LN2, still native DataType (half
+    // when fp16_) -- a reader must reinterpret as fp16, NOT float32; the
+    // enc0_ln1 dump above was misread as float32 once already and gave
+    // spurious ~1e8 "explosion" values that were pure bit-reinterpretation
+    // garbage, not a real overflow (verified: reinterpreted as fp16, ln1 is
+    // clean, absmax ~26, no NaN/Inf). Remove once the real corruption site
+    // is found.
+    DumpBodyStage("enc0_out", in_out_tensor, scope);
   }
 }
 
