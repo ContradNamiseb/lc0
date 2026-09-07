@@ -417,7 +417,14 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
   }
   scratch_elems = std::max(
       {scratch_elems,
-       2 * policy_head.ip2_pol_b.size() + 64,
+       // agora thread 19 #483/#484: wq (d_model), wk (d_model), and
+       // scores (64/token) are now ALL genuine float32 in the policy
+       // head (previously only wk/scores were) -- scale the whole term
+       // by scale_rec like the KDA and PE_DENSE terms above, not just
+       // the elements that changed this round, so a future promotion of
+       // any remaining native-width term here doesn't need yet another
+       // audit of which half of this sum needs it.
+       (2 * policy_head.ip2_pol_b.size() + 64) * scale_rec,
        emb_size + 64 + 64 /* dense concat */,
        // Fused-LayerNorm temporaries. Splitting each encoder tail at its
        // LayerNorms (see LayerNormLayer) leaves two [tokens, C] buffers

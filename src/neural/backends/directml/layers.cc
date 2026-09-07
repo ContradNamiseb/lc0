@@ -3011,12 +3011,21 @@ AttentionPolicyHead<DataType>::AttentionPolicyHead(
       // Old networks without attention body (e.g. T79) use hardcoded SELU
       // activations -- same as the SYCL head.
       act_(attention_body ? act : ACTIVATION_SELU) {
-  ip_pol_w_ = uploader.Add(weights.ip_pol_w);
-  ip_pol_b_ = uploader.Add(weights.ip_pol_b);
-  ip2_pol_w_ = uploader.Add(weights.ip2_pol_w);
-  ip2_pol_b_ = uploader.Add(weights.ip2_pol_b);
-  ip3_pol_w_ = uploader.Add(weights.ip3_pol_w);
-  ip3_pol_b_ = uploader.Add(weights.ip3_pol_b);
+  // AddRaw, not Add: agora thread 19 #483/#484's policy-head FP32 boundary
+  // -- the embedding GEMM and wq/wk projections now run in genuine
+  // float32 (see EnsureCompiled), since #483 measured the residual
+  // post-Phase-2 policy divergence entering in the native-fp16 wq/wk GEMM
+  // itself (an upcast right before the scores dot-product can't recover
+  // precision already lost computing wq_e/wk_e in half).
+  auto add_raw = [&](const std::vector<float>& v) {
+    return uploader.AddRaw(v.data(), v.size() * sizeof(float));
+  };
+  ip_pol_w_ = add_raw(weights.ip_pol_w);
+  ip_pol_b_ = add_raw(weights.ip_pol_b);
+  ip2_pol_w_ = add_raw(weights.ip2_pol_w);
+  ip2_pol_b_ = add_raw(weights.ip2_pol_b);
+  ip3_pol_w_ = add_raw(weights.ip3_pol_w);
+  ip3_pol_b_ = add_raw(weights.ip3_pol_b);
   // note 2523/2494's fourth fp16 defect candidate (agora thread 19 #453):
   // policy_finalize.hlsl now always compiles at fp16=false and its
   // scores_buf/keys_buf/ip4_pol_w_/output_buf are all genuine FLOAT32
@@ -3058,30 +3067,56 @@ void AttentionPolicyHead<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
   const uint32_t tokens = N * 64;
   const size_t elem = sizeof(DataType);
   if (!compiled_.count(N)) {
+    // agora thread 19 #483/#484: policy embedding now runs its own GEMM in
+    // genuine FLOAT32 (weights AddRaw'd in the constructor) -- x comes from
+    // `input`, which stays native DataType width (the shared body's
+    // output; other consumers of that buffer are unaffected), so cast up
+    // here rather than InputF32 (the buffer itself is not float32-typed,
+    // unlike the KDA/PE_DENSE cases where the producer was also forced to
+    // float32 output). y is cast back down to DataType before Compile:
+    // `embedding`'s own buffer must stay native width too, since it also
+    // feeds the policy encoder blocks below (EncoderBlock<DataType>,
+    // unconditionally native) for nets with pol_encoder > 0 -- this net
+    // (kda-native-825532) has none, but the fix must not assume that.
     GraphFactory<DataType> g(scope.ctx());
     const int input_c = this->input_->GetC();
-    auto x = g.Input({1, 1, tokens, (uint32_t)input_c});
-    auto w = g.Weight(ip_pol_w_,
-                      {1, 1, (uint32_t)embedding_op_size_, (uint32_t)input_c});
-    auto b = g.WeightChannel(ip_pol_b_, tokens, (uint32_t)embedding_op_size_);
+    auto x = dml::Cast(g.Input({1, 1, tokens, (uint32_t)input_c}),
+                       DML_TENSOR_DATA_TYPE_FLOAT32);
+    auto w = g.WeightF32(ip_pol_w_,
+                         {1, 1, (uint32_t)embedding_op_size_, (uint32_t)input_c});
+    auto b = g.WeightChannelF32(ip_pol_b_, tokens,
+                                (uint32_t)embedding_op_size_);
     dml::Expression y =
         dml::Gemm(x, w, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
                   DML_MATRIX_TRANSFORM_TRANSPOSE) + b;
     y = ActivationExpr<DataType>(act_, y);
-    compiled_.emplace(
-        N, g.Compile({y}, {(uint64_t)tokens * embedding_op_size_ * elem}));
+    dml::Expression y_native = dml::Cast(y, DmlTensorType<DataType>());
+    compiled_.emplace(N, g.Compile({y_native},
+                                   {(uint64_t)tokens * embedding_op_size_ * elem}));
   }
   if (!compiled_.count(-N - 1)) {
+    // agora #483/#484: wq_e/wk_e now computed directly in genuine FLOAT32
+    // (weights AddRaw'd) instead of native DataType then cast up right
+    // before the scores dot-product -- that upcast-after-the-fact could
+    // not recover precision already lost in the (formerly native fp16)
+    // projection GEMM itself, which #483 measured as exactly where the
+    // residual policy divergence enters. `embedding` (this graph's input)
+    // stays native DataType width per the fix above, so cast up here too.
+    // wq's own Compile output is now float32-sized (was elem) -- it was
+    // already "never read outside this graph" (still true), so widening
+    // it costs nothing and needs no downstream change beyond Eval's offset
+    // arithmetic (see below) and the arena term in network_directml.cc.
     GraphFactory<DataType> g(scope.ctx());
-    auto x = g.Input({1, 1, tokens, (uint32_t)embedding_op_size_});
+    auto x = dml::Cast(g.Input({1, 1, tokens, (uint32_t)embedding_op_size_}),
+                       DML_TENSOR_DATA_TYPE_FLOAT32);
     auto wqe =
-        g.Weight(ip2_pol_w_, {1, 1, (uint32_t)policy_d_model_,
-                              (uint32_t)embedding_op_size_});
-    auto qbe = g.WeightChannel(ip2_pol_b_, tokens, (uint32_t)policy_d_model_);
+        g.WeightF32(ip2_pol_w_, {1, 1, (uint32_t)policy_d_model_,
+                                (uint32_t)embedding_op_size_});
+    auto qbe = g.WeightChannelF32(ip2_pol_b_, tokens, (uint32_t)policy_d_model_);
     auto wke =
-        g.Weight(ip3_pol_w_, {1, 1, (uint32_t)policy_d_model_,
-                              (uint32_t)embedding_op_size_});
-    auto kbe = g.WeightChannel(ip3_pol_b_, tokens, (uint32_t)policy_d_model_);
+        g.WeightF32(ip3_pol_w_, {1, 1, (uint32_t)policy_d_model_,
+                                (uint32_t)embedding_op_size_});
+    auto kbe = g.WeightChannelF32(ip3_pol_b_, tokens, (uint32_t)policy_d_model_);
     dml::Expression wq_e =
         dml::Gemm(x, wqe, dml::NullOpt, DML_MATRIX_TRANSFORM_NONE,
                   DML_MATRIX_TRANSFORM_TRANSPOSE) + qbe;
@@ -3094,32 +3129,21 @@ void AttentionPolicyHead<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
     // maps land the same Q_i.K_j in row-major (i,j); dot products
     // commute, so K_j.Q_i there is the same value). Batch over N with
     // strided views of the dense [T, d] buffers ([N,1,64,d] per batch).
-    //
-    // policy_finalize.hlsl now always reads keys_buf/scores_buf as FLOAT32
-    // (see the constructor above) -- wk and logits (scores) must leave
-    // this graph as genuine FLOAT32 to match, regardless of DataType. wq
-    // is never read outside this graph, left at native width. The score
-    // Gemm's own math is unaffected either way -- already verified correct
-    // against a CPU reference to 7 decimal places (agora thread 19 #446-
-    // #447); this is purely about the TYPE policy_finalize.hlsl now reads.
-    constexpr bool score_fp16 = std::is_same<DataType, DmlHalf>::value;
-    dml::Expression wq_for_score =
-        score_fp16 ? dml::Cast(wq_e, DML_TENSOR_DATA_TYPE_FLOAT32) : wq_e;
-    dml::Expression wk_f32 =
-        score_fp16 ? dml::Cast(wk_e, DML_TENSOR_DATA_TYPE_FLOAT32) : wk_e;
+    // wq_e/wk_e are already genuine float32 now, so no cast is needed
+    // here (was: cast-after-computing-in-half, per #483's diagnosis).
     dml::Expression logits = dml::Gemm(
-        GraphFactory<DataType>::ReinterpretView(wq_for_score, {(uint32_t)N, 1, 64,
+        GraphFactory<DataType>::ReinterpretView(wq_e, {(uint32_t)N, 1, 64,
                                 (uint32_t)policy_d_model_},
                          {64u * policy_d_model_, policy_d_model_, policy_d_model_, 1u}),
-        GraphFactory<DataType>::ReinterpretView(wk_f32, {(uint32_t)N, 1, 64,
+        GraphFactory<DataType>::ReinterpretView(wk_e, {(uint32_t)N, 1, 64,
                                 (uint32_t)policy_d_model_},
                          {64u * policy_d_model_, policy_d_model_, policy_d_model_, 1u}),
         dml::NullOpt, DML_MATRIX_TRANSFORM_NONE, DML_MATRIX_TRANSFORM_TRANSPOSE,
         1.0f / std::sqrt((float)policy_d_model_));
     compiled_.emplace(
         -N - 1,
-        g.Compile({wq_e, wk_f32, logits},
-                  {(uint64_t)tokens * policy_d_model_ * elem,
+        g.Compile({wq_e, wk_e, logits},
+                  {(uint64_t)tokens * policy_d_model_ * sizeof(float),
                    (uint64_t)tokens * policy_d_model_ * sizeof(float),
                    (uint64_t)N * 4096 * sizeof(float)}));
   }
@@ -3135,7 +3159,8 @@ void AttentionPolicyHead<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
                                          DmlExecScope& scope) {
   ID3D12GraphicsCommandList* list = scope.list();
   const uint32_t tokens = N * 64;
-  const size_t elem = sizeof(DataType);
+  // agora #483/#484: wq/wk/scores are now all genuine float32 (below), so
+  // this Eval no longer needs native DataType's element width anywhere.
   DmlPtr buffer1 = output + AlignUp(scratch_size / 2);
   DmlPtr buffer2 = input2 + AlignUp(scratch_size / 2);
   // The fused LayerNorms need two [tokens, C] temporaries that outlive the
@@ -3146,22 +3171,25 @@ void AttentionPolicyHead<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
   DmlPtr ln_scratch = scratch + AlignUp(scratch_size);
 
   DmlPtr embedding = input2;  // policy embedding + encoders run here
+  DumpBodyStage("pol_in", input, scope);
   {
     auto it = compiled_.find(N);
     DispatchOp<DataType>(scope, it->second, input, buffer2, buffer2,
                          {embedding});
   }
+  DumpBodyStage("pol_emb", embedding, scope);
 
   for (const auto& enc : encoder_weights_) {
     enc->Eval(N, embedding, scratch, buffer1, buffer2, ln_scratch, scope);
   }
 
-  // wk and scores are FLOAT32-wide now (policy_finalize.hlsl reads them as
-  // such unconditionally, see EnsureCompiled) -- wq stays at native elem
-  // width, so only its own region uses elem; wk's offset-after and
-  // scores' offset-after both use sizeof(float) to match its real size.
+  // wq, wk, and scores are ALL genuine FLOAT32 now (agora #483/#484: wq
+  // used to stay at native elem width since nothing outside this graph
+  // read it, but computing it in native fp16 then upcasting only for the
+  // scores dot-product couldn't recover precision already lost in that
+  // GEMM -- see EnsureCompiled). Every offset here uses sizeof(float).
   DmlPtr wq = scratch;
-  DmlPtr wk = scratch + (uint64_t)tokens * policy_d_model_ * elem;
+  DmlPtr wk = scratch + (uint64_t)tokens * policy_d_model_ * sizeof(float);
   DmlPtr scores = wk + (uint64_t)tokens * policy_d_model_ * sizeof(float);
 
   {
@@ -3169,6 +3197,15 @@ void AttentionPolicyHead<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
     DispatchOp<DataType>(scope, it->second, embedding, buffer1, buffer2,
                          {wq, wk, scores});
   }
+  // agora thread 19 #482: bisection dumps to localize the residual 0.605
+  // policy-logit diff at move 1703 (post Phase 2's KDA sign-inversion fix).
+  // wq is native DataType width (half when fp16_) per the comment above --
+  // NOT float32 like wk/scores -- a reader must reinterpret accordingly or
+  // repeat the same misread class already caught once this session (ln1).
+  // Temporary; remove once the diff is localized.
+  DumpBodyStage("pol_wq", wq, scope);
+  DumpBodyStage("pol_wk", wk, scope);
+  DumpBodyStage("pol_scores", scores, scope);
 
   {
     PolicyFinalizeConstants constants{};
@@ -3186,6 +3223,12 @@ void AttentionPolicyHead<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     list->ResourceBarrier(1, &barrier);
   }
+  // agora #482: policy_finalize.hlsl's raw output, genuine float32 (its own
+  // 750ae08 fix) -- brackets the finalize kernel: if the diff is already
+  // present in pol_scores/pol_wk but not here, finalize/promotion logic
+  // introduces or corrects it; if it's absent upstream but present here,
+  // finalize itself is where it enters.
+  DumpBodyStage("pol_output", output, scope);
 }
 
 // ===========================================================================
