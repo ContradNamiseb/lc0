@@ -684,6 +684,32 @@ inline float ScaledOutputBound(float reference_scale, bool fp16 = false) {
   return std::max(abs_tol, scale_tol * std::fabs(reference_scale));
 }
 
+// F5 (agora thread 19 #560, codex-sol's independent review): the worst-diff
+// and argmax searches below both rely on `>` comparisons (`diff > worst`,
+// `policy[i] > policy[best]`), and a NaN operand makes every such comparison
+// false in both directions -- so a NaN in a non-winning policy element is
+// silently skipped by the worst-diff search (it can never become the new
+// worst), and a NaN at index 0 of either array pins argmax at index 0
+// forever (nothing can ever beat it, and it can never lose to anything
+// either). Both are real gaps in what "PASSED" has meant from this suite:
+// a candidate array containing a stray NaN could still report a passing
+// worst-diff and a coincidentally-matching argmax. Asserting finiteness of
+// every value before either search runs closes this -- reproduced by
+// codex-sol via source inspection (reference=[2,1,0] vs candidate=[2,NaN,0]
+// gives worst=0 and equal argmax under the old logic), not by observing an
+// actual NaN from this backend; this is a test-harness fix, not evidence
+// the backend itself produces NaNs today.
+inline void AssertFiniteOutputs(const Outputs& o, const char* who) {
+  ASSERT_TRUE(std::isfinite(o.q)) << who << ": q is not finite (" << o.q << ")";
+  ASSERT_TRUE(std::isfinite(o.d)) << who << ": d is not finite (" << o.d << ")";
+  ASSERT_TRUE(std::isfinite(o.m)) << who << ": m is not finite (" << o.m << ")";
+  for (size_t i = 0; i < o.policy.size(); ++i) {
+    ASSERT_TRUE(std::isfinite(o.policy[i]))
+        << who << ": policy[" << i << "] is not finite (" << o.policy[i]
+        << ")";
+  }
+}
+
 // Every sample of a multi-position batch, against BLAS.
 //
 // The single-position CompareBackends validates exactly one (batch, sample) =
@@ -718,6 +744,10 @@ void CompareBackendsBatch(const pblczero::Net& net, int batch) {
   const bool fp16_bound = test_backend == "directml-fp16";
 
   for (int n = 0; n < batch; ++n) {
+    // F5: assert before searching, not after -- see AssertFiniteOutputs.
+    AssertFiniteOutputs(dml[n], "directml");
+    AssertFiniteOutputs(reference[n], "blas reference");
+
     EXPECT_NEAR(dml[n].q, reference[n].q, BoundedOutputBound(fp16_bound))
         << "sample " << n << ": WDL value Q diverges";
     EXPECT_NEAR(dml[n].d, reference[n].d, BoundedOutputBound(fp16_bound))
@@ -785,6 +815,10 @@ void CompareBackends(const pblczero::Net& net) {
   }
   const Outputs dml = RunNetwork(test_backend, net, planes);
   const bool fp16_bound = test_backend == "directml-fp16";
+
+  // F5: assert before searching, not after -- see AssertFiniteOutputs.
+  AssertFiniteOutputs(dml, "directml");
+  AssertFiniteOutputs(reference, "blas reference");
 
   // Bounds and their calibration live with the constants above.
   EXPECT_NEAR(dml.q, reference.q, BoundedOutputBound(fp16_bound))
