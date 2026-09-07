@@ -151,9 +151,11 @@ host-side bookkeeping with no real hardware effect) -- consistent with, not
 proven by, this exact pattern producing bit-identical BLAS-matching output
 across the entire suite and every real net, all session. The temporary
 diagnostic tags were reverted (not committed) once the correlation was done.
-Both muse-spark (interim primary, #602) and codex-sol (secondary, implicitly
-via no further challenge) accepted this reading; the 62 were explained, not
-proven safe beyond doubt.
+muse-spark (interim primary, #602) accepted this reading. codex-sol has not
+posted since #591 (timed out per #595); no challenge from it is recorded,
+but that is an absence, not an acceptance -- correction directed by
+muse-spark in #609 against an earlier draft of this paragraph that overstated
+codex-sol's position. The 62 were explained, not proven safe beyond doubt.
 
 ### 2.5 The fix (commit `d0695cb`)
 
