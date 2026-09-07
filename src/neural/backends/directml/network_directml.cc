@@ -108,6 +108,28 @@ void DmlDeviceContext::Init(const OptionsDict& options) {
       debug->EnableDebugLayer();
       CERR << "directml backend: D3D12 debug layer enabled "
               "(LC0_DML_DEBUG_LAYER)";
+      // GPU-Based Validation (agora thread 19 #591/#594/#597): standard
+      // EnableDebugLayer() only validates API parameters and CPU-tracked
+      // resource states -- it does NOT instrument shaders to catch actual
+      // GPU-timeline hazards (e.g. a UAV read-after-write race on a shared
+      // buffer). SetEnableGPUBasedValidation is the only path that does,
+      // and codex-sol correctly flagged that F2's "zero validation errors"
+      // clearance only ever had CPU-layer coverage. Deliberately a SEPARATE
+      // opt-in from LC0_DML_DEBUG_LAYER (not folded into it): GBV carries a
+      // documented 10x-50x runtime overhead from shader instrumentation, so
+      // it must never turn on just because someone wanted the (cheap)
+      // message-callback plumbing below.
+      if (getenv("LC0_DML_GBV")) {
+        ComPtr<ID3D12Debug1> debug1;
+        if (SUCCEEDED(debug.As(&debug1))) {
+          debug1->SetEnableGPUBasedValidation(TRUE);
+          CERR << "directml backend: D3D12 GPU-Based Validation enabled "
+                  "(LC0_DML_GBV)";
+        } else {
+          CERR << "directml backend: LC0_DML_GBV set but ID3D12Debug1 "
+                  "unavailable -- continuing without GPU-based validation";
+        }
+      }
     } else {
       CERR << "directml backend: LC0_DML_DEBUG_LAYER set but "
               "D3D12GetDebugInterface failed (Graphics Tools optional "
