@@ -1687,6 +1687,14 @@ TEST(DirectMlKdaParity, DumpRealNetKdaDecayForRecurrenceTest) {
   CERR << "[decay-dump] heads=" << heads << " key_dim=" << kda->key_dim
        << " value_dim=" << kda->value_dim
        << " direction_count=" << directions.size() << " -> " << out_path;
+  // agora #465's action item 2: which BuildKdaTails paths this net actually
+  // exercises, before bisecting kda_tail1_compiled_ (mixed_in -> normed ->
+  // dense). Not written to the dump file -- the recurrence test doesn't
+  // need it, only this investigation does.
+  CERR << "[decay-dump] output_rms_norm=" << kda->output_rms_norm
+       << " output_gate=" << kda->output_gate
+       << " local_conv=" << kda->local_conv
+       << " qkv_silu=" << kda->qkv_silu;
 }
 
 // MHA + moves-left head, no KDA encoder: covers the MHA encoder and
@@ -1814,6 +1822,14 @@ pblczero::Net MakePeDenseNet() {
 
 TEST(DirectMlKdaParity, MatchesBlasOnPeDenseNet) {
   CompareBackends(MakePeDenseNet());
+}
+
+// Batch case for the same net -- agora thread 19 #471's request, to run
+// PE_DENSE embedding-only under FP16 at batch>1 as well as batch 1 before
+// touching the real net's arena sizing again (see #468's PE_DENSE arena
+// regression).
+TEST(DirectMlKdaParity, MatchesBlasOnPeDenseBatch) {
+  CompareBackendsBatch(MakePeDenseNet(), 4);
 }
 
 // PE_DENSE feeding an actual encoder stack, which is the shape every real
