@@ -394,6 +394,22 @@ class DmlDeviceContext {
   // lesson). Lives for the context's whole lifetime; it is tiny/one-time,
   // not worth reclaiming.
   ComPtr<ID3D12Resource> init_temp_resource_;
+  // The IDMLOperatorInitializer itself (agora thread 19 #612, codex-sol's
+  // secondary review): Microsoft's own docs are explicit that a compiled
+  // operator's or operator initializer's COM object owns GPU resources
+  // directly and must be kept alive until every dispatch using it has
+  // completed execution on the GPU -- RecordDispatch "doesn't hold
+  // references to any of the interfaces passed in." A local ComPtr here
+  // was destroyed the instant InitializeCompiledOperators returned, before
+  // the caller's Execute+Wait -- real undefined behavior per spec, not
+  // just theoretical (the same class of bug as init_temp_resource_ above,
+  // caught before the build; this one was missed until codex-sol's
+  // review). The binding table does NOT need this treatment -- Microsoft's
+  // docs explicitly say a binding table owns no GPU resources itself, only
+  // the descriptor heap backing it does, and that heap is already a
+  // permanent member (descriptors_) -- so init_table stays a safe local in
+  // InitializeCompiledOperators.
+  ComPtr<IDMLOperatorInitializer> init_initializer_;
   friend class DmlUploadScope;
 };
 

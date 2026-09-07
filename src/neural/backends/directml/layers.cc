@@ -947,14 +947,24 @@ void DmlDeviceContext::InitializeCompiledOperators(
   if (operators_initialized_ || all_ops_.empty()) return;
   operators_initialized_ = true;
 
-  ComPtr<IDMLOperatorInitializer> initializer;
+  // Stored in init_initializer_ (a context member, not a local): per
+  // Microsoft's DirectML resource-lifetime docs, a compiled operator or
+  // operator initializer "owns GPU resources directly" and must be kept
+  // alive until every dispatch using it has completed execution on the
+  // GPU -- RecordDispatch itself "doesn't hold references to any of the
+  // interfaces passed in." This function only records the dispatch; the
+  // caller executes+waits on `list` afterward, so a local ComPtr here
+  // would be undefined behavior the instant this function returned (agora
+  // thread 19 #612, codex-sol's secondary review -- see init_initializer_'s
+  // declaration in dml_common.h for the full citation).
   ReportDmlErrors(
       dml_device_->CreateOperatorInitializer(
           static_cast<UINT>(all_ops_.size()), all_ops_.data(),
-          IID_PPV_ARGS(&initializer)),
+          IID_PPV_ARGS(&init_initializer_)),
       "CreateOperatorInitializer");
 
-  const DML_BINDING_PROPERTIES props = initializer->GetBindingProperties();
+  const DML_BINDING_PROPERTIES props =
+      init_initializer_->GetBindingProperties();
   if (props.PersistentResourceSize != 0) {
     // Every individual operator already throws in GraphFactory::Compile if
     // IT has a nonzero PersistentResourceSize (no DML_TENSOR_FLAG_OWNED_BY_
@@ -972,7 +982,7 @@ void DmlDeviceContext::InitializeCompiledOperators(
       std::max<uint32_t>(props.RequiredDescriptorCount, 1u);
   D3D12_CPU_DESCRIPTOR_HANDLE cpu = descriptors_.TakeCpu(slots);
   DML_BINDING_TABLE_DESC table_desc = {};
-  table_desc.Dispatchable = initializer.Get();
+  table_desc.Dispatchable = init_initializer_.Get();
   table_desc.CPUDescriptorHandle = cpu;
   table_desc.GPUDescriptorHandle = descriptors_.CpuToGpu(cpu);
   table_desc.SizeInDescriptors = slots;
@@ -1014,7 +1024,7 @@ void DmlDeviceContext::InitializeCompiledOperators(
 
   ID3D12DescriptorHeap* heap = descriptors_.heap();
   list->SetDescriptorHeaps(1, &heap);
-  recorder_->RecordDispatch(list, initializer.Get(), init_table.Get());
+  recorder_->RecordDispatch(list, init_initializer_.Get(), init_table.Get());
 }
 
 void DmlDeviceContext::DispatchOperator(
