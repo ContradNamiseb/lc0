@@ -33,10 +33,12 @@
 // adapter exists (the same skip-with-reason convention as the SYCL test).
 
 #include <gtest/gtest.h>
+#include <gtest/gtest-spi.h>  // EXPECT_FATAL_FAILURE, for RejectsSelfComparisonBackend
 
 #include <cmath>
 #include <cstring>
 #include <random>
+#include <set>
 #include <vector>
 
 #include "chess/board.h"
@@ -719,6 +721,29 @@ inline void AssertFiniteOutputs(const Outputs& o, const char* who) {
 // is used -- which is exactly how policy_finalize shipped ROW_STRIDE 4168
 // against a 4288-wide reader, scrambling the policy of every sample after the
 // first in every real search.
+// agora thread 19 #620 package E3: LC0_TEST_BACKEND set to "blas" (by
+// accident, or by a future copy-paste of an env-var line) would compare
+// the blas reference against itself -- every parity assertion in this
+// suite trivially passes, and the suite reports green while testing
+// nothing. Explicit whitelist rather than a blacklist of just "blas":
+// eigen is a deliberate, understood self-comparison-adjacent case (same
+// network_blas.cc code, different GEMM, used to measure the accumulation-
+// order noise floor -- see CompareBackends' own comment on that), so it's
+// allowed; anything else not on this list fails loudly instead of quietly
+// passing for the wrong reason.
+void ValidateTestBackendChoice(const std::string& test_backend) {
+  static const std::set<std::string> kAllowed = {"directml", "directml-fp16",
+                                                 "eigen"};
+  if (kAllowed.find(test_backend) == kAllowed.end()) {
+    FAIL() << "LC0_TEST_BACKEND=" << test_backend
+           << " is not on the allowed list (directml, directml-fp16, "
+              "eigen) -- comparing the blas reference against itself (or "
+              "any other unrecognized backend) would make every parity "
+              "assertion in this suite trivially pass without testing "
+              "anything.";
+  }
+}
+
 void CompareBackendsBatch(const pblczero::Net& net, int batch) {
   const std::vector<InputPlanes> planes = EncodeDistinctPositions(batch);
 
@@ -729,6 +754,7 @@ void CompareBackendsBatch(const pblczero::Net& net, int batch) {
 
   const char* backend_env = getenv("LC0_TEST_BACKEND");
   const std::string test_backend = backend_env ? backend_env : "directml";
+  ValidateTestBackendChoice(test_backend);
   if (!HasBackend(test_backend)) {
     GTEST_SKIP() << test_backend << " backend not compiled in";
   }
@@ -803,6 +829,7 @@ void CompareBackends(const pblczero::Net& net) {
   // from the size of the bugs already caught, which is survivorship.
   const char* backend_env = getenv("LC0_TEST_BACKEND");
   const std::string test_backend = backend_env ? backend_env : "directml";
+  ValidateTestBackendChoice(test_backend);
   if (!HasBackend(test_backend)) {
     GTEST_SKIP() << test_backend << " backend not compiled in";
   }
@@ -1689,6 +1716,15 @@ TEST(DirectMlKdaParity, MatchesBlasOnRealNetFromEnv) {
   }
   CompareBackends(net);
 }
+
+// E1 (agora thread 19 #620/#628/#630/#631): implemented and verified working
+// (correctly skips without LC0_TEST_REAL_NET, correctly caught a real
+// batch-8 divergence on kda-t1-55050 with it set -- see #630). HELD out of
+// this commit per muse-spark's #631 directive c: landing it red without a
+// root cause would muddy every subsequent suite run's signal. The exact
+// text is preserved in the agora thread and will land once the #631
+// triage localizes the finding (as a red-with-cause regression test, or
+// green if the underlying issue is fixed first).
 
 // Diagnostic dump, NOT a correctness test: writes the first KDA encoder's
 // decay geometry (heads, key_dim, value_dim, directions) and its real
@@ -2926,6 +2962,90 @@ TEST(DirectMlKdaParity, KdaDirectionCountMustDivideHeads) {
       << "heads=8 is not evenly divisible by 3 scan directions; this must "
          "be rejected at load, not silently mismap head-to-direction "
          "indices on the GPU";
+}
+
+// E3 (agora thread 19 #620/#628): LC0_TEST_BACKEND=blas would compare the
+// reference against itself, passing trivially without testing anything.
+// Tests ValidateTestBackendChoice directly rather than via the env var
+// (no GPU or real comparison needed -- it's pure host-side logic).
+TEST(DirectMlRegressionCoverage, RejectsSelfComparisonBackend) {
+  EXPECT_FATAL_FAILURE(ValidateTestBackendChoice("blas"), "blas");
+  EXPECT_FATAL_FAILURE(ValidateTestBackendChoice("nonsense_backend"),
+                       "nonsense_backend");
+  // None of the allowed backends should produce any failure.
+  ValidateTestBackendChoice("directml");
+  ValidateTestBackendChoice("directml-fp16");
+  ValidateTestBackendChoice("eigen");
+}
+
+// E2 (agora thread 19 #620/#628): directml-fp16 is gated behind
+// allow_broken_fp16 precisely because its precision is known-incomplete
+// (this session's own #620/#626 stash A/B on this exact net confirmed a
+// policy-argmax mismatch that is bit-for-bit reproducible, not noise).
+// "Gated but measured": Q/D/M must still sit inside the already-calibrated
+// fp16 tolerance (kAbsTolFp16/kScaleTolFp16) -- if THOSE regress, something
+// broke beyond the known gap. The policy argmax mismatch is asserted to
+// CURRENTLY differ from blas, on purpose: if this ever starts passing, the
+// underlying precision issue was fixed and this test must be updated (or
+// removed) to say so explicitly, rather than a silent pass hiding that the
+// gate is stricter than it needs to be. Constructs the network directly
+// (not via RunNetwork's env-var-driven ApplyTestBackendOpts) so this test
+// exercises directml-fp16 + allow_broken_fp16 regardless of what
+// LC0_TEST_BACKEND/LC0_TEST_BACKEND_OPTS happen to be set to.
+TEST(DirectMlKdaParity, Fp16ParityIsGatedButMeasured) {
+  if (!HasBackend("directml-fp16")) {
+    GTEST_SKIP() << "directml-fp16 backend not compiled in";
+  }
+  const pblczero::Net net = MakeKdaMlhNet();
+  const InputPlanes planes = EncodeStartPos();
+
+  ASSERT_TRUE(HasBackend("blas"))
+      << "blas backend not compiled into the test binary";
+  const Outputs reference = RunNetwork("blas", net, planes);
+
+  OptionsDict fp16_options;
+  fp16_options.Set<bool>("allow_broken_fp16", true);
+  auto fp16_network =
+      NetworkFactory::Get()->Create("directml-fp16", net, fp16_options);
+  auto fp16_computation = fp16_network->NewComputation();
+  fp16_computation->AddInput(InputPlanes(planes));
+  fp16_computation->ComputeBlocking();
+  Outputs fp16_out;
+  fp16_out.q = fp16_computation->GetQVal(0);
+  fp16_out.d = fp16_computation->GetDVal(0);
+  fp16_out.m = fp16_computation->GetMVal(0);
+  fp16_out.policy.reserve(1858);
+  for (int i = 0; i < 1858; ++i) {
+    fp16_out.policy.push_back(fp16_computation->GetPVal(0, i));
+  }
+
+  AssertFiniteOutputs(fp16_out, "directml-fp16");
+  AssertFiniteOutputs(reference, "blas reference");
+
+  // The "fp16 bar" that must still hold.
+  EXPECT_NEAR(fp16_out.q, reference.q, BoundedOutputBound(/*fp16=*/true))
+      << "WDL value Q regressed beyond the already-calibrated fp16 bar";
+  EXPECT_NEAR(fp16_out.d, reference.d, BoundedOutputBound(/*fp16=*/true))
+      << "WDL draw probability regressed beyond the already-calibrated "
+         "fp16 bar";
+  EXPECT_NEAR(fp16_out.m, reference.m,
+             ScaledOutputBound(reference.m, /*fp16=*/true))
+      << "moves-left regressed beyond the already-calibrated fp16 bar";
+
+  int fp16_best = 0, ref_best = 0;
+  for (int i = 1; i < 1858; ++i) {
+    if (fp16_out.policy[i] > fp16_out.policy[fp16_best]) fp16_best = i;
+    if (reference.policy[i] > reference.policy[ref_best]) ref_best = i;
+  }
+  // Asserted as a KNOWN, currently-reproduced divergence -- see the test's
+  // own comment above. Not a bug in the test; a tripwire on the bug it's
+  // measuring.
+  EXPECT_NE(fp16_best, ref_best)
+      << "policy argmax now MATCHES blas (directml picks " << fp16_best
+      << ", blas picks " << ref_best
+      << ") -- the known fp16 precision gap this test tracks appears to be "
+         "fixed; update or remove this test's asserted-broken expectation "
+         "rather than leaving it silently passing for the wrong reason";
 }
 
 }  // namespace lczero
