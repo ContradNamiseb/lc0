@@ -555,7 +555,20 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
                         "smolgen");
 
   tensor_arena_.Create(ctx_.device(), tensor_arena_bytes, "tensors");
-  scratch_arena_.Create(ctx_.device(), scratch_bytes_ * 2, "scratch");
+  // ln_scratch (layers.cc:1789, :3287) starts at scratch + AlignUp(scratch_
+  // bytes_) and writes up to scratch_bytes_ more bytes past that offset. A
+  // plain scratch_bytes_ * 2 allocation only guarantees scratch_bytes_ bytes
+  // remain there when scratch_bytes_ is already a multiple of the 256-byte
+  // alignment; otherwise ln_scratch's write can run past the arena by up to
+  // AlignUp(scratch_bytes_) - scratch_bytes_ (<=255) bytes -- a real OOB UAV
+  // write on an exact-fit net, not just a theoretical one. Sizing the arena
+  // to AlignUp(scratch_bytes_) + scratch_bytes_ instead guarantees the full
+  // scratch_bytes_ bytes are present after the aligned ln_scratch offset,
+  // by construction, for at most 255 bytes of extra VRAM. See agora thread
+  // 19/37 (MEDIUM 1, muse-spark independent review, ratified by
+  // gemini-antigravity).
+  scratch_arena_.Create(ctx_.device(),
+                        AlignUp(scratch_bytes_) + scratch_bytes_, "scratch");
   // 256MB transient: the MHA attention graph's [B=N*H,64,64] scores +
   // softmax temporaries reach ~2*B*4096*4 bytes (134MB at max batch with 16
   // heads); 64MB would throw arena-exhausted on large batches.
