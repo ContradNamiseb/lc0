@@ -127,6 +127,22 @@ struct BodyDump {
 };
 std::vector<BodyDump>& BodyDumps();
 
+// Debug aid (LC0_DML_PROFILE): GPU-timestamp stage marks for Phase 3's speed
+// campaign (agora thread 19 #545/#549) -- records the ordered stage names
+// EndQuery was called for, so network_directml.cc can pair each with its
+// resolved D3D12_QUERY_TYPE_TIMESTAMP value and print per-stage deltas after
+// the fence signals. Empty and inert unless the variable is set. Same
+// drain-and-clear-after-use lifecycle as BodyDumps above.
+std::vector<std::string>& ProfileMarks();
+
+// Records an EndQuery at the current point in `scope`'s command list, named
+// `stage`, if LC0_DML_PROFILE is set and the device context created a query
+// heap for it -- a no-op otherwise. Defined in layers.cc; forward-declared
+// here so network_directml.cc's forwardEval (the head boundaries) can call
+// it alongside layers.cc's own EvalKda/EvalMha call sites.
+class DmlExecScope;
+void ProfileStage(const std::string& stage, DmlExecScope& scope);
+
 using Microsoft::WRL::ComPtr;
 
 template <typename DataType>

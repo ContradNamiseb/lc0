@@ -60,6 +60,13 @@ inline uint64_t AlignUp(uint64_t v, uint64_t a = kDmlAlignment) {
   return (v + a - 1) / a * a;
 }
 
+// LC0_DML_PROFILE stage-timing slots (agora thread 19 #545/#549, Phase 3
+// Step 2): one EndQuery per named stage boundary per batch. 256 comfortably
+// covers even a many-encoder net's per-stage marks (kda-native-935532's 4
+// encoders use ~17; the largest nets this backend targets top out around 10
+// encoders per DmlDeviceContext::Init's own descriptor-sizing comment).
+constexpr UINT kProfileQuerySlots = 256;
+
 // Prints and throws on a failed HRESULT, cuda_common.h's ReportCUDAErrors
 // equivalent for the D3D12/DirectML APIs.
 inline void ReportD3DErrors(HRESULT hr, const char* what) {
@@ -330,6 +337,12 @@ class DmlDeviceContext {
   // Blocks until value_ on the given fence; used once per batch.
   void WaitForFence(ID3D12Fence* fence, uint64_t value);
 
+  // Non-null only when LC0_DML_PROFILE was set at Init -- callers must check
+  // before recording EndQuery, matching LC0_DUMP_BODY's getenv-gated,
+  // degrade-silently-when-unset convention right above.
+  ID3D12QueryHeap* profile_heap() const { return profile_heap_.Get(); }
+  UINT64 profile_frequency() const { return profile_frequency_; }
+
  private:
   bool meta_commands_ = true;
   ComPtr<IDXGIFactory4> dxgi_factory_;
@@ -343,6 +356,8 @@ class DmlDeviceContext {
   uint64_t upload_fence_value_ = 0;
   ComPtr<ID3D12CommandAllocator> upload_allocator_;
   ComPtr<ID3D12GraphicsCommandList> upload_list_;
+  ComPtr<ID3D12QueryHeap> profile_heap_;
+  UINT64 profile_frequency_ = 0;
   DmlDescriptorPool descriptors_;
   std::unordered_map<IDMLCompiledOperator*,
                      Microsoft::WRL::ComPtr<IDMLBindingTable>>

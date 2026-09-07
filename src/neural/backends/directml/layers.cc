@@ -1739,6 +1739,31 @@ std::vector<BodyDump>& BodyDumps() {
   return dumps;
 }
 
+std::vector<std::string>& ProfileMarks() {
+  static std::vector<std::string> marks;
+  return marks;
+}
+
+// LC0_DML_PROFILE stage-timing mark (agora thread 19 #545/#549, Phase 3 Step
+// 2): records an EndQuery at the current point in the command list, named
+// for later reporting. Marks are consumed as a running timeline, not paired
+// start/end spans -- network_directml.cc resolves the whole heap after the
+// fence signals and prints each mark's delta from the one before it, so one
+// query per named boundary is enough (the same pattern DumpBodyStage uses
+// for its readback copies, just timestamps instead of tensor bytes). Safe to
+// call from inside a KDA/MHA encoder's Eval even though multiple encoders
+// share this call site: each invocation gets its own slot and its own name
+// in the vector, so per-encoder costs are visible rather than summed away.
+inline void ProfileStage(const std::string& stage, DmlExecScope& scope) {
+  if (!getenv("LC0_DML_PROFILE")) return;
+  ID3D12QueryHeap* heap = scope.ctx().profile_heap();
+  if (!heap) return;  // requested but heap creation was skipped/failed
+  const UINT index = static_cast<UINT>(ProfileMarks().size());
+  if (index >= kProfileQuerySlots) return;  // degrade silently past capacity
+  scope.list()->EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, index);
+  ProfileMarks().push_back(stage);
+}
+
 // Shared by every LC0_DUMP_BODY call site (AttentionBody's per-encoder-layer
 // dump below, and EvalKda's finer sub-stage dumps added for the note
 // 2523/2494 fp16 overflow bisection): copies a fixed, generous byte range
@@ -1989,6 +2014,7 @@ void AttentionBody<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
                            {output});
     }
   }
+  ProfileStage("embedding", scope);
 
   auto stage_dump = [&](const std::string& stage, DmlPtr src) {
     if (!getenv("LC0_DUMP_BODY")) return;
@@ -2792,6 +2818,7 @@ void EncoderBlock<DataType>::EvalMha(int N, DmlPtr in_out_tensor,
     DispatchOp<DataType>(scope, it->second, in_out_tensor, buffer1, buffer2,
                          {q, k, v});
   }
+  ProfileStage("mha_qkv", scope);
 
   // 2. Head-split transpose (HLSL): [T,H*D] -> [B,64,D] dense each.
   {
@@ -2804,6 +2831,7 @@ void EncoderBlock<DataType>::EvalMha(int N, DmlPtr in_out_tensor,
     mha_transpose_->Record(scope.list(), params, k, kt);
     mha_transpose_->Record(scope.list(), params, v, vt);
   }
+  ProfileStage("mha_transpose", scope);
 
   // 3. Attention over dense [B,1,64,D]: scores, softmax, context.
   {
@@ -2848,6 +2876,7 @@ void EncoderBlock<DataType>::EvalMha(int N, DmlPtr in_out_tensor,
     }
     DispatchOp<DataType>(scope, it->second, qt, kt, vt, {ctxb}, bias);
   }
+  ProfileStage("mha_attention", scope);
 
   // 4. Merge back to token-major [T, H*D].
   {
@@ -2879,6 +2908,7 @@ void EncoderBlock<DataType>::EvalMha(int N, DmlPtr in_out_tensor,
     DispatchOp<DataType>(scope, mha_tail2_compiled_.at(N), ln1, buffer2,
                          buffer2, {in_out_tensor});
   }
+  ProfileStage("mha_tail", scope);
 }
 
 template <typename DataType>
@@ -3036,6 +3066,7 @@ void EncoderBlock<DataType>::EvalKda(int N, DmlPtr in_out_tensor,
     outs.push_back(beta);
     DispatchOp<DataType>(scope, it->second, proj_in, buffer1, buffer2, outs);
   }
+  ProfileStage("kda_proj", scope);
   // Bisection dump, continued: q/raw_decay are the recurrence's RAW INPUTS,
   // produced entirely by a DirectML-compiled dml::Graph (kda_proj_compiled_)
   // -- never touched by hand-written HLSL. If these are already bad, the
@@ -3071,6 +3102,7 @@ void EncoderBlock<DataType>::EvalKda(int N, DmlPtr in_out_tensor,
                             raw_decay, kda_dt_bias_, kda_a_log_, beta,
                             kda_direction_order_, mixed);
   }
+  ProfileStage("kda_recurrence", scope);
   // Bisection dump for the note 2523/2494 fp16 overflow: this and the LN1
   // dump below split the encoder block's existing "encN" dump (post-embedding
   // and post-block only) into recurrence-output / gate+dense+LN1 /
@@ -3107,6 +3139,7 @@ void EncoderBlock<DataType>::EvalKda(int N, DmlPtr in_out_tensor,
     // is found.
     DumpBodyStage("enc0_out", in_out_tensor, scope);
   }
+  ProfileStage("kda_tail", scope);
 }
 
 // ===========================================================================

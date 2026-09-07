@@ -129,6 +129,20 @@ void DmlDeviceContext::Init(const OptionsDict& options) {
                                               IID_PPV_ARGS(&queue_)),
                   "CreateCommandQueue");
 
+  // LC0_DML_PROFILE stage-timing profiler (agora thread 19 #545/#549, Phase
+  // 3 Step 2): created only when requested, so the common path pays nothing
+  // for it. GetTimestampFrequency needs queue_, hence placed right after it.
+  if (getenv("LC0_DML_PROFILE")) {
+    D3D12_QUERY_HEAP_DESC query_desc = {};
+    query_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    query_desc.Count = kProfileQuerySlots;
+    ReportD3DErrors(
+        device_->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&profile_heap_)),
+        "CreateQueryHeap (profile)");
+    ReportD3DErrors(queue_->GetTimestampFrequency(&profile_frequency_),
+                    "GetTimestampFrequency");
+  }
+
   ReportDmlErrors(DMLCreateDevice(device_.Get(),
                                   DML_CREATE_DEVICE_FLAG_NONE,
                                   IID_PPV_ARGS(&dml_device_)),
@@ -855,6 +869,12 @@ void DirectMlNetwork<DataType>::forwardEval(
   DmlPtr scratch(scratch_arena_.resource(), 0);
 
   DmlExecScope scope(ctx_, list, &transient_arena_, &smolgen_arena_);
+  // Anchor mark: without this, "embedding" (the first named stage) would
+  // have no prior mark to diff against and ProfileStage's own display logic
+  // would print it as a meaningless 0us, silently hiding the input-upload
+  // barrier/copy below plus the embedding dispatch itself -- exactly the
+  // gap Phase 3 Step 2 was supposed to measure. See ProfileMarks' comment.
+  ProfileStage("start", scope);
 
   // Two-phase: compile every layer's graphs for this batch size BEFORE any
   // dispatch is recorded. On this driver, interleaving diverse-shape graph
@@ -905,6 +925,7 @@ void DirectMlNetwork<DataType>::forwardEval(
   DmlPtr op_pol(io->policy_gpu_.Get(), 0);
   network_[l++]->Eval(batch, op_pol, spare1, spare2, scratch, scratch_bytes_,
                       scope);
+  ProfileStage("policy_head", scope);
 
   // Value head via scratch + copy. The value graph's output silently never
   // lands when bound straight to the io readback buffer on this driver
@@ -932,6 +953,7 @@ void DirectMlNetwork<DataType>::forwardEval(
     vcopy.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     list->ResourceBarrier(1, &vcopy);
   }
+  ProfileStage("value_head", scope);
 
   // Moves left head. Same scratch + copy workaround as the value head above
   // (network_directml.cc:835-843's comment): binding this graph's output
@@ -957,6 +979,7 @@ void DirectMlNetwork<DataType>::forwardEval(
     mcopy.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     mcopy.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     list->ResourceBarrier(1, &mcopy);
+    ProfileStage("movesleft_head", scope);
   }
 
   // Readback: policy/value/moves-left UAV -> COPY_SOURCE -> readback.
@@ -986,6 +1009,21 @@ void DirectMlNetwork<DataType>::forwardEval(
              (uint64_t)batch * sizeof(DataType));
   }
 
+  // LC0_DML_PROFILE (agora thread 19 #545/#549, Phase 3 Step 2):
+  // ResolveQueryData is itself a command list op -- it must be recorded
+  // before Close(), unlike the CPU-side readback of its destination buffer
+  // below, which has to wait for the fence like everything else GPU-written.
+  ComPtr<ID3D12Resource> profile_readback;
+  const size_t profile_marks = ProfileMarks().size();
+  if (profile_marks > 0 && ctx_.profile_heap()) {
+    profile_readback = detail::CreateBuffer(
+        ctx_.device(), profile_marks * sizeof(UINT64),
+        D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    list->ResolveQueryData(ctx_.profile_heap(), D3D12_QUERY_TYPE_TIMESTAMP, 0,
+                           static_cast<UINT>(profile_marks),
+                           profile_readback.Get(), 0);
+  }
+
   ReportD3DErrors(list->Close(), "Close");
   ID3D12CommandList* lists[] = {list};
   ctx_.queue()->ExecuteCommandLists(1, lists);
@@ -993,6 +1031,23 @@ void DirectMlNetwork<DataType>::forwardEval(
   ReportD3DErrors(ctx_.queue()->Signal(io->fence_.Get(), io->fence_value_),
                   "Signal");
   ctx_.WaitForFence(io->fence_.Get(), io->fence_value_);
+  if (profile_readback) {
+    const UINT64* stamps = nullptr;
+    profile_readback->Map(
+        0, nullptr, const_cast<void**>(reinterpret_cast<const void**>(&stamps)));
+    const double freq = static_cast<double>(ctx_.profile_frequency());
+    CERR << "LC0_DML_PROFILE batch=" << batch << " (" << profile_marks
+        << " stage marks, us since previous mark):";
+    for (size_t i = 0; i < profile_marks; ++i) {
+      const double us = i == 0
+                            ? 0.0
+                            : (static_cast<double>(stamps[i] - stamps[i - 1]) /
+                               freq) * 1e6;
+      CERR << "  " << ProfileMarks()[i] << ": " << us << " us";
+    }
+    profile_readback->Unmap(0, nullptr);
+    ProfileMarks().clear();
+  }
   if (const char* prefix = getenv("LC0_DUMP_BODY")) {
     for (auto& d : BodyDumps()) {
       const float* p = nullptr;
