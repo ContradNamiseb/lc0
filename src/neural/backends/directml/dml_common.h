@@ -455,11 +455,28 @@ class DmlExecScope {
 
   DmlPtr TakeTransient(uint64_t bytes) {
     if (bytes > transient_arena_->size()) {
+      // agora thread 19 #620 package C4: transient_arena_ is a fixed
+      // 256MB (network_directml.cc), sized for this session's tested
+      // configs, not computed from the compiled ladder's actual per-op
+      // TemporaryResourceSize. A sufficiently large max_batch/head-count
+      // combination (DirectML's own internal scratch for attention scores
+      // and softmax scales with batch*heads) can genuinely need more than
+      // that. Assessed computing the arena's size from the ladder's real
+      // requirement as a real fix but too invasive to land safely in the
+      // same pass as everything else tonight (arena-sizing formulas have
+      // been a recurring source of real bugs this session); this is the
+      // structured-throw half of that tradeoff instead -- naming the
+      // actual cause and remedy explicitly rather than only the numbers.
       throw Exception(
-          "directml backend: transient arena smaller (" +
+          "directml backend: transient arena of " +
           std::to_string(transient_arena_->size()) +
-          " bytes) than a dispatch requires (" + std::to_string(bytes) +
-          " bytes)");
+          " bytes is smaller than the " + std::to_string(bytes) +
+          " bytes this dispatch's compiled DirectML graph requires as "
+          "internal scratch (IDMLCompiledOperator::GetBindingProperties's "
+          "TemporaryResourceSize). This scales with batch size and "
+          "head/embedding geometry; raise transient_arena_'s fixed size "
+          "in network_directml.cc for this configuration, or reduce "
+          "max_batch/head count.");
     }
     return DmlPtr(transient_arena_->resource(), 0);
   }

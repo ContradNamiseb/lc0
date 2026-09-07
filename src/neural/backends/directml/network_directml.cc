@@ -582,8 +582,23 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
   // maximands (the comment above about "both reduce to max(emb,4288)*4"
   // describes the fp32-elem-width identity between the two formulas, not
   // a tokens/batch relationship, so this fix doesn't undo that reasoning).
+  // agora thread 19 #620 package C2: the "raw NCHW input size" term above
+  // (max_layer_bytes' initial value, max_tokens*64*elem) claims to size the
+  // raw input upload, but the upload it actually needs to hold is
+  // kNumInputPlanes(112) planes wide and ALWAYS float32 -- forwardEval's
+  // CopyBufferRegion into this same tensor-arena slot copies exactly
+  // `batch * kNumInputPlanes * 64 * sizeof(float)` bytes (see below),
+  // independent of the network's own DataType. The existing term uses 64
+  // (not 112) planes and scales by `elem` (the network's DataType width,
+  // 2 for fp16) instead of sizeof(float) -- the same "always-float,
+  // wrongly elem-scaled" bug class F7 already fixed for the policy term
+  // above. At fp32 this term happens to be masked by scratch_bytes_'s own
+  // floor; a small-embedding fp16 net is not guaranteed the same rescue.
+  // Added as an extra maximand (never removes headroom, only adds it if
+  // the other terms were already sufficient).
   max_layer_bytes = std::max(
       {max_layer_bytes, max_tokens * emb * elem,
+       max_tokens * (uint64_t)kNumInputPlanes * sizeof(float),
        (uint64_t)max_batch_size_ * (uint64_t)4288 * sizeof(float)});
   tensor_slot_bytes_ = std::max(max_layer_bytes, scratch_bytes_);
 

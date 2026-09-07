@@ -146,8 +146,24 @@ struct InputsOutputs {
       policy_mapped_ = policy_host_.data();
     }
 
-    const uint64_t value_bytes = static_cast<uint64_t>(max_batch_size) *
-                                 (has_wdl_ ? 3 : 1) * output_elem_bytes_;
+    // agora thread 19 #620 package C1: DWORD-aligned (4-byte) to match
+    // GraphFactory::Compile's canonicalization of the compiled graph's own
+    // output binding size (layers.cc) -- without this, a fp16 (2-byte)
+    // output whose hand-computed byte count isn't a multiple of 4 (e.g.
+    // WDL [N,3] at N=1: 6 bytes) would get a compile-time binding rounded
+    // up to DirectML's own canonical size (8 bytes) while this physical
+    // buffer stayed at the smaller hand-computed size -- moving the
+    // under-binding bug from "declared smaller than DirectML expects" to
+    // "declared larger than the buffer actually is," an out-of-bounds GPU
+    // write instead of a binding-size contract violation. Aligning both
+    // sides the same way keeps the physical buffer always at least as
+    // large as the largest canonical binding any compiled batch size up to
+    // max_batch_size can need (rounding preserves the N-monotonic
+    // ordering of the hand-computed byte count).
+    const uint64_t value_bytes =
+        AlignUp(static_cast<uint64_t>(max_batch_size) *
+                    (has_wdl_ ? 3 : 1) * output_elem_bytes_,
+                4);
     value_gpu_ = detail::CreateBuffer(
         device, value_bytes, D3D12_HEAP_TYPE_DEFAULT,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
@@ -165,8 +181,11 @@ struct InputsOutputs {
     }
 
     if (has_mlh_) {
-      const uint64_t mlh_bytes =
-          static_cast<uint64_t>(max_batch_size) * output_elem_bytes_;
+      // Same DWORD-alignment reasoning as value_bytes above -- a [N,1]
+      // fp16 moves-left output at N=1 hand-computes to 2 bytes vs
+      // DirectML's canonical 4.
+      const uint64_t mlh_bytes = AlignUp(
+          static_cast<uint64_t>(max_batch_size) * output_elem_bytes_, 4);
       moves_left_gpu_ = detail::CreateBuffer(
           device, mlh_bytes, D3D12_HEAP_TYPE_DEFAULT,
           D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);

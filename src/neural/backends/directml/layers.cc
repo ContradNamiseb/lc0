@@ -400,6 +400,34 @@ class GraphFactory {
           "directml backend: unexpectedly received a persistent-resource "
           "operator (no DML_TENSOR_FLAG_OWNED_BY_DML tensors exist here)");
     }
+    // agora thread 19 #620 package C1: output_bytes above is hand-computed
+    // by each call site as `count * sizeof(DataType)`, never run through
+    // the same DWORD-alignment DMLCalcBufferTensorSize applies to every
+    // INPUT/weight tensor's totalTensorSizeInBytes (see
+    // CanonicalTensorBytes/MakeDesc below, and the comment there about
+    // ip2_val_b hitting exactly this class once already). For a fp16
+    // (2-byte) output whose element count isn't a multiple of 2, hand
+    // computation under-sizes: a WDL [N,3] output at N=1 needs 6 bytes by
+    // hand-computation but DirectML's own canonical size is 8 (rounded up
+    // to a 4-byte boundary), and a [N,1] moves-left output at N=1 needs 2
+    // hand-computed vs a canonical 4. Binding SizeInBytes below what the
+    // compiled graph's own output tensor requires is the exact
+    // under-binding class DispatchOperator's input-side size check below
+    // already treats as a contract violation -- outputs need the same
+    // protection. Take the max of the caller's value and DirectML's own
+    // reported canonical size per output, so this stays correct even for a
+    // caller whose hand computation is smaller for some other reason.
+    if (output_bytes.size() != outputs.size()) {
+      throw Exception(
+          "directml backend: Compile() got " +
+          std::to_string(output_bytes.size()) + " output_bytes entries for " +
+          std::to_string(outputs.size()) + " outputs");
+    }
+    for (size_t i = 0; i < outputs.size(); ++i) {
+      const uint64_t canonical =
+          outputs[i].Impl()->GetOutputDesc().totalTensorSizeInBytes;
+      if (canonical > output_bytes[i]) output_bytes[i] = canonical;
+    }
     out.transient_bytes = props.TemporaryResourceSize;
     out.bindings = std::move(bindings_);
     out.output_bytes = std::move(output_bytes);
@@ -1115,7 +1143,23 @@ void DmlDeviceContext::DispatchOperator(
                       binding_descs.data());
   }
 
+  // agora thread 19 #620 package C5: the input loop above has always
+  // checked offset+size against the bound resource's actual Width; the
+  // transient and output bindings below never got the same guard, so a
+  // sizing bug on either path degrades to the same silent
+  // under-bind-then-wrong-numbers (or GBV-flagged/driver-undefined
+  // out-of-bounds) failure mode the input check was written to close.
   if (transient_bytes) {
+    if (transient.res) {
+      const uint64_t resource_bytes = transient.res->GetDesc().Width;
+      if (transient.offset + transient_bytes > resource_bytes) {
+        throw Exception(
+            "directml backend: transient binding of " +
+            std::to_string(transient_bytes) + " bytes at offset " +
+            std::to_string(transient.offset) + " runs past the end of a " +
+            std::to_string(resource_bytes) + "-byte resource");
+      }
+    }
     DML_BUFFER_BINDING tb{transient.res, transient.offset, transient_bytes};
     DML_BINDING_DESC td{DML_BINDING_TYPE_BUFFER, &tb};
     table->BindTemporaryResource(&td);
@@ -1126,7 +1170,18 @@ void DmlDeviceContext::DispatchOperator(
   for (size_t i = 0; i < outputs.size(); ++i) {
     out_bindings[i].Buffer = outputs[i].res;
     out_bindings[i].Offset = outputs[i].offset;
-    out_bindings[i].SizeInBytes = output_bytes[i];
+    const uint64_t out_size = output_bytes[i];
+    if (outputs[i].res) {
+      const uint64_t resource_bytes = outputs[i].res->GetDesc().Width;
+      if (outputs[i].offset + out_size > resource_bytes) {
+        throw Exception(
+            "directml backend: output binding of " +
+            std::to_string(out_size) + " bytes at offset " +
+            std::to_string(outputs[i].offset) + " runs past the end of a " +
+            std::to_string(resource_bytes) + "-byte resource");
+      }
+    }
+    out_bindings[i].SizeInBytes = out_size;
     out_descs[i].Type = DML_BINDING_TYPE_BUFFER;
     out_descs[i].Desc = &out_bindings[i];
   }
@@ -3134,7 +3189,11 @@ void EncoderBlock<DataType>::EvalMha(int N, DmlPtr in_out_tensor,
   {
     BuildMhaTails(N, scope);
     const uint32_t emb = (uint32_t)embedding_op_size_;
-    const DmlPtr ln1 = ln_scratch + max_tokens * emb * elem;
+    // agora thread 19 #620 package C3: AlignUp, same reasoning as EvalKda's
+    // carve steps -- this carve is currently "immune" only because real
+    // embeddings happen to be even (making emb*elem a multiple of 4), not
+    // because the formula guarantees it for any emb.
+    const DmlPtr ln1 = ln_scratch + AlignUp(max_tokens * emb * elem);
 
     // Skip is the block input, still in in_out_tensor at this point.
     DispatchOp<DataType>(scope, mha_tail1_compiled_.at(N), merged, buffer2,
@@ -3173,22 +3232,35 @@ void EncoderBlock<DataType>::EvalKda(int N, DmlPtr in_out_tensor,
   // scratch_bytes_ arena sizing has a matching scale_rec term -- keep both in
   // sync (agora thread 19 #432-#434).
   const size_t elem_rec = sizeof(float);
+  // agora thread 19 #620 package C3: every carve step below is now wrapped
+  // in AlignUp (256 bytes, DML_BUFFER_BINDING's required offset alignment,
+  // dml_common.h). The q/k/v/raw_decay/gate carves are always safe by
+  // construction regardless (elem_rec==sizeof(float) and max_tokens has an
+  // inherent *64 factor, so 64*X*4 is always a multiple of 256 -- the same
+  // structural reason EvalMha's S-carves need no wrapping), but
+  // proj_input's carve uses native `elem` (2 for fp16), where
+  // max_tokens*gr*elem is only guaranteed a multiple of 256 when gr is
+  // even -- an odd gate_rank in a fp16 network would misalign it, and
+  // in_up inherits that misalignment. AlignUp on every step removes the
+  // dependency on gr's parity (or any other dimension's parity) entirely,
+  // matching the "already OK by construction" MHA shape instead of relying
+  // on it by accident.
   DmlPtr q = scratch;
-  DmlPtr k = q + max_tokens * KD * elem_rec;
-  DmlPtr v = k + max_tokens * KD * elem_rec;
-  DmlPtr gate_hidden = v + max_tokens * VD * elem_rec;
+  DmlPtr k = q + AlignUp(max_tokens * KD * elem_rec);
+  DmlPtr v = k + AlignUp(max_tokens * KD * elem_rec);
+  DmlPtr gate_hidden = v + AlignUp(max_tokens * VD * elem_rec);
   // proj_input now holds kda_local_conv_layer_'s output at elem_rec width
   // (always float32) rather than native elem, since the shader is always
   // fp32 now (note 2530/#57) -- a no-op size change in the fp32 network
   // (elem_rec==elem there). in_up is the cast-up staging buffer feeding the
   // shader's input side, only ever written/read when kda_local_conv_ &&
   // fp16_; network_directml.cc's KDA arena term budgets both.
-  DmlPtr proj_input = gate_hidden + max_tokens * gr * elem;
-  DmlPtr in_up = proj_input + max_tokens * emb * elem_rec;
+  DmlPtr proj_input = gate_hidden + AlignUp(max_tokens * gr * elem);
+  DmlPtr in_up = proj_input + AlignUp(max_tokens * emb * elem_rec);
   DmlPtr proj_in = in_out_tensor;
   DmlPtr raw_decay = buffer2;
-  DmlPtr gate = buffer2 + max_tokens * KD * elem_rec;
-  DmlPtr beta = buffer1 + max_tokens * VD * elem_rec;
+  DmlPtr gate = buffer2 + AlignUp(max_tokens * KD * elem_rec);
+  DmlPtr beta = buffer1 + AlignUp(max_tokens * VD * elem_rec);
   DmlPtr mixed = buffer1;
 
 
@@ -3355,7 +3427,10 @@ void EncoderBlock<DataType>::EvalKda(int N, DmlPtr in_out_tensor,
   // less of it than before, never more, so no arena-sizing implications).
   {
     BuildKdaTails(N, scope);
-    const DmlPtr ln1 = ln_scratch + (uint64_t)max_tokens * emb * elem;
+    // agora thread 19 #620 package C3: AlignUp -- see EvalMha's identical
+    // ln1 carve for the same "immune by emb-even, not by construction"
+    // reasoning.
+    const DmlPtr ln1 = ln_scratch + AlignUp((uint64_t)max_tokens * emb * elem);
 
     // Skip is the block input, still in in_out_tensor at this point.
     DispatchOp<DataType>(scope, kda_tail1_compiled_.at(N), mixed, gate,
