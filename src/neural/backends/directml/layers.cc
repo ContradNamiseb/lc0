@@ -47,6 +47,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -980,11 +981,47 @@ void DmlDeviceContext::DispatchOperator(
   list->ResourceBarrier(1, &barrier);
 }
 
+namespace {
+// F9 (agora thread 19 #560/#573, codex-sol's independent review): Microsoft
+// documents ID3D12Fence::GetCompletedValue() returning UINT64_MAX as the
+// device-removed sentinel. `completed >= value` treats that as trivially
+// satisfied for any real `value`, so a device-removed GPU looked exactly
+// like a successful, fully-completed batch -- the caller would go on to
+// read policy/value/moves-left outputs from a computation that never
+// finished. Checked once here so both call sites below (before and after
+// the actual wait) share one definition of "the device is gone."
+void ThrowIfDeviceRemoved(ID3D12Device* device, uint64_t completed_value) {
+  if (completed_value != UINT64_MAX) return;
+  const HRESULT reason = device->GetDeviceRemovedReason();
+  throw Exception(
+      "directml backend: D3D12 device removed while waiting on a fence "
+      "(GetCompletedValue returned the UINT64_MAX sentinel; "
+      "GetDeviceRemovedReason=0x" +
+      [&] {
+        std::ostringstream oss;
+        oss << std::hex << reason;
+        return oss.str();
+      }() +
+      ")");
+}
+}  // namespace
+
 void DmlDeviceContext::WaitForFence(ID3D12Fence* fence, uint64_t value) {
+  ThrowIfDeviceRemoved(device_.Get(), fence->GetCompletedValue());
   if (fence->GetCompletedValue() >= value) return;
   ReportD3DErrors(fence->SetEventOnCompletion(value, fence_event_),
                   "SetEventOnCompletion");
-  WaitForSingleObject(fence_event_, INFINITE);
+  // WaitForSingleObject's return was previously unchecked: a WAIT_FAILED
+  // (or the device being removed mid-wait, which also signals the event)
+  // fell through to the caller as if the fence had genuinely reached
+  // `value`. Re-check both explicitly.
+  const DWORD wait_result = WaitForSingleObject(fence_event_, INFINITE);
+  if (wait_result != WAIT_OBJECT_0) {
+    throw Exception(
+        "directml backend: WaitForSingleObject on the fence event did not "
+        "return WAIT_OBJECT_0 (result=" + std::to_string(wait_result) + ")");
+  }
+  ThrowIfDeviceRemoved(device_.Get(), fence->GetCompletedValue());
 }
 
 // ===========================================================================

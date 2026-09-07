@@ -537,9 +537,22 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
   // would under-size it by half whenever elem==2 (fp16). At elem==4 (fp32)
   // this is algebraically identical to the formula it replaces: both
   // reduce to max(emb, 4288)*4.
+  // F7 (agora thread 19 #560/#573, codex-sol's independent review): this
+  // term used max_tokens (max_batch_size_ * 64), but policy_finalize.hlsl's
+  // output is one [4288]-wide row PER BATCH SAMPLE, not per token/square --
+  // the embedding term right above it is genuinely tokens-scaled (each of
+  // the 64 squares gets its own row), but the policy row count is batch,
+  // never batch*64. At max_batch_size_=256 this was a 64x overestimate
+  // (~268MB per tensor slot, ~804MB across the three rotating slots) for
+  // no correctness benefit -- an oversizing bug, not a correctness one
+  // (more arena than needed doesn't corrupt anything), but real wasted
+  // VRAM. Confirmed emb-term and this term are otherwise independent
+  // maximands (the comment above about "both reduce to max(emb,4288)*4"
+  // describes the fp32-elem-width identity between the two formulas, not
+  // a tokens/batch relationship, so this fix doesn't undo that reasoning).
   max_layer_bytes = std::max(
       {max_layer_bytes, max_tokens * emb * elem,
-       max_tokens * (uint64_t)4288 * sizeof(float)});
+       (uint64_t)max_batch_size_ * (uint64_t)4288 * sizeof(float)});
   tensor_slot_bytes_ = std::max(max_layer_bytes, scratch_bytes_);
 
   // Belt-and-braces on the policy encoder carve-up, in exact bytes.
