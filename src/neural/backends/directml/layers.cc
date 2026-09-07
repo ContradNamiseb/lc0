@@ -57,7 +57,6 @@
 #include "neural/backends/directml/layer_norm_shader_source.h"
 #include "neural/backends/directml/mha_transpose_shader_source.h"
 #include "neural/backends/directml/policy_finalize_shader_source.h"
-#include "neural/backends/directml/smolgen_bias_shader_source.h"
 #include "neural/tables/attention_policy_map.h"
 #include "utils/exception.h"
 #include "utils/logging.h"
@@ -1211,48 +1210,6 @@ void MhaTransposeLayer::Record(ID3D12GraphicsCommandList* command_list,
   command_list->ResourceBarrier(1, &barrier);
 }
 
-struct SmolgenBiasConstants {
-  uint32_t batch;
-  uint32_t heads;
-  uint32_t gen;
-  uint32_t pad0;
-};
-
-SmolgenBiasLayer::SmolgenBiasLayer(ID3D12Device* device, bool fp16)
-    : device_(device), fp16_(fp16) {
-  ComPtr<ID3DBlob> shader =
-      CompileHlsl(kSmolgenBiasShaderSource, sizeof(kSmolgenBiasShaderSource) - 1,
-                  "smolgen_bias.hlsl", "SmolgenBias", fp16_);
-  root_signature_ = CreateShaderRootSignature(
-      device_.Get(), sizeof(SmolgenBiasConstants) / 4, 2, 1);
-  pso_ = CreateComputePso(device_.Get(), root_signature_.Get(), shader.Get());
-}
-
-void SmolgenBiasLayer::Record(ID3D12GraphicsCommandList* command_list,
-                              const Params& params, DmlPtr table, DmlPtr d2,
-                              DmlPtr bias_out) {
-  SmolgenBiasConstants constants{};
-  constants.batch = params.batch;
-  constants.heads = params.heads;
-  constants.gen = params.gen;
-
-  command_list->SetComputeRootSignature(root_signature_.Get());
-  command_list->SetPipelineState(pso_.Get());
-  command_list->SetComputeRoot32BitConstants(0,
-                                             sizeof(SmolgenBiasConstants) / 4,
-                                             &constants, 0);
-  command_list->SetComputeRootShaderResourceView(1, table.GpuVA());
-  command_list->SetComputeRootShaderResourceView(2, d2.GpuVA());
-  command_list->SetComputeRootUnorderedAccessView(3, bias_out.GpuVA());
-  const uint64_t total =
-      (uint64_t)params.batch * params.heads * 4096u;
-  command_list->Dispatch(static_cast<UINT>((total + 63) / 64), 1, 1);
-
-  D3D12_RESOURCE_BARRIER barrier = {};
-  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-  command_list->ResourceBarrier(1, &barrier);
-}
-
 struct LayerNormConstants {
   uint32_t rows;
   uint32_t channels;
@@ -2176,7 +2133,18 @@ EncoderBlock<DataType>::EncoderBlock(
     kda_rms_norm_epsilon_ = kda.rms_norm_epsilon;
     kda_output_gate_ = kda.output_gate;
     kda_output_rms_norm_ = kda.output_rms_norm;
-    kda_local_conv_ = kda.local_conv;
+    // Independent review, agora thread 19 #37/#512 (muse-spark): gating on
+    // the flag alone diverges from BLAS (network_blas.cc requires the flag
+    // AND nonempty weights -- see test_kda_parity_directml.cc's own comment
+    // citing that). A flag-set/weights-empty net would dispatch
+    // kda_local_conv.hlsl over zero-byte AddRaw buffers (AddRaw pushes a
+    // pending upload even for 0 bytes, unlike Add) -- a zero-byte
+    // CopyBufferRegion followed by the shader's own weight_buf[c*9+tap]/
+    // bias_buf[c] reads landing out of bounds. No fixture exercises this
+    // combination today (every synthetic net that sets the flag also fills
+    // the weights), so gating on both here closes a real but untested path.
+    kda_local_conv_ =
+        kda.local_conv && !kda.local_conv_w.empty() && !kda.local_conv_b.empty();
     kda_qkv_silu_ = kda.qkv_silu;
     kda_direction_count_ = std::min<int>(16, (int)kda_directions.size());
     for (int i = 0; i < 16; ++i) {
@@ -2230,8 +2198,14 @@ EncoderBlock<DataType>::EncoderBlock(
     // A no-op for fp32 networks (fp16 is already false there).
     mha_transpose_ = std::make_unique<MhaTransposeLayer>(ctx.device(), false);
   }
-  // Both block kinds have the same two LayerNorms in their tail.
-  layer_norm_ = std::make_unique<LayerNormLayer>(ctx.device(), fp16);
+  // Independent review, agora thread 19 #37/#512 (muse-spark): both block
+  // kinds' two LayerNorms are fused via LayerNormExpr directly into
+  // kda_tail1/2_compiled_ and mha_tail1/2_compiled_ (5c7622c, thread 19
+  // #460) -- this class's own Record was never called again after that, so
+  // constructing an instance here just paid a dead FXC compile at every
+  // encoder's init. LayerNormLayer itself stays (still a valid, reusable
+  // dispatch-only kernel wrapper); only this now-pointless construction
+  // site is gone.
 }
 
 template <typename DataType>
@@ -3314,7 +3288,18 @@ void AttentionPolicyHead<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
   DmlPtr embedding = input2;  // policy embedding + encoders run here
   DumpBodyStage("pol_in", input, scope);
   {
+    // Independent review, agora thread 19 #37/#512 (muse-spark): every other
+    // Eval in this file either lazily builds a missing graph or throws an
+    // explicit Exception (cf. EvalMha's mha_attn_compiled_ check just above
+    // this one in the file); this map lookup had neither, so a batch size
+    // that slipped past the EnsureCompiled pre-pass would dereference
+    // end()->second -- undefined behavior, not a diagnosable error.
     auto it = compiled_.find(N);
+    if (it == compiled_.end()) {
+      throw Exception(
+          "directml backend: policy embedding graph was not compiled; "
+          "EnsureCompiled must run before Eval.");
+    }
     DispatchOp<DataType>(scope, it->second, input, buffer2, buffer2,
                          {embedding});
   }
@@ -3335,6 +3320,11 @@ void AttentionPolicyHead<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
 
   {
     auto it = compiled_.find(-N - 1);  // separate slot for the wqk/scores graph
+    if (it == compiled_.end()) {
+      throw Exception(
+          "directml backend: policy wq/wk/scores graph was not compiled; "
+          "EnsureCompiled must run before Eval.");
+    }
     DispatchOp<DataType>(scope, it->second, embedding, buffer1, buffer2,
                          {wq, wk, scores});
   }

@@ -3,7 +3,7 @@
 // Generated verbatim from shaders/layer_norm.hlsl by concatenating its exact
 // bytes into a raw string literal -- do not hand-edit; edit the .hlsl file
 // and regenerate. Compiled at runtime with D3DCompile, the same way
-// smolgen_bias_shader_source.h is.
+// mha_transpose_shader_source.h is.
 
 namespace lczero {
 namespace directml_backend {

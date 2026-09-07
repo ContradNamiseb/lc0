@@ -467,8 +467,6 @@ class EncoderBlock {
   // MHA blocks; see mha_transpose.hlsl for why a shader is needed).
   std::unique_ptr<class MhaTransposeLayer> mha_transpose_;
   std::unique_ptr<class KdaLocalConvLayer> kda_local_conv_layer_;
-  // Fused LayerNorm, shared by this block's two LN sites.
-  std::unique_ptr<class LayerNormLayer> layer_norm_;
 };
 
 // Attention policy head: ip_pol embedding, optional encoder stack, wq/wk
@@ -555,7 +553,7 @@ class MhaTransposeLayer {
 };
 
 // KDA local 3x3 depthwise board conv + residual
-// (shaders/kda_local_conv.hlsl) -- see SmolgenBiasLayer for the
+// (shaders/kda_local_conv.hlsl) -- see MhaTransposeLayer for the
 // build-once/record-only contract.
 class KdaLocalConvLayer {
  public:
@@ -576,31 +574,6 @@ class KdaLocalConvLayer {
   bool fp16_;
 };
 
-// Smolgen generated-bias matmul (shaders/smolgen_bias.hlsl): computes
-// bias[n,h,i] = sum_g table[h,i,g] * d2[n,h,g] -- the per-(batch, head)
-// attention bias -- as a hand-written kernel, because the equivalent DML
-// graph needs a 5-D broadcast GEMM operand this driver rejects. Same
-// build-once/record-only contract as MhaTransposeLayer.
-class SmolgenBiasLayer {
- public:
-  struct Params {
-    uint32_t batch;  // N
-    uint32_t heads;  // H
-    uint32_t gen;    // per-head generated-vector width
-  };
-
-  SmolgenBiasLayer(ID3D12Device* device, bool fp16);
-
-  void Record(ID3D12GraphicsCommandList* command_list, const Params& params,
-              DmlPtr table, DmlPtr d2, DmlPtr bias_out);
-
- private:
-  ComPtr<ID3D12Device> device_;
-  ComPtr<ID3D12RootSignature> root_signature_;
-  ComPtr<ID3D12PipelineState> pso_;
-  bool fp16_;
-};
-
 // Fused layer normalization (shaders/layer_norm.hlsl):
 //   y = gamma * (act(input + bias) * alpha + skip - mean) / sqrt(var + eps)
 //       + beta
@@ -608,7 +581,7 @@ class SmolgenBiasLayer {
 // of those nodes is a separate dispatch streaming the whole [rows, channels]
 // tensor, so the composed form costs an order of magnitude more memory
 // traffic than the arithmetic warrants; this is one dispatch. Same
-// build-once/record-only contract as SmolgenBiasLayer.
+// build-once/record-only contract as MhaTransposeLayer.
 //
 // Because HLSL cannot live inside a dml::Graph, every call site splits its
 // graph here -- an encoder becomes alternating GEMM graphs and kernels,

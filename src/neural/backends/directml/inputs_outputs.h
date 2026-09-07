@@ -104,9 +104,6 @@ struct InputsOutputs {
                                          D3D12_HEAP_TYPE_UPLOAD,
                                          D3D12_RESOURCE_STATE_GENERIC_READ);
     input_upload_->Map(0, nullptr, reinterpret_cast<void**>(&input_mapped_));
-    input_gpu_ = detail::CreateBuffer(
-        device, input_bytes, D3D12_HEAP_TYPE_DEFAULT,
-        D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
 
     constexpr int kPolicySize = 1858;
     const uint64_t policy_bytes = static_cast<uint64_t>(max_batch_size) *
@@ -185,7 +182,6 @@ struct InputsOutputs {
   // GPU-visible default-heap counterpart (copied into once per
   // ComputeBlocking(), not once per AddInput()).
   ComPtr<ID3D12Resource> input_upload_;
-  ComPtr<ID3D12Resource> input_gpu_;
   float* input_mapped_ = nullptr;
 
   // Output default-heap buffers plus their mapped readback counterparts.

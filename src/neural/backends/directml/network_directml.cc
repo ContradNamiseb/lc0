@@ -492,8 +492,15 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
     const uint64_t pol_d = (!enc.mha.q_w.empty() && pol_emb != 0)
                                ? enc.mha.q_w.size() / pol_emb
                                : pol_emb;
+    // Independent review, agora thread 19 #37/#512 (muse-spark): this guard
+    // was sized in elem (native DataType width) but EvalMha's actual 5
+    // scratch regions (qt/kt/vt/ctx/merged) and 3 q/k/v regions are always
+    // genuine float32 now (the always-FP32 MHA core, thread 19 #488-#493,
+    // layers.cc EvalMha's own S = max_tokens*d_model*sizeof(float)) --
+    // understating this guard by up to 2x on fp16 nets with policy-encoder
+    // blocks. sizeof(float), not elem, matches what Eval actually writes.
     const uint64_t needed =
-        AlignUp(scratch_bytes_ / 2) + 5 * max_tokens * pol_d * elem;
+        AlignUp(scratch_bytes_ / 2) + 5 * max_tokens * pol_d * sizeof(float);
     if (needed > tensor_slot_bytes_) {
       throw Exception(
           "directml backend: this net's policy encoder needs " +
@@ -502,7 +509,7 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
           std::to_string(pol_d) + ", max_batch " +
           std::to_string(max_batch_size_) + ").");
     }
-    const uint64_t qkv_needed = 3 * max_tokens * pol_d * elem;
+    const uint64_t qkv_needed = 3 * max_tokens * pol_d * sizeof(float);
     if (qkv_needed > scratch_bytes_) {
       throw Exception(
           "directml backend: this net's policy encoder needs " +
