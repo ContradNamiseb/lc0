@@ -807,8 +807,26 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
     for (auto& layer : network_) layer->EnsureCompiled(b, pre);
   }
 
-
-
+  // Initialize every compiled operator exactly once, now that the batch
+  // ladder above is done and nothing further will ever be compiled (agora
+  // thread 19 #591/#594/#602 -- see InitializeCompiledOperators's comment
+  // for why this must happen before any operator's first real dispatch).
+  // Same Reset/record/Close/Execute/Signal/Wait drill as the arena-clear
+  // step above, on the same one-shot upload command list.
+  {
+    ReportD3DErrors(ctx_.upload_allocator()->Reset(), "Reset (init ops)");
+    ReportD3DErrors(
+        ctx_.upload_list()->Reset(ctx_.upload_allocator(), nullptr),
+        "Reset (init ops list)");
+    ctx_.InitializeCompiledOperators(ctx_.upload_list());
+    ReportD3DErrors(ctx_.upload_list()->Close(), "Close (init ops)");
+    ID3D12CommandList* lists[] = {ctx_.upload_list()};
+    ctx_.queue()->ExecuteCommandLists(1, lists);
+    const uint64_t fence_value = ctx_.NextUploadFenceValue();
+    ReportD3DErrors(ctx_.queue()->Signal(ctx_.fence(), fence_value),
+                    "Signal (init ops)");
+    ctx_.WaitForFence(ctx_.fence(), fence_value);
+  }
 
   // Pre-allocate one InputsOutputs (the first allocation is slow, like the
   // CUDA backend's note about first cudaMalloc).

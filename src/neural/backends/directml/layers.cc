@@ -915,6 +915,9 @@ IDMLBindingTable* DmlDeviceContext::GetOrCreateBindingTable(
     IDMLCompiledOperator* op) {
   auto it = tables_.find(op);
   if (it != tables_.end()) return it->second.Get();
+  // First time this operator has been seen: also queue it for the one-time
+  // IDMLOperatorInitializer dispatch (InitializeCompiledOperators below).
+  all_ops_.push_back(op);
 
   // The table must cover the dispatchable's RequiredDescriptorCount, which
   // includes DML-internal intermediates (e.g. the KDA projection graph
@@ -937,6 +940,81 @@ IDMLBindingTable* DmlDeviceContext::GetOrCreateBindingTable(
   IDMLBindingTable* raw = table.Get();
   tables_.emplace(op, std::move(table));
   return raw;
+}
+
+void DmlDeviceContext::InitializeCompiledOperators(
+    ID3D12GraphicsCommandList* list) {
+  if (operators_initialized_ || all_ops_.empty()) return;
+  operators_initialized_ = true;
+
+  ComPtr<IDMLOperatorInitializer> initializer;
+  ReportDmlErrors(
+      dml_device_->CreateOperatorInitializer(
+          static_cast<UINT>(all_ops_.size()), all_ops_.data(),
+          IID_PPV_ARGS(&initializer)),
+      "CreateOperatorInitializer");
+
+  const DML_BINDING_PROPERTIES props = initializer->GetBindingProperties();
+  if (props.PersistentResourceSize != 0) {
+    // Every individual operator already throws in GraphFactory::Compile if
+    // IT has a nonzero PersistentResourceSize (no DML_TENSOR_FLAG_OWNED_BY_
+    // DML tensors exist in this backend) -- if that's still true, the
+    // initializer's own combined requirement must be 0 too. Catching this
+    // rather than silently mis-binding: a real persistent resource here
+    // would need one real output binding per operator below instead of the
+    // all-DML_BINDING_TYPE_NONE array this code assumes.
+    throw Exception(
+        "directml backend: operator initializer unexpectedly requires a "
+        "persistent resource (no individual compiled operator does)");
+  }
+
+  const uint32_t slots =
+      std::max<uint32_t>(props.RequiredDescriptorCount, 1u);
+  D3D12_CPU_DESCRIPTOR_HANDLE cpu = descriptors_.TakeCpu(slots);
+  DML_BINDING_TABLE_DESC table_desc = {};
+  table_desc.Dispatchable = initializer.Get();
+  table_desc.CPUDescriptorHandle = cpu;
+  table_desc.GPUDescriptorHandle = descriptors_.CpuToGpu(cpu);
+  table_desc.SizeInDescriptors = slots;
+  ComPtr<IDMLBindingTable> init_table;
+  ReportDmlErrors(
+      dml_device_->CreateBindingTable(&table_desc, IID_PPV_ARGS(&init_table)),
+      "CreateBindingTable (operator initializer)");
+
+  // One output-binding slot per operator, in the same order passed to
+  // CreateOperatorInitializer above; DML_BINDING_TYPE_NONE for all of them
+  // since PersistentResourceSize is confirmed 0 (checked above).
+  std::vector<DML_BINDING_DESC> output_bindings(all_ops_.size());
+  for (auto& b : output_bindings) {
+    b.Type = DML_BINDING_TYPE_NONE;
+    b.Desc = nullptr;
+  }
+  init_table->BindOutputs(static_cast<UINT>(output_bindings.size()),
+                          output_bindings.data());
+
+  // The initializer's own temporary-resource requirement is independent of
+  // (and can be nonzero even when) every operator's per-dispatch
+  // TemporaryResourceSize is 0 -- it sizes the initializer's own scratch
+  // workspace, not any compiled operator's. Stored in init_temp_resource_
+  // (a member, not a local) because it must outlive this function's return:
+  // this function only RECORDS the dispatch, the caller executes+waits on
+  // `list` afterward, and a local ComPtr would free the buffer out from
+  // under a still-queued GPU read the moment this function returns -- the
+  // docs/directml-handoff.md section 2.2 hang, for a different buffer.
+  if (props.TemporaryResourceSize != 0) {
+    init_temp_resource_ = detail::CreateBuffer(
+        device_.Get(), props.TemporaryResourceSize, D3D12_HEAP_TYPE_DEFAULT,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    DML_BUFFER_BINDING tb{init_temp_resource_.Get(), 0,
+                          props.TemporaryResourceSize};
+    DML_BINDING_DESC td{DML_BINDING_TYPE_BUFFER, &tb};
+    init_table->BindTemporaryResource(&td);
+  }
+
+  ID3D12DescriptorHeap* heap = descriptors_.heap();
+  list->SetDescriptorHeaps(1, &heap);
+  recorder_->RecordDispatch(list, initializer.Get(), init_table.Get());
 }
 
 void DmlDeviceContext::DispatchOperator(

@@ -337,6 +337,23 @@ class DmlDeviceContext {
   // Blocks until value_ on the given fence; used once per batch.
   void WaitForFence(ID3D12Fence* fence, uint64_t value);
 
+  // One-time DirectML operator initialization (agora thread 19
+  // #591/#594/#602): the DirectML API contract requires every compiled
+  // operator to be initialized exactly once, via IDMLOperatorInitializer,
+  // before its first real dispatch -- independent of PersistentResourceSize.
+  // This backend never did that. DirectML's own internal MetaCommand
+  // selection (used for GEMMs/convolutions when meta_commands=true) performs
+  // its InitializeMetaCommand as part of that missing step, which is why
+  // skipping it produced the "ExecuteMetaCommand before
+  // InitializeMetaCommand" D3D12 validation errors this session's
+  // debug-layer tooling surfaced (#584/#599) -- codex-sol's #591 diagnosis.
+  // Batches every operator compiled so far (see all_ops_ below) into one
+  // IDMLOperatorInitializer and records its dispatch on `list`; the caller
+  // owns Reset/Close/Execute/Signal/Wait, matching every other load-time
+  // command-list use in this file. Idempotent: a no-op after the first real
+  // call, and a no-op if nothing has been compiled yet.
+  void InitializeCompiledOperators(ID3D12GraphicsCommandList* list);
+
   // Non-null only when LC0_DML_PROFILE was set at Init -- callers must check
   // before recording EndQuery, matching LC0_DUMP_BODY's getenv-gated,
   // degrade-silently-when-unset convention right above.
@@ -362,6 +379,21 @@ class DmlDeviceContext {
   std::unordered_map<IDMLCompiledOperator*,
                      Microsoft::WRL::ComPtr<IDMLBindingTable>>
       tables_;
+  // Every operator GetOrCreateBindingTable has ever seen, in first-seen
+  // order -- the input to InitializeCompiledOperators's one batched
+  // IDMLOperatorInitializer. Appended to exactly where tables_ gains a new
+  // entry, so the two always agree on which operators exist.
+  std::vector<IDMLCompiledOperator*> all_ops_;
+  bool operators_initialized_ = false;
+  // The operator initializer's own temporary-resource binding (if it needs
+  // one): must outlive InitializeCompiledOperators's return, since the
+  // caller executes+waits on the command list AFTER that function only
+  // records the dispatch -- a local ComPtr here would free the buffer while
+  // the GPU still had a recorded read of it queued, the exact
+  // docs/directml-handoff.md section 2.2 hang (a *different* buffer, same
+  // lesson). Lives for the context's whole lifetime; it is tiny/one-time,
+  // not worth reclaiming.
+  ComPtr<ID3D12Resource> init_temp_resource_;
   friend class DmlUploadScope;
 };
 
