@@ -250,8 +250,14 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
 
   max_batch_size_ = std::min(1024, std::max(1, options.GetOrDefault<int>(
                                             "max_batch", 256)));
+  // Default 1, not 4 (agora thread 19 #533/#538/#545): at min_batch=4,
+  // a batch-1 request evaluated 4 positions on the GPU and discarded 3,
+  // measured costing DirectML FP32 batch-1 throughput -26% vs SYCL where
+  // min_batch=1 measured +49% vs SYCL on the same net (kda-native-935532,
+  // 12 clean rotated A/B runs). --backend-opts=min_batch=N still overrides
+  // this for anyone who wants the old batching-for-latency tradeoff.
   min_batch_size_ = std::clamp(
-      options.GetOrDefault<int>("min_batch", std::min(4, max_batch_size_)), 1,
+      options.GetOrDefault<int>("min_batch", std::min(1, max_batch_size_)), 1,
       max_batch_size_);
   if (max_batch_size_ < min_batch_size_) {
     throw Exception("Max batch must not be less than min_batch setting.");
