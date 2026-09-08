@@ -424,9 +424,46 @@ class DmlDeviceContext {
   friend class DmlUploadScope;
 };
 
+// Debug aid (LC0_DUMP_BODY): AttentionBody records a copy of its embedding
+// output and each encoder's output into readback buffers; forwardEval drains
+// them once the fence has signalled and writes them as raw floats, so they
+// can be diffed against the BLAS reference's dumps of the same stages to see
+// which layer first diverges. Empty and inert unless the variable is set.
+// Defined here (not in layers.h, where it used to live) because it is now a
+// DmlExecScope member's element type -- see RR3/P3 below.
+struct BodyDump {
+  std::string stage;
+  Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+  uint64_t bytes;
+};
+
 // RAII recorder for a command list plus the per-batch state hanging off it:
 // the transient bump allocator and the descriptor pool reset. Mirrors the
 // CUDA backend's forwardEval() running under the eval lock.
+//
+// agora thread 19 RR3/P3 (per-evaluation ownership, "Design 1" from muse-
+// spark's #668 proposal): body_dumps_/profile_marks_ used to be process-wide
+// statics (BodyDumps()/ProfileMarks() in layers.cc) guarded by one shared
+// DumpProfileMutex -- safe against concurrent push_back, but the mutex was
+// released between the pre-fence-wait size() snapshot and the post-fence-
+// wait drain (network_directml.cc), so a second DirectMlNetwork instance
+// evaluating concurrently (e.g. directml + directml-fp16 both loaded, as
+// network_check.cc's dual-backend comparison does) could clear the vectors
+// in that gap and hand the first network's drain an out-of-range index, or
+// release a readback resource before that network's own GPU work finished
+// writing it. A DmlExecScope is already constructed fresh per forwardEval
+// call (network_directml.cc) and never shared across networks or calls, so
+// making it the OWNER of these vectors (stack-local, one per evaluation)
+// removes the cross-network hazard by construction -- no mutex needed at
+// all, since nothing outside this one call ever sees this scope's vectors.
+// Exception safety: if anything throws between a ProfileStage/DumpBodyStage
+// call and the eventual drain (network_directml.cc, after Close/Execute/
+// Signal/WaitForFence all succeed), the exception propagates out of
+// forwardEval and this scope's destructor runs during unwinding, releasing
+// its vectors' ComPtr readback resources normally -- the drain code itself
+// is never reached in that case (it is strictly after WaitForFence), so no
+// separate "was this submitted" flag is needed on top of the language's own
+// stack-unwind guarantee for this class's actual call pattern.
 class DmlExecScope {
  public:
   DmlExecScope(DmlDeviceContext& ctx, ID3D12GraphicsCommandList* list,
@@ -438,6 +475,13 @@ class DmlExecScope {
 
   ID3D12GraphicsCommandList* list() const { return list_; }
   DmlDeviceContext& ctx() const { return ctx_; }
+
+  // RR3/P3: per-evaluation storage for the LC0_DUMP_BODY/LC0_DML_PROFILE
+  // debug aids -- see the class comment above. Non-const refs so
+  // ProfileStage/DumpBodyStage (layers.cc) and forwardEval's drain
+  // (network_directml.cc) can push_back/read/clear directly.
+  std::vector<BodyDump>& BodyDumps() { return body_dumps_; }
+  std::vector<std::string>& ProfileMarks() { return profile_marks_; }
 
   // Transient (DirectML-internal scratch) for one dispatch. Every dispatch
   // gets the SAME base region: consecutive dispatches are separated by a
@@ -489,6 +533,8 @@ class DmlExecScope {
   ID3D12GraphicsCommandList* list_;
   DmlArena* transient_arena_;
   DmlArena* smolgen_arena_;
+  std::vector<BodyDump> body_dumps_;
+  std::vector<std::string> profile_marks_;
 };
 
 }  // namespace directml_backend

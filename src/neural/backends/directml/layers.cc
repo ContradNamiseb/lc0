@@ -2039,37 +2039,16 @@ void AttentionBody<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
   }
 }
 
-// agora thread 19 #620 package D2 (R5): BodyDumps()/ProfileMarks() are
-// process-wide statics, and each DirectMlNetwork's eval_lock_ only
-// serializes access WITHIN that one network -- two DIFFERENT network
-// instances evaluating concurrently (directml and directml-fp16 both
-// loaded and interleaved, as network_check.cc's dual-backend comparison
-// does) can race on these shared vectors: concurrent push_back is a real
-// data race (vector reallocation under concurrent readers/writers is
-// undefined behavior, not just "wrong data"), and ProfileStage's
-// size()-then-push_back is a compound read-modify-write that can hand two
-// different networks' calls the same EndQuery slot index if they
-// interleave. A single shared mutex, held across each function's whole
-// compound operation, is the minimum fix that closes the memory-safety
-// risk; per-context storage (threaded through DmlExecScope, so each
-// network gets its own vectors with no cross-network interaction at all)
-// would close the index-attribution question too, but is the larger,
-// more invasive redesign muse-spark's report named as the fuller
-// alternative -- not attempted in this pass.
-std::mutex& DumpProfileMutex() {
-  static std::mutex m;
-  return m;
-}
-
-std::vector<BodyDump>& BodyDumps() {
-  static std::vector<BodyDump> dumps;
-  return dumps;
-}
-
-std::vector<std::string>& ProfileMarks() {
-  static std::vector<std::string> marks;
-  return marks;
-}
+// agora thread 19 RR3/P3 (Design 1, muse-spark's #668 proposal): BodyDumps()/
+// ProfileMarks()/DumpProfileMutex() used to live here as process-wide
+// statics guarded by one shared mutex (agora thread 19 #620 package D2's
+// fix for the concurrent-push_back data race that mutex closed). Both are
+// now DmlExecScope member vectors instead (dml_common.h) -- a DmlExecScope
+// is already constructed fresh per forwardEval call and never shared across
+// networks, so per-scope storage removes the cross-network hazard by
+// construction and needs no mutex at all. See DmlExecScope's class comment
+// for the full reasoning, including why no additional exception-safety flag
+// is needed on top of normal stack unwinding for this call pattern.
 
 // LC0_DML_PROFILE stage-timing mark (agora thread 19 #545/#549, Phase 3 Step
 // 2): records an EndQuery at the current point in the command list, named
@@ -2085,14 +2064,13 @@ inline void ProfileStage(const std::string& stage, DmlExecScope& scope) {
   if (!getenv("LC0_DML_PROFILE")) return;
   ID3D12QueryHeap* heap = scope.ctx().profile_heap();
   if (!heap) return;  // requested but heap creation was skipped/failed
-  // D2: index-then-push_back is a compound operation on the shared
-  // process-wide ProfileMarks() -- lock across both so two networks'
-  // concurrent calls can't interleave and hand out the same slot index.
-  std::lock_guard<std::mutex> lock(DumpProfileMutex());
-  const UINT index = static_cast<UINT>(ProfileMarks().size());
+  // RR3/P3: scope.ProfileMarks() is this call's own vector -- no other
+  // DirectMlNetwork instance or forwardEval call can ever see or touch it,
+  // so no lock is needed around this index-then-push_back.
+  const UINT index = static_cast<UINT>(scope.ProfileMarks().size());
   if (index >= kProfileQuerySlots) return;  // degrade silently past capacity
   scope.list()->EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, index);
-  ProfileMarks().push_back(stage);
+  scope.ProfileMarks().push_back(stage);
 }
 
 // Shared by every LC0_DUMP_BODY call site (AttentionBody's per-encoder-layer
@@ -2143,13 +2121,9 @@ inline void DumpBodyStage(const std::string& stage, DmlPtr src,
   b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
   b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
   scope.list()->ResourceBarrier(1, &b);
-  // D2: push_back on the shared process-wide BodyDumps() -- lock it against
-  // a concurrent push from another network instance (see DumpProfileMutex's
-  // comment above ProfileStage).
-  {
-    std::lock_guard<std::mutex> lock(DumpProfileMutex());
-    BodyDumps().push_back(std::move(d));
-  }
+  // RR3/P3: scope.BodyDumps() is this call's own vector -- see ProfileStage's
+  // comment above for why no lock is needed.
+  scope.BodyDumps().push_back(std::move(d));
 }
 
 template <typename DataType>

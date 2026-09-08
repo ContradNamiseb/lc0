@@ -1183,23 +1183,14 @@ void DirectMlNetwork<DataType>::forwardEval(
   // ResolveQueryData is itself a command list op -- it must be recorded
   // before Close(), unlike the CPU-side readback of its destination buffer
   // below, which has to wait for the fence like everything else GPU-written.
-  // agora thread 19 #620 package D2: BodyDumps()/ProfileMarks() are
-  // process-wide, not per-network -- see DumpProfileMutex's declaration
-  // (layers.h) for why every read/modify of them needs to hold this lock
-  // for its whole compound operation, not just each individual vector
-  // call. This early size() read and the later drain-and-clear block
-  // below are separate critical sections (a lock spanning the fence wait
-  // in between would serialize every network's evaluation on this one
-  // mutex, a bigger behavioral change than intended here); the residual
-  // cross-network mark-attribution question that gap leaves is the R5
-  // "original F10 remains" scope muse-spark's report named as needing the
-  // fuller per-context redesign, not closed by this mutex alone.
+  // agora thread 19 RR3/P3: scope.ProfileMarks() is this call's own vector
+  // now (dml_common.h's DmlExecScope), not the process-wide static the R5
+  // "original F10 remains" gap used to name -- no lock needed, and no
+  // separate-critical-sections dance either, since nothing outside this one
+  // forwardEval call can ever see or touch this scope's vectors regardless
+  // of what happens across the fence wait below.
   ComPtr<ID3D12Resource> profile_readback;
-  size_t profile_marks;
-  {
-    std::lock_guard<std::mutex> lock(DumpProfileMutex());
-    profile_marks = ProfileMarks().size();
-  }
+  const size_t profile_marks = scope.ProfileMarks().size();
   if (profile_marks > 0 && ctx_.profile_heap()) {
     profile_readback = detail::CreateBuffer(
         ctx_.device(), profile_marks * sizeof(UINT64),
@@ -1217,10 +1208,11 @@ void DirectMlNetwork<DataType>::forwardEval(
                   "Signal");
   ctx_.WaitForFence(io->fence_.Get(), io->fence_value_);
   {
-    // D2: one lock across both drains -- see the comment above
-    // profile_marks's read for why this and that are separate critical
-    // sections rather than one spanning the fence wait.
-    std::lock_guard<std::mutex> lock(DumpProfileMutex());
+    // RR3/P3: no lock -- scope.ProfileMarks()/scope.BodyDumps() are this
+    // call's own vectors, unreachable from any other DirectMlNetwork
+    // instance or forwardEval call. This block only runs after Close/
+    // Execute/Signal/WaitForFence all succeeded, so every dump readback
+    // here was genuinely written by this call's own GPU work.
     if (profile_readback) {
       // RR4 (agora thread 19 #650/#652): unchecked, same class as the other
       // three sites -- the stamps[] reads below would otherwise dereference
@@ -1239,13 +1231,13 @@ void DirectMlNetwork<DataType>::forwardEval(
             i == 0 ? 0.0
                    : (static_cast<double>(stamps[i] - stamps[i - 1]) / freq) *
                          1e6;
-        CERR << "  " << ProfileMarks()[i] << ": " << us << " us";
+        CERR << "  " << scope.ProfileMarks()[i] << ": " << us << " us";
       }
       profile_readback->Unmap(0, nullptr);
-      ProfileMarks().clear();
+      scope.ProfileMarks().clear();
     }
     if (const char* prefix = getenv("LC0_DUMP_BODY")) {
-      for (auto& d : BodyDumps()) {
+      for (auto& d : scope.BodyDumps()) {
         // RR4 (agora thread 19 #650/#652): unchecked, same class as above --
         // the f.write below would otherwise read a garbage-pointer range on
         // a failed Map.
@@ -1260,7 +1252,7 @@ void DirectMlNetwork<DataType>::forwardEval(
         f.write(reinterpret_cast<const char*>(p), d.bytes);
         d.readback->Unmap(0, nullptr);
       }
-      BodyDumps().clear();
+      scope.BodyDumps().clear();
     }
   }
   // fp16 output conversion: the readback buffers above just landed raw

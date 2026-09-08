@@ -121,35 +121,11 @@ void ResetForTesting();  // quiescent-test-only: drops retained blobs and
 }  // namespace shader_cache
 
 
-// Debug aid (LC0_DUMP_BODY): AttentionBody records a copy of its embedding
-// output and each encoder's output into readback buffers; forwardEval drains
-// them once the fence has signalled and writes them as raw floats, so they
-// can be diffed against the BLAS reference's dumps of the same stages to see
-// which layer first diverges. Empty and inert unless the variable is set.
-struct BodyDump {
-  std::string stage;
-  Microsoft::WRL::ComPtr<ID3D12Resource> readback;
-  uint64_t bytes;
-};
-std::vector<BodyDump>& BodyDumps();
-
-// agora thread 19 #620 package D2: guards BodyDumps()/ProfileMarks()
-// against concurrent access from more than one DirectMlNetwork instance
-// (each network's own eval_lock_ only serializes within that network).
-// Every producer (ProfileStage/DumpBodyStage in layers.cc) and consumer
-// (network_directml.cc's drain-and-print-and-clear after a fence wait)
-// must hold this for its whole read/modify/clear, not just individual
-// vector calls -- declared here so both translation units share the one
-// mutex instance.
-std::mutex& DumpProfileMutex();
-
-// Debug aid (LC0_DML_PROFILE): GPU-timestamp stage marks for Phase 3's speed
-// campaign (agora thread 19 #545/#549) -- records the ordered stage names
-// EndQuery was called for, so network_directml.cc can pair each with its
-// resolved D3D12_QUERY_TYPE_TIMESTAMP value and print per-stage deltas after
-// the fence signals. Empty and inert unless the variable is set. Same
-// drain-and-clear-after-use lifecycle as BodyDumps above.
-std::vector<std::string>& ProfileMarks();
+// agora thread 19 RR3/P3: BodyDump and the BodyDumps()/ProfileMarks()/
+// DumpProfileMutex() process-wide statics that used to live here are gone --
+// moved into DmlExecScope itself (dml_common.h) as per-evaluation member
+// storage. See that class's comment for why (closes the cross-network
+// safety AND attribution gap the mutex-only fix left open).
 
 // Records an EndQuery at the current point in `scope`'s command list, named
 // `stage`, if LC0_DML_PROFILE is set and the device context created a query
