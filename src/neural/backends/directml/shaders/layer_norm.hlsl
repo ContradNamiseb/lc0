@@ -55,16 +55,29 @@ cbuffer LayerNormConstants : register(b0) {
   uint pad1;
 };
 
-StructuredBuffer<INPUT_TYPE> input_buf : register(t0);
+// agora thread 19 #696 Stream A1: all 5 inputs moved from raw SRV root
+// descriptors to raw UAV root descriptors, matching RR2/P2's fix for the 5
+// other hand-written kernels -- every buffer in this backend stays in
+// D3D12_RESOURCE_STATE_UNORDERED_ACCESS throughout (no shader-read-only
+// transition exists), so an SRV root descriptor here has the same
+// incompatible-resource-state hazard P2 closed elsewhere. This kernel had
+// zero call sites at the time (dead code since 5c7622c fused its LayerNorms
+// via LayerNormExpr), so the hazard was latent rather than live, but the
+// class is kept as a reusable dispatch-only wrapper, and a dead trap left
+// for the next caller to (re)trip is still a trap. Register numbers shift
+// since ShaderRegister numbering restarts per SRV/UAV group -- output_buf
+// moves from u0 to u5 accordingly.
+RWStructuredBuffer<INPUT_TYPE> input_buf : register(u0);
 // bias/skip are always bound to a valid resource; when the corresponding
 // LN_FLAG_ bit is clear they are aliases of input_buf and never read. A null
-// root SRV removes the device on this driver (see the PE_DENSE preprocess
-// crash in docs/directml-handoff.md), so absence is a flag, not a null.
-StructuredBuffer<INPUT_TYPE> bias_buf : register(t1);
-StructuredBuffer<INPUT_TYPE> skip_buf : register(t2);
-StructuredBuffer<INPUT_TYPE> gamma_buf : register(t3);
-StructuredBuffer<INPUT_TYPE> beta_buf : register(t4);
-RWStructuredBuffer<INPUT_TYPE> output_buf : register(u0);
+// root descriptor removes the device on this driver (see the PE_DENSE
+// preprocess crash in docs/directml-handoff.md), so absence is a flag, not a
+// null.
+RWStructuredBuffer<INPUT_TYPE> bias_buf : register(u1);
+RWStructuredBuffer<INPUT_TYPE> skip_buf : register(u2);
+RWStructuredBuffer<INPUT_TYPE> gamma_buf : register(u3);
+RWStructuredBuffer<INPUT_TYPE> beta_buf : register(u4);
+RWStructuredBuffer<INPUT_TYPE> output_buf : register(u5);
 
 groupshared float ln_row[LN_MAX_CHANNELS];
 groupshared float ln_partial[LN_GROUP_SIZE];

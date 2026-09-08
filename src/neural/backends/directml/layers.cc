@@ -1520,8 +1520,12 @@ LayerNormLayer::LayerNormLayer(ID3D12Device* device, bool fp16)
   ComPtr<ID3DBlob> shader =
       CompileHlsl(kLayerNormShaderSource, sizeof(kLayerNormShaderSource) - 1,
                   "layer_norm.hlsl", "LayerNorm", fp16_);
+  // agora thread 19 #696 Stream A1: 0 SRVs, 6 UAVs (was 5/1) -- see
+  // layer_norm.hlsl's comment. Root parameter indices are unaffected
+  // (constants=0, input=1..betas=5, output=6, same as before); only the
+  // TYPE at indices 1-5 changes SRV->UAV.
   root_signature_ = CreateShaderRootSignature(
-      device_.Get(), sizeof(LayerNormConstants) / 4, 5, 1);
+      device_.Get(), sizeof(LayerNormConstants) / 4, 0, 6);
   pso_ = CreateComputePso(device_.Get(), root_signature_.Get(), shader.Get());
 }
 
@@ -1537,9 +1541,10 @@ void LayerNormLayer::Record(ID3D12GraphicsCommandList* command_list,
   constants.alpha = params.alpha;
   constants.eps = params.eps;
 
-  // Every root SRV must point at a real allocation even when the shader
-  // never reads it: a zero GPU VA in a root descriptor removes the device on
-  // this driver (the same failure the PE_DENSE preprocess kernel hit).
+  // Every root descriptor must point at a real allocation even when the
+  // shader never reads it: a zero GPU VA in a root descriptor removes the
+  // device on this driver (the same failure the PE_DENSE preprocess kernel
+  // hit).
   const DmlPtr bias_srv = params.has_bias ? bias : input;
   const DmlPtr skip_srv = params.has_skip ? skip : input;
 
@@ -1547,11 +1552,13 @@ void LayerNormLayer::Record(ID3D12GraphicsCommandList* command_list,
   command_list->SetPipelineState(pso_.Get());
   command_list->SetComputeRoot32BitConstants(0, sizeof(LayerNormConstants) / 4,
                                              &constants, 0);
-  command_list->SetComputeRootShaderResourceView(1, input.GpuVA());
-  command_list->SetComputeRootShaderResourceView(2, bias_srv.GpuVA());
-  command_list->SetComputeRootShaderResourceView(3, skip_srv.GpuVA());
-  command_list->SetComputeRootShaderResourceView(4, gammas.GpuVA());
-  command_list->SetComputeRootShaderResourceView(5, betas.GpuVA());
+  // agora thread 19 #696 Stream A1: UAV binds at the same root indices,
+  // matching the root signature change above.
+  command_list->SetComputeRootUnorderedAccessView(1, input.GpuVA());
+  command_list->SetComputeRootUnorderedAccessView(2, bias_srv.GpuVA());
+  command_list->SetComputeRootUnorderedAccessView(3, skip_srv.GpuVA());
+  command_list->SetComputeRootUnorderedAccessView(4, gammas.GpuVA());
+  command_list->SetComputeRootUnorderedAccessView(5, betas.GpuVA());
   command_list->SetComputeRootUnorderedAccessView(6, output.GpuVA());
   // One thread group per token row (LN_GROUP_SIZE threads cooperate on the
   // channel reduction), so the group count is the row count.
@@ -3271,7 +3278,14 @@ void EncoderBlock<DataType>::EvalKda(int N, DmlPtr in_out_tensor,
   const std::string kdaDumpPrefix = "enc" + std::to_string(encoder_index);
   constexpr float kKdaLogDecayFloor = -10.0f;
   const uint32_t tokens = N * 64;
-  const uint32_t max_tokens = max_batch_size_ * 64;
+  // agora thread 19 #696 Stream A3: uint64_t, matching EvalMha's max_tokens
+  // (~3133) -- every carve below multiplies max_tokens by KD/VD/gr/emb
+  // before AlignUp ever sees it (AlignUp itself takes uint64_t), so with
+  // max_tokens as uint32_t the multiplication happens in 32-bit and can
+  // wrap before the implicit widen at the call boundary. Narrow in
+  // practice (needs a very large max_batch_size_), but the same
+  // computation is already uint64_t one function over.
+  const uint64_t max_tokens = (uint64_t)max_batch_size_ * 64;
   const uint32_t KD = encoder_heads_ * kda_key_dim_;
   const uint32_t VD = encoder_heads_ * kda_value_dim_;
   const uint32_t gr = kda_gate_rank_;
@@ -3305,14 +3319,25 @@ void EncoderBlock<DataType>::EvalKda(int N, DmlPtr in_out_tensor,
   DmlPtr q = scratch;
   DmlPtr k = q + AlignUp(max_tokens * KD * elem_rec);
   DmlPtr v = k + AlignUp(max_tokens * KD * elem_rec);
-  DmlPtr gate_hidden = v + AlignUp(max_tokens * VD * elem_rec);
   // proj_input now holds kda_local_conv_layer_'s output at elem_rec width
   // (always float32) rather than native elem, since the shader is always
   // fp32 now (note 2530/#57) -- a no-op size change in the fp32 network
   // (elem_rec==elem there). in_up is the cast-up staging buffer feeding the
   // shader's input side, only ever written/read when kda_local_conv_ &&
   // fp16_; network_directml.cc's KDA arena term budgets both.
-  DmlPtr proj_input = gate_hidden + AlignUp(max_tokens * gr * elem);
+  //
+  // agora thread 19 #696 Stream A2: this used to carve an intermediate
+  // `gate_hidden` DmlPtr between v and proj_input, sized for what would be
+  // kda_proj_compiled_'s gate-hidden GEMM output -- but that GEMM's actual
+  // result (gate_hidden_e, ~3456 below) lives entirely inside the compiled
+  // dml::Graph as an Expression and is never materialized to a separate
+  // scratch buffer (the graph's real output list is q/k/v/raw_decay/
+  // [gate]/beta, ~3477 below -- no gate_hidden). So the carve was
+  // unreachable dead space, not a live buffer; inlined here as pure address
+  // arithmetic (byte-identical offset, no behavior change) to stop it
+  // reading as a real, bindable buffer to the next person who greps for it.
+  DmlPtr proj_input = v + AlignUp(max_tokens * VD * elem_rec) +
+                       AlignUp(max_tokens * gr * elem);
   DmlPtr in_up = proj_input + AlignUp(max_tokens * emb * elem_rec);
   DmlPtr proj_in = in_out_tensor;
   DmlPtr raw_decay = buffer2;
@@ -3486,8 +3511,9 @@ void EncoderBlock<DataType>::EvalKda(int N, DmlPtr in_out_tensor,
     BuildKdaTails(N, scope);
     // agora thread 19 #620 package C3: AlignUp -- see EvalMha's identical
     // ln1 carve for the same "immune by emb-even, not by construction"
-    // reasoning.
-    const DmlPtr ln1 = ln_scratch + AlignUp((uint64_t)max_tokens * emb * elem);
+    // reasoning. (#696 Stream A3: the explicit (uint64_t) cast here is gone
+    // -- max_tokens is uint64_t at its declaration now, matching EvalMha.)
+    const DmlPtr ln1 = ln_scratch + AlignUp(max_tokens * emb * elem);
 
     // Skip is the block input, still in in_out_tensor at this point.
     DispatchOp<DataType>(scope, kda_tail1_compiled_.at(N), mixed, gate,
