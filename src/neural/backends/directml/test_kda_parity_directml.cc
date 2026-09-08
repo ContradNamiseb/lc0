@@ -2864,6 +2864,53 @@ TEST(DirectMlRegressionCoverage, EmptyBatchNoCrashFp16) {
          "backend too, not crash or throw (P4 vi, agora thread 19 #677)";
 }
 
+// Agora thread 19 #696 Stream A4 ("transient-sizing probe only -- run max
+// supported config to map the throw boundary; implementation [size-from-
+// ladder] stays held as design"): originally aimed at transient_arena_'s
+// FIXED 256MB size (network_directml.cc, DmlArena::Create call), but the
+// actual result is a DIFFERENT, more urgent finding -- it never gets that
+// far. With max_batch configured to its allowed ceiling (1024),
+// EVERY request above 256 throws immediately (verified: batch 256 OK,
+// batch 257 THREW, identical error at batch 320) -- a binary cliff, not a
+// gradual boundary. Mechanism, traced to source: BatchLadder()
+// (network_directml.cc) is {..., 192, 256, max_batch_size_}, so with
+// max_batch_size_=1024 there is a single huge gap from 256 straight to
+// 1024 -- forwardEval's round-up-to-ladder logic sends ANY batch in
+// (256, 1024] straight to 1024, and CheckDispatchGroupCount's pre-existing
+// package-B3 guard (layers.cc) then correctly rejects record_preprocess's
+// resulting 1024*64 = 65536 thread groups, one over D3D12's 65535-per-
+// dimension limit. So max_batch=1024 is not "works up to some point then
+// runs out of transient scratch" -- it is unconditionally broken for any
+// caller who ever requests a batch the ladder doesn't have a close rung
+// for, well before arena sizing is ever relevant. No BLAS reference here
+// (BLAS caps at 256, see "BLAS max batch size is 256" in every suite log)
+// -- directml-only, and no correctness assertion, just a boundary map
+// printed to stderr. DISABLED_ by default (matches
+// DISABLED_TriageBatchContamination/DISABLED_DumpSingleRealNetEval's
+// convention for manual-invocation-only diagnostics); run explicitly with
+// --gtest_also_run_disabled_tests --gtest_filter=*TransientArenaMaxBatchProbe*.
+TEST(DirectMlKdaParity, DISABLED_TransientArenaMaxBatchProbe) {
+  OptionsDict options;
+  options.Set<int>("max_batch", 1024);
+  auto network = NetworkFactory::Get()->Create(
+      "directml", MakeFullRealisticNetRealSmolgenDims(), options);
+  for (int batch : {1, 32, 64, 128, 192, 256, 257, 320, 384, 448, 512, 576,
+                    640, 704, 768, 832, 896, 960, 1024}) {
+    auto computation = network->NewComputation();
+    for (int i = 0; i < batch; ++i) {
+      computation->AddInput(InputPlanes(EncodeStartPos()));
+    }
+    try {
+      computation->ComputeBlocking();
+      std::cerr << "A4 probe: batch " << batch << ": OK\n";
+    } catch (const std::exception& e) {
+      std::cerr << "A4 probe: batch " << batch << ": THREW: " << e.what()
+                << "\n";
+      break;
+    }
+  }
+}
+
 // agora thread 19 P4 (vii), muse-spark's #677/#668 (doubles as RR3's
 // regression test): RR3 moved BodyDumps()/ProfileMarks() from process-wide
 // statics into per-DmlExecScope storage specifically to remove a
