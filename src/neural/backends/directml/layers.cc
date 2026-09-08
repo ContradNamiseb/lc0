@@ -649,6 +649,22 @@ void DispatchOp(DmlExecScope& scope, DmlCompiledOp& op, DmlPtr input,
         ptrs.push_back(scratch);
         break;
       case DmlBindingRef::Kind::kExtra:
+        // agora thread 19 #696 Stream B: a compiled graph that declares an
+        // Extra slot (GraphFactory::Extra) but whose DispatchOp call site
+        // forgets the trailing `extra` argument silently binds a
+        // default-constructed (null) DmlPtr -- a null GPU VA in a root
+        // descriptor removes the device on this driver rather than failing
+        // cleanly (the same class as the PE_DENSE preprocess crash and the
+        // LayerNormLayer::Record comment on this same hazard). Fail loudly
+        // at the C++ call site instead, with the actual op name, rather
+        // than let it reach the GPU as undefined behavior.
+        if (!extra) {
+          throw Exception(
+              "directml backend: DispatchOp for a compiled op with a kExtra "
+              "binding was called without an `extra` argument (null DmlPtr) "
+              "-- the graph declared GraphFactory::Extra() but this call "
+              "site never passed the buffer it feeds.");
+        }
         ptrs.push_back(extra);
         break;
     }
@@ -1337,6 +1353,24 @@ KdaRecurrenceLayer::KdaRecurrenceLayer(ID3D12Device* device, bool fp16,
     throw Exception(
         "directml backend: KDA value_dim exceeds the 1024-thread group "
         "limit.");
+  }
+  // agora thread 19 #696 Stream B: mirrors the value_dim check above for
+  // key_dim's own hardware limit, which is a different resource --
+  // kda_recurrence.hlsl declares three groupshared arrays sized
+  // KDA_KEY_DIM (p_q/p_k/p_decay, 4 bytes each), so key_dim drives
+  // thread-group-shared-memory usage rather than thread count. D3D12
+  // guarantees at least 32KB (32768 bytes) of TGSM per group on every
+  // conformant feature-level-11+ device; 3 arrays * 4 bytes/element = 12
+  // bytes per key_dim unit, so 32768/12 = 2730 is the portable safe bound
+  // (this session's actual hardware budget is larger, per the Stream E
+  // cache research, but the guard is written to the spec minimum, not this
+  // one GPU). No real net comes close (key_dim is 32-64 in every net seen
+  // so far) -- this is a fail-loud guard against a wildly misconfigured or
+  // corrupted net, not a tuning knob.
+  if (key_dim_ > 2730) {
+    throw Exception(
+        "directml backend: KDA key_dim exceeds the thread-group-shared-"
+        "memory budget for this shader's p_q/p_k/p_decay arrays.");
   }
   D3D12_ROOT_PARAMETER params[kKdaRootParamUav + 1] = {};
 
