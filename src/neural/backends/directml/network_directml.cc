@@ -913,7 +913,28 @@ void DirectMlNetwork<DataType>::FlushWeights(DmlWeightUploader& uploader) {
       const float* fsrc = reinterpret_cast<const float*>(p.owned.data());
       DmlHalf* hdst = reinterpret_cast<DmlHalf*>(dst_ptr);
       const size_t n = p.bytes / 4;
-      for (size_t i = 0; i < n; ++i) hdst[i] = DmlHalf(fsrc[i]);
+      for (size_t i = 0; i < n; ++i) {
+        hdst[i] = DmlHalf(fsrc[i]);
+        // agora thread 19 #696 Stream B: F32toF16Bits (F6, already verified
+        // correct) produces IEEE Infinity for any finite fp32 magnitude
+        // beyond fp16's +/-65504 range -- the mathematically correct
+        // conversion result, but a silent one: a trained weight that
+        // happens to exceed this range would become Inf here and then
+        // poison every downstream product it touches, with nothing at
+        // load time to say why. A source value that was already Inf/NaN
+        // converting to Inf/NaN is expected and not flagged -- only a
+        // FINITE source producing a non-finite result is the genuinely
+        // silent case worth failing loudly on.
+        if (std::isfinite(fsrc[i]) &&
+            !std::isfinite(static_cast<float>(hdst[i]))) {
+          throw Exception(
+              "directml backend: fp16 weight conversion overflowed -- "
+              "source value " +
+              std::to_string(fsrc[i]) +
+              " exceeds fp16's +/-65504 representable range and would "
+              "silently become Inf on the GPU.");
+        }
+      }
     } else {
       std::memcpy(dst_ptr, p.owned.data(), p.bytes);
     }
