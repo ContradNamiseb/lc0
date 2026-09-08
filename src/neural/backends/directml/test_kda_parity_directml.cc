@@ -1254,6 +1254,24 @@ TEST(DirectMlKdaParity, MatchesBlasOnLocalConvBatch) {
   CompareBackendsBatch(MakeLocalConvNet(9402), 4);
 }
 
+// agora thread 19 P4 (iv), muse-spark's #677/#668: MakeLocalConvNet above
+// uses NetDims()'s small default dims -- real KDA nets run at
+// RealisticDims() (embedding=128, heads=16). Same head-scale-amplifier
+// reasoning as MakeLocalConvNet's own comment (the effect is otherwise too
+// small to discriminate against the tolerance floor), at batch>1 so the
+// per-sample batch_base stride this shader hand-computes is exercised at
+// realistic scale too, not just the small synthetic dims above.
+pblczero::Net MakeLocalConvRealisticNet(unsigned seed) {
+  KdaFeatures feat;
+  feat.local_conv = true;
+  constexpr float kLocalConvHeadScale = 12.0f;
+  return MakeNetWithDims(RealisticDims(), seed, feat, kLocalConvHeadScale);
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnLocalConvRealisticBatch) {
+  CompareBackendsBatch(MakeLocalConvRealisticNet(9403), 4);
+}
+
 // The other three KDA feature switches were pinned to a single value in every
 // net in this file: output_gate and output_rms_norm always true, qkv_silu
 // always true. Their disabled branches were therefore dead under test while
@@ -1606,6 +1624,19 @@ pblczero::Net MakeKdaSerpentineReverseNet() {
 
 TEST(DirectMlKdaParity, MatchesBlasOnKdaSerpentineReverseNet) {
   CompareBackends(MakeKdaSerpentineReverseNet());
+}
+
+// agora thread 19 P4 (v), muse-spark's #677/#668: both serpentine directions
+// were single-position (batch=1) only -- the direction table is uploaded
+// once and read identically by every sample in a batch (kda_recurrence.hlsl
+// direction_order), so a batch>1 case exercises the same table lookup
+// across multiple per-sample dispatch groups instead of just one.
+TEST(DirectMlKdaParity, MatchesBlasOnKdaSerpentineNetBatch) {
+  CompareBackendsBatch(MakeKdaSerpentineNet(), 4);
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnKdaSerpentineReverseNetBatch) {
+  CompareBackendsBatch(MakeKdaSerpentineReverseNet(), 4);
 }
 
 // End-to-end check against a real trained net, if one is pointed at. Set
@@ -2810,6 +2841,159 @@ TEST(DirectMlRegressionCoverage, EmptyBatchNoCrash) {
   ASSERT_NO_THROW(computation->ComputeBlocking())
       << "ComputeBlocking on an empty batch must return cleanly, not crash "
          "or throw (F8, agora thread 19 #560/#573/#578)";
+}
+
+// agora thread 19 P4 (vi), muse-spark's #677/#668: EmptyBatchNoCrash above
+// only ever exercised directml (fp32). The fp16 path has its own readback
+// conversion (host-side DmlHalf->float, network_directml.cc) and its own
+// allow_broken_fp16 exception gate, both independent of F8's fix -- a
+// separate empty-batch defect in either could exist without this test
+// catching it. Same reproduction shape as F8, on directml-fp16 instead.
+TEST(DirectMlRegressionCoverage, EmptyBatchNoCrashFp16) {
+  if (!HasBackend("directml-fp16")) {
+    GTEST_SKIP() << "directml-fp16 backend not compiled in";
+  }
+  OptionsDict options;
+  options.Set<bool>("allow_broken_fp16", true);
+  auto network =
+      NetworkFactory::Get()->Create("directml-fp16", MakeKdaMlhNet(), options);
+  auto computation = network->NewComputation();
+  // Deliberately no AddInput() call: planes_ stays empty, batch size 0.
+  ASSERT_NO_THROW(computation->ComputeBlocking())
+      << "ComputeBlocking on an empty batch must return cleanly on the fp16 "
+         "backend too, not crash or throw (P4 vi, agora thread 19 #677)";
+}
+
+// agora thread 19 P4 (vii), muse-spark's #677/#668 (doubles as RR3's
+// regression test): RR3 moved BodyDumps()/ProfileMarks() from process-wide
+// statics into per-DmlExecScope storage specifically to remove a
+// cross-network hazard that only existed when TWO DirectMlNetwork
+// instances' evaluations interleaved. The original hazard needed genuine
+// concurrent GPU work from two threads (network_check.cc's dual-backend
+// comparison, or directml+directml-fp16 loaded together) to manifest --
+// this test does not attempt that (it needs the "hook seam mirroring
+// SetFlightHookForTesting" muse-spark's fuller Design 1 proposal named,
+// which does not exist yet; filed as the P3-followup, not built here).
+// What IS achievable and still meaningful without that infrastructure:
+// two DIFFERENT networks (different encoder architecture, so a dump/mark
+// count mix-up would be structurally detectable) alternately evaluated on
+// one thread with LC0_DUMP_BODY+LC0_DML_PROFILE both enabled, verifying
+// network A's own outputs are bit-identical whether evaluated alone or
+// with network B's evaluation interleaved between two of A's calls -- if
+// BodyDumps()/ProfileMarks() (or anything else) still leaked state
+// between instances, this is the simplest scenario that could show it.
+TEST(DirectMlRegressionCoverage, TwoNetworkInterleaveDoesNotCorruptResults) {
+  if (!HasBackend("directml"))
+    GTEST_SKIP() << "directml backend not compiled in";
+  if (!DirectMlAvailability().available) {
+    GTEST_SKIP() << "no usable directml device: "
+                 << DirectMlAvailability().reason;
+  }
+  const pblczero::Net netA = MakeKdaMlhNet();      // 1 KDA encoder.
+  const pblczero::Net netB = MakeKdaMhaNet();      // 1 KDA + 1 MHA encoder.
+  const InputPlanes planes = EncodeStartPos();
+
+  // No new directory needed -- TestBinaryDir() (where the test binary
+  // itself lives) already exists, and DumpBodyStage's writes create files,
+  // not directories, at whatever prefix this names.
+  const std::string dump_prefix =
+      TestBinaryDir() + "interleave_dump_smoke";
+#if defined(_WIN32)
+  _putenv_s("LC0_DUMP_BODY", dump_prefix.c_str());
+  _putenv_s("LC0_DML_PROFILE", "1");
+#else
+  setenv("LC0_DUMP_BODY", dump_prefix.c_str(), 1);
+  setenv("LC0_DML_PROFILE", "1", 1);
+#endif
+
+  auto eval_once = [&](const pblczero::Net& net) {
+    OptionsDict options;
+    auto network = NetworkFactory::Get()->Create("directml", net, options);
+    auto computation = network->NewComputation();
+    computation->AddInput(InputPlanes(planes));
+    computation->ComputeBlocking();
+    Outputs out;
+    out.q = computation->GetQVal(0);
+    out.d = computation->GetDVal(0);
+    out.m = computation->GetMVal(0);
+    out.policy.reserve(1858);
+    for (int i = 0; i < 1858; ++i) out.policy.push_back(computation->GetPVal(0, i));
+    return out;
+  };
+
+  const Outputs a1 = eval_once(netA);
+  const Outputs b = eval_once(netB);
+  const Outputs a2 = eval_once(netA);
+
+#if defined(_WIN32)
+  _putenv_s("LC0_DUMP_BODY", "");
+  _putenv_s("LC0_DML_PROFILE", "");
+#else
+  unsetenv("LC0_DUMP_BODY");
+  unsetenv("LC0_DML_PROFILE");
+#endif
+
+  (void)b;  // Only used to interleave a different network's eval between A's two.
+  EXPECT_EQ(a1.q, a2.q) << "network A's Q changed after B's eval ran between "
+                           "A's two calls -- possible cross-network state leak";
+  EXPECT_EQ(a1.d, a2.d);
+  EXPECT_EQ(a1.m, a2.m);
+  for (int i = 0; i < 1858; ++i) {
+    ASSERT_EQ(a1.policy[i], a2.policy[i])
+        << "network A's policy[" << i << "] changed after B's interleaved eval";
+  }
+}
+
+// agora thread 19 P4 (viii), muse-spark's #677/#668 (E15 -- RR2's own
+// stated exit criterion, codex-sol's #650 audit): GPU-Based Validation
+// messages only ever reached CERR as printed text -- nothing turned an
+// ERROR/CORRUPTION severity into an actual test failure, so a regression
+// reintroducing a resource-state bug would print a warning nobody's CI
+// reads and every numeric test would still stay green. This closes that
+// gate: enable the debug layer + GBV, reset GbvErrorCount(), run a
+// representative net (the same one gbv.log's evidence used throughout
+// this triage), and fail if anything ERROR/CORRUPTION-severity fired.
+// Expected to PASS now that RR2/P2 fixed the one persistent violation this
+// exact scenario used to report.
+TEST(DirectMlRegressionCoverage, GbvReportsNoErrorsOnRepresentativeNet) {
+  if (!HasBackend("directml"))
+    GTEST_SKIP() << "directml backend not compiled in";
+  if (!DirectMlAvailability().available) {
+    GTEST_SKIP() << "no usable directml device: "
+                 << DirectMlAvailability().reason;
+  }
+#if defined(_WIN32)
+  _putenv_s("LC0_DML_DEBUG_LAYER", "1");
+  _putenv_s("LC0_DML_GBV", "1");
+#else
+  setenv("LC0_DML_DEBUG_LAYER", "1", 1);
+  setenv("LC0_DML_GBV", "1", 1);
+#endif
+  using directml_backend::GbvErrorCount;
+  GbvErrorCount() = 0;
+
+  {
+    OptionsDict options;
+    auto network =
+        NetworkFactory::Get()->Create("directml", MakeKdaMlhNet(), options);
+    auto computation = network->NewComputation();
+    computation->AddInput(InputPlanes(EncodeStartPos()));
+    computation->ComputeBlocking();
+  }
+
+  const int errors = GbvErrorCount();
+#if defined(_WIN32)
+  _putenv_s("LC0_DML_DEBUG_LAYER", "");
+  _putenv_s("LC0_DML_GBV", "");
+#else
+  unsetenv("LC0_DML_DEBUG_LAYER");
+  unsetenv("LC0_DML_GBV");
+#endif
+  EXPECT_EQ(errors, 0)
+      << "GPU-Based Validation reported " << errors << " ERROR/CORRUPTION "
+         "severity message(s) -- see the CERR output above for detail "
+         "(P4 viii, agora thread 19 #677; this gate was green-lit by "
+         "RR2/P2's fix, do not silently widen it back open)";
 }
 
 // F6: F32toF16Bits (reached only through DmlHalf's public float constructor
