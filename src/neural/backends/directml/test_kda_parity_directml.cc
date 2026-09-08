@@ -439,6 +439,47 @@ pblczero::Net MakeKdaMhaNet() {
   return file;
 }
 
+// Agora thread 19 #641: byte-for-byte MakeKdaMhaNet() above, except with 3
+// KDA encoders ahead of the trailing MHA encoder instead of 1 -- same dims,
+// same flags, same rng seed/sequence shape (just 2 more FillKdaEncoder
+// calls). Depth is the only variable, matching the real trained nets'
+// 3xKDA+1xMHA body exactly. Diagnostic-only fixture for the #637/#638/#639/
+// #640 batch-contamination triage.
+pblczero::Net MakeThreeKdaThenMhaNet() {
+  const NetDims d;
+  const int input_size = kInputPlanes + 64;
+  const int mlh = 4;
+  std::mt19937 rng(1234);
+  pblczero::Net file;
+  auto* weights = file.mutable_weights();
+  auto* nf = file.mutable_format()->mutable_network_format();
+  using NF = pblczero::NetworkFormat;
+  nf->set_input(NF::INPUT_CLASSICAL_112_PLANE);
+  nf->set_network(NF::NETWORK_KDA_HYBRID_WITH_MULTIHEADFORMAT);
+  nf->set_policy(NF::POLICY_ATTENTION);
+  nf->set_value(NF::VALUE_WDL);
+  nf->set_moves_left(NF::MOVES_LEFT_V1);
+  nf->set_input_embedding(NF::INPUT_EMBEDDING_NONE);
+  nf->set_default_activation(NF::DEFAULT_ACTIVATION_RELU);
+  nf->set_ffn_activation(NF::ACTIVATION_DEFAULT);
+  nf->set_smolgen_activation(NF::ACTIVATION_DEFAULT);
+  for (int dir : {1, 2}) {
+    nf->add_kda_directions(static_cast<NF::KdaDirection>(dir));
+  }
+
+  FillLayer(weights->mutable_ip_emb_w(),
+            RandomVec(rng, d.embedding * input_size, 0.05f));
+  FillLayer(weights->mutable_ip_emb_b(), RandomVec(rng, d.embedding, 0.05f));
+  weights->set_headcount(d.heads);
+
+  FillKdaEncoder(&file, rng, d);
+  FillKdaEncoder(&file, rng, d);
+  FillKdaEncoder(&file, rng, d);
+  FillMhaEncoder(&file, rng, d);
+  FillPolicyAndValueHeads(&file, rng, d, true, mlh);
+  return file;
+}
+
 // Net 3: no encoders at all -- bisects divergence between the
 // embedding/heads and the encoder stacks.
 pblczero::Net MakeNoEncoderNet() {
@@ -1726,6 +1767,22 @@ TEST(DirectMlKdaParity, MatchesBlasOnRealNetFromEnv) {
 // triage localizes the finding (as a red-with-cause regression test, or
 // green if the underlying issue is fixed first).
 
+// E1 (agora thread 19 #620/#628/#630/#631): implemented and verified working
+// (correctly skips without LC0_TEST_REAL_NET, correctly caught a real
+// batch-8 divergence on kda-t1-55050 with it set -- see #630). HELD out of
+// the last commit (31c6bbb) per muse-spark's #631 directive c: landing it
+// red without a root cause would muddy every subsequent suite run's
+// signal. Restored here in the working tree (uncommitted, per the same
+// directive) to run the #631 triage against it; will land once the
+// triage localizes the finding (as a red-with-cause regression test, or
+// green if the underlying issue is fixed first).
+TEST(DirectMlKdaParity, MatchesBlasOnRealNetBatchOfEight) {
+  const char* path = getenv("LC0_TEST_REAL_NET");
+  if (!path) GTEST_SKIP() << "set LC0_TEST_REAL_NET to a .pb.gz to run";
+  pblczero::Net net = LoadWeightsFromFile(path);
+  CompareBackendsBatch(net, 8);
+}
+
 // Diagnostic dump, NOT a correctness test: writes the first KDA encoder's
 // decay geometry (heads, key_dim, value_dim, directions) and its real
 // trained a_log/dt_bias to a small binary file, for
@@ -1950,6 +2007,39 @@ TEST(DirectMlKdaParity, MatchesBlasOnKdaHybridNet) {
 
 TEST(DirectMlKdaParity, MatchesBlasOnKdaMhaNet) {
   CompareBackends(MakeKdaMhaNet());
+}
+
+// Agora thread 19 #639/#640: MakeKdaMhaNet() (1 KDA encoder + 1 MHA encoder)
+// was, until now, only ever compared at batch 1 -- the one synthetic
+// fixture that mixes mixer types in a single body never exercised batch>1
+// on the KDA->MHA handoff. Part of the #637-655 batch-contamination
+// triage's synthetic-fixture sweep (all passed clean, refuting a generic
+// mixer-transition cause -- see thread #19 for the full chain).
+TEST(DirectMlKdaParity, MatchesBlasOnKdaMhaNetBatchOfTwo) {
+  CompareBackendsBatch(MakeKdaMhaNet(), 2);
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnKdaMhaNetBatchOfFour) {
+  CompareBackendsBatch(MakeKdaMhaNet(), 4);
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnKdaMhaNetBatchOfEight) {
+  CompareBackendsBatch(MakeKdaMhaNet(), 8);
+}
+
+// Agora thread 19 #641/#642: matching the real trained nets' exact encoder
+// depth (3xKDA+1xMHA), still at small synthetic dims -- also part of the
+// #637-655 sweep, also passed clean, refuting depth alone as a cause.
+TEST(DirectMlKdaParity, MatchesBlasOnThreeKdaThenMhaNetBatchOfTwo) {
+  CompareBackendsBatch(MakeThreeKdaThenMhaNet(), 2);
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnThreeKdaThenMhaNetBatchOfFour) {
+  CompareBackendsBatch(MakeThreeKdaThenMhaNet(), 4);
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnThreeKdaThenMhaNetBatchOfEight) {
+  CompareBackendsBatch(MakeThreeKdaThenMhaNet(), 8);
 }
 
 TEST(DirectMlKdaParity, MatchesBlasOnNoEncoderNet) {
