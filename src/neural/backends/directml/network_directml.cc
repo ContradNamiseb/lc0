@@ -1036,6 +1036,20 @@ void DirectMlNetwork<DataType>::forwardEval(
       "Reset command list");
   transient_arena_.ResetCursor();
 
+  // agora thread 19 #696 Stream D "F8" (CPU-overhead profile -- distinct
+  // from the unrelated, already-committed "F8" empty-batch fix a few
+  // hundred lines below): LC0_DML_PROFILE measures GPU dispatch time via
+  // timestamp queries, but says nothing about CPU-side overhead -- how
+  // long this thread spends recording binds/dispatches (below) vs blocked
+  // in ExecuteCommandLists+fence-wait vs doing the post-fence readback.
+  // Gated behind its own env var since std::chrono::steady_clock::now()
+  // calls are cheap but not free, and this measures a different axis than
+  // LC0_DML_PROFILE (can be used together or separately).
+  const bool cpu_profile = getenv("LC0_DML_CPU_PROFILE") != nullptr;
+  std::chrono::steady_clock::time_point t_record_start, t_record_end,
+      t_execute_end;
+  if (cpu_profile) t_record_start = std::chrono::steady_clock::now();
+
   ID3D12GraphicsCommandList* list = io->command_list_.Get();
 
   DmlPtr tensor_mem[3];
@@ -1240,6 +1254,7 @@ void DirectMlNetwork<DataType>::forwardEval(
                            profile_readback.Get(), 0);
   }
 
+  if (cpu_profile) t_record_end = std::chrono::steady_clock::now();
   ReportD3DErrors(list->Close(), "Close");
   ID3D12CommandList* lists[] = {list};
   ctx_.queue()->ExecuteCommandLists(1, lists);
@@ -1247,6 +1262,7 @@ void DirectMlNetwork<DataType>::forwardEval(
   ReportD3DErrors(ctx_.queue()->Signal(io->fence_.Get(), io->fence_value_),
                   "Signal");
   ctx_.WaitForFence(io->fence_.Get(), io->fence_value_);
+  if (cpu_profile) t_execute_end = std::chrono::steady_clock::now();
   {
     // RR3/P3: no lock -- scope.ProfileMarks()/scope.BodyDumps() are this
     // call's own vectors, unreachable from any other DirectMlNetwork
@@ -1331,6 +1347,23 @@ void DirectMlNetwork<DataType>::forwardEval(
       v[3 * i + 1] = d / sum;
       v[3 * i + 2] = l / sum;
     }
+  }
+  if (cpu_profile) {
+    const auto t_readback_end = std::chrono::steady_clock::now();
+    const double record_us =
+        std::chrono::duration<double, std::micro>(t_record_end - t_record_start)
+            .count();
+    const double execute_us =
+        std::chrono::duration<double, std::micro>(t_execute_end - t_record_end)
+            .count();
+    const double readback_us =
+        std::chrono::duration<double, std::micro>(t_readback_end -
+                                                   t_execute_end)
+            .count();
+    CERR << "LC0_DML_CPU_PROFILE batch=" << batch << ": record="
+        << record_us << "us execute(submit+GPU+wait)=" << execute_us
+        << "us readback(map+convert+softmax)=" << readback_us
+        << "us total=" << (record_us + execute_us + readback_us) << "us";
   }
 }
 
