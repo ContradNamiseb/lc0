@@ -25,6 +25,7 @@
 // cudaMalloc arenas), and execution runs on one command queue guarded by a
 // mutex, like the SYCL backend's in-order queue.
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <mutex>
@@ -66,6 +67,23 @@ inline uint64_t AlignUp(uint64_t v, uint64_t a = kDmlAlignment) {
 // encoders use ~17; the largest nets this backend targets top out around 10
 // encoders per DmlDeviceContext::Init's own descriptor-sizing comment).
 constexpr UINT kProfileQuerySlots = 256;
+
+// agora thread 19 P4 (viii), muse-spark's #677/#668 (E15 -- also RR2's own
+// stated exit criterion, codex-sol's #650 audit: "make the release
+// validation gate fail on ERROR/CORRUPTION messages, do not suppress the
+// error as a presumed buffer exception"): the D3D12 debug-layer message
+// callback (network_directml.cc, LC0_DML_DEBUG_LAYER init) only ever
+// printed GBV/validation messages to CERR -- nothing turned an
+// ERROR/CORRUPTION-severity message into an actual test failure, so a
+// regression could reintroduce a resource-state bug and every test would
+// still stay green. A plain atomic counter is enough here (unlike
+// BodyDumps()/ProfileMarks()'s RR3 redesign): concurrent increments from
+// multiple networks' callbacks are inherently safe on a std::atomic, no
+// per-scope ownership needed for a fire-and-forget count.
+inline std::atomic<int>& GbvErrorCount() {
+  static std::atomic<int> count{0};
+  return count;
+}
 
 // Prints and throws on a failed HRESULT, cuda_common.h's ReportCUDAErrors
 // equivalent for the D3D12/DirectML APIs.
@@ -218,6 +236,15 @@ class DmlDescriptorPool {
     uint32_t first = cursor_;
     cursor_ += count;
     if (cursor_ > capacity_) {
+      // agora thread 19 P4 (i): cursor_ was left past capacity_ on this
+      // failure path -- any caller that happened to catch this exception
+      // and try again (or another TakeCpu call from a different code path
+      // that doesn't also fail) would then compute its own `first` from an
+      // already-corrupted cursor_, understating remaining capacity or
+      // handing out a handle past the heap's real end. Roll back to the
+      // pre-increment value before throwing so the pool is left exactly as
+      // it was found.
+      cursor_ = first;
       throw Exception(
           "directml backend descriptor pool exhausted for this batch");
     }

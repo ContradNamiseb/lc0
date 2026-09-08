@@ -91,6 +91,18 @@ DmlDeviceContext::~DmlDeviceContext() {
 }
 
 void DmlDeviceContext::Init(const OptionsDict& options) {
+  // agora thread 19 P4 (ii): Init has no guard against being called twice
+  // on the same context -- a second call would re-create the device/queue/
+  // arenas over the top of the first, leaking every GPU resource the first
+  // Init already created (nothing here releases them first) and leaving
+  // whichever callers hold a DmlPtr into the old arenas dangling. Nothing
+  // in this backend currently calls Init twice, so this has never fired,
+  // but it is a one-line, zero-cost guard against a real hazard if that
+  // ever changes.
+  if (device_) {
+    throw Exception("directml backend: DmlDeviceContext::Init called twice "
+                    "on the same context");
+  }
   const int gpu_id = options.GetOrDefault<int>("gpu", 0);
   meta_commands_ = options.GetOrDefault<bool>("meta_commands", true);
 
@@ -190,6 +202,13 @@ void DmlDeviceContext::Init(const OptionsDict& options) {
       auto callback = [](D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY sev,
                          D3D12_MESSAGE_ID, LPCSTR description, void*) {
         CERR << "D3D12 debug layer [" << sev << "]: " << description;
+        // agora thread 19 P4 (viii): count ERROR/CORRUPTION severities so a
+        // test can assert this stays zero (RR2's own stated exit criterion
+        // -- see GbvErrorCount's comment, dml_common.h).
+        if (sev == D3D12_MESSAGE_SEVERITY_CORRUPTION ||
+            sev == D3D12_MESSAGE_SEVERITY_ERROR) {
+          ++GbvErrorCount();
+        }
       };
       DWORD cookie = 0;
       if (SUCCEEDED(info_queue->RegisterMessageCallback(

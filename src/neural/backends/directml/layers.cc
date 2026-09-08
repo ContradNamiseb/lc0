@@ -1287,9 +1287,13 @@ static_assert(sizeof(KdaShaderConstants) == 96,
 
 constexpr UINT kKdaNum32BitConstants = sizeof(KdaShaderConstants) / 4;
 constexpr UINT kKdaRootParamConstants = 0;
-constexpr UINT kKdaRootParamSrvBase = 1;
+// agora thread 19 P4 (iii): renamed from kKdaRootParamSrvBase -- RR2/P2 step
+// S2 moved these 9 params from SRV to UAV type; the old name was stale as
+// soon as that landed. Value and role (root parameter index base for the 9
+// input tensors) are unchanged.
+constexpr UINT kKdaRootParamTensorBase = 1;
 constexpr UINT kKdaSrvCount = 9;  // 8 tensors + the direction-order table
-constexpr UINT kKdaRootParamUav = kKdaRootParamSrvBase + kKdaSrvCount;
+constexpr UINT kKdaRootParamUav = kKdaRootParamTensorBase + kKdaSrvCount;
 
 struct PreprocessConstants {
   uint32_t mode;
@@ -1346,11 +1350,11 @@ KdaRecurrenceLayer::KdaRecurrenceLayer(ID3D12Device* device, bool fp16,
 
   // agora thread 19 RR2/P2 step S2: these 9 are UAV parameters now, not SRV
   // (see shaders/kda_recurrence.hlsl's comment) -- root parameter indices
-  // are unaffected (kKdaRootParamSrvBase + i, same as before), only the
+  // are unaffected (kKdaRootParamTensorBase + i, same as before), only the
   // TYPE changes, and mixed_out's ShaderRegister moves to kKdaSrvCount (9)
   // since these 9 now occupy registers 0-8.
   for (UINT i = 0; i < kKdaSrvCount; ++i) {
-    auto& p = params[kKdaRootParamSrvBase + i];
+    auto& p = params[kKdaRootParamTensorBase + i];
     p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
     p.Descriptor.ShaderRegister = i;
     p.Descriptor.RegisterSpace = 0;
@@ -1440,7 +1444,7 @@ void KdaRecurrenceLayer::Record(ID3D12GraphicsCommandList* command_list,
   // matching the root signature change above.
   for (UINT i = 0; i < kKdaSrvCount; ++i) {
     command_list->SetComputeRootUnorderedAccessView(
-        kKdaRootParamSrvBase + i, slots[i].GpuVA());
+        kKdaRootParamTensorBase + i, slots[i].GpuVA());
   }
   command_list->SetComputeRootUnorderedAccessView(kKdaRootParamUav,
                                                   mixed_out.GpuVA());
