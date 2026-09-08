@@ -27,10 +27,16 @@ cbuffer KdaLocalConvConstants : register(b0) {
   uint emb;     // embedding width (channels)
 };
 
-StructuredBuffer<INPUT_TYPE> input_buf : register(t0);
-StructuredBuffer<INPUT_TYPE> weight_buf : register(t1);  // [emb, 9]
-StructuredBuffer<INPUT_TYPE> bias_buf : register(t2);    // [emb]
-RWStructuredBuffer<INPUT_TYPE> output_buf : register(u0);
+// agora thread 19 RR2/P2 step S4: input_buf/weight_buf/bias_buf move from
+// raw SRV binds to raw UAV binds -- every buffer this backend allocates
+// stays in D3D12_RESOURCE_STATE_UNORDERED_ACCESS throughout, so binding
+// them via SRV read the resources in the wrong declared state. None of the
+// three are ever written through here; RWStructuredBuffer only matches the
+// resources' actual, unchanging state.
+RWStructuredBuffer<INPUT_TYPE> input_buf : register(u0);
+RWStructuredBuffer<INPUT_TYPE> weight_buf : register(u1);  // [emb, 9]
+RWStructuredBuffer<INPUT_TYPE> bias_buf : register(u2);    // [emb]
+RWStructuredBuffer<INPUT_TYPE> output_buf : register(u3);
 
 [numthreads(64, 1, 1)]
 void KdaLocalConv(uint3 tid : SV_GroupThreadID, uint3 gtid : SV_GroupID) {

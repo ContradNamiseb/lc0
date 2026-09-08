@@ -38,9 +38,19 @@ cbuffer PreprocessConstants : register(b0) {
   uint enc_batch_stride;  // only used by mode 1
 };
 
-StructuredBuffer<float> input_buf : register(t0);
-StructuredBuffer<INPUT_TYPE> encoding_buf : register(t1);
-RWStructuredBuffer<INPUT_TYPE> output_buf : register(u0);
+// agora thread 19 RR2/P2 step S1: input_buf/encoding_buf move from raw SRV
+// binds to raw UAV binds -- every buffer this backend allocates stays in
+// D3D12_RESOURCE_STATE_UNORDERED_ACCESS throughout (including the raw
+// input-planes upload, always float32 regardless of INPUT_TYPE per the
+// comment above), so binding them via SRV read the resources in the wrong
+// declared state -- this is the dispatch-index-0 error GBV reports (the
+// first dispatch of every eval). Neither is ever written through here;
+// RWStructuredBuffer only matches each resource's actual, unchanging
+// state, keeping input_buf's type genuinely float and encoding_buf's type
+// INPUT_TYPE exactly as declared before.
+RWStructuredBuffer<float> input_buf : register(u0);
+RWStructuredBuffer<INPUT_TYPE> encoding_buf : register(u1);
+RWStructuredBuffer<INPUT_TYPE> output_buf : register(u2);
 
 [numthreads(64, 1, 1)]
 void AttentionPreprocess(uint3 tid : SV_GroupThreadID,

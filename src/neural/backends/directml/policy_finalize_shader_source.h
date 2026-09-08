@@ -34,10 +34,17 @@ cbuffer PolicyFinalizeConstants : register(b0) {
   uint key_width;  // C (policy d_model)
 };
 
-StructuredBuffer<INPUT_TYPE> scores_buf : register(t0);
-StructuredBuffer<INPUT_TYPE> keys_buf : register(t1);
-StructuredBuffer<INPUT_TYPE> ppo_buf : register(t2);
-RWStructuredBuffer<INPUT_TYPE> output_buf : register(u0);
+// agora thread 19 RR2/P2 step S5: scores_buf/keys_buf/ppo_buf move from raw
+// SRV binds to raw UAV binds -- every buffer this backend allocates
+// (including the weight arena ppo_buf lives in) stays in
+// D3D12_RESOURCE_STATE_UNORDERED_ACCESS throughout, so binding them via SRV
+// read the resources in the wrong declared state. None of the three are
+// ever written through here; RWStructuredBuffer only matches the resources'
+// actual, unchanging state.
+RWStructuredBuffer<INPUT_TYPE> scores_buf : register(u0);
+RWStructuredBuffer<INPUT_TYPE> keys_buf : register(u1);
+RWStructuredBuffer<INPUT_TYPE> ppo_buf : register(u2);
+RWStructuredBuffer<INPUT_TYPE> output_buf : register(u3);
 
 #define PROMO_BASE 4096
 #define ROW_STRIDE 4288  // 64 * 64 + 8 * 24

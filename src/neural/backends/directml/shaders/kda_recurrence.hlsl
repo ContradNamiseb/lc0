@@ -81,14 +81,27 @@ cbuffer KdaRecurrenceConstants : register(b0) {
 // D3D12 only supports raw or structured buffer views, not Buffer<T>/
 // RWBuffer<T>'s formatted views, and structured buffers skip needing a
 // descriptor heap entirely for a shader with this few resources.
-StructuredBuffer<INPUT_TYPE> qkv           : register(t0);
-StructuredBuffer<INPUT_TYPE> q_in          : register(t1);
-StructuredBuffer<INPUT_TYPE> k_in          : register(t2);
-StructuredBuffer<INPUT_TYPE> v_in          : register(t3);
-StructuredBuffer<INPUT_TYPE> raw_decay     : register(t4);
-StructuredBuffer<INPUT_TYPE> dt_bias       : register(t5);
-StructuredBuffer<INPUT_TYPE> a_log         : register(t6);
-StructuredBuffer<INPUT_TYPE> beta          : register(t7);
+// agora thread 19 RR2/P2 step S2 (the final blast-radius site): all 9 of
+// these move from raw SRV binds to raw UAV binds -- every buffer this
+// backend allocates stays in D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+// throughout, so binding them via SRV read the resources in the wrong
+// declared state. Transitioning them instead (Option A) is not viable
+// here: qkv/q_in alias the SAME resource at two different root slots
+// (the fused-vs-unfused q binding), and interleaving per-resource state
+// transitions with this shader's own read/write pattern within one
+// dispatch is not possible with the barrier model this backend uses
+// elsewhere -- UAV-binding (Option B) is the only shape that fits. None
+// of the 9 are ever written through here; RWStructuredBuffer only matches
+// each resource's actual, unchanging state. mixed's register moves from
+// u0 to u9 since these 9 now occupy u0-u8.
+RWStructuredBuffer<INPUT_TYPE> qkv           : register(u0);
+RWStructuredBuffer<INPUT_TYPE> q_in          : register(u1);
+RWStructuredBuffer<INPUT_TYPE> k_in          : register(u2);
+RWStructuredBuffer<INPUT_TYPE> v_in          : register(u3);
+RWStructuredBuffer<INPUT_TYPE> raw_decay     : register(u4);
+RWStructuredBuffer<INPUT_TYPE> dt_bias       : register(u5);
+RWStructuredBuffer<INPUT_TYPE> a_log         : register(u6);
+RWStructuredBuffer<INPUT_TYPE> beta          : register(u7);
 // The 16 x 64 square traversal order, uploaded from the single definition in
 // neural/kda_directions.h rather than transcribed here. Transcribing it is
 // exactly the hazard that header warns about: a divergence between the C++
@@ -96,8 +109,8 @@ StructuredBuffer<INPUT_TYPE> beta          : register(t7);
 // It also used to be a branch chain that only covered directions 1-8, so the
 // eight serpentine directions (9-16) fell through to plain rank order and
 // produced quietly wrong output for any net trained with them.
-StructuredBuffer<uint> direction_order      : register(t8);
-RWStructuredBuffer<INPUT_TYPE> mixed       : register(u0);
+RWStructuredBuffer<uint> direction_order      : register(u8);
+RWStructuredBuffer<INPUT_TYPE> mixed       : register(u9);
 
 groupshared float p_q[KDA_KEY_DIM];
 groupshared float p_k[KDA_KEY_DIM];

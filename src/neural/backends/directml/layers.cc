@@ -1344,16 +1344,21 @@ KdaRecurrenceLayer::KdaRecurrenceLayer(ID3D12Device* device, bool fp16,
       kKdaNum32BitConstants;
   params[kKdaRootParamConstants].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
+  // agora thread 19 RR2/P2 step S2: these 9 are UAV parameters now, not SRV
+  // (see shaders/kda_recurrence.hlsl's comment) -- root parameter indices
+  // are unaffected (kKdaRootParamSrvBase + i, same as before), only the
+  // TYPE changes, and mixed_out's ShaderRegister moves to kKdaSrvCount (9)
+  // since these 9 now occupy registers 0-8.
   for (UINT i = 0; i < kKdaSrvCount; ++i) {
     auto& p = params[kKdaRootParamSrvBase + i];
-    p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
     p.Descriptor.ShaderRegister = i;
     p.Descriptor.RegisterSpace = 0;
     p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
   }
 
   params[kKdaRootParamUav].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-  params[kKdaRootParamUav].Descriptor.ShaderRegister = 0;
+  params[kKdaRootParamUav].Descriptor.ShaderRegister = kKdaSrvCount;
   params[kKdaRootParamUav].Descriptor.RegisterSpace = 0;
   params[kKdaRootParamUav].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
@@ -1431,8 +1436,10 @@ void KdaRecurrenceLayer::Record(ID3D12GraphicsCommandList* command_list,
   command_list->SetComputeRoot32BitConstants(kKdaRootParamConstants,
                                              kKdaNum32BitConstants, &constants,
                                              0);
+  // agora thread 19 RR2/P2 step S2: UAV binds at the same root indices,
+  // matching the root signature change above.
   for (UINT i = 0; i < kKdaSrvCount; ++i) {
-    command_list->SetComputeRootShaderResourceView(
+    command_list->SetComputeRootUnorderedAccessView(
         kKdaRootParamSrvBase + i, slots[i].GpuVA());
   }
   command_list->SetComputeRootUnorderedAccessView(kKdaRootParamUav,
@@ -1453,8 +1460,15 @@ MhaTransposeLayer::MhaTransposeLayer(ID3D12Device* device, bool fp16)
       CompileHlsl(kMhaTransposeShaderSource,
                   sizeof(kMhaTransposeShaderSource) - 1,
                   "mha_transpose.hlsl", "MhaTranspose", fp16_);
+  // agora thread 19 RR2/P2 step S3: 0 SRVs, 2 UAVs (was 1/1) -- in_buf moves
+  // from a raw SRV bind to a raw UAV bind to match its actual, unchanging
+  // D3D12_RESOURCE_STATE_UNORDERED_ACCESS state (see mha_transpose.hlsl's
+  // comment). Root parameter indices are unaffected (constants=0, in_buf=1,
+  // out_buf=2, same as before); only the TYPE at indices 1 changes SRV->UAV,
+  // which shifts out_buf's HLSL register from u0 to u1 since ShaderRegister
+  // numbering restarts at 0 for each of the SRV and UAV groups separately.
   root_signature_ = CreateShaderRootSignature(
-      device_.Get(), sizeof(TransposeConstants) / 4, 1, 1);
+      device_.Get(), sizeof(TransposeConstants) / 4, 0, 2);
   pso_ = CreateComputePso(device_.Get(), root_signature_.Get(), shader.Get());
 }
 
@@ -1471,7 +1485,9 @@ void MhaTransposeLayer::Record(ID3D12GraphicsCommandList* command_list,
   command_list->SetPipelineState(pso_.Get());
   command_list->SetComputeRoot32BitConstants(0, sizeof(TransposeConstants) / 4,
                                              &constants, 0);
-  command_list->SetComputeRootShaderResourceView(1, input.GpuVA());
+  // agora thread 19 RR2/P2 step S3: UAV bind at the same root index (1),
+  // matching the root signature change above.
+  command_list->SetComputeRootUnorderedAccessView(1, input.GpuVA());
   command_list->SetComputeRootUnorderedAccessView(2, output.GpuVA());
   const uint64_t total =
       (uint64_t)params.batch_size * params.heads * 64 * params.head_dim;
@@ -1556,8 +1572,13 @@ KdaLocalConvLayer::KdaLocalConvLayer(ID3D12Device* device, bool fp16)
       CompileHlsl(kKdaLocalConvShaderSource,
                   sizeof(kKdaLocalConvShaderSource) - 1, "kda_local_conv.hlsl",
                   "KdaLocalConv", fp16_);
+  // agora thread 19 RR2/P2 step S4: 0 SRVs, 4 UAVs (was 3/1) -- see
+  // shaders/kda_local_conv.hlsl's comment. Root parameter indices are
+  // unaffected (constants=0, input=1, weights=2, bias=3, output=4); only
+  // the TYPE at indices 1-3 changes SRV->UAV, which shifts every HLSL
+  // register (input/weight/bias now u0/u1/u2, output now u3).
   root_signature_ = CreateShaderRootSignature(
-      device_.Get(), sizeof(KdaLocalConvConstants) / 4, 3, 1);
+      device_.Get(), sizeof(KdaLocalConvConstants) / 4, 0, 4);
   pso_ = CreateComputePso(device_.Get(), root_signature_.Get(), shader.Get());
 }
 
@@ -1573,9 +1594,11 @@ void KdaLocalConvLayer::Record(ID3D12GraphicsCommandList* command_list,
   command_list->SetComputeRoot32BitConstants(0,
                                              sizeof(KdaLocalConvConstants) / 4,
                                              &constants, 0);
-  command_list->SetComputeRootShaderResourceView(1, input.GpuVA());
-  command_list->SetComputeRootShaderResourceView(2, weights.GpuVA());
-  command_list->SetComputeRootShaderResourceView(3, bias.GpuVA());
+  // agora thread 19 RR2/P2 step S4: UAV binds at the same root indices
+  // (1,2,3), matching the root signature change above.
+  command_list->SetComputeRootUnorderedAccessView(1, input.GpuVA());
+  command_list->SetComputeRootUnorderedAccessView(2, weights.GpuVA());
+  command_list->SetComputeRootUnorderedAccessView(3, bias.GpuVA());
   command_list->SetComputeRootUnorderedAccessView(4, output.GpuVA());
   const uint64_t total = (uint64_t)params.tokens * params.emb;
   const uint64_t local_conv_groups = (total + 63) / 64;
@@ -1826,9 +1849,14 @@ AttentionBody<DataType>::AttentionBody(
                   sizeof(kAttentionPreprocessShaderSource) - 1,
                   "attention_preprocess.hlsl", "AttentionPreprocess",
                   preprocess_fp16);
+  // agora thread 19 RR2/P2 step S1: 0 SRVs, 3 UAVs (was 2/1) -- see
+  // shaders/attention_preprocess.hlsl's comment. Root parameter indices are
+  // unaffected (constants=0, in=1, encoding=2, out=3); only the TYPE at
+  // indices 1-2 changes SRV->UAV, which shifts the HLSL registers (input
+  // now u0, encoding now u1, output now u2).
   preprocess_root_signature_ =
       CreateShaderRootSignature(ctx.device(), sizeof(PreprocessConstants) / 4,
-                                2, 1);
+                                0, 3);
   preprocess_pso_ =
       CreateComputePso(ctx.device(), preprocess_root_signature_.Get(),
                        shader.Get());
@@ -2154,13 +2182,15 @@ void AttentionBody<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
     list->SetPipelineState(preprocess_pso_.Get());
     list->SetComputeRoot32BitConstants(0, sizeof(PreprocessConstants) / 4,
                                        &constants, 0);
-    list->SetComputeRootShaderResourceView(1, in.GpuVA());
-    // Mode 2 never reads the encoding SRV; bind a valid address anyway (a
+    // agora thread 19 RR2/P2 step S1: UAV binds at the same root indices
+    // (1,2), matching the root signature change above.
+    list->SetComputeRootUnorderedAccessView(1, in.GpuVA());
+    // Mode 2 never reads the encoding buffer; bind a valid address anyway (a
     // null DmlPtr's GpuVA() would dereference null -- PE_DENSE nets have no
     // positional-encoding table uploaded).
     const DmlPtr encoding_slot =
         encoding ? encoding : in;
-    list->SetComputeRootShaderResourceView(2, encoding_slot.GpuVA());
+    list->SetComputeRootUnorderedAccessView(2, encoding_slot.GpuVA());
     list->SetComputeRootUnorderedAccessView(3, out.GpuVA());
     const UINT groups =
         mode == 2 ? static_cast<UINT>(N * 64) : static_cast<UINT>(N * 64);
@@ -3550,8 +3580,14 @@ AttentionPolicyHead<DataType>::AttentionPolicyHead(
       CompileHlsl(kPolicyFinalizeShaderSource,
                   sizeof(kPolicyFinalizeShaderSource) - 1,
                   "policy_finalize.hlsl", "PolicyFinalize", /*fp16=*/false);
+  // agora thread 19 RR2/P2 step S5: 0 SRVs, 4 UAVs (was 3/1) -- see
+  // shaders/policy_finalize.hlsl's comment. Root parameter indices are
+  // unaffected (constants=0, scores=1, wk=2, ip4_pol_w_=3, output=4); only
+  // the TYPE at indices 1-3 changes SRV->UAV, which shifts every HLSL
+  // register (scores/keys/ppo now u0/u1/u2, output now u3, since
+  // ShaderRegister numbering restarts at 0 for the UAV group).
   finalize_root_signature_ = CreateShaderRootSignature(
-      ctx.device(), sizeof(PolicyFinalizeConstants) / 4, 3, 1);
+      ctx.device(), sizeof(PolicyFinalizeConstants) / 4, 0, 4);
   finalize_pso_ = CreateComputePso(ctx.device(), finalize_root_signature_.Get(),
                                    shader.Get());
 
@@ -3745,9 +3781,11 @@ void AttentionPolicyHead<DataType>::Eval(int N, DmlPtr output, DmlPtr input,
     list->SetPipelineState(finalize_pso_.Get());
     list->SetComputeRoot32BitConstants(0, sizeof(PolicyFinalizeConstants) / 4,
                                        &constants, 0);
-    list->SetComputeRootShaderResourceView(1, scores.GpuVA());
-    list->SetComputeRootShaderResourceView(2, wk.GpuVA());
-    list->SetComputeRootShaderResourceView(3, ip4_pol_w_.GpuVA());
+    // agora thread 19 RR2/P2 step S5: UAV binds at the same root indices
+    // (1,2,3), matching the root signature change above.
+    list->SetComputeRootUnorderedAccessView(1, scores.GpuVA());
+    list->SetComputeRootUnorderedAccessView(2, wk.GpuVA());
+    list->SetComputeRootUnorderedAccessView(3, ip4_pol_w_.GpuVA());
     list->SetComputeRootUnorderedAccessView(4, output.GpuVA());
     list->Dispatch(N, 1, 1);
     D3D12_RESOURCE_BARRIER barrier = {};

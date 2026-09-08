@@ -39,8 +39,15 @@ cbuffer TransposeConstants : register(b0) {
   uint head_dim;    // D
 };
 
-StructuredBuffer<INPUT_TYPE> in_buf : register(t0);
-RWStructuredBuffer<INPUT_TYPE> out_buf : register(u0);
+// agora thread 19 RR2/P2 step S3: in_buf is bound via a raw root
+// UAV descriptor now, not SRV -- every buffer this backend allocates stays
+// in D3D12_RESOURCE_STATE_UNORDERED_ACCESS throughout (no transition to a
+// shader-read-only state exists for it), so an SRV bind here was reading a
+// resource in the wrong declared state, the exact violation GBV's dispatch-0
+// error reports. RWStructuredBuffer is never written through in_buf; the
+// UAV declaration only matches the resource's actual, unchanging state.
+RWStructuredBuffer<INPUT_TYPE> in_buf : register(u0);
+RWStructuredBuffer<INPUT_TYPE> out_buf : register(u1);
 
 [numthreads(64, 1, 1)]
 void MhaTranspose(uint3 tid : SV_GroupThreadID,
