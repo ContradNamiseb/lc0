@@ -360,8 +360,11 @@ class AttentionBody : public BaseLayer<DataType> {
   // The preprocess HLSL pipeline state (root signature + PSO), compiled once.
   ComPtr<ID3D12RootSignature> preprocess_root_signature_;
   ComPtr<ID3D12PipelineState> preprocess_pso_;
-  ComPtr<ID3D12Resource> preprocess_const_buffer_;  // persistently mapped
-  void* preprocess_const_mapped_ = nullptr;
+  // agora thread 19 #696 Stream C: preprocess_const_buffer_/
+  // preprocess_const_mapped_ were declared here but never assigned or read
+  // anywhere -- record_preprocess (layers.cc) passes its constants via
+  // SetComputeRoot32BitConstants, not a mapped constant buffer. Deleted;
+  // dead members cost real class-layout size for zero behavior.
 
   std::unordered_map<int, DmlCompiledOp> compiled_;      // embedding graph(s)
   std::unordered_map<int, DmlCompiledOp> pre_compiled_;  // PE_DENSE pre gemm
@@ -514,8 +517,11 @@ class AttentionPolicyHead : public BaseLayer<DataType> {
 
   ComPtr<ID3D12RootSignature> finalize_root_signature_;
   ComPtr<ID3D12PipelineState> finalize_pso_;
-  ComPtr<ID3D12Resource> finalize_const_buffer_;
-  void* finalize_const_mapped_ = nullptr;
+  // agora thread 19 #696 Stream C: finalize_const_buffer_/
+  // finalize_const_mapped_ were declared here but never assigned or read
+  // anywhere -- same dead-member class as preprocess_const_buffer_/
+  // preprocess_const_mapped_ above (this finalize kernel also passes its
+  // constants via SetComputeRoot32BitConstants). Deleted.
 
   std::unordered_map<int, DmlCompiledOp> compiled_;  // gemms + scores
 };
