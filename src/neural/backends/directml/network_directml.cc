@@ -785,8 +785,13 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
         ctx_.device(), kChunk, D3D12_HEAP_TYPE_UPLOAD,
         D3D12_RESOURCE_STATE_GENERIC_READ);
     {
+      // RR4 (agora thread 19 #650/#652): an unchecked Map leaves z
+      // indeterminate on failure, and memset below would then write through
+      // a garbage pointer instead of failing cleanly at the Map call site --
+      // same class as the InputsOutputs constructor's A2 fix.
       uint8_t* z = nullptr;
-      zeros->Map(0, nullptr, reinterpret_cast<void**>(&z));
+      ReportD3DErrors(zeros->Map(0, nullptr, reinterpret_cast<void**>(&z)),
+                      "Map (arena-clear zeros)");
       std::memset(z, 0, kChunk);
       zeros->Unmap(0, nullptr);
     }
@@ -870,8 +875,12 @@ void DirectMlNetwork<DataType>::FlushWeights(DmlWeightUploader& uploader) {
   ComPtr<ID3D12Resource> staging = detail::CreateBuffer(
       ctx_.device(), total ? total : 256, D3D12_HEAP_TYPE_UPLOAD,
       D3D12_RESOURCE_STATE_GENERIC_READ);
+  // RR4 (agora thread 19 #650/#652): unchecked, same class as the arena-clear
+  // and InputsOutputs A2 fixes -- every weight-copy write below through
+  // `mapped` would otherwise run against a garbage pointer on failure.
   uint8_t* mapped = nullptr;
-  staging->Map(0, nullptr, reinterpret_cast<void**>(&mapped));
+  ReportD3DErrors(staging->Map(0, nullptr, reinterpret_cast<void**>(&mapped)),
+                  "Map (weight staging)");
 
   ReportD3DErrors(ctx_.upload_allocator()->Reset(), "Reset (upload)");
   ReportD3DErrors(
@@ -1213,10 +1222,15 @@ void DirectMlNetwork<DataType>::forwardEval(
     // sections rather than one spanning the fence wait.
     std::lock_guard<std::mutex> lock(DumpProfileMutex());
     if (profile_readback) {
+      // RR4 (agora thread 19 #650/#652): unchecked, same class as the other
+      // three sites -- the stamps[] reads below would otherwise dereference
+      // a garbage pointer on a failed Map.
       const UINT64* stamps = nullptr;
-      profile_readback->Map(
-          0, nullptr,
-          const_cast<void**>(reinterpret_cast<const void**>(&stamps)));
+      ReportD3DErrors(
+          profile_readback->Map(
+              0, nullptr,
+              const_cast<void**>(reinterpret_cast<const void**>(&stamps))),
+          "Map (profile readback)");
       const double freq = static_cast<double>(ctx_.profile_frequency());
       CERR << "LC0_DML_PROFILE batch=" << batch << " (" << profile_marks
           << " stage marks, us since previous mark):";
@@ -1232,9 +1246,15 @@ void DirectMlNetwork<DataType>::forwardEval(
     }
     if (const char* prefix = getenv("LC0_DUMP_BODY")) {
       for (auto& d : BodyDumps()) {
+        // RR4 (agora thread 19 #650/#652): unchecked, same class as above --
+        // the f.write below would otherwise read a garbage-pointer range on
+        // a failed Map.
         const float* p = nullptr;
-        d.readback->Map(
-            0, nullptr, const_cast<void**>(reinterpret_cast<const void**>(&p)));
+        ReportD3DErrors(
+            d.readback->Map(
+                0, nullptr,
+                const_cast<void**>(reinterpret_cast<const void**>(&p))),
+            "Map (body dump readback)");
         std::ofstream f(std::string(prefix) + ".dml." + d.stage + ".bin",
                         std::ios::binary);
         f.write(reinterpret_cast<const char*>(p), d.bytes);

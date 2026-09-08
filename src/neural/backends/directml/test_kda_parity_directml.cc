@@ -2914,6 +2914,39 @@ TEST(DirectMlRegressionCoverage, DispatchGroupCountGuardThreshold) {
          "package B3 must throw (65536 groups)";
 }
 
+// RR4 (agora thread 19 #650/#652, codex-sol's release audit): network_
+// directml.cc:789/874/1217/1236 (four Map() call sites) were unchecked --
+// each site's dependent-use code (memset/memcpy/f.write through the mapped
+// pointer) would run against a garbage pointer on a failed Map instead of
+// failing cleanly at the call site. The fix at all 4 sites is
+// ReportD3DErrors(...->Map(...), "..."), the exact same wrapper the
+// InputsOutputs constructor's earlier A2 fix already established as the
+// pattern. Real D3D12 Map() failure injection needs a mock/scripted
+// resource (no such Map-failing double exists for a real allocated
+// ID3D12Resource, unlike ScriptedFence's real COM interface for
+// WaitForFence's B1 fix) -- so this failure-injection test targets the one
+// shared mechanism every RR4 site (and every pre-existing ReportD3DErrors
+// call in this backend) actually depends on: that a FAILED HRESULT reaches
+// the dependent-use boundary as a clean throw, never a silent pass-through
+// to code that dereferences whatever Map happened to write on failure.
+TEST(DirectMlRegressionCoverage, ReportD3DErrorsThrowsOnFailedHresult) {
+  using directml_backend::ReportD3DErrors;
+  EXPECT_NO_THROW(ReportD3DErrors(S_OK, "ok case"))
+      << "a successful HRESULT must not throw -- no behavior change on the "
+         "success path is the explicit RR4 authorization condition";
+  EXPECT_THROW(ReportD3DErrors(E_FAIL, "generic failure"), Exception)
+      << "a failed HRESULT must throw before any caller can dereference an "
+         "indeterminate pointer from the failed call";
+  EXPECT_THROW(ReportD3DErrors(E_OUTOFMEMORY, "out of memory"), Exception)
+      << "the specific HRESULT a real Map() failure is most likely to "
+         "return (driver/allocator exhaustion) must also throw";
+  EXPECT_THROW(ReportD3DErrors(DXGI_ERROR_DEVICE_REMOVED, "device removed"),
+              Exception)
+      << "a removed-device HRESULT, which a Map() call can legitimately "
+         "return mid-eval, must also throw rather than hand back a garbage "
+         "pointer";
+}
+
 // B4 (agora thread 19 #620/#622): kda_recurrence.hlsl computes
 // `direction_index = head / (heads / direction_count)` on the GPU --
 // direction_count 0 (empty kda_directions list) is a GPU-side divide by
