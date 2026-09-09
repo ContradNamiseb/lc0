@@ -1076,6 +1076,33 @@ void BlasComputation<use_eigen>::ComputeBlocking() {
 
     // Policy head.
     if (attn_policy_) {
+      // Agora thread 19 #725/#726 (claude-opus, DML-1 residual localization
+      // extended past enc3): mirrors DML's DumpBodyStage("pol_*", ...) call
+      // sites in AttentionPolicyHead::Eval (layers.cc) exactly, by name and
+      // by position, so the same stage-by-stage diff methodology that
+      // localized RR1 to enc3 can extend into the policy head. Pointer-based
+      // (not the vector-based dump_stage above, out of scope here) because
+      // each stage is a sub-range of a shared buffer, not a whole vector.
+      // Debug aid only -- no behavior change.
+      const char* pol_dump_prefix = getenv("LC0_DUMP_BODY");
+      auto dump_stage_ptr = [&](const char* stage, const float* p,
+                                size_t count) {
+        if (!pol_dump_prefix) return;
+        const std::string path =
+            std::string(pol_dump_prefix) + ".blas." + stage + ".bin";
+        const size_t n = std::min<size_t>(count, 64 * 1024);
+        std::ofstream f(path, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(p), n * sizeof(float));
+      };
+      // pol_in is dumped BEFORE the NCHW->NHWC conversion below runs, so its
+      // width matches whatever is actually in buffer1 at this point: the
+      // attention body's embedding width when attn_body_ (unchanged since
+      // the last "enc*" dump above -- this should read identical to that),
+      // or output_channels in NCHW layout otherwise.
+      const size_t pol_in_width =
+          attn_body_ ? weights_.ip_emb_b.size() : output_channels;
+      dump_stage_ptr("pol_in", buffer1.data(),
+                     batch_size * kSquares * pol_in_width);
       if (!attn_body_) {
         // NCHW to NHWC conversion.
         for (auto batch = size_t{0}; batch < batch_size; batch++) {
@@ -1098,6 +1125,8 @@ void BlasComputation<use_eigen>::ComputeBlocking() {
               ? default_activation_
               : ACTIVATION_SELU,  // SELU activation hardcoded for apmish nets.
           buffer2.data());
+      dump_stage_ptr("pol_emb", buffer2.data(),
+                     batch_size * kSquares * policy_embedding_size);
 
       const size_t policy_d_model =
           policy_head.ip2_pol_w.size() / policy_embedding_size;
@@ -1115,11 +1144,15 @@ void BlasComputation<use_eigen>::ComputeBlocking() {
           batch_size * kSquares, policy_embedding_size, policy_d_model,
           buffer2.data(), policy_head.ip2_pol_w.data(),
           policy_head.ip2_pol_b.data(), ACTIVATION_NONE, buffer1.data());
+      dump_stage_ptr("pol_wq", buffer1.data(),
+                     batch_size * kSquares * policy_d_model);
       // K
       FullyConnectedLayer<use_eigen>::Forward1D(
           batch_size * kSquares, policy_embedding_size, policy_d_model,
           buffer2.data(), policy_head.ip3_pol_w.data(),
           policy_head.ip3_pol_b.data(), ACTIVATION_NONE, buffer3.data());
+      dump_stage_ptr("pol_wk", buffer3.data(),
+                     batch_size * kSquares * policy_d_model);
       const float scaling = 1.0f / sqrtf(policy_d_model);
       for (auto batch = size_t{0}; batch < batch_size; batch++) {
         const float* A = &buffer1[batch * 64 * policy_d_model];
@@ -1143,6 +1176,12 @@ void BlasComputation<use_eigen>::ComputeBlocking() {
 #endif
         }
       }
+      // pol_scores: only the leading 64*64 of each batch's (64*64+8*24)
+      // block is valid here (promotion offsets haven't been written into
+      // the trailing 8*24 yet) -- fine for the batch_size==1 solo case this
+      // is used for; a batch>1 caller would need to dump per-batch with the
+      // 4288 stride skipped instead of this straight contiguous count.
+      dump_stage_ptr("pol_scores", head_buffer.data(), batch_size * 64 * 64);
       // Promotion offset calculation.
       for (auto batch = size_t{0}; batch < batch_size; batch++) {
         float promotion_offsets[4][8];
@@ -1174,6 +1213,12 @@ void BlasComputation<use_eigen>::ComputeBlocking() {
           }
         }
       }
+      // pol_output: full (64*64+8*24)=4288-per-batch block, matching DML's
+      // raw policy_finalize.hlsl output dump (layers.cc DumpBodyStage
+      // "pol_output") before either backend's own remap into the final
+      // 1858-length policy vector.
+      dump_stage_ptr("pol_output", head_buffer.data(),
+                     batch_size * (64 * 64 + 8 * 24));
       // Mapping from attention policy to lc0 policy
       for (auto batch = size_t{0}; batch < batch_size; batch++) {
         std::vector<float> policy(num_output_policy);

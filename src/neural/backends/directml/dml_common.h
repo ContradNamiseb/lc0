@@ -85,6 +85,25 @@ inline std::atomic<int>& GbvErrorCount() {
   return count;
 }
 
+// agora thread 19 DML-4 (codex-sol #724): GbvErrorCount() staying at 0 is
+// the PASS condition, but it is exactly as consistent with "no violations
+// occurred" as with "the debug layer/GBV never actually turned on" --
+// D3D12GetDebugInterface, ID3D12Debug1, and ID3D12InfoQueue1 all fail soft
+// (network_directml.cc's LC0_DML_DEBUG_LAYER/LC0_DML_GBV init logs and
+// continues rather than throwing, deliberately, since this is a diagnostic
+// aid normal operation must not depend on) -- so a machine missing the
+// Windows SDK's Graphics Tools optional feature would report zero errors
+// from a validation gate that silently never ran. Set true only once EVERY
+// step that has to succeed for a real ERROR/CORRUPTION message to actually
+// reach GbvErrorCount() has succeeded: EnableDebugLayer,
+// SetEnableGPUBasedValidation, AND RegisterMessageCallback. A test asserting
+// GbvErrorCount()==0 must also assert this is true, or it is not testing
+// what it claims to.
+inline std::atomic<bool>& GbvActuallyActive() {
+  static std::atomic<bool> active{false};
+  return active;
+}
+
 // Prints and throws on a failed HRESULT, cuda_common.h's ReportCUDAErrors
 // equivalent for the D3D12/DirectML APIs.
 inline void ReportD3DErrors(HRESULT hr, const char* what) {

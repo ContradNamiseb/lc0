@@ -152,10 +152,27 @@ struct KdaFeatures {
   bool qkv_silu = true;
 };
 
+// Agora thread 19 #699 Track 1 next knob: scales only the decay path's
+// parameters (decay_a_w/decay_a_b/decay_b_w/decay_b_b + a_log/dt_bias),
+// independent of and composable with the other *_SCALE knobs via the same
+// RandomVec-composition mechanism. beta and every other KDA parameter are
+// deliberately left alone -- "decay_a/b + a_log + dt_bias only" per #699's
+// scope, since decay_scale = exp(a_log[head]) is the specific
+// exponentiating path muse-spark's comment on LC0_TEST_RANDOMIZE=decay
+// (below, MatchesBlasOnRealNetFromEnv) already singles out for the same
+// reason. Diagnostic-only, test-file-only, no production code.
+float DecayScale() {
+  if (const char* s = getenv("LC0_TEST_DECAY_SCALE")) {
+    return static_cast<float>(atof(s));
+  }
+  return 1.0f;
+}
+
 void FillKdaEncoder(pblczero::Net* net, std::mt19937& rng, const NetDims& d,
                     const KdaFeatures& feat = KdaFeatures()) {
   const int key_depth = d.heads * d.key_dim;
   const int value_depth = d.heads * d.value_dim;
+  const float dscale = DecayScale();
   auto* enc = net->mutable_weights()->add_encoder();
   enc->set_mixer(pblczero::Weights::EncoderLayer::MIXER_KDA);
   auto* kda = enc->mutable_kda();
@@ -166,15 +183,18 @@ void FillKdaEncoder(pblczero::Net* net, std::mt19937& rng, const NetDims& d,
   FillLayer(kda->mutable_v_w(), RandomVec(rng, d.embedding * value_depth, 0.1f));
   FillLayer(kda->mutable_v_b(), RandomVec(rng, value_depth, 0.05f));
   FillLayer(kda->mutable_decay_a_w(),
-            RandomVec(rng, d.embedding * d.gate_rank, 0.1f));
-  FillLayer(kda->mutable_decay_a_b(), RandomVec(rng, d.gate_rank, 0.05f));
+            RandomVec(rng, d.embedding * d.gate_rank, 0.1f * dscale));
+  FillLayer(kda->mutable_decay_a_b(),
+            RandomVec(rng, d.gate_rank, 0.05f * dscale));
   FillLayer(kda->mutable_decay_b_w(),
-            RandomVec(rng, d.gate_rank * key_depth, 0.1f));
-  FillLayer(kda->mutable_decay_b_b(), RandomVec(rng, key_depth, 0.05f));
+            RandomVec(rng, d.gate_rank * key_depth, 0.1f * dscale));
+  FillLayer(kda->mutable_decay_b_b(),
+            RandomVec(rng, key_depth, 0.05f * dscale));
   FillLayer(kda->mutable_beta_w(), RandomVec(rng, d.embedding * d.heads, 0.1f));
   FillLayer(kda->mutable_beta_b(), RandomVec(rng, d.heads, 0.05f));
-  FillLayer(kda->mutable_a_log(), RandomVec(rng, d.heads, 0.05f));
-  FillLayer(kda->mutable_dt_bias(), RandomVec(rng, key_depth, 0.05f));
+  FillLayer(kda->mutable_a_log(), RandomVec(rng, d.heads, 0.05f * dscale));
+  FillLayer(kda->mutable_dt_bias(),
+            RandomVec(rng, key_depth, 0.05f * dscale));
   FillLayer(kda->mutable_gate_a_w(),
             RandomVec(rng, d.embedding * d.gate_rank, 0.1f));
   FillLayer(kda->mutable_gate_a_b(), RandomVec(rng, d.gate_rank, 0.05f));
@@ -1011,25 +1031,43 @@ struct SmolgenDims {
 // unnoticed: the attention graph added an unbound bias tensor whenever a
 // block had NO smolgen, and the generated-bias matmul ran as a hand-written
 // kernel that was never checked against BLAS.
+// Agora thread 19 #685 Track 1 step (b) ("SCOPE TO CHAIN"): scales only the
+// smolgen chain's own weight matrices (compress/dense1/dense2/the shared
+// global table), independent of and composable with LC0_TEST_WEIGHT_SCALE
+// (which scales every synthetic weight in the net). Biases and the LN1/LN2
+// gammas/betas are deliberately left alone -- gammas are GAMMA_ONE's axis
+// (queued behind this step), and biases were never implicated by the
+// whole-net WEIGHT_SCALE sweep in the way the multiplicative weights were.
+// Diagnostic-only, test-file-only, no production code.
+float SmolgenChainScale() {
+  if (const char* s = getenv("LC0_TEST_SMOLGEN_SCALE")) {
+    return static_cast<float>(atof(s));
+  }
+  return 1.0f;
+}
+
 void FillSmolgen(pblczero::Net* net, std::mt19937& rng, const NetDims& d,
                  const SmolgenDims& sd) {
+  const float sscale = SmolgenChainScale();
   auto* weights = net->mutable_weights();
   auto* enc = weights->mutable_encoder(weights->encoder_size() - 1);
   auto* smol = enc->mutable_mha()->mutable_smolgen();
   FillLayer(smol->mutable_compress(),
-            RandomVec(rng, sd.hidden_channels * d.embedding, 0.1f));
+            RandomVec(rng, sd.hidden_channels * d.embedding, 0.1f * sscale));
   FillLayer(smol->mutable_dense1_w(),
-            RandomVec(rng, sd.hidden_sz * 64 * sd.hidden_channels, 0.05f));
+            RandomVec(rng, sd.hidden_sz * 64 * sd.hidden_channels,
+                      0.05f * sscale));
   FillLayer(smol->mutable_dense1_b(), RandomVec(rng, sd.hidden_sz, 0.05f));
   FillLayer(smol->mutable_ln1_gammas(), GammaVec(rng, sd.hidden_sz));
   FillLayer(smol->mutable_ln1_betas(), RandomVec(rng, sd.hidden_sz, 0.05f));
   FillLayer(smol->mutable_dense2_w(),
-            RandomVec(rng, sd.gen_outputs * sd.hidden_sz, 0.05f));
+            RandomVec(rng, sd.gen_outputs * sd.hidden_sz, 0.05f * sscale));
   FillLayer(smol->mutable_dense2_b(), RandomVec(rng, sd.gen_outputs, 0.05f));
   FillLayer(smol->mutable_ln2_gammas(), GammaVec(rng, sd.gen_outputs));
   FillLayer(smol->mutable_ln2_betas(), RandomVec(rng, sd.gen_outputs, 0.05f));
   FillLayer(weights->mutable_smolgen_w(),
-            RandomVec(rng, 64 * 64 * (sd.gen_outputs / d.heads), 0.05f));
+            RandomVec(rng, 64 * 64 * (sd.gen_outputs / d.heads),
+                      0.05f * sscale));
 }
 
 // The same net at a real net's dimensions. Every other synthetic net here is
@@ -1152,6 +1190,18 @@ TEST(DirectMlKdaParity, MatchesBlasOnGatedEmbeddingNet) {
 
 TEST(DirectMlKdaParity, MatchesBlasOnGatedEmbeddingRealisticDims) {
   CompareBackends(MakeGatedNet(RealisticDims(), 6002));
+}
+
+// agora thread 19 D3: the gating path above was batch-1-only, and the
+// per-sample batch_base stride its shader hand-computes needs batch>1 to
+// mean anything. Same fixtures at batch 4 (fresh seeds per the file's seed
+// diversity rule), mirroring MatchesBlasOnLocalConvBatch above.
+TEST(DirectMlKdaParity, MatchesBlasOnGatedEmbeddingBatch) {
+  CompareBackendsBatch(MakeGatedNet(NetDims(), 6003), 4);
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnGatedEmbeddingRealisticDimsBatch) {
+  CompareBackendsBatch(MakeGatedNet(RealisticDims(), 6004), 4);
 }
 
 // A policy encoder wide enough that its own scratch requirement dominates.
@@ -1550,6 +1600,60 @@ pblczero::Net MakeFullRealisticNet(bool pe_dense, bool smolgen, bool mha) {
   return file;
 }
 
+// Agora thread 19 #637-#642 (this iteration, user-directed): the real trained
+// nets' KDA encoders all have qkv_silu=false (confirmed via
+// DISABLED_TriageBatchContamination's diagnostic print on all 3 real nets --
+// local_conv=0, qkv_silu=0, gate_rank=32, key_dim=32, value_dim=32,
+// enc3.has_smolgen=1). Every synthetic fixture tested so far in this triage
+// (MakeKdaMhaNet, MakeThreeKdaThenMhaNet, MakeFullRealisticNet) calls
+// FillKdaEncoder with the DEFAULT KdaFeatures, whose qkv_silu defaults to
+// true (line ~152) -- every batch>1 synthetic test run in this triage has
+// therefore exercised the SWISH-activated q/k/v path, never the
+// ACTIVATION_NONE path the real nets actually use. Byte-for-byte
+// MakeFullRealisticNet(false, true, true) (the closest match that already
+// passed clean at batch 2/4/8) except qkv_silu=false on all 3 KDA encoders --
+// the one remaining known flag mismatch against the real nets' confirmed
+// config. Diagnostic-only, no tolerance change.
+pblczero::Net MakeFullRealisticNetNoQkvSilu() {
+  const NetDims d = RealisticDims();
+  const int input_size = kInputPlanes + 64;
+  std::mt19937 rng(5150);
+  pblczero::Net file;
+  auto* weights = file.mutable_weights();
+  auto* nf = file.mutable_format()->mutable_network_format();
+  using NF = pblczero::NetworkFormat;
+  nf->set_input(NF::INPUT_CLASSICAL_112_PLANE);
+  nf->set_network(NF::NETWORK_KDA_HYBRID_WITH_MULTIHEADFORMAT);
+  nf->set_policy(NF::POLICY_ATTENTION);
+  nf->set_value(NF::VALUE_WDL);
+  nf->set_moves_left(NF::MOVES_LEFT_V1);
+  nf->set_input_embedding(NF::INPUT_EMBEDDING_NONE);
+  nf->set_default_activation(NF::DEFAULT_ACTIVATION_MISH);
+  nf->set_ffn_activation(NF::ACTIVATION_DEFAULT);
+  nf->set_smolgen_activation(NF::ACTIVATION_SWISH);
+  for (int dir : {9, 10, 11, 12}) {
+    nf->add_kda_directions(static_cast<NF::KdaDirection>(dir));
+  }
+
+  FillLayer(weights->mutable_ip_emb_w(),
+            RandomVec(rng, d.embedding * input_size, 0.05f));
+  FillLayer(weights->mutable_ip_emb_b(), RandomVec(rng, d.embedding, 0.05f));
+  weights->set_headcount(d.heads);
+  KdaFeatures feat;
+  feat.qkv_silu = false;
+  FillKdaEncoder(&file, rng, d, feat);
+  FillKdaEncoder(&file, rng, d, feat);
+  FillKdaEncoder(&file, rng, d, feat);
+  FillMhaEncoder(&file, rng, d);
+  SmolgenDims sd;
+  sd.hidden_channels = 32;
+  sd.hidden_sz = 256;
+  sd.gen_outputs = d.heads * 16;
+  FillSmolgen(&file, rng, d, sd);
+  FillPolicyAndValueHeads(&file, rng, d, true, 32);
+  return file;
+}
+
 TEST(DirectMlKdaParity, FullRealistic_NoPeDenseNoMha) {
   CompareBackends(MakeFullRealisticNet(false, false, false));
 }
@@ -1564,6 +1668,186 @@ TEST(DirectMlKdaParity, FullRealistic_MhaSmolgen) {
 }
 TEST(DirectMlKdaParity, FullRealistic_Everything) {
   CompareBackends(MakeFullRealisticNet(true, true, true));
+}
+
+// Agora thread 19 #637-#642: MakeFullRealisticNet(false, true, true) /
+// FullRealistic_MhaSmolgen above already matches the real trained nets'
+// structure (3xKDA+1xMHA) AND dims (RealisticDims(): embedding=128,
+// heads=16) AND has smolgen on the MHA layer -- the closest synthetic match
+// to the real nets that exists, but until now only ever compared at batch=1.
+// MakeKdaMhaNet()-based fixtures (small dims, no smolgen) passed clean at
+// batch 2/4/8 regardless of KDA encoder depth (#640/#642) -- these three
+// test whether real dims and/or smolgen are the missing factor. The
+// NoSmolgen variant isolates dims alone; the Smolgen variant adds smolgen on
+// top, so a pass/fail split between them separates which factor matters.
+// Diagnostic-only, no tolerance change.
+TEST(DirectMlKdaParity, FullRealistic_MhaNoSmolgen_BatchOfTwo) {
+  CompareBackendsBatch(MakeFullRealisticNet(false, false, true), 2);
+}
+TEST(DirectMlKdaParity, FullRealistic_MhaNoSmolgen_BatchOfFour) {
+  CompareBackendsBatch(MakeFullRealisticNet(false, false, true), 4);
+}
+TEST(DirectMlKdaParity, FullRealistic_MhaNoSmolgen_BatchOfEight) {
+  CompareBackendsBatch(MakeFullRealisticNet(false, false, true), 8);
+}
+TEST(DirectMlKdaParity, FullRealistic_MhaSmolgen_BatchOfTwo) {
+  CompareBackendsBatch(MakeFullRealisticNet(false, true, true), 2);
+}
+TEST(DirectMlKdaParity, FullRealistic_MhaSmolgen_BatchOfFour) {
+  CompareBackendsBatch(MakeFullRealisticNet(false, true, true), 4);
+}
+TEST(DirectMlKdaParity, FullRealistic_MhaSmolgen_BatchOfEight) {
+  CompareBackendsBatch(MakeFullRealisticNet(false, true, true), 8);
+}
+
+// The one remaining known flag mismatch against the real nets: qkv_silu=false
+// (see MakeFullRealisticNetNoQkvSilu's comment above).
+TEST(DirectMlKdaParity, FullRealistic_NoQkvSilu_BatchOfTwo) {
+  CompareBackendsBatch(MakeFullRealisticNetNoQkvSilu(), 2);
+}
+TEST(DirectMlKdaParity, FullRealistic_NoQkvSilu_BatchOfFour) {
+  CompareBackendsBatch(MakeFullRealisticNetNoQkvSilu(), 4);
+}
+TEST(DirectMlKdaParity, FullRealistic_NoQkvSilu_BatchOfEight) {
+  CompareBackendsBatch(MakeFullRealisticNetNoQkvSilu(), 8);
+}
+
+// Agora thread 19 #648/#652 (muse-spark authorization item 3, user-directed
+// this iteration): codex-sol's freshly-extracted real decay metadata found
+// output_rms_norm=0 for all 3 real nets' KDA encoders -- KdaFeatures
+// defaults output_rms_norm=true, and MakeFullRealisticNetNoQkvSilu above
+// only overrode qkv_silu, leaving output_rms_norm at its true default. This
+// is byte-for-byte MakeFullRealisticNetNoQkvSilu except output_rms_norm is
+// ALSO false on all 3 KDA encoders -- now matching the real nets' confirmed
+// config on every checked dimension: dims, depth, mixer types, smolgen,
+// qkv_silu, output_rms_norm, gate_rank, key/value dim, local_conv.
+// Diagnostic-only, no tolerance change.
+pblczero::Net MakeFullRealisticNetNoQkvSiluNoRmsNorm() {
+  const NetDims d = RealisticDims();
+  const int input_size = kInputPlanes + 64;
+  std::mt19937 rng(5150);
+  pblczero::Net file;
+  auto* weights = file.mutable_weights();
+  auto* nf = file.mutable_format()->mutable_network_format();
+  using NF = pblczero::NetworkFormat;
+  nf->set_input(NF::INPUT_CLASSICAL_112_PLANE);
+  nf->set_network(NF::NETWORK_KDA_HYBRID_WITH_MULTIHEADFORMAT);
+  nf->set_policy(NF::POLICY_ATTENTION);
+  nf->set_value(NF::VALUE_WDL);
+  nf->set_moves_left(NF::MOVES_LEFT_V1);
+  nf->set_input_embedding(NF::INPUT_EMBEDDING_NONE);
+  nf->set_default_activation(NF::DEFAULT_ACTIVATION_MISH);
+  nf->set_ffn_activation(NF::ACTIVATION_DEFAULT);
+  nf->set_smolgen_activation(NF::ACTIVATION_SWISH);
+  for (int dir : {9, 10, 11, 12}) {
+    nf->add_kda_directions(static_cast<NF::KdaDirection>(dir));
+  }
+
+  FillLayer(weights->mutable_ip_emb_w(),
+            RandomVec(rng, d.embedding * input_size, 0.05f));
+  FillLayer(weights->mutable_ip_emb_b(), RandomVec(rng, d.embedding, 0.05f));
+  weights->set_headcount(d.heads);
+  KdaFeatures feat;
+  feat.qkv_silu = false;
+  feat.output_rms_norm = false;
+  FillKdaEncoder(&file, rng, d, feat);
+  FillKdaEncoder(&file, rng, d, feat);
+  FillKdaEncoder(&file, rng, d, feat);
+  FillMhaEncoder(&file, rng, d);
+  SmolgenDims sd;
+  sd.hidden_channels = 32;
+  sd.hidden_sz = 256;
+  sd.gen_outputs = d.heads * 16;
+  FillSmolgen(&file, rng, d, sd);
+  FillPolicyAndValueHeads(&file, rng, d, true, 32);
+  return file;
+}
+
+TEST(DirectMlKdaParity, FullRealistic_NoQkvSiluNoRmsNorm_BatchOfTwo) {
+  CompareBackendsBatch(MakeFullRealisticNetNoQkvSiluNoRmsNorm(), 2);
+}
+TEST(DirectMlKdaParity, FullRealistic_NoQkvSiluNoRmsNorm_BatchOfFour) {
+  CompareBackendsBatch(MakeFullRealisticNetNoQkvSiluNoRmsNorm(), 4);
+}
+TEST(DirectMlKdaParity, FullRealistic_NoQkvSiluNoRmsNorm_BatchOfEight) {
+  CompareBackendsBatch(MakeFullRealisticNetNoQkvSiluNoRmsNorm(), 8);
+}
+
+// Agora thread 19 #668 P1 step 1 (muse-spark's proposal, user-directed this
+// iteration -- "you have the go ahead from me"): the smolgen-bias
+// generation chain (m1 compress -> m2 dense1+LN -> m3 dense2+LN -> m4
+// bias-GEMM) was found corrupted at batch>1 (#665), but every synthetic
+// smolgen fixture tested so far (including MakeFullRealisticNetNoQkvSilu
+// NoRmsNorm above) used SmolgenDims{32,256,heads*16=256} -- LARGER than the
+// real nets' actual smolgen shape. Extracted directly from the real nets
+// still on disk (resolving muse-spark's caveat that these were
+// unverified): kda-native-935532/825532 both have hidden_channels=8,
+// hidden_sz=32, gen_outputs=512 (kda-t1-55050: gen_outputs=256). This is
+// byte-for-byte MakeFullRealisticNetNoQkvSiluNoRmsNorm except the smolgen
+// dims match 935532/825532 exactly -- a FAIL here means shape/driver
+// (matches muse-spark's small-M/small-N meta-command hypothesis); a PASS
+// re-opens value-driven causes. Diagnostic-only, no tolerance change.
+// Agora thread 19 #694 Track 1 next knob: scales only the input embedding
+// (ip_emb_w), independent of and composable with LC0_TEST_WEIGHT_SCALE and
+// LC0_TEST_SMOLGEN_SCALE (same RandomVec-composition mechanism). Bias left
+// alone, mirroring SmolgenChainScale's precedent. Diagnostic-only,
+// test-file-only, no production code.
+float EmbScale() {
+  if (const char* s = getenv("LC0_TEST_EMB_SCALE")) {
+    return static_cast<float>(atof(s));
+  }
+  return 1.0f;
+}
+
+pblczero::Net MakeFullRealisticNetRealSmolgenDims() {
+  const NetDims d = RealisticDims();
+  const int input_size = kInputPlanes + 64;
+  std::mt19937 rng(5150);
+  pblczero::Net file;
+  auto* weights = file.mutable_weights();
+  auto* nf = file.mutable_format()->mutable_network_format();
+  using NF = pblczero::NetworkFormat;
+  nf->set_input(NF::INPUT_CLASSICAL_112_PLANE);
+  nf->set_network(NF::NETWORK_KDA_HYBRID_WITH_MULTIHEADFORMAT);
+  nf->set_policy(NF::POLICY_ATTENTION);
+  nf->set_value(NF::VALUE_WDL);
+  nf->set_moves_left(NF::MOVES_LEFT_V1);
+  nf->set_input_embedding(NF::INPUT_EMBEDDING_NONE);
+  nf->set_default_activation(NF::DEFAULT_ACTIVATION_MISH);
+  nf->set_ffn_activation(NF::ACTIVATION_DEFAULT);
+  nf->set_smolgen_activation(NF::ACTIVATION_SWISH);
+  for (int dir : {9, 10, 11, 12}) {
+    nf->add_kda_directions(static_cast<NF::KdaDirection>(dir));
+  }
+
+  FillLayer(weights->mutable_ip_emb_w(),
+            RandomVec(rng, d.embedding * input_size, 0.05f * EmbScale()));
+  FillLayer(weights->mutable_ip_emb_b(), RandomVec(rng, d.embedding, 0.05f));
+  weights->set_headcount(d.heads);
+  KdaFeatures feat;
+  feat.qkv_silu = false;
+  feat.output_rms_norm = false;
+  FillKdaEncoder(&file, rng, d, feat);
+  FillKdaEncoder(&file, rng, d, feat);
+  FillKdaEncoder(&file, rng, d, feat);
+  FillMhaEncoder(&file, rng, d);
+  SmolgenDims sd;
+  sd.hidden_channels = 8;
+  sd.hidden_sz = 32;
+  sd.gen_outputs = 512;
+  FillSmolgen(&file, rng, d, sd);
+  FillPolicyAndValueHeads(&file, rng, d, true, 32);
+  return file;
+}
+
+TEST(DirectMlKdaParity, FullRealistic_RealSmolgenDims_BatchOfTwo) {
+  CompareBackendsBatch(MakeFullRealisticNetRealSmolgenDims(), 2);
+}
+TEST(DirectMlKdaParity, FullRealistic_RealSmolgenDims_BatchOfFour) {
+  CompareBackendsBatch(MakeFullRealisticNetRealSmolgenDims(), 4);
+}
+TEST(DirectMlKdaParity, FullRealistic_RealSmolgenDims_BatchOfEight) {
+  CompareBackendsBatch(MakeFullRealisticNetRealSmolgenDims(), 8);
 }
 
 // The same KDA encoder driven by the four serpentine (boustrophedon)
@@ -1788,15 +2072,6 @@ TEST(DirectMlKdaParity, MatchesBlasOnRealNetFromEnv) {
   }
   CompareBackends(net);
 }
-
-// E1 (agora thread 19 #620/#628/#630/#631): implemented and verified working
-// (correctly skips without LC0_TEST_REAL_NET, correctly caught a real
-// batch-8 divergence on kda-t1-55050 with it set -- see #630). HELD out of
-// this commit per muse-spark's #631 directive c: landing it red without a
-// root cause would muddy every subsequent suite run's signal. The exact
-// text is preserved in the agora thread and will land once the #631
-// triage localizes the finding (as a red-with-cause regression test, or
-// green if the underlying issue is fixed first).
 
 // E1 (agora thread 19 #620/#628/#630/#631): implemented and verified working
 // (correctly skips without LC0_TEST_REAL_NET, correctly caught a real
@@ -2032,6 +2307,44 @@ TEST(DirectMlKdaParity, MatchesBlasOnPeDenseWithEncodersNet) {
   CompareBackends(MakePeDenseWithEncodersNet());
 }
 
+// agora thread 19 D3 rework (codex-sol #724): MatchesBlasOnGatedEmbedding*
+// above covers has_gating_ on INPUT_EMBEDDING_NONE nets only (MakeGatedNet
+// wraps MakeNetWithDims, which never sets PE_DENSE); MakePeDenseNet and
+// MakePeDenseWithEncodersNet above never populate the gate tensors. That
+// leaves the PE_DENSE embedding's own gating block (layers.cc's
+// is_pe_dense_embedding_ branch, both in EnsureCompiled and in Eval's
+// lazy-compile fallback -- structurally identical duplicated code, so one
+// fixture covers both) with zero test coverage, exactly as codex-sol's
+// review found: "MakePeDenseNet and FullRealistic(true,...) still leave
+// gate tensors empty." Real trained nets ARE PE_DENSE with gating live, so
+// this is the actual shape being shipped, not a synthetic corner case.
+pblczero::Net MakePeDenseGatedNet(unsigned seed) {
+  const NetDims d;
+  pblczero::Net file = MakePeDenseWithEncodersNet();
+  std::mt19937 rng(seed ^ 0x9e37u);
+  auto* w = file.mutable_weights();
+  // Same shape/scale convention as MakeGatedNet: values must vary across
+  // squares (a per-channel broadcast would still agree with a per-square
+  // read and prove nothing -- see the 39%-wrong bug this caught on the
+  // non-PE_DENSE branch).
+  FillLayer(w->mutable_ip_mult_gate(),
+            RandomVec(rng, static_cast<size_t>(d.embedding) * 64, 0.3f));
+  FillLayer(w->mutable_ip_add_gate(),
+            RandomVec(rng, static_cast<size_t>(d.embedding) * 64, 0.1f));
+  return file;
+}
+
+TEST(DirectMlKdaParity, MatchesBlasOnPeDenseGatedNet) {
+  CompareBackends(MakePeDenseGatedNet(6005));
+}
+
+// Batch case, same reasoning as MatchesBlasOnGatedEmbeddingBatch: the
+// per-sample batch_base stride the gating shader hand-computes needs
+// batch>1 to mean anything.
+TEST(DirectMlKdaParity, MatchesBlasOnPeDenseGatedBatch) {
+  CompareBackendsBatch(MakePeDenseGatedNet(6006), 4);
+}
+
 TEST(DirectMlKdaParity, MatchesBlasOnKdaHybridNet) {
   CompareBackends(MakeKdaHybridNet());
 }
@@ -2040,12 +2353,13 @@ TEST(DirectMlKdaParity, MatchesBlasOnKdaMhaNet) {
   CompareBackends(MakeKdaMhaNet());
 }
 
-// Agora thread 19 #639/#640: MakeKdaMhaNet() (1 KDA encoder + 1 MHA encoder)
-// was, until now, only ever compared at batch 1 -- the one synthetic
-// fixture that mixes mixer types in a single body never exercised batch>1
-// on the KDA->MHA handoff. Part of the #637-655 batch-contamination
-// triage's synthetic-fixture sweep (all passed clean, refuting a generic
-// mixer-transition cause -- see thread #19 for the full chain).
+// Agora thread 19 #639: MakeKdaMhaNet() (1 KDA encoder + 1 MHA encoder) was,
+// until now, only ever compared at batch 1 -- the one synthetic fixture that
+// mixes mixer types in a single body never exercised batch>1 on the KDA->MHA
+// handoff. Real trained nets are 3xKDA+1xMHA and fail at every batch>=2; the
+// all-KDA single-encoder MakeKdaMlhNet() batch tests above pass. These three
+// close that exact coverage gap (agora #637/#638/#639) -- diagnostic-only,
+// reporting numbers, no tolerance change.
 TEST(DirectMlKdaParity, MatchesBlasOnKdaMhaNetBatchOfTwo) {
   CompareBackendsBatch(MakeKdaMhaNet(), 2);
 }
@@ -2058,9 +2372,10 @@ TEST(DirectMlKdaParity, MatchesBlasOnKdaMhaNetBatchOfEight) {
   CompareBackendsBatch(MakeKdaMhaNet(), 8);
 }
 
-// Agora thread 19 #641/#642: matching the real trained nets' exact encoder
-// depth (3xKDA+1xMHA), still at small synthetic dims -- also part of the
-// #637-655 sweep, also passed clean, refuting depth alone as a cause.
+// Agora thread 19 #641: candidate 1 from #640 -- does chaining 3 KDA
+// encoders (matching the real nets' depth) ahead of the trailing MHA
+// encoder reproduce the contamination that a single KDA+MHA pair (above)
+// did not? Diagnostic-only, no tolerance change.
 TEST(DirectMlKdaParity, MatchesBlasOnThreeKdaThenMhaNetBatchOfTwo) {
   CompareBackendsBatch(MakeThreeKdaThenMhaNet(), 2);
 }
@@ -2911,6 +3226,50 @@ TEST(DirectMlKdaParity, DISABLED_TransientArenaMaxBatchProbe) {
   }
 }
 
+// agora thread 19 DML-4 (codex-sol #724): the two env-mutating tests below
+// used to set process-wide vars at the top and clear them with a second
+// hand-matched _putenv_s/setenv block just before their assertions -- any
+// ASSERT_* failure or exception between those two points (which DOES
+// happen: TwoNetworkInterleaveDoesNotCorruptResults's own ASSERT_EQ loop
+// runs entirely inside that window) skips the restore and leaks the
+// setting into every later test in the same process. A scoped RAII helper,
+// same shape as ScopedTempDir above, makes that impossible: restores on
+// every exit path, including an unset var back to genuinely unset (not "").
+class ScopedEnvVar {
+ public:
+  ScopedEnvVar(const char* name, const char* value) : name_(name) {
+#if defined(_WIN32)
+    const char* prev = getenv(name);
+    had_prev_ = prev != nullptr;
+    if (had_prev_) prev_value_ = prev;
+    _putenv_s(name, value);
+#else
+    const char* prev = getenv(name);
+    had_prev_ = prev != nullptr;
+    if (had_prev_) prev_value_ = prev;
+    setenv(name, value, 1);
+#endif
+  }
+  ~ScopedEnvVar() {
+#if defined(_WIN32)
+    _putenv_s(name_.c_str(), had_prev_ ? prev_value_.c_str() : "");
+#else
+    if (had_prev_) {
+      setenv(name_.c_str(), prev_value_.c_str(), 1);
+    } else {
+      unsetenv(name_.c_str());
+    }
+#endif
+  }
+  ScopedEnvVar(const ScopedEnvVar&) = delete;
+  ScopedEnvVar& operator=(const ScopedEnvVar&) = delete;
+
+ private:
+  std::string name_;
+  bool had_prev_ = false;
+  std::string prev_value_;
+};
+
 // agora thread 19 P4 (vii), muse-spark's #677/#668 (doubles as RR3's
 // regression test): RR3 moved BodyDumps()/ProfileMarks() from process-wide
 // statics into per-DmlExecScope storage specifically to remove a
@@ -2921,14 +3280,20 @@ TEST(DirectMlKdaParity, DISABLED_TransientArenaMaxBatchProbe) {
 // this test does not attempt that (it needs the "hook seam mirroring
 // SetFlightHookForTesting" muse-spark's fuller Design 1 proposal named,
 // which does not exist yet; filed as the P3-followup, not built here).
-// What IS achievable and still meaningful without that infrastructure:
-// two DIFFERENT networks (different encoder architecture, so a dump/mark
-// count mix-up would be structurally detectable) alternately evaluated on
-// one thread with LC0_DUMP_BODY+LC0_DML_PROFILE both enabled, verifying
-// network A's own outputs are bit-identical whether evaluated alone or
-// with network B's evaluation interleaved between two of A's calls -- if
-// BodyDumps()/ProfileMarks() (or anything else) still leaked state
-// between instances, this is the simplest scenario that could show it.
+//
+// agora thread 19 DML-4 (codex-sol #724): codex-sol's "A and B never
+// coexist" was, on inspection, stronger than "sequential" -- the original
+// eval_once lambda called NetworkFactory::Get()->Create(...) INSIDE itself
+// on every invocation, so network A's C++ object was destroyed before B's
+// was even constructed; they were never simultaneously alive at all, let
+// alone overlapping in flight. Genuine overlapping GPU submission still
+// needs the not-yet-built hook infrastructure noted above and is NOT added
+// here. What this rework does add, safely and single-threaded: both
+// DirectMlNetwork instances are constructed ONCE, up front, and stay alive
+// for the whole test, so their per-instance state (weight uploads, arenas,
+// the DmlDeviceContext they each own) genuinely coexists while calls
+// alternate between them -- a real strengthening of "two networks coexist"
+// even though true concurrent-submission overlap is still future work.
 TEST(DirectMlRegressionCoverage, TwoNetworkInterleaveDoesNotCorruptResults) {
   if (!HasBackend("directml"))
     GTEST_SKIP() << "directml backend not compiled in";
@@ -2936,8 +3301,6 @@ TEST(DirectMlRegressionCoverage, TwoNetworkInterleaveDoesNotCorruptResults) {
     GTEST_SKIP() << "no usable directml device: "
                  << DirectMlAvailability().reason;
   }
-  const pblczero::Net netA = MakeKdaMlhNet();      // 1 KDA encoder.
-  const pblczero::Net netB = MakeKdaMhaNet();      // 1 KDA + 1 MHA encoder.
   const InputPlanes planes = EncodeStartPos();
 
   // No new directory needed -- TestBinaryDir() (where the test binary
@@ -2945,17 +3308,18 @@ TEST(DirectMlRegressionCoverage, TwoNetworkInterleaveDoesNotCorruptResults) {
   // not directories, at whatever prefix this names.
   const std::string dump_prefix =
       TestBinaryDir() + "interleave_dump_smoke";
-#if defined(_WIN32)
-  _putenv_s("LC0_DUMP_BODY", dump_prefix.c_str());
-  _putenv_s("LC0_DML_PROFILE", "1");
-#else
-  setenv("LC0_DUMP_BODY", dump_prefix.c_str(), 1);
-  setenv("LC0_DML_PROFILE", "1", 1);
-#endif
+  ScopedEnvVar dump_body_env("LC0_DUMP_BODY", dump_prefix.c_str());
+  ScopedEnvVar profile_env("LC0_DML_PROFILE", "1");
 
-  auto eval_once = [&](const pblczero::Net& net) {
-    OptionsDict options;
-    auto network = NetworkFactory::Get()->Create("directml", net, options);
+  // Both networks constructed up front and held for the whole test -- see
+  // the DML-4 comment above for why this matters.
+  OptionsDict options_a, options_b;
+  auto network_a = NetworkFactory::Get()->Create(
+      "directml", MakeKdaMlhNet(), options_a);   // 1 KDA encoder.
+  auto network_b = NetworkFactory::Get()->Create(
+      "directml", MakeKdaMhaNet(), options_b);   // 1 KDA + 1 MHA encoder.
+
+  auto eval_once = [&](Network* network) {
     auto computation = network->NewComputation();
     computation->AddInput(InputPlanes(planes));
     computation->ComputeBlocking();
@@ -2968,17 +3332,9 @@ TEST(DirectMlRegressionCoverage, TwoNetworkInterleaveDoesNotCorruptResults) {
     return out;
   };
 
-  const Outputs a1 = eval_once(netA);
-  const Outputs b = eval_once(netB);
-  const Outputs a2 = eval_once(netA);
-
-#if defined(_WIN32)
-  _putenv_s("LC0_DUMP_BODY", "");
-  _putenv_s("LC0_DML_PROFILE", "");
-#else
-  unsetenv("LC0_DUMP_BODY");
-  unsetenv("LC0_DML_PROFILE");
-#endif
+  const Outputs a1 = eval_once(network_a.get());
+  const Outputs b = eval_once(network_b.get());
+  const Outputs a2 = eval_once(network_a.get());
 
   (void)b;  // Only used to interleave a different network's eval between A's two.
   EXPECT_EQ(a1.q, a2.q) << "network A's Q changed after B's eval ran between "
@@ -3002,6 +3358,16 @@ TEST(DirectMlRegressionCoverage, TwoNetworkInterleaveDoesNotCorruptResults) {
 // this triage), and fail if anything ERROR/CORRUPTION-severity fired.
 // Expected to PASS now that RR2/P2 fixed the one persistent violation this
 // exact scenario used to report.
+//
+// agora thread 19 DML-4 (codex-sol #724): errors==0 alone cannot
+// distinguish "validation ran clean" from "validation never actually
+// turned on" -- D3D12GetDebugInterface/ID3D12Debug1/ID3D12InfoQueue1 all
+// fail soft (network_directml.cc), so a machine missing the Windows SDK's
+// Graphics Tools optional feature would pass this exact assertion for the
+// wrong reason. Also assert GbvActuallyActive() (dml_common.h), set true
+// only once SetEnableGPUBasedValidation AND RegisterMessageCallback have
+// both actually succeeded -- this job must fail loudly on a machine where
+// GBV silently didn't start, not report a false green.
 TEST(DirectMlRegressionCoverage, GbvReportsNoErrorsOnRepresentativeNet) {
   if (!HasBackend("directml"))
     GTEST_SKIP() << "directml backend not compiled in";
@@ -3009,13 +3375,9 @@ TEST(DirectMlRegressionCoverage, GbvReportsNoErrorsOnRepresentativeNet) {
     GTEST_SKIP() << "no usable directml device: "
                  << DirectMlAvailability().reason;
   }
-#if defined(_WIN32)
-  _putenv_s("LC0_DML_DEBUG_LAYER", "1");
-  _putenv_s("LC0_DML_GBV", "1");
-#else
-  setenv("LC0_DML_DEBUG_LAYER", "1", 1);
-  setenv("LC0_DML_GBV", "1", 1);
-#endif
+  ScopedEnvVar debug_layer_env("LC0_DML_DEBUG_LAYER", "1");
+  ScopedEnvVar gbv_env("LC0_DML_GBV", "1");
+  using directml_backend::GbvActuallyActive;
   using directml_backend::GbvErrorCount;
   GbvErrorCount() = 0;
 
@@ -3029,13 +3391,13 @@ TEST(DirectMlRegressionCoverage, GbvReportsNoErrorsOnRepresentativeNet) {
   }
 
   const int errors = GbvErrorCount();
-#if defined(_WIN32)
-  _putenv_s("LC0_DML_DEBUG_LAYER", "");
-  _putenv_s("LC0_DML_GBV", "");
-#else
-  unsetenv("LC0_DML_DEBUG_LAYER");
-  unsetenv("LC0_DML_GBV");
-#endif
+  const bool gbv_active = GbvActuallyActive();
+  ASSERT_TRUE(gbv_active)
+      << "GPU-Based Validation never actually activated on this machine "
+         "(D3D12GetDebugInterface/ID3D12Debug1/ID3D12InfoQueue1 failed "
+         "soft somewhere -- see the CERR output above for which step) -- "
+         "errors==0 in that case proves nothing; this job must fail "
+         "loudly rather than report a false green (DML-4, agora #724)";
   EXPECT_EQ(errors, 0)
       << "GPU-Based Validation reported " << errors << " ERROR/CORRUPTION "
          "severity message(s) -- see the CERR output above for detail "
@@ -3400,6 +3762,174 @@ TEST(DirectMlKdaParity, Fp16ParityIsGatedButMeasured) {
       << ") -- the known fp16 precision gap this test tracks appears to be "
          "fixed; update or remove this test's asserted-broken expectation "
          "rather than leaving it silently passing for the wrong reason";
+}
+
+// TEMPORARY, uncommitted, agora thread 19 #620/#635 directive (a): the
+// decisive contamination experiment. Runs the same 2 positions once as a
+// batch of 2 (directml), and once each as an independent batch of 1
+// (directml), then diffs batch-2's sample against the solo run of the
+// SAME position. If they match, whatever's wrong is per-position numerics
+// (not what the earlier findings look like); if they differ, sample 1's
+// slot in the batch-2 run is reading contaminated/wrong data -- a
+// stride/offset bug, not a precision one. Prints only; no EXPECT/ASSERT
+// (diagnostic, not a permanent assertion), no fix, no tolerance change.
+TEST(DirectMlKdaParity, DISABLED_TriageBatchContamination) {
+  const char* path = getenv("LC0_TEST_REAL_NET");
+  if (!path) GTEST_SKIP() << "set LC0_TEST_REAL_NET to a .pb.gz to run";
+  pblczero::Net net = LoadWeightsFromFile(path);
+  CERR << "[dims] encoders=" << net.weights().encoder_size()
+       << " embedding=" << LayerAdapter(net.weights().ip_emb_b()).size()
+       << " headcount=" << net.weights().headcount();
+  for (int i = 0; i < net.weights().encoder_size(); ++i) {
+    const auto& enc = net.weights().encoder(i);
+    CERR << "[dims] enc" << i << " mixer="
+         << (enc.mixer() == pblczero::Weights::EncoderLayer::MIXER_KDA
+                 ? "KDA"
+                 : "MHA");
+    if (enc.mixer() == pblczero::Weights::EncoderLayer::MIXER_KDA) {
+      CERR << "[dims] enc" << i << " local_conv=" << enc.kda().local_conv()
+           << " qkv_silu=" << enc.kda().qkv_silu()
+           << " gate_rank=" << enc.kda().gate_rank()
+           << " key_dim=" << enc.kda().key_dim()
+           << " value_dim=" << enc.kda().value_dim();
+    } else {
+      CERR << "[dims] enc" << i << " has_smolgen=" << enc.mha().has_smolgen();
+      if (enc.mha().has_smolgen()) {
+        const auto& sg = enc.mha().smolgen();
+        const uint64_t emb = LayerAdapter(net.weights().ip_emb_b()).size();
+        const uint64_t hidden_channels =
+            emb ? LayerAdapter(sg.compress()).size() / emb : 0;
+        // Agora #668 P1 step 1: resolving muse-spark's stated caveat ("exact
+        // real C_c/D1/D2 unverified, .pb.gz no longer on disk") -- the net
+        // is still on disk for this session, so print the REAL smolgen
+        // dims directly instead of guessing/approximating them.
+        CERR << "[dims] enc" << i
+             << " smolgen hidden_channels=" << hidden_channels
+             << " hidden_sz=" << LayerAdapter(sg.dense1_b()).size()
+             << " gen_outputs=" << LayerAdapter(sg.dense2_b()).size();
+      }
+    }
+  }
+  // Agora #637 audit: mirror network_directml.cc's scratch_elems maximand
+  // computation by hand (fp32, scale_rec=1) to check whether the MHA
+  // encoder's 8*d_model term or a KDA encoder's term is the actual binding
+  // constraint for these real nets -- see the reasoning posted to thread 19
+  // about EvalMha's buffer1 needing 5*d_model*max_tokens*sizeof(float)
+  // bytes out of a half-scratch region only guaranteed >= scratch_bytes_/2.
+  {
+    const MultiHeadWeights decoded{net.weights()};
+    const uint64_t emb_size = decoded.ip_emb_b.size();
+    uint64_t scratch_elems = 0;
+    uint64_t mha_need = 0, kda_need = 0;
+    for (const auto& enc : decoded.encoder) {
+      if (enc.is_kda) {
+        const uint64_t KD =
+            (uint64_t)decoded.encoder_head_count * enc.kda.key_dim;
+        const uint64_t VD =
+            (uint64_t)decoded.encoder_head_count * enc.kda.value_dim;
+        const uint64_t need =
+            (2 * KD + VD + std::max<uint64_t>(2 * KD, VD + 3 * enc.kda.key_dim)) +
+            enc.kda.gate_rank + emb_size +
+            (enc.kda.local_conv ? emb_size : 0);
+        kda_need = std::max(kda_need, need);
+        scratch_elems = std::max(scratch_elems, need);
+      } else {
+        const uint64_t d_model =
+            !enc.mha.q_w.empty() ? enc.mha.q_w.size() / emb_size : emb_size;
+        const uint64_t need = 8 * d_model;
+        mha_need = std::max(mha_need, need);
+        scratch_elems = std::max(scratch_elems, need);
+        CERR << "[arena] MHA encoder d_model=" << d_model
+             << " buffer1_needs(5*d_model)=" << 5 * d_model
+             << " half_of(8*d_model)=" << (8 * d_model) / 2;
+      }
+    }
+    CERR << "[arena] scratch_elems(fp32 approx)=" << scratch_elems
+         << " kda_term_max=" << kda_need << " mha_term(8*d_model)=" << mha_need
+         << " -- buffer1 gets AlignUp(scratch_elems/2) elems, "
+         << "MHA needs 5*d_model contiguous: "
+         << ((scratch_elems / 2) >= 5 * (mha_need / 8) ? "OK (fits)"
+                                                        : "SHORTFALL");
+  }
+  const std::vector<InputPlanes> planes = EncodeDistinctPositions(2);
+
+  const std::vector<Outputs> batch2 = RunNetworkBatch("directml", net, planes);
+  const Outputs solo0 = RunNetwork("directml", net, planes[0]);
+  const Outputs solo1 = RunNetwork("directml", net, planes[1]);
+
+  auto worst_policy_diff = [](const std::vector<float>& a,
+                              const std::vector<float>& b, int* move) {
+    float worst = 0.0f;
+    for (int i = 0; i < 1858; ++i) {
+      const float d = std::fabs(a[i] - b[i]);
+      if (d > worst) {
+        worst = d;
+        *move = i;
+      }
+    }
+    return worst;
+  };
+
+  int move0 = -1, move1 = -1;
+  const float p0_diff =
+      worst_policy_diff(batch2[0].policy, solo0.policy, &move0);
+  const float p1_diff =
+      worst_policy_diff(batch2[1].policy, solo1.policy, &move1);
+
+  CERR << "[contamination] sample 0: batch2 vs solo -- Q diff="
+       << std::fabs(batch2[0].q - solo0.q)
+       << " D diff=" << std::fabs(batch2[0].d - solo0.d)
+       << " policy worst diff=" << p0_diff << " at move " << move0;
+  CERR << "[contamination] sample 1: batch2 vs solo -- Q diff="
+       << std::fabs(batch2[1].q - solo1.q)
+       << " D diff=" << std::fabs(batch2[1].d - solo1.d)
+       << " policy worst diff=" << p1_diff << " at move " << move1;
+  CERR << "[contamination] solo0 vs solo1 policy worst diff (sanity: these "
+          "are genuinely different positions) ="
+       << worst_policy_diff(solo0.policy, solo1.policy, &move0);
+}
+
+// Agora thread 19 #652 item 4 / #656 (muse-spark, user-directed): the RR1
+// real-net LC0_DUMP_BODY bisection. LC0_DUMP_BODY's file prefix is fixed
+// for the whole process and each forwardEval call's drain truncates and
+// overwrites its stage files -- DISABLED_TriageBatchContamination above
+// does 3 evaluations (batch2, solo0, solo1) in ONE process, so its dumps
+// would only ever reflect the LAST call. This harness does exactly ONE
+// evaluation per process invocation, chosen by LC0_TEST_TRIAGE_BATCH (1 =
+// solo RunNetwork on position 0, N>1 = RunNetworkBatch on N distinct
+// positions) -- run it twice with different LC0_DUMP_BODY prefixes (once
+// at batch 1, once at the batch under investigation) to get two clean,
+// non-overwritten dump sets to diff stage-by-stage. No EXPECT/ASSERT, no
+// tolerance, no fix -- dumps only, exactly as directed. E1 untouched.
+// Agora thread 19 #725/DML-1 residual localization (claude-opus, post-D1-fix):
+// LC0_TEST_TRIAGE_BACKEND (default "directml") added so this same harness can
+// capture a BLAS ".blas.<stage>.bin" dump set for the identical position,
+// letting the stage-by-stage diff that originally localized RR1 to enc3 be
+// rerun against the current source to see whether the much smaller residual
+// (2pass/4fail per codex-sol's #723/#724) still enters at the same stage.
+// Still dumps only -- no EXPECT/ASSERT, no tolerance, no fix.
+TEST(DirectMlKdaParity, DISABLED_DumpSingleRealNetEval) {
+  const char* path = getenv("LC0_TEST_REAL_NET");
+  if (!path) GTEST_SKIP() << "set LC0_TEST_REAL_NET to a .pb.gz to run";
+  const char* backend_env = getenv("LC0_TEST_TRIAGE_BACKEND");
+  const std::string backend = backend_env ? backend_env : "directml";
+  const char* batch_env = getenv("LC0_TEST_TRIAGE_BATCH");
+  const int batch = batch_env ? std::atoi(batch_env) : 1;
+  pblczero::Net net = LoadWeightsFromFile(path);
+  if (batch <= 1) {
+    // LC0_TEST_TRIAGE_POS (default 0): which EncodeDistinctPositions index
+    // to run solo -- needed to get a genuine standalone-batch1 reference
+    // for sample N>0 of a larger batch (position i's FEN only depends on
+    // i, not on the requested count, so EncodeDistinctPositions(pos+1)[pos]
+    // is byte-identical to that same slot in a bigger batch's plane list).
+    const char* pos_env = getenv("LC0_TEST_TRIAGE_POS");
+    const int pos = pos_env ? std::atoi(pos_env) : 0;
+    const std::vector<InputPlanes> planes = EncodeDistinctPositions(pos + 1);
+    RunNetwork(backend, net, planes[pos]);
+  } else {
+    const std::vector<InputPlanes> planes = EncodeDistinctPositions(batch);
+    RunNetworkBatch(backend, net, planes);
+  }
 }
 
 }  // namespace lczero

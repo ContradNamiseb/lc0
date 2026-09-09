@@ -114,6 +114,10 @@ void DmlDeviceContext::Init(const OptionsDict& options) {
   // so this fails soft (logs and continues without validation) rather than
   // throwing -- it is a diagnostic aid, not something normal operation
   // should ever depend on being available.
+  // agora thread 19 DML-4 (codex-sol #724): true only once BOTH
+  // SetEnableGPUBasedValidation and RegisterMessageCallback (further below)
+  // have actually succeeded -- see GbvActuallyActive's comment, dml_common.h.
+  bool gbv_enabled_this_far = false;
   if (getenv("LC0_DML_DEBUG_LAYER")) {
     ComPtr<ID3D12Debug> debug;
     if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
@@ -135,6 +139,7 @@ void DmlDeviceContext::Init(const OptionsDict& options) {
         ComPtr<ID3D12Debug1> debug1;
         if (SUCCEEDED(debug.As(&debug1))) {
           debug1->SetEnableGPUBasedValidation(TRUE);
+          gbv_enabled_this_far = true;
           CERR << "directml backend: D3D12 GPU-Based Validation enabled "
                   "(LC0_DML_GBV)";
         } else {
@@ -216,6 +221,11 @@ void DmlDeviceContext::Init(const OptionsDict& options) {
               &cookie))) {
         CERR << "directml backend: D3D12 debug layer message callback "
                 "registered";
+        // agora thread 19 DML-4: only now have BOTH prerequisites for a
+        // real ERROR/CORRUPTION message to actually reach GbvErrorCount()
+        // been confirmed -- GBV itself enabled above, and this callback
+        // registered to receive its output.
+        if (gbv_enabled_this_far) GbvActuallyActive() = true;
       }
     } else {
       CERR << "directml backend: LC0_DML_DEBUG_LAYER set but "
@@ -363,8 +373,46 @@ DirectMlNetwork<DataType>::DirectMlNetwork(const WeightsFile& file,
                     "(POLICY_ATTENTION only).");
   }
 
-  max_batch_size_ = std::min(1024, std::max(1, options.GetOrDefault<int>(
-                                            "max_batch", 256)));
+  // agora thread 19 DML-2 (codex-sol #724): a flat 1024 ceiling assumes
+  // every batch up to max_batch_size_ can actually be dispatched. It can't
+  // for every net. MhaTransposeLayer and KdaLocalConvLayer (layers.cc) are
+  // raw HLSL compute shaders whose Dispatch() thread-group count scales as
+  // batch_size * (this net's own mha_d_model, or embedding_size for KDA
+  // local-conv), checked against D3D12's hard per-dimension limit
+  // (CheckDispatchGroupCount). For a net with mha_d_model=128 that limit
+  // bites at batch>511, well below 1024. BatchLadder()'s top rung is
+  // max_batch_size_ itself and forwardEval rounds any request above the
+  // previous rung straight up to it, so an uncapped max_batch=1024 silently
+  // made every batch in (256,1024] throw for such a net -- reproduced and
+  // traced to source in Agora #696/#724. Compute the actual dispatch-safe
+  // ceiling from the loaded net's real geometry (never smaller than the
+  // record_preprocess floor of 64) and fold it into the same clamp, instead
+  // of trusting a single global constant. This narrows the ceiling only for
+  // nets whose real dims need it; small/synthetic nets are unaffected (their
+  // computed ceiling comes out above 1024, same as before this change).
+  uint32_t dispatch_group_scale = 64;  // record_preprocess: N*64, always.
+  const uint32_t embedding_size_for_ceiling =
+      static_cast<uint32_t>(weights_.ip_emb_b.size());
+  for (const auto& enc : weights_.encoder) {
+    if (!enc.is_kda && !enc.mha.q_w.empty() && embedding_size_for_ceiling > 0) {
+      // MhaTransposeLayer: N * mha_d_model groups. Same derivation
+      // EncoderBlock's own constructor uses for mha_q_size_ (layers.cc).
+      const uint32_t mha_d_model = static_cast<uint32_t>(enc.mha.q_w.size()) /
+                                   embedding_size_for_ceiling;
+      dispatch_group_scale = std::max(dispatch_group_scale, mha_d_model);
+    }
+    if (enc.is_kda && enc.kda.local_conv && !enc.kda.local_conv_w.empty() &&
+        !enc.kda.local_conv_b.empty()) {
+      // KdaLocalConvLayer: N * embedding_size groups.
+      dispatch_group_scale =
+          std::max(dispatch_group_scale, embedding_size_for_ceiling);
+    }
+  }
+  const int dispatch_safe_max_batch = static_cast<int>(
+      D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION / dispatch_group_scale);
+  max_batch_size_ = std::min(
+      {1024, dispatch_safe_max_batch,
+       std::max(1, options.GetOrDefault<int>("max_batch", 256))});
   // Default 1, not 4 (agora thread 19 #533/#538/#545): at min_batch=4,
   // a batch-1 request evaluated 4 positions on the GPU and discarded 3,
   // measured costing DirectML FP32 batch-1 throughput -26% vs SYCL where
