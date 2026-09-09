@@ -29,10 +29,16 @@ namespace openvino_backend {
 // sequential scan) is >98% of OpenVINO's total inference time on a
 // KDA-hybrid net -- see docs/inference-backends-handoff.md.
 //
-// This op is direction-agnostic: converter.cc already reorders q/k/v/decay/
-// beta into each direction's board-traversal order (and un-reorders the
-// output afterwards) *outside* the Scan node, so all this op does is the
-// generic per-step recurrence body over axis 1, matching:
+// This op folds the directional scan token->square permutation into
+// itself: it takes the net's direction set (validated in kda_scan_op.cc),
+// applies it internally -- via the kDirectionTable lookup in
+// kda_scan_kernel_source.h on the GPU path, via KdaSquareForToken
+// (neural/kda_directions.h) on the CPU evaluate() path -- and writes its
+// output square-major. kda_scan_pass.cc relies on that: it feeds the op
+// the unpermuted tensors (TraceToUnpermutedInput) and bypasses the
+// downstream Slice->Gather->Concat reassembly
+// (FindDownstreamReorderedOutput) because the result is already in square
+// order. The recurrence body itself matches:
 //   - converter.cc's EmitKdaLayer Scan body, and
 //   - sycl/common_kernels.dp.cpp's kdaRecurrenceValueParallel
 // bit-for-bit. If either of those changes, this must change with it.

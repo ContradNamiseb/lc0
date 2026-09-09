@@ -528,6 +528,7 @@ std::string WriteKdaScanGpuConfig(int heads, int key_dim, int value_dim,
       << "  <CompilerOptions options=\"-D HEADS_=" << heads
       << " -D KEY_DIM_=" << key_dim << " -D VALUE_DIM_=" << value_dim
       << " -D DIRECTION_COUNT_=" << direction_count
+      << " -D LOG_DECAY_FLOOR_=" << KdaScanOp::kLogDecayFloor
       << " -D DIRECTIONS_LIST_=" << dir_list_str
       << " -D DTYPE=" << dtype_str
       << (fp16 ? " -D FP16_SUPPORTED=1" : "")

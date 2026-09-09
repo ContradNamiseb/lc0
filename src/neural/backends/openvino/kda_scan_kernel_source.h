@@ -94,7 +94,7 @@ __kernel void kda_scan_kernel(__global const DTYPE* q,          // [N,64,H,K] in
       const float softplus = (decay_input > 0.0f ? decay_input : 0.0f) +
                              log1p(exp(-fabs(decay_input)));
       float log_decay = neg_scale_h * softplus;
-      log_decay = log_decay > -10.0f ? log_decay : -10.0f;
+      log_decay = log_decay > LOG_DECAY_FLOOR_ ? log_decay : LOG_DECAY_FLOOR_;
       p_decay[i] = exp(log_decay);
     }
 

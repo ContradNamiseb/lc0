@@ -73,6 +73,11 @@ void KdaScanOp::validate_and_infer_types() {
     if (q_shape[2].is_static()) heads_ = static_cast<int>(q_shape[2].get_length());
     if (q_shape[3].is_static()) key_dim_ = static_cast<int>(q_shape[3].get_length());
   }
+  if (heads_ > 0 && direction_count_ > 0 && heads_ % direction_count_ != 0) {
+    throw Exception("KdaScanOp: heads (" + std::to_string(heads_) +
+                    ") must be evenly divisible by direction_count (" +
+                    std::to_string(direction_count_) + ").");
+  }
   set_output_type(0, get_input_element_type(0), out_shape);
 }
 
