@@ -1067,6 +1067,16 @@ if get_option('gtest')
     include_directories: includes, dependencies: [deps, gtest]
   ), args: '--gtest_output=xml:kda_parity.xml', timeout: 600)
 
+  # OpenVINO parity: converter-valid synthetic nets (PE_MAP embedding, which
+  # the ONNX converter accepts) through the blas reference and the openvino
+  # backend. The old KDA test above is SYCL-hardcoded and its NONE-embedding
+  # fixture is rejected by the converter, so nothing there covers OpenVINO.
+  test('OpenvinoParity',
+    executable('openvino_parity_test', 'src/neural/openvino_parity_test.cc',
+    files,
+    include_directories: includes, dependencies: [deps, gtest]
+  ), args: '--gtest_output=xml:openvino_parity.xml', timeout: 900)
+
   test('EngineTest',
     executable('engine_test', 'src/engine_test.cc', 'src/engine.cc',
                'src/neural/memcache.cc', pb_files,
