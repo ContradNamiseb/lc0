@@ -409,7 +409,8 @@ class EncoderBlock {
                DmlPtr buffer2, DmlPtr ln_scratch, DmlExecScope& scope,
                int encoder_index);
   void EvalMha(int N, DmlPtr in_out_tensor, DmlPtr scratch, DmlPtr buffer1,
-               DmlPtr buffer2, DmlPtr ln_scratch, DmlExecScope& scope);
+               DmlPtr buffer2, DmlPtr ln_scratch, DmlExecScope& scope,
+               int encoder_index);
 
   // MHA weights.
   DmlPtr mha_q_w_, mha_q_b_, mha_k_w_, mha_k_b_;

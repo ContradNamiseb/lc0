@@ -1065,6 +1065,24 @@ if get_option('gtest')
         dependencies: [gtest] + dml_deps),
       args: '--gtest_output=xml:kda_recurrence_directml.xml', timeout: 300)
 
+    # Agora thread 19 DML-5/D2 (codex-sol #724): descriptor-level unit tests
+    # of GraphFactory<float>::ReinterpretView itself. Same standalone
+    # pattern as KdaRecurrenceDirectML above -- the TEST_F cases live inside
+    # layers.cc (see its LC0_DIRECTML_TESTS comment) since GraphFactory has
+    # no external linkage; this target's own source only supplies main().
+    # LC0_DIRECTML_TESTS is scoped to just this target's compile of
+    # layers.cc -- lc0.exe and the other two DirectML test targets above
+    # compile the same file without it, so they never see this code.
+    test('ReinterpretViewDirectML',
+      executable('reinterpretview_test_directml',
+                 'src/neural/backends/directml/test_reinterpretview_directml.cc',
+                 'src/neural/backends/directml/layers.cc', pb_files,
+                 'src/utils/logging.cc',
+        include_directories: includes + include_directories('third_party/directml'),
+        cpp_args: ['-DLC0_DIRECTML_TESTS'],
+        dependencies: [gtest] + dml_deps),
+      args: '--gtest_output=xml:reinterpretview_directml.xml', timeout: 120)
+
     # Whole-network parity vs the BLAS reference, the same harness the SYCL
     # kda_parity_test uses.
     # Sources ('files', like the lc0 executable -- common_files has no

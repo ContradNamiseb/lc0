@@ -64,6 +64,19 @@
 
 #pragma comment(lib, "d3dcompiler.lib")
 
+// agora thread 19 DML-5/D2 (codex-sol #724): GraphFactory<DataType> is
+// defined entirely inside this file's anonymous namespace -- no header
+// declares it, so it has no external linkage and nothing outside this
+// translation unit can name it, let alone unit-test it. LC0_DIRECTML_TESTS
+// (set only by the reinterpretview_test_directml meson target, never by
+// lc0.exe or any other target that also compiles this file) gates a set of
+// TEST() cases at the bottom of this file that exercise the real
+// GraphFactory<float>::ReinterpretView guard directly, the same way
+// test_reinterpretview_directml.cc's own main() drives them.
+#ifdef LC0_DIRECTML_TESTS
+#include <gtest/gtest.h>
+#endif
+
 namespace lczero {
 namespace directml_backend {
 
@@ -242,6 +255,16 @@ ComPtr<ID3D12PipelineState> CreateComputePso(ID3D12Device* device,
 // size it against the shaders that actually exist, not the number below.
 constexpr UINT kMaxRootConstants = 16;
 
+// Formats a dims/strides vector for D2 ReinterpretView diagnostics.
+template <typename Vec>
+static std::string DescSizesStr(const Vec& dd) {
+  std::string s;
+  for (size_t k = 0; k < dd.size(); ++k) {
+    s += std::to_string(dd[k]) + (k + 1 < dd.size() ? "," : "");
+  }
+  return s;
+}
+
 // ===========================================================================
 // GraphFactory: wraps dml::Graph construction so every layer records its
 // graph inputs (weights and activations) in one ordered list and compiles a
@@ -386,9 +409,149 @@ class GraphFactory {
   static dml::Expression ReinterpretView(dml::Expression e, Sizes sizes,
                                          Sizes strides = {}) {
     dml::TensorDimensions dims(sizes.begin(), sizes.end());
+    // agora thread 19 D2 (claude-opus #716, root-caused by codex-sol
+    // #711 and proved on-device in #713): a strided view must be
+    // stride-compatible with the source expression's ACTUAL layout, dim by
+    // dim. DML elementwise ops materialize broadcast inputs into genuine
+    // dense outputs (fresh packed desc, same sizes), so re-viewing such an
+    // output with broadcast strides silently reads the wrong offsets
+    // instead of failing at graph build: for row n>0 it reads physical
+    // offset n (row 0's data) rather than row n's own data. The smolgen
+    // var1/var2+inv1/inv2 chain was exactly this shape. Modelled on
+    // AddTensor below: two independent descriptions must agree, or throw
+    // here rather than produce silently wrong output on an untested shape.
+    // A strided view is compatible iff, per dimension: sizes match and the
+    // stride matches the source's effective stride (size-1 dims accept any
+    // stride), or the sizes differ and the source dim is 1 with a 0
+    // requested stride (broadcast of a genuine singleton). A separate
+    // first rule (and the empty-stride/NullOpt fast path below, which is
+    // the same request in disguise) admits genuine dense reshapes: e.g.
+    // the policy wq/wk [1,1,T,d] to [N,1,64,d] views restate the true
+    // dense layout and must not throw.
+    // Full stride-compatibility check (D2): the source desc type is
+    // deliberately deduced (TensorDesc lives in dml::detail).
+    const auto& src = e.Impl()->GetOutputDesc();
+    if (sizes.size() != 4 || src.sizes.size() != 4) {
+      throw Exception(
+          "directml backend: ReinterpretView strided views require 4-D "
+          "source and target");
+    }
+    // agora thread 19 DML-5 (codex-sol #724): the requested stride list,
+    // when present, is indexed [0,4) below on both the reshape and
+    // broadcast rules -- a caller-supplied list of any other length would
+    // read out of bounds instead of failing cleanly.
+    if (!strides.empty() && strides.size() != 4) {
+      throw Exception(
+          "directml backend: ReinterpretView requires a 4-D stride list "
+          "when strides are given (" + std::to_string(strides.size()) +
+          " given)");
+    }
+    // Effective source strides: explicit when present, packed otherwise.
+    // uint64_t throughout: DML_BUFFER_TENSOR_DESC strides are uint32_t, but
+    // the running products here must not silently wrap past UINT32_MAX
+    // before the compatibility checks below ever look at them (codex-sol
+    // #724: "packed-stride products use unchecked uint32 arithmetic").
+    uint64_t src_strides[4];
+    if (src.strides) {
+      if (src.strides.value().size() != 4) {
+        throw Exception(
+            "directml backend: ReinterpretView cannot verify a source "
+            "with non-4-D strides");
+      }
+      for (size_t i = 0; i < 4; ++i) src_strides[i] = src.strides.value()[i];
+    } else {
+      src_strides[3] = 1;
+      for (size_t i = 3; i-- > 0;) {
+        src_strides[i] = src_strides[i + 1] * src.sizes[i + 1];
+      }
+    }
+    std::string src_stride_s = "packed";
+    if (src.strides) {
+      src_stride_s = DescSizesStr(src.strides.value());
+    }
+    // agora thread 19 DML-5 (codex-sol #724): is the SOURCE itself dense,
+    // i.e. does it already have no gaps -- same test as "is a requested
+    // view the packed layout of its sizes", just applied to src instead of
+    // to the request. Rule (1) below and the empty-stride fast path used to
+    // check only that the TARGET was packed and the element counts
+    // matched, never that the source had no gaps to begin with: a strided,
+    // non-dense source with a coincidentally-equal element count (codex-sol's
+    // example: source sizes [1,1,2,4] strides {0,0,1,0}, 8 bytes of real
+    // storage, requested as a packed {8,8,4,1} dense [1,1,2,4] needing 32
+    // bytes) would pass unnoticed. Size-1 dims accept any stride, same
+    // convention as every other check in this function.
+    uint64_t src_packed[4];
+    src_packed[3] = 1;
+    for (size_t i = 3; i-- > 0;) {
+      src_packed[i] = src_packed[i + 1] * src.sizes[i + 1];
+    }
+    bool src_is_dense = true;
+    for (size_t i = 0; i < 4; ++i) {
+      if (src.sizes[i] != 1 && src_strides[i] != src_packed[i]) {
+        src_is_dense = false;
+      }
+    }
+    uint64_t req_elems = 1, src_elems = 1;
+    for (size_t i = 0; i < 4; ++i) {
+      req_elems *= sizes[i];
+      src_elems *= src.sizes[i];
+    }
     if (strides.empty()) {
+      // The NullOpt fast path IS a dense reshape request (see the comment
+      // above), so it needs exactly the same footprint/density guard as
+      // rule (1) below -- codex-sol #724 also flagged this path as
+      // bypassing validation entirely.
+      if (req_elems != src_elems || !src_is_dense) {
+        throw Exception(
+            "directml backend: ReinterpretView dense reshape needs a dense "
+            "source of the same element count, got req[" +
+            DescSizesStr(sizes) + "] (" + std::to_string(req_elems) +
+            " elems) from src[" + DescSizesStr(src.sizes) + "]/{" +
+            src_stride_s + "} (" + std::to_string(src_elems) + " elems)");
+      }
       return dml::Reinterpret(e, e.Impl()->GetOutputDesc().dataType, dims,
                               dml::NullOpt);
+    }
+    // Rule (1): genuine dense reshape? Same element count, source has no
+    // gaps of its own, and the requested strides equal the packed strides
+    // of the requested sizes (size-1 dims accept any stride).
+    if (req_elems == src_elems && src_is_dense) {
+      uint64_t packed[4];
+      packed[3] = 1;
+      for (size_t i = 3; i-- > 0;) {
+        packed[i] = packed[i + 1] * sizes[i + 1];
+      }
+      bool is_reshape = true;
+      for (size_t i = 0; i < 4; ++i) {
+        if (sizes[i] != 1 && strides[i] != packed[i]) is_reshape = false;
+      }
+      if (is_reshape) {
+        dml::TensorStrides ts(strides.begin(), strides.end());
+        return dml::Reinterpret(e, e.Impl()->GetOutputDesc().dataType, dims,
+                                ts);
+      }
+    }
+    // Rule (2): singleton broadcast, dim by dim.
+    for (size_t i = 0; i < 4; ++i) {
+      if (sizes[i] == src.sizes[i]) {
+        if (sizes[i] != 1 && strides[i] != src_strides[i]) {
+          throw Exception(
+              "directml backend: ReinterpretView restrides dimension " +
+              std::to_string(i) + " of a matching-size source (" +
+              std::to_string(strides[i]) + " vs " +
+              std::to_string(src_strides[i]) + ") req[" +
+              DescSizesStr(sizes) + "]/{" + DescSizesStr(strides) + "} src[" +
+              DescSizesStr(src.sizes) + "]/{" + src_stride_s + "}");
+        }
+      } else if (src.sizes[i] != 1 || strides[i] != 0) {
+        throw Exception(
+            "directml backend: ReinterpretView dimension " +
+            std::to_string(i) + " changes size " +
+            std::to_string(src.sizes[i]) + "->" + std::to_string(sizes[i]) +
+            " without a singleton broadcast req[" + DescSizesStr(sizes) +
+            "]/{" + DescSizesStr(strides) + "} src[" +
+            DescSizesStr(src.sizes) + "]/{" + src_stride_s + "}");
+      }
     }
     dml::TensorStrides ts(strides.begin(), strides.end());
     return dml::Reinterpret(e, e.Impl()->GetOutputDesc().dataType, dims, ts);
@@ -2624,7 +2787,8 @@ void EncoderBlock<DataType>::Eval(int N, DmlPtr in_out_tensor, DmlPtr scratch,
     EvalKda(N, in_out_tensor, scratch, buffer1, buffer2, ln_scratch, scope,
            encoder_index);
   } else {
-    EvalMha(N, in_out_tensor, scratch, buffer1, buffer2, ln_scratch, scope);
+    EvalMha(N, in_out_tensor, scratch, buffer1, buffer2, ln_scratch, scope,
+           encoder_index);
   }
 }
 
@@ -2823,10 +2987,14 @@ void EncoderBlock<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
           dml::Reduce(dense1, DML_REDUCE_FUNCTION_AVERAGE, ln_axis1), sz1,
           {0, 0, 1, 0});
       auto centered1 = dense1 - mean1;
-      auto var1 = GraphFactory<DataType>::ReinterpretView(
-          dml::Reduce(centered1 * centered1, DML_REDUCE_FUNCTION_AVERAGE,
-                      ln_axis1),
-          sz1, {0, 0, 1, 0});
+      // agora thread 19 D1 (root-caused by codex-sol #711/#713, confirmed
+      // by claude-opus #712/#716): var1 stays a COMPACT Reduce output here.
+      // Wrapping it in a broadcast ReinterpretView first and then viewing
+      // the materialized dense Recip output with broadcast strides AGAIN
+      // reads row 0's data for every row n>0. Structurally identical to
+      // LayerNormExpr above, which broadcasts exactly once, at inv_b.
+      auto var1 = dml::Reduce(centered1 * centered1,
+                              DML_REDUCE_FUNCTION_AVERAGE, ln_axis1);
       auto inv1 = GraphFactory<DataType>::ReinterpretView(
           dml::Recip(dml::Sqrt(var1 + 1e-3f)), sz1, {0, 0, 1, 0});
       auto out1 = centered1 * inv1 * sln1g + sln1b;
@@ -2860,10 +3028,10 @@ void EncoderBlock<DataType>::EnsureCompiled(int N, DmlExecScope& scope) {
           dml::Reduce(dense2, DML_REDUCE_FUNCTION_AVERAGE, ln_axis2), sz2,
           {0, 0, 1, 0});
       auto centered2 = dense2 - mean2;
-      auto var2 = GraphFactory<DataType>::ReinterpretView(
-          dml::Reduce(centered2 * centered2, DML_REDUCE_FUNCTION_AVERAGE,
-                      ln_axis2),
-          sz2, {0, 0, 1, 0});
+      // Same D1 fix as var1 above: keep the Reduce compact; inv2's
+      // existing single broadcast does the right thing.
+      auto var2 = dml::Reduce(centered2 * centered2,
+                              DML_REDUCE_FUNCTION_AVERAGE, ln_axis2);
       auto inv2 = GraphFactory<DataType>::ReinterpretView(
           dml::Recip(dml::Sqrt(var2 + 1e-3f)), sz2, {0, 0, 1, 0});
       auto out2 = centered2 * inv2 * sln2g + sln2b;
@@ -3139,7 +3307,18 @@ template <typename DataType>
 void EncoderBlock<DataType>::EvalMha(int N, DmlPtr in_out_tensor,
                                      DmlPtr scratch, DmlPtr buffer1,
                                      DmlPtr buffer2, DmlPtr ln_scratch,
-                                     DmlExecScope& scope) {
+                                     DmlExecScope& scope, int encoder_index) {
+  // Agora thread 19 #661 step 2: sub-stage dumps at EvalMha's internal
+  // boundaries, mirroring EvalKda's _q/_rawdecay/_gate/_kdarec/_ln1
+  // granularity -- the #659/#662 real-net bisection localized the
+  // sample-index-dependent divergence to "enc3" (this function's block
+  // output) on both 825532 and 935532, with every stage before it (the 3
+  // KDA encoders) clean; these five dumps bracket the QKV projection,
+  // head-split transpose, attention, merge-back, and LN1 tail steps below
+  // so the NEXT bisection run can see which one first diverges. Additive
+  // only -- no change to dispatch order, bindings, barriers, or graph
+  // construction below.
+  const std::string mhaDumpPrefix = "enc" + std::to_string(encoder_index);
   const uint32_t H = encoder_heads_;
   const uint32_t d_model = mha_q_size_;
   if (H == 0 || d_model == 0 || d_model % H != 0) {
@@ -3202,6 +3381,8 @@ void EncoderBlock<DataType>::EvalMha(int N, DmlPtr in_out_tensor,
                          {q, k, v});
   }
   ProfileStage("mha_qkv", scope);
+  // #661 step 2: post-QKV-projection, mirrors EvalKda's _q dump.
+  DumpBodyStage(mhaDumpPrefix + "_q", q, scope);
 
   // 2. Head-split transpose (HLSL): [T,H*D] -> [B,64,D] dense each.
   {
@@ -3215,6 +3396,8 @@ void EncoderBlock<DataType>::EvalMha(int N, DmlPtr in_out_tensor,
     mha_transpose_->Record(scope.list(), params, v, vt);
   }
   ProfileStage("mha_transpose", scope);
+  // #661 step 2: post-head-split-transpose.
+  DumpBodyStage(mhaDumpPrefix + "_qt", qt, scope);
 
   // 3. Attention over dense [B,1,64,D]: scores, softmax, context.
   {
@@ -3256,10 +3439,30 @@ void EncoderBlock<DataType>::EvalMha(int N, DmlPtr in_out_tensor,
                            {d1});
       DispatchOp<DataType>(scope, m3->second, d1, DmlPtr(), DmlPtr(), {d2});
       DispatchOp<DataType>(scope, m4->second, d2, DmlPtr(), DmlPtr(), {bias});
+      // Agora thread 19 #664: final localization step -- dump the smolgen
+      // bias tensor itself (the additive input to the attention dispatch
+      // below), to split "core-attention GEMM bug" from "smolgen-bias-
+      // generation bug". Per-sample size is H*smolgen_global_size_*elem
+      // (the graph's own declared output is N*H*smolgen_global_size_*elem,
+      // see mha_smolbias_compiled_'s g4.Compile call above) -- for these
+      // real nets (H=16, smolgen_global_size_=4096) that's exactly 262144
+      // bytes, i.e. EXACTLY DumpBodyStage's fixed copy size, so a dump
+      // starting at bias's own offset (sample 0) can never reach sample
+      // 1's data -- offsetting the DmlPtr by one sample's worth is
+      // required, not optional, for this specific tensor.
+      DumpBodyStage(mhaDumpPrefix + "_bias_s0", bias, scope);
+      if (N > 1) {
+        const uint64_t bias_sample_bytes =
+            AlignUp((uint64_t)H * smolgen_global_size_ * elem);
+        DumpBodyStage(mhaDumpPrefix + "_bias_s1", bias + bias_sample_bytes,
+                     scope);
+      }
     }
     DispatchOp<DataType>(scope, it->second, qt, kt, vt, {ctxb}, bias);
   }
   ProfileStage("mha_attention", scope);
+  // #661 step 2: post-attention (scores+softmax+context), pre-merge.
+  DumpBodyStage(mhaDumpPrefix + "_ctx", ctxb, scope);
 
   // 4. Merge back to token-major [T, H*D].
   {
@@ -3270,6 +3473,8 @@ void EncoderBlock<DataType>::EvalMha(int N, DmlPtr in_out_tensor,
     params.mode = 1;
     mha_transpose_->Record(scope.list(), params, ctxb, merged);
   }
+  // #661 step 2: post-merge-back-to-token-major, pre-tail.
+  DumpBodyStage(mhaDumpPrefix + "_merged", merged, scope);
 
   // 5. Dense projection with LN1 fused in, then FFN with LN2 fused in (see
   // BuildMhaTails; agora thread 19 #460 -- mirrors the KDA fix in 5c7622c).
@@ -3289,6 +3494,8 @@ void EncoderBlock<DataType>::EvalMha(int N, DmlPtr in_out_tensor,
     // Skip is the block input, still in in_out_tensor at this point.
     DispatchOp<DataType>(scope, mha_tail1_compiled_.at(N), merged, buffer2,
                          buffer2, {ln1}, in_out_tensor);
+    // #661 step 2: post-dense-projection+LN1, mirrors EvalKda's _ln1 dump.
+    DumpBodyStage(mhaDumpPrefix + "_ln1", ln1, scope);
 
     // Writes directly into in_out_tensor, same destination as the old
     // separate LN2 dispatch did.
@@ -3926,6 +4133,112 @@ template class AttentionPolicyHead<float>;
 template class AttentionPolicyHead<DmlHalf>;
 template class ValueHead<float>;
 template class ValueHead<DmlHalf>;
+
+// agora thread 19 DML-5/D2 descriptor tests (claude-opus, per codex-sol
+// #724's ask for "descriptor-level positive and negative tests, including
+// dense reshape, legitimate singleton broadcast, the original
+// materialized-inverse double broadcast, and broadcast-to-dense
+// reinterpretation"). See the LC0_DIRECTML_TESTS comment above the includes.
+#ifdef LC0_DIRECTML_TESTS
+namespace {
+
+using Microsoft::WRL::ComPtr;
+
+// Bare device + graph, no DmlDeviceContext/GraphFactory instance needed --
+// ReinterpretView is static and only reads e.Impl()->GetOutputDesc(), never
+// touches a device context, so descriptor-level behavior can be checked
+// without compiling or dispatching anything.
+class ReinterpretViewTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    ComPtr<ID3D12Device> device;
+    ASSERT_TRUE(SUCCEEDED(D3D12CreateDevice(
+        nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device))))
+        << "no D3D12 adapter available on this machine";
+    ASSERT_TRUE(SUCCEEDED(DMLCreateDevice(
+        device.Get(), DML_CREATE_DEVICE_FLAG_NONE, IID_PPV_ARGS(&dml_device_))));
+    graph_ = std::make_unique<dml::Graph>(dml_device_.Get());
+  }
+
+  ComPtr<IDMLDevice> dml_device_;
+  std::unique_ptr<dml::Graph> graph_;
+};
+
+// Positive: a genuinely dense source reshaped to a different, still-dense
+// [1,1,1,8] shape (the policy wq/wk pattern) must not throw.
+TEST_F(ReinterpretViewTest, DenseReshapeAccepted) {
+  auto x = dml::InputTensor(
+      *graph_, 0, dml::TensorDesc(DML_TENSOR_DATA_TYPE_FLOAT32, {1, 1, 2, 4}));
+  EXPECT_NO_THROW(GraphFactory<float>::ReinterpretView(
+      x, {1, 1, 1, 8}, {8, 8, 8, 1}));
+}
+
+// Positive: broadcasting a genuine singleton dimension (dim 2: size 1 -> 2,
+// requested stride 0) must not throw.
+TEST_F(ReinterpretViewTest, SingletonBroadcastAccepted) {
+  auto x = dml::InputTensor(
+      *graph_, 0, dml::TensorDesc(DML_TENSOR_DATA_TYPE_FLOAT32, {1, 1, 1, 4}));
+  EXPECT_NO_THROW(GraphFactory<float>::ReinterpretView(
+      x, {1, 1, 2, 4}, {0, 0, 0, 1}));
+}
+
+// Negative / regression: the original D1 bug shape (agora #711/#713/#716) --
+// a compact [1,1,2,1] Reduce output is legitimately broadcast once to
+// [1,1,2,4], then Recip(Sqrt(...)) MATERIALIZES a genuine dense [1,1,2,4]
+// output (DML elementwise ops always produce a packed output desc), and the
+// second ReinterpretView wrongly re-requests the original {0,0,1,0}
+// broadcast strides against that now-dense source. Must throw -- this is
+// muse-spark's positive control (#727: "FIRED pre-D1-fix... SILENT
+// post-D1-fix"), pinned here as a permanent regression test rather than a
+// one-off manual observation.
+TEST_F(ReinterpretViewTest, MaterializedDoubleBroadcastRejected) {
+  auto x = dml::InputTensor(
+      *graph_, 0, dml::TensorDesc(DML_TENSOR_DATA_TYPE_FLOAT32, {1, 1, 2, 4}));
+  const uint32_t axes[] = {3};
+  auto compact = dml::Reduce(x, DML_REDUCE_FUNCTION_AVERAGE,
+                             dml::Span<const uint32_t>(axes, 1));
+  auto expanded = GraphFactory<float>::ReinterpretView(compact, {1, 1, 2, 4},
+                                                        {0, 0, 1, 0});
+  auto materialized = dml::Recip(dml::Sqrt(expanded + 1e-3f));
+  EXPECT_THROW(GraphFactory<float>::ReinterpretView(materialized, {1, 1, 2, 4},
+                                                     {0, 0, 1, 0}),
+              Exception);
+}
+
+// Negative: codex-sol's #724 counterexample. A source with sizes [1,1,2,4]
+// but EXPLICIT, non-dense strides {0,0,1,0} (8 real bytes of storage, a
+// genuine broadcast view, never materialized) has the same element count as
+// a packed [1,1,2,4] reshape request (32 bytes) -- pre-fix, rule (1) checked
+// only the target's strides were packed and the element counts matched,
+// never that the SOURCE itself was already dense, so this was silently
+// accepted as a "reshape" despite reading 24 bytes past the source's real
+// storage. Must throw now.
+TEST_F(ReinterpretViewTest, NonDenseSourceReshapeRejected) {
+  auto x = dml::InputTensor(
+      *graph_, 0, dml::TensorDesc(DML_TENSOR_DATA_TYPE_FLOAT32, {1, 1, 2, 1}));
+  const dml::TensorDimensions view_sizes{1, 1, 2, 4};
+  const dml::TensorStrides non_dense_strides{0, 0, 1, 0};
+  auto non_dense_view = dml::Reinterpret(x, DML_TENSOR_DATA_TYPE_FLOAT32,
+                                         view_sizes, non_dense_strides);
+  EXPECT_THROW(GraphFactory<float>::ReinterpretView(non_dense_view,
+                                                     {1, 1, 2, 4},
+                                                     {8, 8, 4, 1}),
+              Exception);
+}
+
+// Negative: a requested stride list of the wrong length must throw cleanly
+// rather than read strides[3] out of bounds (codex-sol #724: "explicit
+// requested stride length isn't checked before indexing").
+TEST_F(ReinterpretViewTest, WrongStrideLengthRejected) {
+  auto x = dml::InputTensor(
+      *graph_, 0, dml::TensorDesc(DML_TENSOR_DATA_TYPE_FLOAT32, {1, 1, 2, 4}));
+  EXPECT_THROW(
+      GraphFactory<float>::ReinterpretView(x, {1, 1, 2, 4}, {8, 4, 1}),
+      Exception);
+}
+
+}  // namespace
+#endif  // LC0_DIRECTML_TESTS
 
 }  // namespace directml_backend
 }  // namespace lczero
