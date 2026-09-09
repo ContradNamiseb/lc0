@@ -43,6 +43,15 @@ jobs:
               - 'src/neural/onnx/**'
             openvino:
               - 'src/neural/backends/openvino/**'
+              # The OpenVINO backend depends on the ONNX converter, the KDA
+              # direction helper/proto, and the build definitions -- changes
+              # there must gate its build too, not just backend-local edits.
+              - 'src/neural/onnx/**'
+              - 'src/neural/kda_directions.h'
+              - 'proto/**'
+              - 'meson.build'
+              - 'meson_options.txt'
+              - '.github/workflows/openvino.yml'
             common_files:
               # Engine files
               - 'src/engine.cc'

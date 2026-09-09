@@ -70,7 +70,23 @@ jobs:
           cd build
           # The CI runner has no Intel GPU; device=CPU exercises the ONNX
           # conversion + graph compilation path end to end.
-          ./lc0 backend=openvino,device=CPU,weights=T79.pb.gz --benchmark
+          # NOTE: `lc0 <backendopts> --benchmark` is NOT a valid invocation
+          # (main.cc dispatches on the first positional mode; unknown args
+          # print help and exit 0 -- a false-green gate). Use the
+          # backendbench mode and require positive evidence of inference.
+          ./lc0 backendbench --backend=openvino --backend-opts=device=CPU \
+            --weights=T79.pb.gz --start-batch-size=1 --max-batch-size=1 \
+            --batches=2 2>&1 | tee openvino-smoke.log
+          # Negative sentinels: an invalid CLI, a missing net, an
+          # unavailable backend, or an all-skipped run must fail here --
+          # none of them may masquerade as a green gate.
+          grep -q 'Unknown command line argument' openvino-smoke.log && \
+            { echo 'SMOKE FAIL: CLI rejected (false-green shape)'; exit 1; } || true
+          grep -q '^size, mean nps' openvino-smoke.log || \
+            { echo 'SMOKE FAIL: no result header -- backend produced no measurements'; exit 1; }
+          grep -Eq '^ +1,' openvino-smoke.log || \
+            { echo 'SMOKE FAIL: no batch-1 data row -- no inference ran'; exit 1; }
+          echo 'OpenVINO smoke: inference evidence present.'
       - name: Upload a Build Artifact
         if: success()
         uses: actions/upload-artifact@v4.4.3
