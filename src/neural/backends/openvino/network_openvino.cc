@@ -33,6 +33,7 @@
 // ReplaceKdaScan).
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cassert>
 #include <cstdint>
@@ -118,7 +119,18 @@ struct CachedOutputPorts {
 class OpenVinoNetwork : public Network {
  public:
   OpenVinoNetwork(const WeightsFile& weights, const OptionsDict& options);
-  ~OpenVinoNetwork() override { if (profile_) DumpProfile(); }
+  ~OpenVinoNetwork() override {
+    if (profile_) DumpProfile();
+    // Best-effort removal of this instance's config directory (may hold
+    // nothing on the CPU path, which never writes custom-layer files).
+    // Destructors must not throw; failures leave temp files behind, which
+    // is untidy but never incorrect -- the unique name guarantees no one
+    // else can be using them.
+    if (!config_dir_.empty()) {
+      std::error_code ec;
+      std::filesystem::remove_all(config_dir_, ec);
+    }
+  }
 
   const NetworkCapabilities& GetCapabilities() const override {
     return capabilities_;
@@ -176,6 +188,8 @@ class OpenVinoNetwork : public Network {
   }
   int min_batch() const { return min_batch_; }
   bool is_ir_model() const { return is_ir_model_; }
+  // Test seam: this instance's private config directory, as a string.
+  const std::string& config_dir() const { return config_dir_string_; }
 
   // Rounds an inference batch up to the next warmed bucket.
   //
@@ -237,6 +251,14 @@ class OpenVinoNetwork : public Network {
   // than this many positions, padding the batch out instead. There
   // it is about output variance on tiny batches; here it also keeps
   // the GPU plugin off the degenerate small-batch path.
+  // This instance's private config directory (unique per instance, see
+  // MakeInstanceConfigDir): created once in the constructor, passed to
+  // every config writer below, removed best-effort at teardown. Always
+  // created, even on paths that end up writing nothing into it, so
+  // concurrent construction is testable without a GPU. The string copy
+  // exists so tests can read the path without touching std::filesystem.
+  std::filesystem::path config_dir_;
+  std::string config_dir_string_;
   int min_batch_ = 4;
   // Ascending batch shapes the search is allowed to use, and which warmup
   // pre-compiles. Empty means "no bucketing" -- see BucketBatch().
@@ -398,7 +420,7 @@ std::uint32_t ProcessId() {
 #endif
 }
 
-// The per-process temp directory both WriteKdaScanGpuConfig and
+// The per-INSTANCE temp directory both WriteKdaScanGpuConfig and
 // WriteSEResidualGpuConfig write their .cl sources into, and where the
 // single merged CONFIG_FILE ends up. OpenVINO's GPU plugin loads multiple
 // custom ops from one CONFIG_FILE as sibling <CustomLayer> elements with no
@@ -409,17 +431,25 @@ std::uint32_t ProcessId() {
 // below), which is why all of this shares one directory rather than each op
 // getting its own.
 //
-// The directory is keyed on the process id: the merged XML embeds this net's
-// KDA/SE geometry as -D defines and is rewritten (truncating whatever is
-// there) on every backend load, so a fixed shared path would let two
-// concurrent lc0 processes converting different nets -- match play,
-// selfplay workers, lc0 plus a benchmark -- race on one file, and the loser
-// would compile the winner's geometry with nothing logged. The .cl sources
-// are net-independent, so only the XML needs this protection.
-std::filesystem::path CustomLayerConfigDir() {
+// The directory is unique per model instance, not just per process: the
+// merged XML embeds this net's KDA/SE geometry as -D defines and is
+// rewritten (truncating whatever is there) on every backend load, so two
+// model instances alive in one process (A/B evaluation, network_check
+// dual-backend comparison, concurrent constructors) would otherwise race --
+// A writes A's XML, B truncates it with B's XML, A compiles B's geometry
+// with nothing logged. The PID key keeps concurrent PROCESSES apart (match
+// play, selfplay workers, lc0 plus a benchmark); the per-instance sequence
+// number below keeps concurrent INSTANCES in one process apart. The .cl
+// sources are net-independent, so only the XML needed this protection, but
+// the whole directory is per-instance so cleanup is unambiguous.
+// Each OpenVinoNetwork creates its directory once (member config_dir_)
+// and removes it best-effort at teardown; see the destructor.
+std::filesystem::path MakeInstanceConfigDir() {
   namespace fs = std::filesystem;
+  static std::atomic<unsigned> instance_seq{0};
   fs::path dir = fs::temp_directory_path() /
-                 ("lc0_openvino_" + std::to_string(ProcessId()));
+                 ("lc0_openvino_" + std::to_string(ProcessId()) + "_" +
+                  std::to_string(instance_seq.fetch_add(1)));
   std::error_code ec;
   fs::create_directories(dir, ec);
   if (ec) {
@@ -431,18 +461,25 @@ std::filesystem::path CustomLayerConfigDir() {
 
 // Writes the merged CONFIG_FILE from however many <CustomLayer> fragments
 // were generated (one KdaScanOp fragment, one SEResidualOp fragment, both,
-// or neither). Must be called before compile_model().
+// or neither) into the caller's instance directory. Must be called before
+// compile_model().
 std::filesystem::path WriteMergedGpuConfig(
+    const std::filesystem::path& dir,
     const std::vector<std::string>& fragments) {
   namespace fs = std::filesystem;
-  fs::path xml_path = CustomLayerConfigDir() / "lc0_custom_layers.xml";
+  fs::path xml_path = dir / "lc0_custom_layers.xml";
   std::ofstream xml(xml_path, std::ios::trunc);
   if (!xml) {
     throw Exception("OpenVINO: could not write custom-layer config to '" +
                     xml_path.string() + "'.");
   }
   for (const auto& fragment : fragments) xml << fragment;
+  xml.flush();
   xml.close();
+  if (!xml) {
+    throw Exception("OpenVINO: failed writing custom-layer config to '" +
+                    xml_path.string() + "' (flush/close reported an error).");
+  }
   return xml_path;
 }
 
@@ -451,10 +488,11 @@ std::filesystem::path WriteMergedGpuConfig(
 // different net shapes, so the kernel is JIT-compiled per model rather than
 // shipped pre-built), and returns its <CustomLayer> XML fragment for
 // WriteMergedGpuConfig to concatenate alongside any other custom op's.
-std::string WriteKdaScanGpuConfig(int heads, int key_dim, int value_dim,
-                                  int direction_count,
-                                  const std::vector<int>& directions,
-                                  bool fp16) {
+std::string WriteKdaScanGpuConfig(const std::filesystem::path& dir, int heads,
+                                   int key_dim, int value_dim,
+                                   int direction_count,
+                                   const std::vector<int>& directions,
+                                   bool fp16) {
   namespace fs = std::filesystem;
   // The kernel launches with a work-group VALUE_DIM_ wide (WorkSizes
   // local="1,X,1" below), which must fit CL_KERNEL_WORK_GROUP_SIZE --
@@ -468,7 +506,6 @@ std::string WriteKdaScanGpuConfig(int heads, int key_dim, int value_dim,
         " exceeds the " + std::to_string(kMaxWorkgroupWidth) +
         "-wide work-group this GPU kernel launches with.");
   }
-  fs::path dir = CustomLayerConfigDir();
 
   fs::path cl_path = dir / "kda_scan.cl";
   std::ofstream cl(cl_path, std::ios::trunc);
@@ -492,7 +529,12 @@ std::string WriteKdaScanGpuConfig(int heads, int key_dim, int value_dim,
   }
   cl << "};\n\n";
   cl << kKdaScanKernelSource;
+  cl.flush();
   cl.close();
+  if (!cl) {
+    throw Exception("OpenVINO: failed writing KDA kernel source to '" +
+                    cl_path.string() + "' (flush/close reported an error).");
+  }
 
   std::string dir_list_str;
   for (size_t i = 0; i < directions.size(); ++i) {
@@ -542,9 +584,10 @@ std::string WriteKdaScanGpuConfig(int heads, int key_dim, int value_dim,
 // se_filters are static per net (uniform across every residual block in an
 // lc0 resnet tower), so -- like KdaScanOp -- exactly one compiled kernel
 // covers every SEResidualOp instance in the model.
-std::string WriteSEResidualGpuConfig(int channels, int se_filters,
-                                     SEResidualOp::Activation activation,
-                                     bool fp16) {
+std::string WriteSEResidualGpuConfig(const std::filesystem::path& dir,
+                                      int channels, int se_filters,
+                                      SEResidualOp::Activation activation,
+                                      bool fp16) {
   namespace fs = std::filesystem;
   // Same work-group-width limit as the KDA kernel (local="1,F,1" with
   // F = channels).
@@ -555,7 +598,6 @@ std::string WriteSEResidualGpuConfig(int channels, int se_filters,
         " exceeds the " + std::to_string(kMaxWorkgroupWidth) +
         "-wide work-group this GPU kernel launches with.");
   }
-  fs::path dir = CustomLayerConfigDir();
 
   fs::path cl_path = dir / "se_residual.cl";
   std::ofstream cl(cl_path, std::ios::trunc);
@@ -564,7 +606,12 @@ std::string WriteSEResidualGpuConfig(int channels, int se_filters,
                     cl_path.string() + "'.");
   }
   cl << kSEResidualKernelSource;
+  cl.flush();
   cl.close();
+  if (!cl) {
+    throw Exception("OpenVINO: failed writing SE kernel source to '" +
+                    cl_path.string() + "' (flush/close reported an error).");
+  }
 
   std::string dtype_str = fp16 ? "half" : "float";
 
@@ -620,6 +667,12 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
   // up by doubling until they reach kMaxBatchSize, which 0 never does.
   min_batch_ = std::clamp(requested_min_batch, 1, kMaxBatchSize);
   is_cpu_ = is_cpu_device;
+  // Claim this instance's private config directory up front (unique per
+  // instance even within one process -- see MakeInstanceConfigDir), so every
+  // config writer below shares one directory that no other live instance
+  // can name.
+  config_dir_ = MakeInstanceConfigDir();
+  config_dir_string_ = config_dir_.string();
 
   const auto& format = weights.format().network_format();
   capabilities_.input_format = format.input();
@@ -932,9 +985,9 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
         // With kda_safe the scan's tensors stay f32, so the kernel must be
         // compiled to read f32 -- half would misinterpret every buffer.
         config_fragments.push_back(WriteKdaScanGpuConfig(
-            first_kda->heads(), first_kda->key_dim(), first_kda->value_dim(),
-            first_kda->direction_count(), first_kda->directions(),
-            want_fp16 && !kda_safe));
+            config_dir_, first_kda->heads(), first_kda->key_dim(),
+            first_kda->value_dim(), first_kda->direction_count(),
+            first_kda->directions(), want_fp16 && !kda_safe));
       }
 
       std::shared_ptr<SEResidualOp> first_se;
@@ -957,12 +1010,12 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
       }
       if (first_se) {
         config_fragments.push_back(WriteSEResidualGpuConfig(
-            first_se->channels(), first_se->se_filters(),
+            config_dir_, first_se->channels(), first_se->se_filters(),
             first_se->activation(), want_fp16));
       }
       if (!config_fragments.empty()) {
         device_config["CONFIG_FILE"] =
-            WriteMergedGpuConfig(config_fragments).string();
+            WriteMergedGpuConfig(config_dir_, config_fragments).string();
         // This model carries a per-shape-JIT'd custom layer, so confine the
         // search to a fixed ladder of batch shapes. Powers of two above
         // min_batch: few enough to warm in one startup pass, and since lc0's

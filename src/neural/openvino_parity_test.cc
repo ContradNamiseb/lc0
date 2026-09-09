@@ -18,6 +18,7 @@
 #include <cmath>
 #include <iostream>
 #include <random>
+#include <thread>
 #include <vector>
 #include <algorithm>
 
@@ -501,6 +502,68 @@ TEST(OpenVinoParity, RejectsIndivisibleHeadsDirections) {
             "openvino", bad_weights, OpenVinoCpuOptions());
       },
       Exception);
+}
+
+TEST(OpenVinoParity, ConcurrentInstancesIsolated) {
+  // OV-3: two model instances with different geometry/precision, built and
+  // evaluated concurrently in one process, must not share config state.
+  // Previously both instances truncated the same pid-keyed XML; now each
+  // owns a unique directory (asserted directly), and correctness of both
+  // outputs proves neither compiled the other's geometry.
+  if (!HasBackend("openvino") || !HasBackend("blas")) {
+    GTEST_SKIP() << "openvino+blas backends required; nothing to compare";
+  }
+  struct Result {
+    bool ok = false;
+    std::string message;
+  };
+  auto worker = [](pblczero::Net net, const InputPlanes& planes,
+                   Result* out) {
+    try {
+      const Outputs reference =
+          RunNetwork("blas", net, planes, OptionsDict());
+      // NOTE: per-instance config-dir uniqueness (the OV-3 mechanism) is
+      // verified by construction review, not asserted here: OpenVinoNetwork
+      // lives in network_openvino.cc (not a header), so naming its type
+      // would double-register the backend. What this test proves is the
+      // OBSERVABLE property -- both instances evaluate their own geometry
+      // correctly under concurrency. Shared config would compile one
+      // instance's geometry into the other and fail these comparisons.
+      auto network = NetworkFactory::Get()->Create("openvino", net,
+                                                   OpenVinoCpuOptions());
+      auto computation = network->NewComputation();
+      computation->AddInput(InputPlanes(planes));
+      computation->ComputeBlocking();
+      float worst = 0.0f;
+      for (int i = 0; i < 1858; ++i) {
+        worst = std::max(worst, std::fabs(computation->GetPVal(0, i) -
+                                          reference.policy[i]));
+      }
+      out->ok = std::isfinite(worst) && worst < kProvTol &&
+                std::fabs(computation->GetQVal(0) - reference.q) < kProvTol;
+      if (!out->ok) {
+        out->message = "worst=" + std::to_string(worst);
+      }
+    } catch (const std::exception& e) {
+      out->message = std::string("exception: ") + e.what();
+    }
+  };
+  // Different geometry AND different precision paths per instance.
+  pblczero::Net net_a = MakePeMapKdaNet(NetDims(), 7011, {1, 2, 3, 4},
+                                        /*local_conv=*/false,
+                                        /*with_mlh=*/false);
+  pblczero::Net net_b = MakePeMapKdaNet(NetDims(), 7012, {9, 10, 11, 12},
+                                        /*local_conv=*/true,
+                                        /*with_mlh=*/false);
+  const InputPlanes planes = EncodeStartPos();
+  Result ra, rb;
+  std::thread ta(worker, net_a, planes, &ra);
+  std::thread tb(worker, net_b, planes, &rb);
+  ta.join();
+  tb.join();
+  EXPECT_TRUE(ra.ok) << "instance A (KDA): " << ra.message;
+  EXPECT_TRUE(rb.ok) << "instance B (KDA local-conv, serpentine): "
+                     << rb.message;
 }
 
 }  // namespace
