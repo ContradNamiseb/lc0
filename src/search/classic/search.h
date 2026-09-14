@@ -28,6 +28,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <optional>
@@ -44,7 +45,7 @@
 #include "utils/logging.h"
 #include "utils/mutex.h"
 #include "utils/spinhelper.h"
-#include <atomic>
+#include "utils/task_stealing_pool.h"
 
 namespace lczero {
 namespace classic {
@@ -226,9 +227,26 @@ class SearchWorker {
             std::thread::hardware_concurrency() / working_threads - 1, 4U);
       }
     }
-    for (int i = 0; i < task_workers_; i++) {
-      task_workspaces_.emplace_back();
-      task_threads_.emplace_back([this, i]() { this->RunTasks(i); });
+    if (task_workers_ > 0) {
+      for (int i = 0; i < task_workers_; i++) {
+        task_workspaces_.emplace_back();
+      }
+      task_pool_ = std::make_unique<TaskStealingPool<PickTask>>(
+          task_workers_, [this](PickTask& task, int tid) {
+            switch (task.task_type) {
+              case PickTask::kGathering:
+                PickNodesToExtendTask(task.start, task.base_depth,
+                                      task.collision_limit, task.moves_to_base,
+                                      &(task.results),
+                                      &(task_workspaces_[tid]));
+                break;
+              case PickTask::kProcessing:
+                ProcessPickedTask(task.start_idx, task.end_idx,
+                                  &(task_workspaces_[tid]));
+                break;
+            }
+            task.complete = true;
+          });
     }
     target_minibatch_size_ = params_.GetMiniBatchSize();
     if (target_minibatch_size_ == 0) {
@@ -241,14 +259,8 @@ class SearchWorker {
   }
 
   ~SearchWorker() {
-    {
-      task_count_.store(-1, std::memory_order_release);
-      Mutex::Lock lock(picking_tasks_mutex_);
-      exiting_ = true;
-      task_added_.notify_all();
-    }
-    for (size_t i = 0; i < task_threads_.size(); i++) {
-      task_threads_[i].join();
+    if (task_pool_) {
+      task_pool_->Shutdown();
     }
   }
 
@@ -353,25 +365,42 @@ class SearchWorker {
           is_collision(is_collision) {}
   };
 
-  // Helper struct to hold cached data during the traversal.
-  struct CachedNodeData {
-    std::array<Node::Iterator, 256> cur_iters; // Current iterations cache.
-    std::array<float, 256> policy_cache{};
-    std::array<float, 256> utility_cache{};    // Q + M-utility
-    std::array<float, 256> uct_score_cache{};
-    std::array<int,   256> n_started_cache{};
-    std::vector<int> vtp_last_filled_cache{};  // indices we have filled
-    float puct_mult = 0.0f;                    // cpuct * sqrt(parent_visits)
-    int   cache_filled_idx = -1;              // highest index we have filled
-    int   max_policy_entries_needed = 0;       // how many children we consider
-    int   collision_limit_for_level = 0;       // visits allocated to this node
-    
-    CachedNodeData() { // forces value-init on all 256 iterators 
-       vtp_last_filled_cache.reserve(30);
-    }
+  struct ChildCache {
+    Node::Iterator iter;
+    float policy = 0.0f;
+    float utility = 0.0f;
+    float uct_score = 0.0f;
+    int n_started = 0;
+  };
 
-    // Remove this line completely:
-    // Node::Iterator current_edge_iterator;   // Dangling danger!
+  // A lightweight, cache-friendly vector replacement
+  struct InlineDepthStack {
+    int count = 0;
+    std::array<int, 256> data{};  // 256 plies deep should be plenty for MCTS
+
+    void clear() { count = 0; }
+    void push_back(int val) { data[count++] = val; }
+    void pop_back() {
+      if (count > 0) count--;
+    }
+    int& back() { return data[count - 1]; }
+  };
+
+  // Helper struct to hold cached data during the traversal.
+  struct alignas(64) CachedNodeData {
+    // 1. Hot scalars (fits into the 1st 64-byte chunk)
+    float puct_mult = 0.0f;
+    int cache_filled_idx = -1;
+    int max_policy_entries_needed = 0;
+    int collision_limit_for_level = 0;
+
+    // 2. Inline Depth Stack
+    InlineDepthStack vtp_last_filled_cache;
+
+    // 3. Packed Array of Structures
+    std::array<ChildCache, 256> children{};
+
+    CachedNodeData() = default;
   };
 
   struct TaskWorkspace {
@@ -379,22 +408,22 @@ class SearchWorker {
     // std::vector<CachedNodeData> cached_data;
     std::vector<std::unique_ptr<std::array<int, 256>>> vtp_buffer;
     std::vector<std::unique_ptr<std::array<int, 256>>> visits_to_perform;
-    
-    std::vector<int> current_path;     // which child index we took at each level
+
+    std::vector<int> current_path;  // which child index we took at each level
     std::vector<Move> moves_to_path;
     PositionHistory history;
 
     TaskWorkspace() {
-        //cached_data.reserve(30);
-        vtp_buffer.reserve(30);
-        visits_to_perform.reserve(30);
-        current_path.reserve(30);
-        moves_to_path.reserve(30);
-        history.Reserve(30);
+      // cached_data.reserve(30);
+      vtp_buffer.reserve(30);
+      visits_to_perform.reserve(30);
+      current_path.reserve(30);
+      moves_to_path.reserve(30);
+      history.Reserve(30);
     }
   };
-  
-  struct alignas(64) PickTask {
+
+  struct PickTask {
     enum PickTaskType { kGathering, kProcessing };
     PickTaskType task_type;
 
@@ -420,6 +449,7 @@ class SearchWorker {
           moves_to_base(base_moves) {}
     PickTask(int start_idx, int end_idx)
         : task_type(kProcessing), start_idx(start_idx), end_idx(end_idx) {}
+    PickTask() = default;
   };
 
   NodeToProcess PickNodeToExtend(int collision_limit);
@@ -440,10 +470,6 @@ class SearchWorker {
   void ExtendNode(Node* node, int depth, const std::vector<Move>& moves_to_add,
                   PositionHistory* history);
   void FetchSingleNodeResult(NodeToProcess* node_to_process);
-  void RunTasks(int tid);
-  void ResetTasks();
-  // Returns how many tasks there were.
-  int WaitForTasks();
 
   Search* const search_;
   // List of nodes to process.
@@ -460,22 +486,13 @@ class SearchWorker {
   IterationStats iteration_stats_;
   StoppersHints latest_time_manager_hints_;
 
-  // Multigather task related fields.
-
-  // Task management.
-  Mutex picking_tasks_mutex_;
-  std::vector<PickTask> picking_tasks_;
-  std::condition_variable task_added_;
-  std::vector<std::thread> task_threads_;
+  // Task-stealing pool and workspaces.
+  std::unique_ptr<TaskStealingPool<PickTask>> task_pool_;
   std::vector<TaskWorkspace> task_workspaces_;
   TaskWorkspace main_workspace_;
-  std::atomic<bool> exiting_{false};
 
-  // Padded atomic counters to avoid false sharing.
-  alignas(64) std::atomic<int> task_count_{-1};
-  alignas(64) std::atomic<int> task_taking_started_{0};
-  alignas(64) std::atomic<int> tasks_taken_{0};
-  alignas(64) std::atomic<int> completed_tasks_{0};
+  // Mutex for two-fold draw correction (used by task workers).
+  Mutex twofold_mutex_;
 };
 
 }  // namespace classic
