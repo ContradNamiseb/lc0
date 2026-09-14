@@ -163,7 +163,9 @@ class Node {
   // Returns sum of policy priors which have had at least one playout.
   float GetVisitedPolicy() const;
   uint32_t GetN() const { return n_.load(std::memory_order_relaxed); }
-  uint32_t GetNInFlight() const { return n_in_flight_.load(std::memory_order_relaxed); }
+  uint32_t GetNInFlight() const {
+    return n_in_flight_.load(std::memory_order_relaxed);
+  }
   uint32_t GetChildrenVisits() const {
     uint32_t n = n_.load(std::memory_order_relaxed);
     return n > 0 ? n - 1 : 0;
@@ -189,11 +191,24 @@ class Node {
   uint8_t GetNumEdges() const { return num_edges_; }
 
   // Output must point to at least max_needed floats.
-  void CopyPolicy(int max_needed, float* output) const {
+  void CopyPolicy(int max_needed, float* output,
+                  size_t stride = sizeof(float)) const {
     if (!edges_) return;
     int loops = std::min(static_cast<int>(num_edges_), max_needed);
-    for (int i = 0; i < loops; i++) {
-      output[i] = edges_[i].GetP();
+
+    if (stride == sizeof(float)) {
+      // Fast path: contiguous memory — compiler can auto-vectorize with
+      // SSE/AVX.
+      for (int i = 0; i < loops; i++) {
+        output[i] = edges_[i].GetP();
+      }
+    } else {
+      // Strided path: fallback for non-standard layouts.
+      char* current_byte = reinterpret_cast<char*>(output);
+      for (int i = 0; i < loops; i++) {
+        *reinterpret_cast<float*>(current_byte) = edges_[i].GetP();
+        current_byte += stride;
+      }
     }
   }
 
