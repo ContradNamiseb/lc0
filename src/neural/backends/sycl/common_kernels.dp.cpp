@@ -483,29 +483,9 @@ void convertNCHWtoNHWC(DstType* output_tensor, const SrcType* input_tensor,
       });
 }
 
-template <typename DstType, typename SrcType>
-void copyTypeConverted_kernel(DstType* op, SrcType* ip, int N,
-                              const sycl::nd_item<3> &item_ct1) {
-  int tid = item_ct1.get_group(2) * item_ct1.get_local_range(2) +
-            item_ct1.get_local_id(2);
-
-  if (tid >= N) return;
-
-  DstType el = (DstType)ip[tid];
-  op[tid] = el;
-}
-
-template <typename DstType, typename SrcType>
-void copyTypeConverted(DstType* op, SrcType* ip, int N, sycl::queue &sycl_queue) {
-  const int kBlockSize = 256;
-  int blocks = DivUp(N, kBlockSize);
-  sycl_queue.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) *
-                                             sycl::range<3>(1, 1, kBlockSize),
-                                         sycl::range<3>(1, 1, kBlockSize)),
-                       [=](sycl::nd_item<3> item_ct1) {
-                         copyTypeConverted_kernel(op, ip, N, item_ct1);
-                       });
-}
+// copyTypeConverted and its kernel are now defined inline in kernels.h --
+// see the comment there for why (cross-TU explicit-instantiation of this
+// kernel was dropping it from the linked device image on this toolchain).
 
 template <typename T>
 void batchNorm_kernel(T* output, const T* input, const T* skipInput,
@@ -1751,10 +1731,8 @@ void genOffsetPointers(T** offsets, int heads, int max_batch, int depth,
 }
 
 // Template instantiation.
-template void copyTypeConverted<sycl::half, float>(sycl::half* op, float* ip, int N, sycl::queue &sycl_queue);
-template void copyTypeConverted<float, sycl::half>(float* op, sycl::half* ip, int N, sycl::queue &sycl_queue);
-template void copyTypeConverted<float, float>(float* op, float* ip, int N, sycl::queue &sycl_queue);
-template void copyTypeConverted<sycl::half, sycl::half>(sycl::half* op, sycl::half* ip, int N, sycl::queue &sycl_queue);
+// copyTypeConverted is now header-inline (kernels.h); no explicit
+// instantiation needed here.
 
 template void batchNorm<float>(float* output, const float* input,
                                const float* skipInput, int N, int C, int H,
