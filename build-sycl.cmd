@@ -1,6 +1,18 @@
 @echo off
 setlocal
 
+rem vcvars64 MUST run before oneAPI setvars: without it setvars cannot locate
+rem Visual Studio, leaves the MSVC/SDK and Intel compiler lib dirs out of LIB,
+rem and icx then fails meson's sanity check with
+rem   LNK1104: cannot open file 'libircmt.lib'
+rem The LIB prepend is required as well -- libircmt.lib is an Intel compiler
+rem library, so vcvars64 alone does not supply it. Same order as
+rem rebuild-sycl-openvino.cmd, which already documented this.
+call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat" >nul
+if errorlevel 1 (echo vcvars64 failed & exit /b 1)
+call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat"
+set "LIB=C:\Program Files (x86)\Intel\oneAPI\compiler\2026.1\lib;%LIB%"
+
 rem 1. Set the following for the options you want to build.
 rem SYCL can be off, l0, amd or nvidia.
 set SYCL=l0
@@ -18,18 +30,28 @@ rem 2. Edit the paths for the build dependencies.
 set CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v10.0
 set CUDNN_PATH=%CUDA_PATH%
 set OPENBLAS_PATH=C:\OpenBLAS
-set MKL_PATH=C:\Program Files (x86)\Intel\oneAPI\mkl\latest\
-set DNNL_PATH=C:\Program Files (x86)\Intel\oneAPI\dnnl\latest\cpu_iomp
+set MKL_PATH=C:\Program Files (x86)\Intel\oneAPI\mkl\2026.1
+set DNNL_PATH=C:\Program Files (x86)\Intel\oneAPI\dnnl\2026.0
+set SYCL_PATH=C:\Program Files (x86)\Intel\oneAPI\compiler\latest\windows
 set OPENCL_LIB_PATH=%CUDA_PATH%\lib\x64
 set OPENCL_INCLUDE_PATH=%CUDA_PATH%\include
+if not exist "%OPENCL_LIB_PATH%\OpenCL.lib" (
+  set "OPENCL_LIB_PATH=C:\Program Files (x86)\Intel\oneAPI\compiler\latest\lib"
+  set "OPENCL_INCLUDE_PATH=C:\Program Files (x86)\Intel\oneAPI\compiler\latest\include"
+)
 
 rem 3. In most cases you won't need to change anything further down.
-echo Deleting build directory:
-rd /s build
+call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat"
+if errorlevel 1 exit /b
 
-rem Use cl for C files to get a resource compiler as needed for zlib.
-set CC=cl
+echo Deleting build directory:
+if exist build rd /s /q build
+
+rem Use Intel compilers for SYCL and proper archiver
+set CC=icx
 set CXX=icx
+rem set AR=xilib.exe
+rem set RANLIB=xilib.exe
 
 set BLAS=true
 if %MKL%==false if %DNNL%==false if %OPENBLAS%==false if %EIGEN%==false set BLAS=false
@@ -47,14 +69,14 @@ if %CUDNN%==true set PATH=%CUDA_PATH%\bin;%PATH%
 meson setup build --buildtype release -Ddx=%DX12% -Dcudnn=%CUDNN% -Dplain_cuda=%CUDA% ^
 -Dopencl=%OPENCL% -Dblas=%BLAS% -Dmkl=%MKL% -Dopenblas=%OPENBLAS% -Ddnnl=%DNNL% -Dgtest=%TEST% ^
 -Dcudnn_include="%CUDNN_INCLUDE_PATH%" -Dcudnn_libdirs="%CUDNN_LIB_PATH%" ^
--Dmkl_include="%MKL_PATH%\include" -Dmkl_libdirs="%MKL_PATH%\lib\intel64" -Ddnnl_dir="%DNNL_PATH%" ^
+-Dmkl_include="%MKL_PATH%\include" -Dmkl_libdirs="%MKL_PATH%\lib,%MKL_PATH%\lib\intel64" -Ddnnl_dir="%DNNL_PATH%" ^
 -Dopencl_libdirs="%OPENCL_LIB_PATH%" -Dopencl_include="%OPENCL_INCLUDE_PATH%" ^
 -Dopenblas_include="%OPENBLAS_PATH%\include" -Dopenblas_libdirs="%OPENBLAS_PATH%\lib" ^
 -Ddefault_library=static -Dsycl=%SYCL% -Db_vscrt=md
 
 if errorlevel 1 exit /b
 
-pause
+rem pause
 
 cd build
 

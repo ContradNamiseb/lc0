@@ -1,0 +1,152 @@
+/*
+  This file is part of Leela Chess Zero.
+  Copyright (C) 2026 The LCZero Authors
+
+  Leela Chess is free software: you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+*/
+
+// Tests for TaskStealingPool, motivated by the classic-search refactor review
+// (agora #858): the publish-before-count race in Submit() let WaitForAll()
+// return while tasks were still mutating the tree under the caller's
+// exclusive lock, and a throwing executor killed the worker thread and
+// stranded the counter. Both are regression-tested here.
+
+#include "utils/task_stealing_pool.h"
+
+#include <atomic>
+#include <chrono>
+#include <functional>
+#include <stdexcept>
+#include <thread>
+#include <vector>
+
+#include "gtest/gtest.h"
+
+namespace lczero {
+namespace {
+
+TEST(TaskStealingPool, RunsAllSubmittedTasksExactlyOnce) {
+  std::atomic<int> total{0};
+  std::atomic<int> executions{0};
+  TaskStealingPool<int> pool(4, [&total, &executions](int& t, int) {
+    total.fetch_add(t);
+    executions.fetch_add(1);
+  });
+  std::vector<int> v;
+  for (int i = 1; i <= 100; ++i) v.push_back(i);
+  pool.Submit(std::move(v));
+  pool.WaitForAll();
+  EXPECT_EQ(total.load(), 5050);
+  EXPECT_EQ(executions.load(), 100);
+  auto done = pool.DrainCompleted();
+  EXPECT_EQ(done.size(), 100u);
+}
+
+TEST(TaskStealingPool, SingleSubmitsRoundTrip) {
+  std::atomic<int> seen{0};
+  TaskStealingPool<int> pool(3, [&seen](int& t, int) {
+    seen.fetch_add(t);
+  });
+  for (int i = 0; i < 30; ++i) pool.Submit(2);
+  pool.WaitForAll();
+  EXPECT_EQ(seen.load(), 60);
+  EXPECT_EQ(pool.CompletedCount(), 30);
+}
+
+// The #858 finding 1 detector. A parent task submits children from INSIDE
+// the executor and then lingers; with the old protocol (push to queue, then
+// count) a thief could finish a child and drive active_tasks_ transiently to
+// zero before the parent's increment landed, releasing WaitForAll early
+// while the parent still ran. With count-before-publish, WaitForAll may wait
+// too long but never too little -- executed() must equal submitted+children
+// at every round boundary.
+TEST(TaskStealingPool, SubmitFromTaskNeverReleasesWaitEarly) {
+  constexpr int kParents = 6;
+  constexpr int kChildren = 6;
+  constexpr int kRounds = 120;
+  std::atomic<int> executed{0};
+  TaskStealingPool<int>* pool = nullptr;
+  std::function<void(int&, int)> exec = [&executed, &pool](int& tag, int) {
+    if (tag > 0) {
+      for (int i = 0; i < kChildren; ++i) pool->Submit(-tag);
+      // Widen the race window the old code lost: children can finish here,
+      // before this parent's own completion decrement, while the parent's
+      // per-child increments were historically still pending.
+      std::this_thread::sleep_for(std::chrono::microseconds(30));
+    }
+    executed.fetch_add(1);
+  };
+  TaskStealingPool<int> the_pool(3, std::move(exec));
+  pool = &the_pool;
+  for (int round = 0; round < kRounds; ++round) {
+    the_pool.Reset();
+    std::vector<int> parents;
+    for (int i = 1; i <= kParents; ++i) parents.push_back(i);
+    the_pool.Submit(std::move(parents));
+    the_pool.WaitForAll();
+    ASSERT_EQ(executed.load(), kParents * (1 + kChildren) * (round + 1))
+        << "WaitForAll() returned before nested submissions completed "
+           "(round "
+        << round << ") -- publish-before-count regression";
+  }
+  EXPECT_EQ(the_pool.CompletedCount(), kParents * (1 + kChildren));
+}
+
+// The #858 finding 2 companion: an executor exception used to escape into
+// the std::thread (terminate) and/or strand active_tasks_ (hang WaitForAll
+// while the caller holds nodes_mutex_). Now the pool must absorb it, keep
+// waiting correctness, and stay usable.
+TEST(TaskStealingPool, ThrowingExecutorDoesNotStrandWaitOrKillPool) {
+  std::atomic<int> ran{0};
+  TaskStealingPool<int> pool(2, [&ran](int& tag, int) {
+    ++ran;
+    if (tag == 13) throw std::runtime_error("injected executor failure");
+  });
+  std::vector<int> v;
+  for (int i = 0; i < 20; ++i) v.push_back(i);
+  pool.Submit(std::move(v));
+  pool.WaitForAll();
+  EXPECT_EQ(ran.load(), 20);
+  EXPECT_EQ(pool.DrainCompleted().size(), 20u);
+  // Still usable afterwards.
+  pool.Reset();
+  pool.Submit(5);
+  pool.WaitForAll();
+  EXPECT_EQ(pool.CompletedCount(), 1);
+}
+
+// After the worker sleep path (real condvar sleep since the notify-protocol
+// fix), work must still arrive promptly -- guards both the sleep itself and
+// the Submit wakes-a-sleeper protocol.
+TEST(TaskStealingPool, WorkArrivesAfterRealSleep) {
+  std::atomic<int> sum{0};
+  TaskStealingPool<int> pool(2, [&sum](int& t, int) { sum.fetch_add(t); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  std::vector<int> v{6, 7};
+  pool.Submit(std::move(v));
+  pool.WaitForAll();
+  EXPECT_EQ(sum.load(), 13);
+}
+
+TEST(TaskStealingPool, StealUnderLoadPreservesCounts) {
+  std::atomic<long long> sum{0};
+  TaskStealingPool<int> pool(4, [&sum](int& t, int) {
+    sum.fetch_add(t);
+  });
+  std::vector<int> v;
+  for (int i = 1; i <= 2000; ++i) v.push_back(i);
+  pool.Submit(std::move(v));
+  pool.WaitForAll();
+  EXPECT_EQ(sum.load(), 2000LL * 2001 / 2);
+}
+
+}  // namespace
+}  // namespace lczero
+
+int main(int argc, char** argv) {
+  ::testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}

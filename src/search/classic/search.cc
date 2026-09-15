@@ -1475,26 +1475,12 @@ void SearchWorker::EnsureNodeTwoFoldCorrectForDepth(Node* child_node,
   }
 }
 
-// --- CONSTANTS FOR TIE-BREAKING AND CHECK BONUS ---
-// These should ideally be defined globally or in the SearchParams struct.
-// Deterministic Tie-Breaker: Small, negative factor applied to the move index
-// (i). A smaller index (higher policy probability) gets a smaller penalty
-// (higher score).
-const float kTieBreakerFactor = 1.0e-6f;
-// Check Bonus: Fixed bonus for unvisited moves that are checks.
-const float kCheckBonus = 0.01f;
-
-// Helper function to check if the new position after 'move' is a check.
-// NOTE: This requires the PositionHistory object (history) to be updated and
-// unwound.
-bool IsCheckingMove(const Move& move, PositionHistory& history) {
-  history.Append(move);
-  // Check if the board is in check for the side that just moved (the opponent's
-  // side).
-  bool is_check = history.Last().GetBoard().IsUnderCheck();
-  history.Pop();  // Crucial: Undo the move immediately
-  return is_check;
-}
+// (kTieBreakerFactor / kCheckBonus / IsCheckingMove removed: none were
+// reachable -- the check-bonus block that used them lives commented out in
+// PickNodesToExtendTask, the history it needs is no longer maintained during
+// the descent, and appending+popping a position per candidate child would
+// cost more than the bonus is worth. Restore from git history if that
+// feature is ever picked up again.)
 
 void SearchWorker::PickNodesToExtendTask(
     Node* cur_node, int base_search_depth, int collision_visit_limit,
@@ -1502,17 +1488,22 @@ void SearchWorker::PickNodesToExtendTask(
     std::vector<NodeToProcess>* output_receiver,
     TaskWorkspace* workspace) NO_THREAD_SAFETY_ANALYSIS {
   LCTRACE_FUNCTION_SCOPE;
+  // NOTE (thread safety): the NO_THREAD_SAFETY_ANALYSIS on this function is
+  // only sound because the pool protocol guarantees WaitForAll cannot
+  // release before every published task finished (count-before-publish in
+  // TaskStealingPool::Submit, fixed for review #858 finding 1) -- which is
+  // what keeps this function's tree mutation inside the exclusive
+  // nodes_mutex_ the caller holds.
   // -----------------------------------------------------------------------
-  // Local history that follows the path we are walking
+  // Local history was copied here per call; the walk stopped maintaining it
+  // (descent Append/Pop were commented out) and the only consumers are
+  // gone -- extension happens in ProcessPickedTask with its own history.
   // -----------------------------------------------------------------------
-  PositionHistory history = search_->played_history_;
-  history.Trim(search_->played_history_.GetLength());
-  for (const Move m : moves_to_node) history.Append(m);
 
   // -----------------------------------------------------------------------
   // Stacks for recursion
   // -----------------------------------------------------------------------
-  CachedNodeData cache{};
+  CachedNodeData cache;
   auto& vtp_buffer = workspace->vtp_buffer;
   auto& visits_to_perform = workspace->visits_to_perform;
   visits_to_perform.clear();
@@ -1530,7 +1521,6 @@ void SearchWorker::PickNodesToExtendTask(
     output_receiver->reserve(output_receiver->size() + 30);
   }
 
-  // Node* cur_node = node;
   bool root_node = (cur_node == search_->root_node_);
   const auto& root_move_filter = search_->root_move_filter_;
   // ----- M-evaluator (MLH) -------
@@ -1542,10 +1532,13 @@ void SearchWorker::PickNodesToExtendTask(
 
   int passed_off = 0;
   int completed_visits = 0;
-  cache.vtp_last_filled_cache.clear();
-
-  const int estimated_remaining =
-      latest_time_manager_hints_.GetEstimatedRemainingPlayouts();
+  // Cap on subtrees one gather task hands to the pool, restoring master's
+  // MAX_TASKS=100: at the cap, remaining children simply keep their visits
+  // in vtp and the walking thread explores them itself (review #858 f7 --
+  // the old bounded buffer was the back-pressure; unbounded submission is
+  // not a behavior-preserved port of it).
+  static constexpr int kMaxSplitsPerTask = 100;
+  int splits_submitted = 0;
 
   current_path.push_back(-1);  // “need to select children” marker
 
@@ -1596,7 +1589,6 @@ void SearchWorker::PickNodesToExtendTask(
       if (root_node) cur_node->IncrementNInFlight(cur_limit);
 
       // ----- prepare caches for this level --------------------------------
-      cache.collision_limit_for_level = cur_limit;
 
       // Create visits_to_perform new back entry for this level.
       if (vtp_buffer.size() > 0) {
@@ -1605,9 +1597,6 @@ void SearchWorker::PickNodesToExtendTask(
       } else {
         visits_to_perform.push_back(std::make_unique<std::array<int, 256>>());
       }
-      // Clear the visits array for this level
-      // std::fill(visits_to_perform.back()->begin(),
-      // visits_to_perform.back()->end(), 0);
       cache.vtp_last_filled_cache.push_back(-1);
 
       // Cache all constant UCT parameters.
@@ -1633,10 +1622,13 @@ void SearchWorker::PickNodesToExtendTask(
       cur_node->CopyPolicy(cache.max_policy_entries_needed,
                            &cache.children[0].policy, sizeof(ChildCache));
       // Here we need odd_depth = true; and even_depth = false;.
-      const bool odd_depth =
-          ((current_path.size() + base_search_depth) % 2 != 0);
       // Root depth is 1 here, while for GetDrawScore() it's 0-based, that's why
-      // the weirdness.
+      // the weirdness: an EVEN sum is the ODD argument (origin/master
+      // ((size + base) % 2 == 0) ? odd_draw_score : even_draw_score). The
+      // inverted parity was silently wrong for any nonzero draw score
+      // (review #858 finding 3).
+      const bool odd_depth =
+          ((current_path.size() + base_search_depth) % 2 == 0);
       const float draw_score = search_->GetDrawScore(odd_depth);
       // ----- pre-compute PUCT multiplier -----
       const float cpuct = ComputeCpuct(params_, cur_node->GetN(), root_node);
@@ -1663,32 +1655,15 @@ void SearchWorker::PickNodesToExtendTask(
       const float fpu =
           GetFpu(params_, cur_node, root_node, draw_score, visited_policy_sum);
 
-      // Pre-initialize edge iterators so we can access moves for check bonus
-      /*      if (kCheckBonus > 0.0f) {
-              auto edge_iter = cur_node->Edges();
-              for (int i = 0; i < cache.max_policy_entries_needed; ++i) {
-                if (i == 0) {
-                  cache.cur_iters[i] = edge_iter;
-                } else {
-                  cache.cur_iters[i] = cache.cur_iters[i - 1];
-                  ++cache.cur_iters[i];
-                }
-              }
-            }
-      */
-
-      // unvisited children get FPU (and optional deterministic tie-breaker)
+      // unvisited children get FPU; equal scores are resolved by scan order
+      // (edges are in descending policy order and the scan uses strict >).
       for (int i = 0; i < cache.max_policy_entries_needed; ++i) {
         if (cache.children[i].utility == std::numeric_limits<float>::lowest()) {
           cache.children[i].utility = fpu + m_eval.GetDefaultMUtility();
-          // Add tiny tie-breaker so higher-policy moves win ties
-          cache.children[i].utility +=
-              1e-7f * (cache.max_policy_entries_needed - i);
         }
       }
 
       // ----- repeatedly pick the current best child ----------------------
-      cache.collision_limit_for_level = cur_limit;
       cache.cache_filled_idx = -1;
       while (cur_limit > 0) {
         // Perform UCT for current node.
@@ -1827,6 +1802,7 @@ void SearchWorker::PickNodesToExtendTask(
       if (task_pool_) {
         for (int i = 0; i <= cache.vtp_last_filled_cache.back(); i++) {
           int child_limit = (*visits_to_perform.back())[i];
+          if (splits_submitted >= kMaxSplitsPerTask) break;
           if (child_limit > params_.GetMinimumWorkSizeForPicking() &&
               child_limit <
                   ((collision_visit_limit - passed_off - completed_visits) * 2 /
@@ -1844,6 +1820,7 @@ void SearchWorker::PickNodesToExtendTask(
                 child_node, current_path.size() - 1 + base_search_depth + 1,
                 moves_to_path, child_limit));
             moves_to_path.pop_back();
+            ++splits_submitted;
 
             passed_off += child_limit;
             (*visits_to_perform.back())[i] = 0;
@@ -1858,7 +1835,6 @@ void SearchWorker::PickNodesToExtendTask(
     // -------------------------------------------------------------------
     int min_idx = current_path.back();
     bool found_child = false;
-    // if (!cache) CERR << "Cache(CachedNodeData) is Empty";
     if (cache.vtp_last_filled_cache.back() > min_idx) {
       int idx = -1;
       for (auto& child : cur_node->Edges()) {
@@ -1871,7 +1847,6 @@ void SearchWorker::PickNodesToExtendTask(
           }
           current_path.back() = idx;
           current_path.push_back(-1);
-          // history.Append(child.GetMove());
           cur_node = child.GetOrSpawnNode(/* parent */ cur_node);
           found_child = true;
           break;
@@ -1888,7 +1863,6 @@ void SearchWorker::PickNodesToExtendTask(
       if (!moves_to_path.empty()) moves_to_path.pop_back();
       current_path.pop_back();
       vtp_buffer.push_back(std::move(visits_to_perform.back()));
-      // history.Pop();
       visits_to_perform.pop_back();
       cache.vtp_last_filled_cache.pop_back();
     }
