@@ -1415,6 +1415,11 @@ void SearchWorker::PickNodesToExtend(int collision_limit) {
   if (task_pool_) {
     task_pool_->Reset();
   }
+  // Round-wide split cap (see kMaxSplitsPerTask in PickNodesToExtendTask):
+  // reset once per gather round, shared by every call -- main-thread walk,
+  // every pool worker, and every task those workers recursively submit --
+  // during this round.
+  splits_submitted_.store(0, std::memory_order_relaxed);
   std::vector<Move> empty_movelist;
   // This lock must be held until after the tasks complete below.
   // Since the tasks perform work which assumes they have the lock, even though
@@ -1532,13 +1537,17 @@ void SearchWorker::PickNodesToExtendTask(
 
   int passed_off = 0;
   int completed_visits = 0;
-  // Cap on subtrees one gather task hands to the pool, restoring master's
-  // MAX_TASKS=100: at the cap, remaining children simply keep their visits
-  // in vtp and the walking thread explores them itself (review #858 f7 --
-  // the old bounded buffer was the back-pressure; unbounded submission is
-  // not a behavior-preserved port of it).
+  // Cap on subtrees handed to the pool across one WHOLE gather round,
+  // restoring master's MAX_TASKS=100: at the cap, remaining children simply
+  // keep their visits in vtp and the walking thread explores them itself.
+  // This must be a per-SearchWorker counter (splits_submitted_ member,
+  // reset once per round in PickNodesToExtend), not a local: this function
+  // runs concurrently across every pool worker AND recursively (a submitted
+  // PickTask can itself split further), so a call-local counter only caps
+  // each individual call at 100 and lets the round-wide total scale with
+  // however many calls are in flight -- not a behavior-preserved port of
+  // master's shared, mutex-protected picking_tasks_ bound.
   static constexpr int kMaxSplitsPerTask = 100;
-  int splits_submitted = 0;
 
   current_path.push_back(-1);  // “need to select children” marker
 
@@ -1802,7 +1811,10 @@ void SearchWorker::PickNodesToExtendTask(
       if (task_pool_) {
         for (int i = 0; i <= cache.vtp_last_filled_cache.back(); i++) {
           int child_limit = (*visits_to_perform.back())[i];
-          if (splits_submitted >= kMaxSplitsPerTask) break;
+          if (splits_submitted_.load(std::memory_order_relaxed) >=
+              kMaxSplitsPerTask) {
+            break;
+          }
           if (child_limit > params_.GetMinimumWorkSizeForPicking() &&
               child_limit <
                   ((collision_visit_limit - passed_off - completed_visits) * 2 /
@@ -1820,7 +1832,7 @@ void SearchWorker::PickNodesToExtendTask(
                 child_node, current_path.size() - 1 + base_search_depth + 1,
                 moves_to_path, child_limit));
             moves_to_path.pop_back();
-            ++splits_submitted;
+            splits_submitted_.fetch_add(1, std::memory_order_relaxed);
 
             passed_off += child_limit;
             (*visits_to_perform.back())[i] = 0;
