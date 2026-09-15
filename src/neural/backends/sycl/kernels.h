@@ -62,8 +62,36 @@ void convertNCHWtoNHWC(DstType* output_tensor, const SrcType* input_tensor,
                        int Nin, int Cin, int Nout, int Cout, int H, int W, sycl::queue &sycl_queue);
 
 // Plain data-type conversion (no layout conversion).
+//
+// Defined inline (header-only) rather than declared here and explicitly
+// instantiated in common_kernels.dp.cpp: on this toolchain a SYCL kernel
+// that is only reachable via a cross-translation-unit explicit template
+// instantiation can go missing from the linked device image ("No kernel
+// named ... was found" at runtime, e.g. for copyTypeConverted<float,
+// float> during fp32 weight loading) even though the host-side stub
+// links fine. Defining the kernel in the header makes every calling TU
+// (network_sycl.cc.dp.cpp, layers.cc.dp.cpp) compile and register its
+// own copy, which is the portable pattern for SYCL free-function kernels.
 template <typename DstType, typename SrcType>
-void copyTypeConverted(DstType* op, SrcType* ip, int N, sycl::queue &sycl_queue);
+void copyTypeConverted_kernel(DstType* op, SrcType* ip, int N,
+                              const sycl::nd_item<3> &item_ct1) {
+  int tid = item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+            item_ct1.get_local_id(2);
+  if (tid >= N) return;
+  op[tid] = (DstType)ip[tid];
+}
+
+template <typename DstType, typename SrcType>
+void copyTypeConverted(DstType* op, SrcType* ip, int N, sycl::queue &sycl_queue) {
+  const int kBlockSize = 256;
+  int blocks = DivUp(N, kBlockSize);
+  sycl_queue.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, blocks) *
+                                             sycl::range<3>(1, 1, kBlockSize),
+                                         sycl::range<3>(1, 1, kBlockSize)),
+                       [=](sycl::nd_item<3> item_ct1) {
+                         copyTypeConverted_kernel(op, ip, N, item_ct1);
+                       });
+}
 
 // Perform batch normilization.
 template <typename T>
