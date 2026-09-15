@@ -748,11 +748,32 @@ if get_option('build_backends')
       if get_option('sycl') == 'l0'
         message('Building SYCL for the L0 backend')
         add_project_arguments('-DMKL_ILP64', language : 'cpp')
-        deps += cc.find_library('mkl_sycl', required: true)
-        deps += cc.find_library('mkl_intel_ilp64', required: true)
-        deps += cc.find_library('mkl_sequential', required: true)
-        deps += cc.find_library('mkl_core', required: true)
-        deps += cc.find_library('OpenCL', required: true)
+        # Ported from master's fix: layers.cc.dp.cpp includes <oneapi/mkl.hpp>
+        # directly, outside the -Dmkl BLAS-backend path, so it needs its own
+        # include directories (setvars.bat doesn't always populate INCLUDE with
+        # MKL headers). oneMKL 2024+ split the unified mkl_sycl into domain
+        # libraries -- mkl_sycl_blas_dll carries the GEMM symbols oneAPI 2026.1
+        # no longer ships mkl_sycl at all; the fallbacks keep old toolkits
+        # working. This is what unblocks the link without any custom GEMM.
+        foreach mkl_inc_dir : get_option('mkl_include')
+          if run_command('scripts/checkdir.py', mkl_inc_dir, check : false).returncode() == 0
+            includes += include_directories(mkl_inc_dir)
+          endif
+        endforeach
+        mkl_libdirs = get_option('mkl_libdirs')
+        opencl_libdirs = get_option('opencl_libdirs')
+        mkl_sycl_dep = cc.find_library('mkl_sycl_blas_dll', dirs: mkl_libdirs, required: false)
+        if not mkl_sycl_dep.found()
+          mkl_sycl_dep = cc.find_library('mkl_sycl', dirs: mkl_libdirs, required: false)
+          if not mkl_sycl_dep.found()
+            mkl_sycl_dep = cc.find_library('mkl_sycl_dll', dirs: mkl_libdirs, required: true)
+          endif
+        endif
+        deps += mkl_sycl_dep
+        deps += cc.find_library('mkl_intel_ilp64', dirs: mkl_libdirs, required: true)
+        deps += cc.find_library('mkl_sequential', dirs: mkl_libdirs, required: true)
+        deps += cc.find_library('mkl_core', dirs: mkl_libdirs, required: true)
+        deps += cc.find_library('OpenCL', dirs: opencl_libdirs, required: true)
       elif get_option('sycl') == 'amd'
         hip_libdirs = get_option('hip_libdirs')
         hip_args = []
@@ -1001,6 +1022,16 @@ if get_option('gtest')
                'src/neural/memcache.cc', pb_files,
     include_directories: includes, link_with: lc0_lib, dependencies: [gtest, gmock]),
     args: '--gtest_output=xml:engine_test.xml', timeout: 90)
+
+  test('TaskStealingPool',
+    executable('task_stealing_pool_test', 'src/utils/task_stealing_pool_test.cc', pb_files,
+    include_directories: includes, link_with: lc0_lib, dependencies: gtest),
+    args: '--gtest_output=xml:taskpool.xml', timeout: 180)
+
+  test('DepthStackAndCache',
+    executable('inline_depth_stack_test', 'src/search/classic/inline_depth_stack_test.cc', pb_files,
+    include_directories: includes, link_with: lc0_lib, dependencies: gtest),
+    args: '--gtest_output=xml:depthstack.xml', timeout: 90)
 endif
 
 

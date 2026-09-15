@@ -27,6 +27,7 @@
 #include <thread>
 #include <vector>
 
+#include "utils/logging.h"
 #include "utils/spinhelper.h"
 
 namespace lczero {
@@ -60,21 +61,33 @@ class TaskStealingPool {
   TaskStealingPool& operator=(const TaskStealingPool&) = delete;
 
   // Submit a single task. Distributes to the least-loaded worker.
+  // Publish protocol (review #858/#859): active_tasks_ is incremented BEFORE
+  // the task becomes visible in any queue, and under wait_mutex_ so a worker
+  // evaluating its wait predicate can never miss the increment. Overcounting
+  // for a few instructions is harmless; undercounting released WaitForAll
+  // early while tree mutation continued outside nodes_mutex_.
   void Submit(Task&& task) {
     int target = LeastLoaded();
+    {
+      std::lock_guard<std::mutex> lock(wait_mutex_);
+      active_tasks_.fetch_add(1, std::memory_order_release);
+    }
     {
       std::lock_guard<std::mutex> lock(workers_[target].queue_mutex);
       workers_[target].local_queue.push_back(std::move(task));
     }
     workers_[target].queue_size.fetch_add(1, std::memory_order_release);
-    active_tasks_.fetch_add(1, std::memory_order_release);
-    work_available_.notify_all();
+    work_available_.notify_one();
   }
 
   // Submit a batch of tasks, distributed round-robin across workers.
   void Submit(std::vector<Task>&& tasks) {
     if (tasks.empty()) return;
     int n = static_cast<int>(tasks.size());
+    {
+      std::lock_guard<std::mutex> lock(wait_mutex_);
+      active_tasks_.fetch_add(n, std::memory_order_release);
+    }
     for (int i = 0; i < n; i++) {
       int target = i % num_workers_;
       {
@@ -83,8 +96,7 @@ class TaskStealingPool {
       }
       workers_[target].queue_size.fetch_add(1, std::memory_order_release);
     }
-    active_tasks_.fetch_add(n, std::memory_order_release);
-    work_available_.notify_all();
+    work_available_.notify_all();  // batch may need several workers.
   }
 
   // Block until all submitted tasks complete.
@@ -106,7 +118,17 @@ class TaskStealingPool {
 
   // Reset counters for a new round of work.
   void Reset() {
-    // All tasks should be complete before calling Reset.
+    // All tasks should be complete before calling Reset. A nonzero
+    // active_tasks_ here means an earlier WaitForAll() returned while work
+    // was in flight (that was the #858 publish race) -- restore the counter
+    // rather than poison every later round with a phantom that hangs or
+    // instant-releases forever, and say so loudly.
+    const int leftover = active_tasks_.exchange(0, std::memory_order_acq_rel);
+    if (leftover != 0) {
+      CERR << "TaskStealingPool::Reset with " << leftover
+           << " tasks still counted active: an earlier WaitForAll() returned"
+              " early. Counter restored; investigate the submit protocol.";
+    }
     completed_.store(0, std::memory_order_release);
     {
       std::lock_guard<std::mutex> lock(completed_mutex_);
@@ -122,7 +144,11 @@ class TaskStealingPool {
   // Signal shutdown and join all threads.
   void Shutdown() {
     if (shutdown_.load(std::memory_order_acquire)) return;
-    shutdown_.store(true, std::memory_order_release);
+    // Same publish protocol as Submit: state under wait_mutex_, then notify.
+    {
+      std::lock_guard<std::mutex> lock(wait_mutex_);
+      shutdown_.store(true, std::memory_order_release);
+    }
     work_available_.notify_all();
     for (auto& t : threads_) {
       if (t.joinable()) t.join();
@@ -167,9 +193,16 @@ class TaskStealingPool {
 
   // Try to steal a task from another worker's deque (FIFO for breadth).
   bool TrySteal(int thief_tid, Task& out) {
-    // Start from a random offset to avoid thundering herd on worker 0.
-    thread_local std::mt19937 rng(std::random_device{}());
-    int start = std::uniform_int_distribution<int>(0, num_workers_ - 1)(rng);
+    // Start from a cheap per-thread pseudo-random offset to avoid a thundering
+    // herd on worker 0. (mt19937 + a distribution object per attempt showed up
+    // as real cost in the spin loops -- review #859.)
+    thread_local uint32_t rng = 2654435761u * static_cast<uint32_t>(
+                                     reinterpret_cast<uintptr_t>(&rng)) +
+                                 1013904223u;
+    rng ^= rng << 13;
+    rng ^= rng >> 17;
+    rng ^= rng << 5;
+    int start = static_cast<int>(rng % static_cast<unsigned>(num_workers_));
 
     for (int attempt = 0; attempt < num_workers_; attempt++) {
       int victim = (start + attempt) % num_workers_;
@@ -223,22 +256,38 @@ class TaskStealingPool {
           if (TryPopOwn(tid, task) || TrySteal(tid, task)) {
             got_task = true;
           } else {
-            // Sleep on condvar until new work arrives or shutdown.
+            // Sleep until new work arrives or shutdown. This is a REAL sleep
+            // now, not a 100us poll: Submit/Shutdown publish state under
+            // wait_mutex_ before notifying, so the predicate can never be
+            // missed (the old timed wait existed only to recover from that
+            // lost-wakeup race -- review #858 finding 8).
             std::unique_lock<std::mutex> lock(wait_mutex_);
-            work_available_.wait_for(
-                lock, std::chrono::microseconds(100), [this]() {
-                  return shutdown_.load(std::memory_order_acquire) ||
-                         active_tasks_.load(std::memory_order_acquire) > 0;
-                });
-            if (shutdown_.load(std::memory_order_acquire)) return;
+            work_available_.wait(lock, [this]() {
+              return shutdown_.load(std::memory_order_acquire) ||
+                     active_tasks_.load(std::memory_order_acquire) > 0;
+            });
+            if (shutdown_.load(std::memory_order_acquire) &&
+                active_tasks_.load(std::memory_order_acquire) == 0) {
+              return;
+            }
             continue;  // Restart the loop to try popping/stealing.
           }
         }
       }
 
       if (got_task) {
-        // Execute the task.
-        executor_(task, tid);
+        // Execute the task. An executor exception must not strand the
+        // active_tasks_ count (that would hang the next WaitForAll under the
+        // caller's lock) nor kill the worker thread (std::terminate) --
+        // bookkeeping runs either way; the task's partial results still reach
+        // completed_tasks_ so the caller's undo/cancel logic sees them.
+        try {
+          executor_(task, tid);
+        } catch (const std::exception& e) {
+          CERR << "TaskStealingPool: executor threw: " << e.what();
+        } catch (...) {
+          CERR << "TaskStealingPool: executor threw a non-standard exception";
+        }
         {
           std::lock_guard<std::mutex> lock(completed_mutex_);
           completed_tasks_.push_back(std::move(task));

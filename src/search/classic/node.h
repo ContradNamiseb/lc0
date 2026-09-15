@@ -140,12 +140,10 @@ class Node {
         upper_bound_(GameResult::WHITE_WON),
         solid_children_(false) {}
 
-  // Custom move operations: we implement them in node.cc. Move operations
-  // must carefully handle std::atomic members (which are not movable)
-  // by copying their values via load()/store(), and should not overwrite
-  // the target's parent_/index_ when used via move-assignment in-place.
-  Node(Node&& move_from) noexcept;
-  Node& operator=(Node&& move_from) noexcept;
+  // We have a custom destructor, but its behavior does not need to be emulated
+  // during move operations so default is fine.
+  Node(Node&& move_from) = default;
+  Node& operator=(Node&& move_from) = default;
 
   // Allocates a new edge and a new node. The node has to be no edges before
   // that.
@@ -162,19 +160,11 @@ class Node {
 
   // Returns sum of policy priors which have had at least one playout.
   float GetVisitedPolicy() const;
-  uint32_t GetN() const { return n_.load(std::memory_order_relaxed); }
-  uint32_t GetNInFlight() const {
-    return n_in_flight_.load(std::memory_order_relaxed);
-  }
-  uint32_t GetChildrenVisits() const {
-    uint32_t n = n_.load(std::memory_order_relaxed);
-    return n > 0 ? n - 1 : 0;
-  }
+  uint32_t GetN() const { return n_; }
+  uint32_t GetNInFlight() const { return n_in_flight_; }
+  uint32_t GetChildrenVisits() const { return n_ > 0 ? n_ - 1 : 0; }
   // Returns n = n_if_flight.
-  int GetNStarted() const {
-    return n_.load(std::memory_order_relaxed) +
-           n_in_flight_.load(std::memory_order_relaxed);
-  }
+  int GetNStarted() const { return n_ + n_in_flight_; }
   float GetQ(float draw_score) const { return wl_ + draw_score * d_; }
   // Returns node eval, i.e. average subtree V for non-terminal node and -1/0/1
   // for terminal nodes.
@@ -190,20 +180,21 @@ class Node {
   Bounds GetBounds() const { return {lower_bound_, upper_bound_}; }
   uint8_t GetNumEdges() const { return num_edges_; }
 
-  // Output must point to at least max_needed floats.
+  // Output must point to at least max_needed floats. STRIDED: the directml-
+  // era picking cache (CachedNodeData::children) wants policy written
+  // directly into an array-of-structs, so the stride parameter carries the
+  // element pitch; the default keeps the contiguous (vectorizable) form for
+  // every other caller. Both paths verified equivalent + non-clobbering by
+  // the #857 probes.
   void CopyPolicy(int max_needed, float* output,
                   size_t stride = sizeof(float)) const {
     if (!edges_) return;
     int loops = std::min(static_cast<int>(num_edges_), max_needed);
-
     if (stride == sizeof(float)) {
-      // Fast path: contiguous memory — compiler can auto-vectorize with
-      // SSE/AVX.
       for (int i = 0; i < loops; i++) {
         output[i] = edges_[i].GetP();
       }
     } else {
-      // Strided path: fallback for non-standard layouts.
       char* current_byte = reinterpret_cast<char*>(output);
       for (int i = 0; i < loops; i++) {
         *reinterpret_cast<float*>(current_byte) = edges_[i].GetP();
@@ -239,9 +230,7 @@ class Node {
   // When search decides to treat one visit as several (in case of collisions
   // or visiting terminal nodes several times), it amplifies the visit by
   // incrementing n_in_flight.
-  void IncrementNInFlight(int multivisit) {
-    n_in_flight_.fetch_add(multivisit, std::memory_order_relaxed);
-  }
+  void IncrementNInFlight(int multivisit) { n_in_flight_ += multivisit; }
 
   // Updates max depth, if new depth is larger.
   void UpdateMaxDepth(int depth);
@@ -331,11 +320,11 @@ class Node {
   // Estimated remaining plies.
   float m_ = 0.0f;
   // How many completed visits this node had.
-  std::atomic<uint32_t> n_{0};
+  uint32_t n_ = 0;
   // (AKA virtual loss.) How many threads currently process this node (started
   // but not finished). This value is added to n during selection which node
   // to pick in MCTS, and also when selecting the best move.
-  std::atomic<uint32_t> n_in_flight_{0};
+  uint32_t n_in_flight_ = 0;
 
   // 2 byte fields.
   // Index of this node is parent's edge list.

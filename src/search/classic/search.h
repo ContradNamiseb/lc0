@@ -29,6 +29,7 @@
 
 #include <array>
 #include <atomic>
+#include <cassert>
 #include <condition_variable>
 #include <functional>
 #include <optional>
@@ -223,8 +224,12 @@ class SearchWorker {
       } else {
         int working_threads = std::max(
             search_->thread_count_.load(std::memory_order_acquire) - 1, 1);
-        task_workers_ = std::min(
-            std::thread::hardware_concurrency() / working_threads - 1, 4U);
+        // Signed arithmetic: hardware_concurrency()/working_threads == 0 used
+        // to wrap to UINT_MAX via the unsigned "- 1" and clamp to 4, giving
+        // low-core boxes four spinning helpers instead of zero (#858 f9).
+        const unsigned hw = std::thread::hardware_concurrency();
+        task_workers_ =
+            std::max(0, std::min(static_cast<int>(hw / working_threads) - 1, 4));
       }
     }
     if (task_workers_ > 0) {
@@ -245,7 +250,6 @@ class SearchWorker {
                                   &(task_workspaces_[tid]));
                 break;
             }
-            task.complete = true;
           });
     }
     target_minibatch_size_ = params_.GetMiniBatchSize();
@@ -351,14 +355,18 @@ class SearchWorker {
       return NodeToProcess(node, depth, true, collision_count, max_count);
     }
     static NodeToProcess Visit(Node* node, uint16_t depth) {
-      return NodeToProcess(node, depth, false, 1, 0);
+      NodeToProcess np(node, depth, false, 1, 0);
+      // Only visits are ever evaluated (collisions never touch eval -- every
+      // consumer is behind IsCollision/nn_queried guards), so allocate here
+      // rather than for every collision entry (#859 addition 5).
+      np.eval = std::make_unique<EvalResult>();
+      return np;
     }
 
    private:
     NodeToProcess(Node* node, uint16_t depth, bool is_collision, int multivisit,
                   int max_count)
         : node(node),
-          eval(std::make_unique<EvalResult>()),
           multivisit(multivisit),
           maxvisit(max_count),
           depth(depth),
@@ -373,39 +381,81 @@ class SearchWorker {
     int n_started = 0;
   };
 
-  // A lightweight, cache-friendly vector replacement
+  // A lightweight, cache-friendly vector replacement with a spill path.
+  // This stack is indexed by DESCENT DEPTH within one gather task -- which
+  // nothing bounds at 256 (current_path/visits_to_perform are unbounded
+  // vectors, and deep lines occur in real reused trees). The old fixed
+  // array overflowed at push 257 (ASan-confirmed, agora #857 P1); entries
+  // past the inline capacity now spill to `overflow`, keeping the inline
+  // array hot for every ordinary tree.
   struct InlineDepthStack {
+    static constexpr int kInlineCapacity = 256;
     int count = 0;
-    std::array<int, 256> data{};  // 256 plies deep should be plenty for MCTS
+    std::array<int, kInlineCapacity> data;  // gated by count; see cache notes
+    std::vector<int> overflow;              // depth > kInlineCapacity
 
-    void clear() { count = 0; }
-    void push_back(int val) { data[count++] = val; }
-    void pop_back() {
-      if (count > 0) count--;
+    void clear() {
+      count = 0;
+      overflow.clear();
     }
-    int& back() { return data[count - 1]; }
+    bool empty() const { return count == 0; }
+    void push_back(int val) {
+      if (count < kInlineCapacity) {
+        data[count++] = val;
+      } else {
+        overflow.push_back(val);
+        ++count;
+      }
+    }
+    void pop_back() {
+      if (count > 0) {
+        --count;
+        if (count >= kInlineCapacity) overflow.pop_back();
+      }
+    }
+    int& back() {
+      // Callers only invoke this on a level whose -1 marker was pushed;
+      // the old silent data[-1] was UB, keep it an assertion in debug.
+      assert(count > 0);
+      return count > kInlineCapacity ? overflow[count - kInlineCapacity - 1]
+                                     : data[count - 1];
+    }
   };
 
   // Helper struct to hold cached data during the traversal.
+  // Layout contract: `children` is deliberately NOT zero-initialized --
+  // every live entry is written before it is read (policy by the strided
+  // CopyPolicy, utility by the fill loops, iterator/n_started/uct_score by
+  // the cache_filled_idx-gated precompute inside the UCT scan), and reads
+  // are bounded by max_policy_entries_needed/cache_filled_idx. The same
+  // gating discipline covers vtp_last_filled_cache (push -1 per level).
+  // Zeroing ~7KB per gather task bought nothing (#859).
   struct alignas(64) CachedNodeData {
     // 1. Hot scalars (fits into the 1st 64-byte chunk)
     float puct_mult = 0.0f;
     int cache_filled_idx = -1;
     int max_policy_entries_needed = 0;
-    int collision_limit_for_level = 0;
 
     // 2. Inline Depth Stack
     InlineDepthStack vtp_last_filled_cache;
 
     // 3. Packed Array of Structures
-    std::array<ChildCache, 256> children{};
+    std::array<ChildCache, 256> children;
 
     CachedNodeData() = default;
   };
 
   struct TaskWorkspace {
     // Core search stacks.
-    // std::vector<CachedNodeData> cached_data;
+    // vtp arrays are recycled through vtp_buffer WITHOUT being cleared, and
+    // that is load-bearing, not an oversight: every read index is gated by
+    // the per-level InlineDepthStack (vtp_last_filled_cache), fresh ranges
+    // are zeroed by the targeted std::fill where a level first touches
+    // indices above its tracked last-filled, the split pass zeroes entries
+    // it hands off, and consumed-by-child entries are skipped by min_idx
+    // ordering. A path that leaves a nonzero above last-filled, or reads
+    // beyond it, would resurrect stale visits -- keep the invariant (see
+    // PickNodesToExtendTask) or add the fill back with a measurement.
     std::vector<std::unique_ptr<std::array<int, 256>>> vtp_buffer;
     std::vector<std::unique_ptr<std::array<int, 256>>> visits_to_perform;
 
@@ -414,7 +464,6 @@ class SearchWorker {
     PositionHistory history;
 
     TaskWorkspace() {
-      // cached_data.reserve(30);
       vtp_buffer.reserve(30);
       visits_to_perform.reserve(30);
       current_path.reserve(30);
@@ -425,7 +474,10 @@ class SearchWorker {
 
   struct PickTask {
     enum PickTaskType { kGathering, kProcessing };
-    PickTaskType task_type;
+    // Deterministic default so a default-constructed pool scratch task can
+    // never execute a garbage switch arm (the pool only runs moved-in tasks,
+    // but don't make the next reader re-prove it -- #859).
+    PickTaskType task_type = kGathering;
 
     // For task type gathering.
     Node* start;
@@ -437,8 +489,6 @@ class SearchWorker {
     // Task type post gather processing.
     int start_idx;
     int end_idx;
-
-    bool complete = false;
 
     PickTask(Node* node, uint16_t depth, const std::vector<Move>& base_moves,
              int collision_limit)
