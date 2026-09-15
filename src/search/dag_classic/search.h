@@ -269,9 +269,15 @@ class SearchWorker {
         ExecuteOneIteration();
       } while (search_->IsSearchActive());
     } catch (std::exception& e) {
+      // A failing backend must not kill the engine mid-game: the old
+      // abort() here turned a lone Level Zero UR_RESULT_ERROR_UNKNOWN
+      // (2026-09 gameplay crash class) into a dead engine the GUI kept
+      // waiting on. Stop exactly like a UCI `stop`: this worker's part is
+      // over, the other workers wrap up, and the best move still gets
+      // emitted -- the game goes on and the log names the failure.
       std::cerr << "Unhandled exception in worker thread: " << e.what()
                 << std::endl;
-      abort();
+      search_->Stop();
     }
   }
 
