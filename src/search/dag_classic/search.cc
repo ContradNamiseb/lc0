@@ -1397,7 +1397,9 @@ void SearchWorker::GatherMinibatch() {
       try {
         ProcessPickedTask(ppt_start, static_cast<int>(minibatch_.size()));
       } catch (...) {
-        pending_exception = std::current_exception();
+        // Preserve the first failure: a Submit error captured above takes
+        // priority (review #881 minor).
+        if (!pending_exception) pending_exception = std::current_exception();
       }
       if (needs_wait) {
         try {
@@ -1754,6 +1756,7 @@ void SearchWorker::PickNodesToExtendTask(
     // First check if node is terminal or not-expanded.  If either than create
     // a collision of appropriate size and pop current_path.
     if (current_path.back().stop_picking_) {
+      bool emitted_visit = false;
       if (current_path.back().visit_child_) {
         cur_limit -= 1;
         receiver->push_back(NodeToProcess::Visit(full_path, history));
@@ -1766,6 +1769,7 @@ void SearchWorker::PickNodesToExtendTask(
         // stays owned until its own insertion succeeds.
         current_path.back().visit_child_ = 0;
         current_path.back().visits_ -= 1;
+        emitted_visit = true;
       }
       // Create collisions here.
       if (cur_limit > 0) {
@@ -1774,10 +1778,19 @@ void SearchWorker::PickNodesToExtendTask(
             max_limit > cur_limit) {
           max_count = max_limit;
         }
-        // Test-only seam (#878 f2): between the successful Visit above and
-        // the collision insertion, with the colliding share still owned by
-        // the ledger entry.
-        TestOnlyMaybeThrowAt(TestOnlyThrowSite::kBeforeEmission);
+        if (emitted_visit) {
+          // Dedicated seam (review #881 P2): only reachable when a Visit was
+          // just inserted AND a collision share remains -- the exact window
+          // the split-ownership fix protects. It records the remaining share
+          // so the regression test asserts this post-visit context instead
+          // of merely that some emission happened somewhere.
+          TestOnlyRecordPostVisitRemainingShare(cur_limit);
+          TestOnlyMaybeThrowAt(
+              TestOnlyThrowSite::kBeforeCollisionAfterVisit);
+        } else {
+          // Collision-only entry: the generic emission seam.
+          TestOnlyMaybeThrowAt(TestOnlyThrowSite::kBeforeEmission);
+        }
         receiver->push_back(
             NodeToProcess::Collision(full_path, cur_limit, max_count));
         // Collision share transferred too (leaf-exclusive cancellation); the

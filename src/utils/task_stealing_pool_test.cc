@@ -202,12 +202,90 @@ TEST(TaskStealingPool, StealUnderLoadPreservesCounts) {
 }
 
 // Fault-injection fixture for the Submit publication rollback (#878 finding
-// 4): always leave every seam disarmed so an unexpectedly surviving countdown
-// cannot bleed into the next test in this binary.
+// 4) and the completion-publication contract (#881): always leave every seam
+// disarmed so an unexpectedly surviving countdown cannot bleed into the next
+// test in this binary.
 class PoolInsertFailureTest : public ::testing::Test {
  protected:
   void TearDown() override { TestOnlyResetSeams(); }
 };
+
+// Task with an owned payload, so "partial result ownership" is observable.
+struct PoolPayloadTask {
+  int tag = 0;
+  std::vector<int> payload;
+};
+
+// review #881: completion publication must not allocate on worker threads.
+// The completion slot is reserved at acceptance, on the submitting thread, so
+// a failure there rejects the task cleanly -- no phantom counts -- while
+// already-accepted peers keep their payloads and drain normally.
+TEST_F(PoolInsertFailureTest, CompletionReserveFailureRollsBackAcceptance) {
+  std::atomic<int> ran{0};
+  std::atomic<int> payload_entries{0};
+  TaskStealingPool<PoolPayloadTask> pool(3, [&](PoolPayloadTask& t, int) {
+    ran.fetch_add(1);
+    payload_entries.fetch_add(static_cast<int>(t.payload.size()));
+  });
+
+  // Accepted peers published BEFORE the failure...
+  std::vector<PoolPayloadTask> first;
+  for (int i = 0; i < 3; ++i) {
+    first.push_back(PoolPayloadTask{i, std::vector<int>(2, i)});
+  }
+  pool.Submit(std::move(first));
+
+  // ...then the completion-slot reserve fails and this task is rejected.
+  TestOnlySetThrowCount(TestOnlyThrowSite::kPoolCompletionReserve, 0);
+  EXPECT_THROW(pool.Submit(PoolPayloadTask{99, std::vector<int>{9}}),
+               TestOnlyInjectedReservationThrow);
+
+  // Bounded completion: the accepted prefix runs with payloads intact, and
+  // the rejected task never ran and left no phantom count behind.
+  pool.WaitForAll();
+  EXPECT_EQ(ran.load(), 3);
+  EXPECT_EQ(payload_entries.load(), 6);
+  EXPECT_EQ(pool.DrainCompleted().size(), 3u);
+  EXPECT_EQ(pool.CompletedCount(), 3);
+
+  // Next round is fully usable.
+  TestOnlyResetSeams();
+  pool.Reset();
+  std::vector<PoolPayloadTask> second;
+  for (int i = 0; i < 4; ++i) {
+    second.push_back(PoolPayloadTask{i, std::vector<int>(1, i)});
+  }
+  pool.Submit(std::move(second));
+  pool.WaitForAll();
+  EXPECT_EQ(pool.CompletedCount(), 4);
+  EXPECT_EQ(pool.DrainCompleted().size(), 4u);
+}
+
+// Capacity survives drains (review #881): DrainCompleted() must not drop the
+// member vector's capacity, or a later worker completion would allocate again.
+// Pinned behaviorally across submit/wait/drain rounds with partial-result
+// payloads.
+TEST_F(PoolInsertFailureTest, CompletionCapacitySurvivesDrains) {
+  std::atomic<int> ran{0};
+  TaskStealingPool<PoolPayloadTask> pool(4, [&ran](PoolPayloadTask& t, int) {
+    ran.fetch_add(1);
+    t.payload.clear();  // consume, like task results merged by the caller
+  });
+
+  for (int round = 0; round < 5; ++round) {
+    std::vector<PoolPayloadTask> tasks;
+    for (int i = 0; i < 12; ++i) {
+      tasks.push_back(
+          PoolPayloadTask{i, std::vector<int>(static_cast<size_t>(i) + 1, i)});
+    }
+    pool.Submit(std::move(tasks));
+    pool.WaitForAll();
+    auto done = pool.DrainCompleted();
+    ASSERT_EQ(done.size(), 12u) << "round " << round;
+    pool.Reset();
+  }
+  EXPECT_EQ(ran.load(), 60);
+}
 
 // A single-insertion failure must not strand a phantom active task (WaitForAll
 // would hang with nothing left to complete it), must reject the task, and must

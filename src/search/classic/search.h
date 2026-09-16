@@ -242,7 +242,10 @@ class SearchWorker {
             // Test-only seams (#876 f5): a worker-executor fault site before
             // the task's own code runs, and per-type execution counters that
             // prove these callbacks actually executed while a pool round was
-            // in flight (tree size/shape alone does not).
+            // in flight (tree size/shape alone does not). The context mark
+            // lets a seam throw record that it happened in a pool task
+            // (review #881 P2).
+            TestOnlyMarkPoolTaskContext();
             TestOnlyMaybeThrowAt(TestOnlyThrowSite::kWorkerExecutor);
             switch (task.task_type) {
               case PickTask::kGathering:
