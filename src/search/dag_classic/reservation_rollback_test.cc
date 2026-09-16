@@ -97,9 +97,9 @@ class FakeBackend : public Backend {
 void ExpectZeroNInFlightEverywhere(Node* node) {
   ASSERT_NE(node, nullptr);
   EXPECT_EQ(node->GetNInFlight(), 0u)
-      << "leaked reservation on a non-root node";
-  for (Node* child : node->VisitedNodes()) {
-    ExpectZeroNInFlightEverywhere(child);
+      << "leaked reservation on a non-root node (N=" << node->GetN() << ")";
+  for (auto& edge : node->Edges()) {
+    if (edge.node() != nullptr) ExpectZeroNInFlightEverywhere(edge.node());
   }
 }
 
