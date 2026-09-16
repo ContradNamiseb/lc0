@@ -517,12 +517,32 @@ class SearchWorker {
   struct TaskWorkspace {
     std::vector<CurrentPath> current_path;
     BackupPath full_path;
+    // Reservation-rollback bookkeeping for PickNodesToExtendTask (agora
+    // #41/#872 P1): n_in_flight_ reservations made mid-traversal are not
+    // visible to CancelPendingMinibatchVisits until they land in the output
+    // receiver, so an exception between reservation and emission would
+    // otherwise leak them. reservation_ledger runs parallel to current_path
+    // (same push/pop sites): (node, ancestor_prefix_len), where
+    // ancestor_prefix_len is how many entries at the FRONT of full_path (as
+    // it stood when this entry was pushed) are that node's ancestors --
+    // Node has no GetParent() here (a DAG node can have several), so
+    // rollback has to walk the same path-slice CancelPendingMinibatchVisits
+    // does instead of a parent chain. A zero current_path[i].visits_ marks
+    // that slot superseded-by-its-own-children rather than live.
+    // level_reservations holds the current, not-yet-promoted level's picks
+    // (Node*, amount) -- these are cancelled directly on their own node, no
+    // path walk, since the still-live parent entry above already accounts
+    // for the ancestor chain until it's promoted or handed to a task.
+    std::vector<std::pair<Node*, int>> reservation_ledger;
+    std::vector<std::pair<Node*, int>> level_reservations;
     // One per worker (this workspace is), reused across every gather task
     // that worker runs -- see CachedNodeData's comment above.
     CachedNodeData cache;
     TaskWorkspace() {
       current_path.reserve(30);
       full_path.reserve(30);
+      reservation_ledger.reserve(30);
+      level_reservations.reserve(16);
     }
   };
 

@@ -1080,7 +1080,40 @@ if get_option('gtest')
     include_directories: includes, link_with: lc0_lib, dependencies: [gtest] + deps),
     args: '--gtest_output=xml:poolequiv.xml', timeout: 120)
 
+  test('ClassicReservationRollback',
+    executable('classic_reservation_rollback_test', 'src/search/classic/reservation_rollback_test.cc',
+    'src/search/classic/params.cc',
+    'src/search/classic/search.cc',
+    'src/search/classic/stoppers/alphazero.cc',
+    'src/search/classic/stoppers/common.cc',
+    'src/search/classic/stoppers/factory.cc',
+    'src/search/classic/stoppers/legacy.cc',
+    'src/search/classic/stoppers/simple.cc',
+    'src/search/classic/stoppers/smooth.cc',
+    'src/search/classic/stoppers/stoppers.cc',
+    'src/search/classic/stoppers/timemgr.cc',
+    pb_files,
+    include_directories: includes, link_with: lc0_lib, dependencies: [gtest] + deps),
+    args: '--gtest_output=xml:reservationrollback.xml', timeout: 120)
+
   if get_option('dag_classic')
+    test('DagSearchBackendFailure',
+      executable('dag_backend_failure_test', 'src/search/dag_classic/backend_failure_test.cc',
+      'src/search/dag_classic/node.cc',
+      'src/search/dag_classic/search.cc',
+      'src/search/classic/params.cc',
+      'src/search/classic/stoppers/alphazero.cc',
+      'src/search/classic/stoppers/common.cc',
+      'src/search/classic/stoppers/factory.cc',
+      'src/search/classic/stoppers/legacy.cc',
+      'src/search/classic/stoppers/simple.cc',
+      'src/search/classic/stoppers/smooth.cc',
+      'src/search/classic/stoppers/stoppers.cc',
+      'src/search/classic/stoppers/timemgr.cc',
+      pb_files,
+      include_directories: includes, link_with: lc0_lib, dependencies: [gtest] + deps),
+      args: '--gtest_output=xml:dagbackendfailure.xml', timeout: 90)
+
     test('DagSearchPoolEquivalence',
       executable('dag_pool_equivalence_test', 'src/search/dag_classic/pool_equivalence_test.cc',
       'src/search/dag_classic/node.cc',
@@ -1097,6 +1130,23 @@ if get_option('gtest')
       pb_files,
       include_directories: includes, link_with: lc0_lib, dependencies: [gtest] + deps),
       args: '--gtest_output=xml:dagpoolequiv.xml', timeout: 120)
+
+    test('DagReservationRollback',
+      executable('dag_reservation_rollback_test', 'src/search/dag_classic/reservation_rollback_test.cc',
+      'src/search/dag_classic/node.cc',
+      'src/search/dag_classic/search.cc',
+      'src/search/classic/params.cc',
+      'src/search/classic/stoppers/alphazero.cc',
+      'src/search/classic/stoppers/common.cc',
+      'src/search/classic/stoppers/factory.cc',
+      'src/search/classic/stoppers/legacy.cc',
+      'src/search/classic/stoppers/simple.cc',
+      'src/search/classic/stoppers/smooth.cc',
+      'src/search/classic/stoppers/stoppers.cc',
+      'src/search/classic/stoppers/timemgr.cc',
+      pb_files,
+      include_directories: includes, link_with: lc0_lib, dependencies: [gtest] + deps),
+      args: '--gtest_output=xml:dagreservationrollback.xml', timeout: 120)
   endif
 endif
 

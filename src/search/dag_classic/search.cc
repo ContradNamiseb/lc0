@@ -44,6 +44,7 @@
 #include "utils/fastmath.h"
 #include "utils/random.h"
 #include "utils/spinhelper.h"
+#include "utils/testonly_throw_hook.h"
 #include "utils/trace.h"
 
 namespace lczero {
@@ -1619,6 +1620,11 @@ void SearchWorker::PickNodesToExtendTask(
   full_path = path;
   assert(full_path.size() > 0);
   auto [node, repetitions, moves_left] = full_path.back();
+  // Reservation rollback bookkeeping -- see the TaskWorkspace comment.
+  auto& reservation_ledger = workspace->reservation_ledger;
+  reservation_ledger.clear();
+  auto& level_reservations = workspace->level_reservations;
+  level_reservations.clear();
   // Sometimes receiver is reused, othertimes not, so only jump start if small.
   if (receiver->capacity() < 30) {
     receiver->reserve(receiver->size() + 30);
@@ -1651,11 +1657,24 @@ void SearchWorker::PickNodesToExtendTask(
       is_root_node && ShouldStopPickingHere(node, true, repetitions);
   const bool visit_root = stop_root && node->TryStartScoreUpdate();
   current_path.emplace_back(collision_limit, true, visit_root, stop_root, 0);
+  // full_path currently ends AT root itself (full_path.back() == node), so
+  // root's own ancestor prefix is everything before that.
+  reservation_ledger.emplace_back(node, static_cast<int>(full_path.size()) - 1);
   // take base sqrt(2) logarithm of root node for large subbranch N limit. It is
   // used to split tasks.
   const unsigned large_branch_limit =
       std::bit_width(search_->root_node_->GetN()) * 2;
 
+  // Everything from here down can leave a partial reservation behind if it
+  // throws mid-traversal (agora #41/#872 P1): n_in_flight_ increments made
+  // for a node that hasn't yet produced a receiver entry (Visit/Collision)
+  // or been handed to a submitted task are invisible to
+  // CancelPendingMinibatchVisits, which only walks emitted entries. Roll
+  // those back here before propagating, using the same per-entry
+  // node-to-root walk CancelPendingMinibatchVisits uses for a real entry --
+  // see the cleanup block below for why each entry needs that walk, not a
+  // direct cancel on its own node.
+  try {
   while (current_path.size() > 0) {
     assert(full_path.size() >= path.size());
     // First prepare visits_to_perform.
@@ -1682,6 +1701,7 @@ void SearchWorker::PickNodesToExtendTask(
       do {
         saved_is_last_child = current_path.back().last_child_;
         current_path.pop_back();
+        reservation_ledger.pop_back();
         if (current_path.size() == 0) break;
         history.Pop();
         full_path.pop_back();
@@ -1834,6 +1854,7 @@ void SearchWorker::PickNodesToExtendTask(
           // Add more visits to the branch.
           Node* child_node = best_edge.GetOrSpawnNode(/* parent */ node);
           child_node->IncrementNInFlight(new_visits);
+          level_reservations.emplace_back(child_node, new_visits);
           auto& child_cache = cache.children[best_idx];
           child_cache.n_started += new_visits;
           child_cache.uct_score = child_cache.iter.GetP() * puct_mult /
@@ -1850,6 +1871,8 @@ void SearchWorker::PickNodesToExtendTask(
         visits_to_perform[best_idx].large_branch_ =
             child_node->GetN() > large_branch_limit;
         if (child_node->TryStartScoreUpdate()) {
+          level_reservations.emplace_back(child_node, 1);
+          TestOnlyMaybeThrowAfterReservation();
           auto& child_cache = cache.children[best_idx];
           child_cache.n_started++;
           new_visits -= 1;
@@ -1858,6 +1881,7 @@ void SearchWorker::PickNodesToExtendTask(
             visits_to_perform[best_idx].stop_picking_ = 1;
           } else {
             child_node->IncrementNInFlight(new_visits);
+            level_reservations.emplace_back(child_node, new_visits);
             child_cache.n_started += new_visits;
           }
           child_cache.uct_score = child_cache.iter.GetP() * puct_mult /
@@ -1919,6 +1943,20 @@ void SearchWorker::PickNodesToExtendTask(
             if (passed) {
               task_pool_->Submit(PickTask(full_path, history, child_limit));
               visits_to_perform[i] = 0;
+              // Ownership of this child's reservation transfers to the
+              // submitted task, which rolls it back itself on its own
+              // throw -- it's no longer this call's responsibility. This
+              // has to happen before the test-only throw seam below: a
+              // throw before the ownership transfer completes would leave
+              // both this call's cleanup and the already-running submitted
+              // task racing to cancel the same reservation.
+              auto new_end = std::remove_if(
+                  level_reservations.begin(), level_reservations.end(),
+                  [child_node](const std::pair<Node*, int>& e) {
+                    return e.first == child_node;
+                  });
+              level_reservations.erase(new_end, level_reservations.end());
+              TestOnlyMaybeThrowAfterReservation();
             }
           }
           history.Pop();
@@ -1928,13 +1966,33 @@ void SearchWorker::PickNodesToExtendTask(
       auto rend = visits_to_perform.rend();
       auto rbegin = rend - std::distance(visits_to_perform.begin(), end);
       size_t size = current_path.size();
-      std::copy_if(rbegin, rend, std::back_inserter(current_path),
-                   [](CurrentPath& v) {
-                     return !!v;
-                   });
+      // This level's own reservation is about to be fully redistributed to
+      // whatever survives below (pushed onto current_path) or was handed
+      // off to a task above -- zero it so the cleanup block on an exception
+      // doesn't also treat it as still outstanding (current_path[i].visits_
+      // == 0 marks a superseded/dead entry, matching the sentinel-zero
+      // convention CurrentPath::operator bool already uses).
+      current_path.back().visits_ = 0;
+      // All the children pushed below share this same parent, so they
+      // share the same ancestor prefix: everything currently in full_path
+      // (which still ends at `node`, this level's parent -- the child
+      // itself is never appended to full_path here, only when the
+      // traversal actually descends into it).
+      const int child_ancestor_prefix_len = static_cast<int>(full_path.size());
+      for (auto it = rbegin; it != rend; ++it) {
+        if (!*it) continue;
+        current_path.push_back(*it);
+        reservation_ledger.emplace_back(
+            cache.children[it->index_].iter.GetOrSpawnNode(node),
+            child_ancestor_prefix_len);
+      }
       if (current_path.size() != size) {
         current_path[size].last_child_ = true;
       }
+      // Everything still in level_reservations at this point was either
+      // promoted above (now tracked via current_path/reservation_ledger) or
+      // handed off to a task -- this level's traversal is done with it.
+      level_reservations.clear();
       // Fall through to select the first child.
     }
     // Prepare state for the next node to be processed. The parent node
@@ -1952,6 +2010,55 @@ void SearchWorker::PickNodesToExtendTask(
           GetRepetitions(full_path.size(), history.Last());
       full_path.push_back({node, repetitions, moves_left});
     }
+  }
+  } catch (...) {
+    // Roll back every reservation this call made that never reached the
+    // output receiver or a submitted task, using the same path-slice walk
+    // CancelPendingMinibatchVisits performs for a real receiver entry (Node
+    // has no GetParent() in a DAG -- a node can have several -- so this
+    // walks the ancestor prefix of full_path recorded alongside each
+    // reservation_ledger entry instead of a parent chain; see the
+    // TaskWorkspace comment for why level_reservations doesn't need this).
+    auto cancel_prefix = [&full_path](int prefix_len, int amount) {
+      if (amount <= 0) return;
+      for (int j = 0; j < prefix_len; ++j) {
+        std::get<0>(full_path[j])->CancelScoreUpdate(amount);
+      }
+    };
+    // This level's not-yet-promoted picks were reserved directly on their
+    // own node only -- the still-live ancestor entry below (not yet
+    // superseded, since promotion for this level hasn't happened) already
+    // accounts for the rest of the chain up to root.
+    for (auto& entry : level_reservations) {
+      entry.first->CancelScoreUpdate(entry.second);
+    }
+    level_reservations.clear();
+    // Everything still on the stack: current_path[i].visits_ == 0 marks an
+    // entry superseded by its own already-pushed children (nothing to
+    // cancel there -- its share is fully covered by those children's own
+    // walks). A live non-leaf entry had its full amount applied at its own
+    // node and every ancestor. A live leaf-shaped (stop_picking_) entry is
+    // split the same way a real Visit/Collision receiver entry would be:
+    // up to 1 visit walked leaf-inclusive, the remainder (a would-be
+    // collision) walked leaf-exclusive (ancestors only).
+    for (size_t i = 0; i < current_path.size(); ++i) {
+      const auto& entry = current_path[i];
+      if (entry.visits_ == 0) continue;
+      auto [n, prefix_len] = reservation_ledger[i];
+      if (entry.stop_picking_) {
+        int visit_amount = entry.visit_child_ ? 1 : 0;
+        if (visit_amount > 0) n->CancelScoreUpdate(visit_amount);
+        cancel_prefix(prefix_len, visit_amount);
+        cancel_prefix(prefix_len,
+                       static_cast<int>(entry.visits_) - visit_amount);
+      } else {
+        n->CancelScoreUpdate(static_cast<int>(entry.visits_));
+        cancel_prefix(prefix_len, static_cast<int>(entry.visits_));
+      }
+    }
+    current_path.clear();
+    reservation_ledger.clear();
+    throw;
   }
   assert(!starting_from_root ||
          history.GetLength() == search_->played_history_.GetLength());

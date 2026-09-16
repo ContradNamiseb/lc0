@@ -16,10 +16,25 @@
 // visit budget with zero leaked N-in-flight -- codex-sol's re-review
 // (agora #867) asked for this as validation before approving the
 // TaskStealingPool migration.
+//
+// review #872 point 2: the original version of this test used
+// recommended_batch_size=1 and a one-visit collision budget, so
+// AddInput always returned FETCHED_IMMEDIATELY, classic's gather split
+// never triggered (child_limit never exceeded MinimumWorkSizeForPicking),
+// and the pooled/serial comparison was only a loose total-playout ratio --
+// none of it proved either config's worker paths actually executed.
+// FakeBackend now queues into a real batch (ComputeBlocking() gets called
+// for real), and RunFixedVisitSearch additionally walks the resulting tree
+// and reports its node count and max depth, so every test below can assert
+// real multi-level, multi-node exploration happened -- collisions alone
+// never grow the tree, so a shallow/sparse tree here would mean the pool
+// path degenerated into pure collisions instead of real picking/processing.
 
 #include "search/classic/search.h"
 
+#include <algorithm>
 #include <atomic>
+#include <mutex>
 
 #include "chess/board.h"
 #include "chess/callbacks.h"
@@ -34,31 +49,54 @@ namespace lczero {
 namespace classic {
 namespace {
 
-// Deterministic, always-cache-hit computation: same shape as
-// backend_failure_test.cc's FakeSuccessComputation. Uniform policy/value
-// removes real-NN timing/precision noise so a visit-count comparison
-// between serial and pooled runs is meaningful.
+// Deterministic, real-batching computation: uniform policy/value removes
+// real-NN timing/precision noise so a visit-count comparison between
+// serial and pooled runs is meaningful, and queuing into ComputeBlocking()
+// instead of fetching immediately means processing tasks (ProcessPickedTask)
+// have real work to do, not just gathering ones.
+//
+// AddInput() is called concurrently by every gathering task feeding this
+// same per-round computation_ (that's the whole point of pooled gathering,
+// and what a real backend has to support too), so queued_ needs a lock --
+// unlike the FETCHED_IMMEDIATELY version this replaces, which never had
+// shared mutable state across a call.
 class FakeComputation : public BackendComputation {
  public:
-  size_t UsedBatchSize() const override { return used_; }
+  size_t UsedBatchSize() const override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return queued_.size();
+  }
   AddInputResult AddInput(const EvalPosition& pos,
                           EvalResultPtr result) override {
-    if (result.q) *result.q = 0.0f;
-    if (result.d) *result.d = 1.0f;
-    if (result.m) *result.m = 0.0f;
-    if (!result.p.empty()) {
-      const float p = pos.legal_moves.empty()
-                          ? 0.0f
-                          : 1.0f / pos.legal_moves.size();
-      for (auto& v : result.p) v = p;
-    }
-    ++used_;
-    return FETCHED_IMMEDIATELY;
+    std::lock_guard<std::mutex> lock(mutex_);
+    queued_.push_back(result);
+    legal_move_counts_.push_back(pos.legal_moves.size());
+    return ENQUEUED_FOR_EVAL;
   }
-  void ComputeBlocking() override {}
+  void ComputeBlocking() override {
+    // No concurrent AddInput() calls can be in flight once ComputeBlocking
+    // is reached (matches the real GatherMinibatch/RunNNComputation
+    // ordering), so the lock here is a belt-and-suspenders visibility
+    // fence, not contention prevention.
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (size_t i = 0; i < queued_.size(); ++i) {
+      EvalResultPtr result = queued_[i];
+      if (result.q) *result.q = 0.0f;
+      if (result.d) *result.d = 1.0f;
+      if (result.m) *result.m = 0.0f;
+      if (!result.p.empty()) {
+        const float p = legal_move_counts_[i] == 0
+                            ? 0.0f
+                            : 1.0f / legal_move_counts_[i];
+        for (auto& v : result.p) v = p;
+      }
+    }
+  }
 
  private:
-  size_t used_ = 0;
+  mutable std::mutex mutex_;
+  std::vector<EvalResultPtr> queued_;
+  std::vector<size_t> legal_move_counts_;
 };
 
 class FakeBackend : public Backend {
@@ -77,7 +115,7 @@ class FakeBackend : public Backend {
                              .has_wdl = true,
                              .runs_on_cpu = runs_on_cpu_,
                              .suggested_num_search_threads = 1,
-                             .recommended_batch_size = 1,
+                             .recommended_batch_size = 32,
                              .maximum_batch_size = 256};
   }
   std::unique_ptr<BackendComputation> CreateComputation() override {
@@ -100,12 +138,35 @@ class FakeBackend : public Backend {
   bool runs_on_cpu_;
 };
 
+// Walks the whole tree, reporting how many nodes were actually visited
+// (GetN() > 0) and how deep the deepest one is. Collisions never expand a
+// node, so a real split/processing pipeline should reach visibly more
+// nodes and depth than picking alone could produce serially in the same
+// budget -- this is the "did the pool actually do search work" proxy in
+// place of instrumenting TaskStealingPool's own counters directly (it has
+// no test-visible identity here -- pool_equivalence_test only ever sees
+// the Search/SearchWorker surface).
+struct TreeShape {
+  int visited_nodes = 0;
+  int max_depth = 0;
+};
+
+void WalkTreeShape(Node* node, int depth, TreeShape* shape) {
+  if (node->GetN() == 0) return;
+  ++shape->visited_nodes;
+  shape->max_depth = std::max(shape->max_depth, depth);
+  for (Node* child : node->VisitedNodes()) {
+    WalkTreeShape(child, depth + 1, shape);
+  }
+}
+
 // Runs a fixed-visit search with the given TaskWorkers setting and returns
-// (bestmove is set, final root N-in-flight, total playouts).
+// (bestmove is set, final root N-in-flight, total playouts, tree shape).
 struct RunResult {
   bool got_bestmove = false;
   uint32_t root_n_in_flight = 0xffffffffu;  // poisoned until set
   int64_t total_playouts = 0;
+  TreeShape shape;
 };
 
 RunResult RunFixedVisitSearch(int task_workers, int visits, int threads,
@@ -141,44 +202,63 @@ RunResult RunFixedVisitSearch(int task_workers, int visits, int threads,
 
   result.root_n_in_flight = tree.GetCurrentHead()->GetNInFlight();
   result.total_playouts = search->GetTotalPlayouts();
+  WalkTreeShape(tree.GetCurrentHead(), /*depth=*/0, &result.shape);
   return result;
 }
 
 TEST(SearchPoolEquivalence, SerialConvergesCleanly) {
-  RunResult r = RunFixedVisitSearch(/*task_workers=*/0, /*visits=*/2000,
+  RunResult r = RunFixedVisitSearch(/*task_workers=*/0, /*visits=*/5000,
                                     /*threads=*/4);
   EXPECT_TRUE(r.got_bestmove);
   EXPECT_EQ(r.root_n_in_flight, 0u);
-  EXPECT_GE(r.total_playouts, 2000);
+  EXPECT_GE(r.total_playouts, 5000);
+  EXPECT_GE(r.shape.visited_nodes, 500);
+  EXPECT_GE(r.shape.max_depth, 4);
 }
 
 TEST(SearchPoolEquivalence, PooledConvergesCleanly) {
-  RunResult r = RunFixedVisitSearch(/*task_workers=*/4, /*visits=*/2000,
+  RunResult r = RunFixedVisitSearch(/*task_workers=*/4, /*visits=*/5000,
                                     /*threads=*/4);
   EXPECT_TRUE(r.got_bestmove);
   EXPECT_EQ(r.root_n_in_flight, 0u);
-  EXPECT_GE(r.total_playouts, 2000);
+  EXPECT_GE(r.total_playouts, 5000);
+  // The real proof the pool path did search work rather than degenerating
+  // into pure collisions: with real batching and 4 task workers, a shallow
+  // or sparse tree here means gathering/processing tasks never actually
+  // ran real picks, only what codex-sol's #872 review flagged as an
+  // unproven "constructing worker threads is not evidence they executed."
+  EXPECT_GE(r.shape.visited_nodes, 500);
+  EXPECT_GE(r.shape.max_depth, 4);
 }
 
 // Not a strict node-for-node match (thread scheduling can pick a slightly
 // different path near the visit-budget boundary under either config), but
 // both must land in the same ballpark for the identical uniform-eval
 // backend -- a real behavioral divergence between the two code paths would
-// show up as a large, not a marginal, gap.
+// show up as a large, not a marginal, gap. Tightened from the original
+// 0.5x-2.0x band now that real batching (not FETCHED_IMMEDIATELY-always)
+// makes both configs' pacing more comparable.
 TEST(SearchPoolEquivalence, SerialAndPooledConvergeToComparablePlayouts) {
-  RunResult serial = RunFixedVisitSearch(/*task_workers=*/0, /*visits=*/2000,
+  RunResult serial = RunFixedVisitSearch(/*task_workers=*/0, /*visits=*/5000,
                                          /*threads=*/4);
-  RunResult pooled = RunFixedVisitSearch(/*task_workers=*/4, /*visits=*/2000,
+  RunResult pooled = RunFixedVisitSearch(/*task_workers=*/4, /*visits=*/5000,
                                          /*threads=*/4);
   ASSERT_TRUE(serial.got_bestmove);
   ASSERT_TRUE(pooled.got_bestmove);
   EXPECT_EQ(serial.root_n_in_flight, 0u);
   EXPECT_EQ(pooled.root_n_in_flight, 0u);
+  EXPECT_GE(serial.shape.visited_nodes, 500);
+  EXPECT_GE(pooled.shape.visited_nodes, 500);
 
   const double ratio = static_cast<double>(pooled.total_playouts) /
                        static_cast<double>(serial.total_playouts);
-  EXPECT_GT(ratio, 0.5);
-  EXPECT_LT(ratio, 2.0);
+  EXPECT_GT(ratio, 0.7);
+  EXPECT_LT(ratio, 1.4);
+
+  const double node_ratio = static_cast<double>(pooled.shape.visited_nodes) /
+                            static_cast<double>(serial.shape.visited_nodes);
+  EXPECT_GT(node_ratio, 0.6);
+  EXPECT_LT(node_ratio, 1.6);
 }
 
 // TaskWorkers=-1 (the actual UCI default -- real games never set this
@@ -188,22 +268,26 @@ TEST(SearchPoolEquivalence, SerialAndPooledConvergeToComparablePlayouts) {
 // hardware_concurrency(). Both branches need their own coverage since
 // they're different code paths, not just different inputs to the same one.
 TEST(SearchPoolEquivalence, DefaultHeuristicOnCpuBackendResolvesToSerial) {
-  RunResult r = RunFixedVisitSearch(/*task_workers=*/-1, /*visits=*/2000,
+  RunResult r = RunFixedVisitSearch(/*task_workers=*/-1, /*visits=*/5000,
                                     /*threads=*/4, /*runs_on_cpu=*/true);
   EXPECT_TRUE(r.got_bestmove);
   EXPECT_EQ(r.root_n_in_flight, 0u);
-  EXPECT_GE(r.total_playouts, 2000);
+  EXPECT_GE(r.total_playouts, 5000);
+  EXPECT_GE(r.shape.visited_nodes, 500);
+  EXPECT_GE(r.shape.max_depth, 4);
 }
 
 TEST(SearchPoolEquivalence, DefaultHeuristicOnGpuBackendResolvesToPooled) {
   // runs_on_cpu=false takes the hardware_concurrency()-sized branch -- this
   // is what a real sycl-fp16/sycl-auto game actually runs with, since -1 is
   // the option's default and nothing in a normal UCI session overrides it.
-  RunResult r = RunFixedVisitSearch(/*task_workers=*/-1, /*visits=*/2000,
+  RunResult r = RunFixedVisitSearch(/*task_workers=*/-1, /*visits=*/5000,
                                     /*threads=*/4, /*runs_on_cpu=*/false);
   EXPECT_TRUE(r.got_bestmove);
   EXPECT_EQ(r.root_n_in_flight, 0u);
-  EXPECT_GE(r.total_playouts, 2000);
+  EXPECT_GE(r.total_playouts, 5000);
+  EXPECT_GE(r.shape.visited_nodes, 500);
+  EXPECT_GE(r.shape.max_depth, 4);
 }
 
 }  // namespace

@@ -8,32 +8,22 @@
   (at your option) any later version.
 */
 
-// Also covers review #872 point 3: a backend that always returns
-// FETCHED_IMMEDIATELY from AddInput() never exercises a real
-// ComputeBlocking() failure, since nothing ever reaches it with pooled
-// tasks having actually contributed to the batch. RealBatchThenThrowBackend
-// below queues into a real batch instead and throws from ComputeBlocking()
-// itself, with task_workers>0 so the batch is built from real pooled-task
-// contributions, not just the main thread's own picks.
+// dag_classic mirror of classic/backend_failure_test.cc (agora #867 P1-B /
+// #872): a real Backend::CreateComputation() failure between two
+// iterations used to hit a stale-state bug -- InitializeIteration()
+// cleared minibatch_ AFTER the throwing CreateComputation() call, so a
+// throw on iteration N skipped the clear and left iteration (N-1)'s
+// already-backed-up entries sitting in minibatch_. The worker's
+// catch(...) -> CancelPendingMinibatchVisits() then walked those stale
+// entries and cancelled reservations DoBackupUpdate had already
+// legitimately released, double-cancelling/underflowing N-in-flight.
 //
-// Fault-injection coverage for review #867 P1-B: a real Backend::
-// CreateComputation() failure (the original motivating case was a Level
-// Zero device exception mid-game) between two iterations used to hit a
-// stale-state bug -- InitializeIteration() cleared minibatch_ AFTER the
-// throwing CreateComputation() call, so a throw on iteration N skipped the
-// clear and left iteration (N-1)'s already-backed-up entries sitting in
-// minibatch_. The worker's catch(...) -> CancelPendingMinibatch() then
-// walked those stale entries and cancelled reservations DoBackupUpdate had
-// already legitimately released, double-cancelling/underflowing N-in-flight.
-//
-// This test runs one iteration to real completion (so minibatch_ actually
-// holds backed-up entries afterward) and then makes the NEXT
-// CreateComputation() call throw, asserting the search still converges to
-// exactly one bestmove and every node's N-in-flight returns to zero -- the
-// double-cancel this fix prevents would otherwise drive some node's count
-// negative (uint32_t underflow) rather than leave it at zero.
+// This runs one iteration to real completion (so minibatch_ actually holds
+// backed-up entries afterward) and then makes the NEXT CreateComputation()
+// call throw, asserting the search still converges to exactly one bestmove
+// and every node's N-in-flight returns to zero.
 
-#include "search/classic/search.h"
+#include "search/dag_classic/search.h"
 
 #include <atomic>
 #include <stdexcept>
@@ -43,24 +33,17 @@
 #include "gtest/gtest.h"
 #include "neural/backend.h"
 #include "neural/shared_params.h"
-#include "search/classic/params.h"
 #include "search/classic/stoppers/stoppers.h"
+#include "search/dag_classic/params.h"
 #include "utils/optionsparser.h"
 
 namespace lczero {
-namespace classic {
+namespace dag_classic {
 namespace {
 
 // Synchronous, always-cache-hit computation: AddInput fills the result
 // directly and reports FETCHED_IMMEDIATELY, so ComputeBlocking() is a
-// no-op. Good enough to let a real gather/backup cycle complete.
-//
-// MaybePrefetchIntoCache() legitimately calls AddInput() with a
-// default-constructed, all-null EvalResultPtr{} (search.cc ~2160) as a
-// fire-and-forget cache-warming signal -- it never reads the result, so a
-// real backend must not unconditionally dereference q/d/m. This fake
-// mirrors that contract instead of assuming every call carries a real,
-// non-null result to write into.
+// no-op -- good enough to let a real gather/backup cycle complete.
 class FakeSuccessComputation : public BackendComputation {
  public:
   size_t UsedBatchSize() const override { return used_; }
@@ -128,7 +111,8 @@ class ThrowAfterNBackend : public Backend {
 // ComputeBlocking() itself once the batch reaches a real size -- unlike
 // FakeSuccessComputation above, this exercises the path where pooled tasks
 // have actually added work to the same in-flight computation before it
-// fails.
+// fails (review #872 point 3: FETCHED_IMMEDIATELY-everywhere never reaches
+// a real ComputeBlocking() failure).
 class RealBatchThenThrowComputation : public BackendComputation {
  public:
   size_t UsedBatchSize() const override { return queued_; }
@@ -189,9 +173,11 @@ TEST(SearchBackendFailure, ComputeBlockingThrowWithPooledTasksIsSafe) {
 
   NodeTree tree;
   tree.ResetToPosition(ChessBoard::kStartposFen, {});
+  TranspositionTable tt;
 
-  auto stopper = std::make_unique<ChainedSearchStopper>();
-  stopper->AddStopper(std::make_unique<VisitsStopper>(5000, false));
+  auto stopper = std::make_unique<classic::ChainedSearchStopper>();
+  stopper->AddStopper(
+      std::make_unique<classic::VisitsStopper>(5000, false));
 
   std::atomic<int> bestmove_count{0};
   auto responder = std::make_unique<CallbackUciResponder>(
@@ -201,7 +187,7 @@ TEST(SearchBackendFailure, ComputeBlockingThrowWithPooledTasksIsSafe) {
   auto search = std::make_unique<Search>(
       tree, &backend, std::move(responder), MoveList(),
       std::chrono::steady_clock::now(), std::move(stopper),
-      /*infinite=*/false, /*ponder=*/false, option_dict, nullptr);
+      /*infinite=*/false, /*ponder=*/false, option_dict, &tt, nullptr);
 
   search->StartThreads(4);
   search->Wait();
@@ -225,9 +211,11 @@ TEST(SearchBackendFailure, CreateComputationThrowDoesNotUnderflowOrHang) {
 
   NodeTree tree;
   tree.ResetToPosition(ChessBoard::kStartposFen, {});
+  TranspositionTable tt;
 
-  auto stopper = std::make_unique<ChainedSearchStopper>();
-  stopper->AddStopper(std::make_unique<VisitsStopper>(100000, false));
+  auto stopper = std::make_unique<classic::ChainedSearchStopper>();
+  stopper->AddStopper(
+      std::make_unique<classic::VisitsStopper>(100000, false));
 
   std::atomic<int> bestmove_count{0};
   auto responder = std::make_unique<CallbackUciResponder>(
@@ -237,7 +225,7 @@ TEST(SearchBackendFailure, CreateComputationThrowDoesNotUnderflowOrHang) {
   auto search = std::make_unique<Search>(
       tree, &backend, std::move(responder), MoveList(),
       std::chrono::steady_clock::now(), std::move(stopper),
-      /*infinite=*/false, /*ponder=*/false, option_dict, nullptr);
+      /*infinite=*/false, /*ponder=*/false, option_dict, &tt, nullptr);
 
   // Single search thread: deterministic ordering between the one
   // successful iteration and the throwing one that follows it.
@@ -256,17 +244,13 @@ TEST(SearchBackendFailure, CreateComputationThrowDoesNotUnderflowOrHang) {
 }
 
 }  // namespace
-}  // namespace classic
+}  // namespace dag_classic
 }  // namespace lczero
 
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   // GenerateLegalMoves() depends on the magic-bitboard sliding-piece attack
-  // tables, normally built once by main() before any engine code runs
-  // (main.cc). Without this, ChessBoard::GenerateLegalMoves() reads
-  // uninitialized lookup tables and crashes -- the standalone unit-test
-  // binaries that touch chess logic (board_test.cc, position_test.cc) all
-  // call this explicitly for the same reason.
+  // tables, normally built once by main() before any engine code runs.
   lczero::InitializeMagicBitboards();
   return RUN_ALL_TESTS();
 }
