@@ -1042,6 +1042,22 @@ if get_option('gtest')
     executable('dag_cached_node_data_test', 'src/search/dag_classic/cached_node_data_test.cc', pb_files,
     include_directories: includes, link_with: lc0_lib, dependencies: [gtest] + deps),
     args: '--gtest_output=xml:dagcache.xml', timeout: 90)
+
+  test('ClassicSearchBackendFailure',
+    executable('classic_backend_failure_test', 'src/search/classic/backend_failure_test.cc',
+    'src/search/classic/params.cc',
+    'src/search/classic/search.cc',
+    'src/search/classic/stoppers/alphazero.cc',
+    'src/search/classic/stoppers/common.cc',
+    'src/search/classic/stoppers/factory.cc',
+    'src/search/classic/stoppers/legacy.cc',
+    'src/search/classic/stoppers/simple.cc',
+    'src/search/classic/stoppers/smooth.cc',
+    'src/search/classic/stoppers/stoppers.cc',
+    'src/search/classic/stoppers/timemgr.cc',
+    pb_files,
+    include_directories: includes, link_with: lc0_lib, dependencies: [gtest] + deps),
+    args: '--gtest_output=xml:backendfailure.xml', timeout: 90)
 endif
 
 
