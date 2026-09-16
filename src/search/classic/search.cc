@@ -27,6 +27,8 @@
 
 #include "search/classic/search.h"
 
+#include <absl/cleanup/cleanup.h>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -623,8 +625,22 @@ void Search::MaybeTriggerStop(const IterationStats& stats,
   Mutex::Lock lock(counters_mutex_);
   // Already responded bestmove, nothing to do here.
   if (bestmove_is_sent_) return;
-  // Don't stop when the root node is not yet expanded.
-  if (stats.total_nodes == 0) return;
+  // Don't let the stopper's own heuristics (ShouldStop below) fire on an
+  // empty tree -- but if a stop was ALREADY requested (UCI `stop`, a time
+  // limit, or a worker exception calling Search::Stop() after the very
+  // first NN batch failed), fall through instead of bailing out: with zero
+  // playouts, no worker will ever gather more (this can be the only
+  // iteration that ever ran), so returning here would leave stop_ true
+  // forever with no bestmove ever sent -- WatchdogThread's loop calls this
+  // every ~100ms but has no way to make total_nodes nonzero itself, so
+  // that's a permanent hang, not just a delay (review #863 finding 3).
+  // EnsureBestMoveKnown() already handles an unexpanded root safely (it
+  // just leaves final_bestmove_ at its default Move(), which serializes to
+  // a syntactically valid if nonsensical "a1a1" rather than crashing) --
+  // better a degenerate response than a hung GUI.
+  if (stats.total_nodes == 0 && !stop_.load(std::memory_order_acquire)) {
+    return;
+  }
 
   if (!stop_.load(std::memory_order_acquire)) {
     if (stopper_->ShouldStop(stats, hints)) FireStopInternal();
@@ -1130,6 +1146,13 @@ void SearchWorker::ExecuteOneIteration() {
   // 2. Gather minibatch.
   GatherMinibatch();
   search_->backend_waiting_counter_.fetch_add(1, std::memory_order_relaxed);
+  // RunNNComputation() below can throw (a backend/device error) -- without
+  // this, that skips the matching decrement below and leaves the counter
+  // permanently inflated for the rest of the search, throwing off the
+  // thread-idling heuristic in GatherMinibatch that reads it (review #863).
+  absl::Cleanup release_backend_waiting = [this] {
+    search_->backend_waiting_counter_.fetch_add(-1, std::memory_order_relaxed);
+  };
 
   // 2b. Collect collisions.
   CollectCollisions();
@@ -1143,7 +1166,7 @@ void SearchWorker::ExecuteOneIteration() {
 
   // 4. Run NN computation.
   RunNNComputation();
-  search_->backend_waiting_counter_.fetch_add(-1, std::memory_order_relaxed);
+  std::move(release_backend_waiting).Invoke();
 
   // 5. Retrieve NN computations (and terminal values) into nodes.
   FetchMinibatchResults();
@@ -1185,6 +1208,35 @@ void SearchWorker::InitializeIteration() {
   computation_ = search_->backend_->CreateComputation();
   minibatch_.clear();
   minibatch_.reserve(2 * target_minibatch_size_);
+}
+
+void SearchWorker::CancelPendingMinibatch() {
+  SharedMutex::Lock lock(search_->nodes_mutex_);
+  for (auto& entry : minibatch_) {
+    Node* node = entry.node;
+    if (node == nullptr) continue;
+    if (entry.IsCollision()) {
+      // Collisions never touched the leaf's own n_in_flight_ (that belongs
+      // to the original, separately-tracked visit already in flight) --
+      // only the ancestors were incremented during the path walk. Mirrors
+      // Search::CancelSharedCollisions / the some_ooo revert block above.
+      for (node = node->GetParent(); node != search_->root_node_->GetParent();
+           node = node->GetParent()) {
+        node->CancelScoreUpdate(entry.multivisit);
+      }
+    } else {
+      // A real visit: TryStartScoreUpdate() reserved the leaf itself, and
+      // IncrementNInFlight() reserved every ancestor on the way down.
+      // Release exactly what DoBackupUpdateSingleNode would have finalized,
+      // starting at the leaf -- but cancel instead of completing the visit,
+      // since it never actually ran.
+      for (Node* n = node; n != search_->root_node_->GetParent();
+           n = n->GetParent()) {
+        n->CancelScoreUpdate(entry.multivisit);
+      }
+    }
+  }
+  minibatch_.clear();
 }
 
 // 2. Gather minibatch.
@@ -1415,11 +1467,6 @@ void SearchWorker::PickNodesToExtend(int collision_limit) {
   if (task_pool_) {
     task_pool_->Reset();
   }
-  // Round-wide split cap (see kMaxSplitsPerTask in PickNodesToExtendTask):
-  // reset once per gather round, shared by every call -- main-thread walk,
-  // every pool worker, and every task those workers recursively submit --
-  // during this round.
-  splits_submitted_.store(0, std::memory_order_relaxed);
   std::vector<Move> empty_movelist;
   // This lock must be held until after the tasks complete below.
   // Since the tasks perform work which assumes they have the lock, even though
@@ -1508,7 +1555,11 @@ void SearchWorker::PickNodesToExtendTask(
   // -----------------------------------------------------------------------
   // Stacks for recursion
   // -----------------------------------------------------------------------
-  CachedNodeData cache;
+  // Lives in the workspace (one per worker), not a per-call local -- review
+  // #864: a local here paid a ~14KB stack frame + 256-entry NSDMI init on
+  // every call regardless of the dropped `{}`. Reused across calls the same
+  // way vtp_buffer/visits_to_perform below already are.
+  auto& cache = workspace->cache;
   auto& vtp_buffer = workspace->vtp_buffer;
   auto& visits_to_perform = workspace->visits_to_perform;
   visits_to_perform.clear();
@@ -1537,17 +1588,17 @@ void SearchWorker::PickNodesToExtendTask(
 
   int passed_off = 0;
   int completed_visits = 0;
-  // Cap on subtrees handed to the pool across one WHOLE gather round,
-  // restoring master's MAX_TASKS=100: at the cap, remaining children simply
-  // keep their visits in vtp and the walking thread explores them itself.
-  // This must be a per-SearchWorker counter (splits_submitted_ member,
-  // reset once per round in PickNodesToExtend), not a local: this function
-  // runs concurrently across every pool worker AND recursively (a submitted
-  // PickTask can itself split further), so a call-local counter only caps
-  // each individual call at 100 and lets the round-wide total scale with
-  // however many calls are in flight -- not a behavior-preserved port of
-  // master's shared, mutex-protected picking_tasks_ bound.
+  // Cap on subtrees THIS CALL hands to the pool -- deliberately per-call,
+  // not a round-wide/global bound. PickNodesToExtendTask runs concurrently
+  // across every pool worker and recursively (a submitted PickTask can
+  // itself split further), so the effective number of splits in one gather
+  // round scales with however many calls are in flight, not a flat 100.
+  // That's intentional here: a true global cap (tried and measured) throttled
+  // splitting hard enough to cost real search speed once the tree is large,
+  // which is the case that matters. Keep this per-call unless a future
+  // measurement says otherwise.
   static constexpr int kMaxSplitsPerTask = 100;
+  int splits_submitted = 0;
 
   current_path.push_back(-1);  // “need to select children” marker
 
@@ -1626,10 +1677,13 @@ void SearchWorker::PickNodesToExtendTask(
                      cur_node->GetNStarted() + cur_limit + 2);
       }
 
-      // Write policy values straight into the AoS cache at a stride, so no
-      // temp buffer is needed.
-      cur_node->CopyPolicy(cache.max_policy_entries_needed,
-                           &cache.children[0].policy, sizeof(ChildCache));
+      // Write policy values straight into the AoS cache, one typed field
+      // access per edge -- no temp buffer, and no pointer arithmetic past
+      // the bounds of what CopyPolicy's old stride parameter was actually
+      // given (review #864).
+      for (int i = 0; i < cache.max_policy_entries_needed; i++) {
+        cache.children[i].policy = cur_node->GetEdgeP(i);
+      }
       // Here we need odd_depth = true; and even_depth = false;.
       // Root depth is 1 here, while for GetDrawScore() it's 0-based, that's why
       // the weirdness: an EVEN sum is the ODD argument (origin/master
@@ -1811,10 +1865,7 @@ void SearchWorker::PickNodesToExtendTask(
       if (task_pool_) {
         for (int i = 0; i <= cache.vtp_last_filled_cache.back(); i++) {
           int child_limit = (*visits_to_perform.back())[i];
-          if (splits_submitted_.load(std::memory_order_relaxed) >=
-              kMaxSplitsPerTask) {
-            break;
-          }
+          if (splits_submitted >= kMaxSplitsPerTask) break;
           if (child_limit > params_.GetMinimumWorkSizeForPicking() &&
               child_limit <
                   ((collision_visit_limit - passed_off - completed_visits) * 2 /
@@ -1832,7 +1883,7 @@ void SearchWorker::PickNodesToExtendTask(
                 child_node, current_path.size() - 1 + base_search_depth + 1,
                 moves_to_path, child_limit));
             moves_to_path.pop_back();
-            splits_submitted_.fetch_add(1, std::memory_order_relaxed);
+            ++splits_submitted;
 
             passed_off += child_limit;
             (*visits_to_perform.back())[i] = 0;

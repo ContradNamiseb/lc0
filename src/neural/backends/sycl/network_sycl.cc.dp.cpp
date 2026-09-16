@@ -23,6 +23,7 @@
 
 #include <sycl/sycl.hpp>
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <functional>
 #include <list>
@@ -231,11 +232,30 @@ class SyclNetwork : public Network {
            try {
                std::rethrow_exception(e);
             } catch(sycl::exception const& e) {
-				CERR 
-                << "Caught asynchronous SYCL exception during GEMM:\n"
-                << e.what() 
+				CERR
+                << "Caught asynchronous SYCL exception (device error, e.g. "
+                   "a driver TDR reset):\n"
+                << e.what()
                 << "\n ";
-                std::terminate();
+                // Do NOT terminate here: this handler can run on a thread
+                // with no lc0 catch block up its stack (SYCL is free to
+                // invoke it from an internal thread, not necessarily the
+                // search worker that submitted the work), so an uncaught
+                // throw here would still take down the whole process either
+                // way. Set a sticky flag instead; forwardEval() checks it on
+                // the search worker's own thread -- which does have a
+                // catch(std::exception&) up its stack -- and throws there,
+                // so the search stops gracefully rather than the engine
+                // dying mid-game.
+                backend_failed_.store(true, std::memory_order_release);
+            } catch (...) {
+                // sycl::exception is the expected/documented case above, but
+                // exception_list is std::exception_ptr -- anything else
+                // (e.g. a std::bad_alloc from inside the runtime) would
+                // otherwise escape this handler uncaught (review #863).
+                CERR << "Caught asynchronous non-SYCL exception from the "
+                        "backend (unknown type)\n ";
+                backend_failed_.store(true, std::memory_order_release);
             }
         }
     };
@@ -597,7 +617,9 @@ class SyclNetwork : public Network {
       for (auto& mem : tensor_mem_) {
             //mem = (typename std::remove_reference<decltype(mem)>::type)
             mem = (DataType *)sycl::malloc_device(maxSize, *sycl_queue_);
-            sycl_queue_->memset(mem, 0, maxSize).wait();
+            // wait_and_throw(), not wait(): same delivery-guarantee reason
+            // as forwardEval()'s post-batch wait -- see there.
+            sycl_queue_->memset(mem, 0, maxSize).wait_and_throw();
       }
     }
 
@@ -612,9 +634,20 @@ class SyclNetwork : public Network {
   }
 
   void forwardEval(InputsOutputs* io, int batchSize) {
-    
-    
-    if (!multi_stream_) lock_.lock();
+
+
+    // RAII, not raw lock()/unlock(): a synchronous SYCL throw anywhere below
+    // (plausible for a device-loss error, which is exactly what this is
+    // hardening against) used to skip the unlock at its old call site further
+    // down, permanently stranding lock_ and hanging every other search
+    // worker that later blocks on it in Search::Wait(). unique_lock's
+    // destructor still unlocks on that exceptional path; the explicit
+    // .unlock() below (kept, same call site, same reason: let the next
+    // thread start using the GPU while this one is still waiting/
+    // postprocessing) makes owns_lock() false by the time we'd reach here,
+    // so the destructor is then a no-op on the normal path, same as before.
+    std::unique_lock<std::mutex> forward_lock(lock_, std::defer_lock);
+    if (!multi_stream_) forward_lock.lock();
 
 #ifdef DEBUG_RAW_NPS
     auto t_start = std::chrono::high_resolution_clock::now();
@@ -864,10 +897,34 @@ class SyclNetwork : public Network {
       //ReportCUDAErrors(
         //  DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()));
       // The next thread can start using the GPU now.
-      lock_.unlock();
+      forward_lock.unlock();
     }
 
-    event.wait();
+    // wait_and_throw(), not wait(): per the SYCL 2020 spec, only
+    // wait_and_throw()/queue::throw_asynchronous()/queue-or-context
+    // destruction are guaranteed delivery points for the async exception
+    // handler registered in the constructor -- plain wait() can return
+    // before that handler has run, which would let the backend_failed_
+    // check below race the handler and read a stale `false` right after a
+    // real async device error (review #863/#864).
+    event.wait_and_throw();
+
+    // A device error (see exceptions_handler in the constructor) may have
+    // landed asynchronously at any point during this batch's kernels --
+    // op_value_mem_shared_/op_policy_mem_ can be garbage in that case. This
+    // is the first point back on the search worker's own call stack since
+    // the batch was submitted, so it's the right place to surface it as a
+    // normal exception: SearchWorker's worker-thread loop already has a
+    // catch(std::exception&) that stops the search gracefully instead of
+    // letting the process die. wait_and_throw() above guarantees the
+    // handler (which only sets this flag, deliberately not throwing itself
+    // -- see the handler for why) has already run by this point.
+    if (backend_failed_.load(std::memory_order_acquire)) {
+      throw Exception(
+          "SYCL backend reported an asynchronous device error mid-batch "
+          "(see log above for detail, e.g. a driver TDR reset) -- aborting "
+          "this search rather than returning results computed from it.");
+    }
 
     if (wdl_) {
       // Value softmax done cpu side.
@@ -965,6 +1022,14 @@ class SyclNetwork : public Network {
   mutable std::mutex lock_;
   sycl::queue* sycl_queue_;
   bool is_cpu_;
+  // Set by the async SYCL exception handler (e.g. a Level Zero device-loss/
+  // TDR reset) instead of calling std::terminate() there -- that handler can
+  // run on a thread with no lc0 exception handler up its stack, so throwing
+  // or terminating from inside it is unsafe either way. forwardEval() checks
+  // this on the calling (search worker) thread, which does have one, and
+  // throws a normal Exception there so the search stops gracefully instead
+  // of the whole engine dying mid-game.
+  std::atomic<bool> backend_failed_{false};
 
 
   int numBlocks_;

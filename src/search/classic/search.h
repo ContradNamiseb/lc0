@@ -286,6 +286,11 @@ class SearchWorker {
       // emitted -- the game goes on and the log names the failure.
       std::cerr << "Unhandled exception in worker thread: " << e.what()
                 << std::endl;
+      // Release this worker's own abandoned virtual-loss reservations
+      // before signalling stop (review #863 finding 3) -- otherwise they
+      // leak for the rest of the search, skewing every other worker's UCT
+      // selection and risking Search::Wait()'s ZeroNInFlight() check.
+      CancelPendingMinibatch();
       search_->Stop();
     }
   }
@@ -299,6 +304,16 @@ class SearchWorker {
   // 6. Propagate the new nodes' information to all their parents in the tree.
   // 7. Update the Search's status and progress information.
   void ExecuteOneIteration();
+
+  // If an iteration is abandoned mid-flight (a backend exception, caught in
+  // RunBlocking() below), every entry still sitting in minibatch_ holds a
+  // virtual-loss (n_in_flight_) reservation from PickNodesToExtendTask that
+  // will now never be finalized by DoBackupUpdate -- release it, mirroring
+  // DoBackupUpdateSingleNode's own leaf-to-root walk but cancelling instead
+  // of completing the visit. Without this, those reservations leak for the
+  // rest of the search: they skew UCT selection for every other worker and
+  // can trip Search::Wait()'s ZeroNInFlight() expectation (review #863).
+  void CancelPendingMinibatch();
 
   // The same operations one by one:
   // 1. Initialize internal structures.
@@ -429,13 +444,21 @@ class SearchWorker {
   };
 
   // Helper struct to hold cached data during the traversal.
-  // Layout contract: `children` is deliberately NOT zero-initialized --
-  // every live entry is written before it is read (policy by the strided
-  // CopyPolicy, utility by the fill loops, iterator/n_started/uct_score by
-  // the cache_filled_idx-gated precompute inside the UCT scan), and reads
+  // Layout contract: `children` is not explicitly cleared between uses --
+  // every live entry is written before it is read (policy by the per-edge
+  // GetEdgeP() loop, utility by the fill loops, iterator/n_started/uct_score
+  // by the cache_filled_idx-gated precompute inside the UCT scan), and reads
   // are bounded by max_policy_entries_needed/cache_filled_idx. The same
-  // gating discipline covers vtp_last_filled_cache (push -1 per level).
-  // Zeroing ~7KB per gather task bought nothing (#859).
+  // gating discipline covers vtp_last_filled_cache (push -1 per level), and
+  // it holds whether this object is reused across levels within one call
+  // (always true) or across calls (true now that it lives in TaskWorkspace
+  // below instead of being a per-call local -- review #864: a bare local
+  // `CachedNodeData cache;` here does NOT skip construction despite the
+  // dropped `{}` -- every ChildCache scalar has an NSDMI, so the compiler
+  // still emits a ~14KB stack frame and a 256-entry init loop on every call
+  // regardless, confirmed by disassembling the release build. Living in the
+  // already-one-per-worker TaskWorkspace pays that cost once per worker
+  // instead of once per gather task).
   struct alignas(64) CachedNodeData {
     // 1. Hot scalars (fits into the 1st 64-byte chunk)
     float puct_mult = 0.0f;
@@ -468,6 +491,16 @@ class SearchWorker {
     std::vector<int> current_path;  // which child index we took at each level
     std::vector<Move> moves_to_path;
     PositionHistory history;
+
+    // One per worker (this workspace is), reused across every gather task
+    // that worker runs -- see the comment on CachedNodeData above for why
+    // that matters. Same write-before-read gating that already covers reuse
+    // across levels within one call extends to reuse across calls: nothing
+    // reads cache_filled_idx/vtp_last_filled_cache without first resetting
+    // them for the current level (PickNodesToExtendTask does this at the
+    // top of every level's prep block), so a previous call's leftover
+    // contents are never observed.
+    CachedNodeData cache;
 
     TaskWorkspace() {
       vtp_buffer.reserve(30);

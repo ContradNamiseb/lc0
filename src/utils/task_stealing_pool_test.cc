@@ -108,7 +108,12 @@ TEST(TaskStealingPool, ThrowingExecutorDoesNotStrandWaitOrKillPool) {
   std::vector<int> v;
   for (int i = 0; i < 20; ++i) v.push_back(i);
   pool.Submit(std::move(v));
-  pool.WaitForAll();
+  // WaitForAll() now rethrows the executor's exception on the caller's own
+  // stack (review #863 finding 4: silently marking a partially-mutated task
+  // as a plain success was the bug, not just "does WaitForAll hang"), but
+  // every task -- including ones queued/stolen after the throwing one --
+  // must still have run and reached completed_tasks_ first.
+  EXPECT_THROW(pool.WaitForAll(), std::runtime_error);
   EXPECT_EQ(ran.load(), 20);
   EXPECT_EQ(pool.DrainCompleted().size(), 20u);
   // Still usable afterwards.
@@ -116,6 +121,17 @@ TEST(TaskStealingPool, ThrowingExecutorDoesNotStrandWaitOrKillPool) {
   pool.Submit(5);
   pool.WaitForAll();
   EXPECT_EQ(pool.CompletedCount(), 1);
+}
+
+TEST(TaskStealingPool, WaitForAllRethrowsOnlyOnce) {
+  // A second WaitForAll() call (no new work submitted, no Reset()) must not
+  // rethrow the same exception again -- it was already delivered.
+  TaskStealingPool<int> pool(1, [](int& tag, int) {
+    if (tag == 1) throw std::runtime_error("boom");
+  });
+  pool.Submit(1);
+  EXPECT_THROW(pool.WaitForAll(), std::runtime_error);
+  EXPECT_NO_THROW(pool.WaitForAll());
 }
 
 // After the worker sleep path (real condvar sleep since the notify-protocol
