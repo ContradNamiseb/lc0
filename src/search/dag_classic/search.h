@@ -45,6 +45,7 @@
 #include "syzygy/syzygy.h"
 #include "utils/logging.h"
 #include "utils/mutex.h"
+#include "utils/task_stealing_pool.h"
 
 namespace lczero {
 namespace dag_classic {
@@ -217,11 +218,6 @@ class Search {
 class SearchWorker {
  public:
   static constexpr int kMaxMovesInPosition = 218;
-  static constexpr int kTaskCountDigits = std::numeric_limits<int>::digits + 1;
-  static constexpr int kTasksTakenShift = kTaskCountDigits/2;
-  static constexpr int kTasksTakenOne = 1 << kTasksTakenShift;
-  // Suspend is -1 for the low half.
-  static constexpr int kTaskCountSuspend = kTasksTakenOne - 1;
 
   SearchWorker(Search* search, const SearchParams& params)
       : search_(search),
@@ -239,13 +235,23 @@ class SearchWorker {
             std::thread::hardware_concurrency() / working_threads - 1, 4U);
       }
     }
-    for (int i = 0; i < task_workers_; i++) {
-      task_workspaces_.emplace_back();
-      task_threads_.emplace_back([this, i]() {
-          LOGFILE << "Task worker " << i << " starting.";
-          this->RunTasks(i);
-          LOGFILE << "Task worker " << i << " exiting.";
-        });
+    if (task_workers_ > 0) {
+      for (int i = 0; i < task_workers_; i++) {
+        task_workspaces_.emplace_back();
+      }
+      task_pool_ = std::make_unique<TaskStealingPool<PickTask>>(
+          task_workers_, [this](PickTask& task, int tid) {
+            switch (task.task_type) {
+              case PickTask::kGathering:
+                PickNodesToExtendTask(task.start_path, task.collision_limit,
+                                      task.history, &task.results,
+                                      &task_workspaces_[tid]);
+                break;
+              case PickTask::kProcessing:
+                ProcessPickedTask(task.start_idx, task.end_idx);
+                break;
+            }
+          });
     }
     target_minibatch_size_ = params_.GetMiniBatchSize();
     if (target_minibatch_size_ == 0) {
@@ -257,7 +263,11 @@ class SearchWorker {
                                      target_minibatch_size_));
   }
 
-  ~SearchWorker();
+  ~SearchWorker() {
+    if (task_pool_) {
+      task_pool_->Shutdown();
+    }
+  }
 
   // Runs iterations while needed.
   void RunBlocking() {
@@ -517,11 +527,13 @@ class SearchWorker {
 
   struct PickTask {
     enum PickTaskType { kGathering, kProcessing };
-    PickTaskType task_type;
+    // Deterministic default so a default-constructed pool scratch task can
+    // never execute a garbage switch arm (the pool only runs moved-in tasks,
+    // but don't make the next reader re-prove it -- mirrors classic #859).
+    PickTaskType task_type = kGathering;
 
     // For task type gathering.
     BackupPath start_path;
-    Node* start;
     int collision_limit;
     PositionHistory history;
     std::vector<NodeToProcess> results;
@@ -530,17 +542,15 @@ class SearchWorker {
     int start_idx;
     int end_idx;
 
-    bool complete = false;
-
     PickTask(const BackupPath& start_path, const PositionHistory& in_history,
              int collision_limit)
         : task_type(kGathering),
           start_path(start_path),
-          start(std::get<0>(start_path.back())),
           collision_limit(collision_limit),
           history(in_history) {}
     PickTask(int start_idx, int end_idx)
         : task_type(kProcessing), start_idx(start_idx), end_idx(end_idx) {}
+    PickTask() = default;
   };
 
   NodeToProcess PickNodeToExtend(int collision_limit);
@@ -574,14 +584,6 @@ class SearchWorker {
   void ProcessPickedTask(int batch_start, int batch_end);
   void ExtendNode(NodeToProcess& picked_node);
   void FetchSingleNodeResult(NodeToProcess* node_to_process);
-  std::tuple<PickTask*, int, int> PickTaskToProcess();
-  void ProcessTask(PickTask* task, int id,
-                   std::vector<NodeToProcess>* receiver,
-                   TaskWorkspace* workspace);
-  void RunTasks(int tid);
-  void ResetTasks();
-  // Returns how many tasks there were.
-  int WaitForTasks();
 
   Search* const search_;
   // List of nodes to process.
@@ -599,18 +601,17 @@ class SearchWorker {
   classic::IterationStats iteration_stats_;
   classic::StoppersHints latest_time_manager_hints_;
 
-  // Multigather task related fields.
-
-  Mutex picking_tasks_mutex_;
-  std::vector<PickTask> picking_tasks_;
-  // A packed atomic. LSB half is task_count_. MSB half is tasks_taken_.
-  std::atomic<int> task_count_ = kTaskCountSuspend;
-  std::atomic<int> completed_tasks_ = 0;
-  std::condition_variable task_added_;
-  std::vector<std::thread> task_threads_;
+  // Task-stealing pool and workspaces.
+  std::unique_ptr<TaskStealingPool<PickTask>> task_pool_;
   std::vector<TaskWorkspace> task_workspaces_;
   TaskWorkspace main_workspace_;
-  bool exiting_ = false;
+  // Round-wide cap on recursively-submitted kGathering tasks, preserving
+  // the old scheduler's MAX_TASKS==256 budget (agora #41/#867 stage 4 --
+  // explicitly NOT classic's per-invocation cap, which would change
+  // behavior). Reset at the top of every PickNodesToExtend() call, claimed
+  // via CAS in PickNodesToExtendTask since multiple task-pool workers can
+  // be recursively submitting concurrently.
+  std::atomic<int> tasks_submitted_this_round_{0};
 };
 
 }  // namespace dag_classic

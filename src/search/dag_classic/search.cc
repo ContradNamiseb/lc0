@@ -33,6 +33,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <exception>
 #include <iomanip>
 #include <iostream>
 #include <iterator>
@@ -148,44 +149,6 @@ class MEvaluator {
   float parent_m_ = 0.0f;
   bool parent_within_threshold_ = false;
 };
-
-// Unpack task_count_ atomic which holds both task_count_ and tasks_taken_. It
-// can unpack a value from an already read value or load it from the atomic
-// variable.
-// Variables are packed together because there is a potential race between task
-// workers and ResetTasks. A task worker can read tasks_taken_ and task_count
-// to a local register. A task worker can be suspended by kernel before tries
-// to acquire work. Other threads can process all tasks and main thread resets
-// tasks before the suspended thread resumes. The suspended thread now manages
-// to acquire work based on stale values if the stale tasks_taken was zero.
-// Packed values avoid the race because compare exchange is checking both when
-// incrementing tasks_taken_.
-template<typename T>
-std::tuple<int, int, int> ReadTaskCount(T& task_count) {
-  int packed;
-  if constexpr(std::is_same_v<T, std::atomic<int>>) {
-    packed = task_count.load(std::memory_order_acquire);
-  } else {
-    packed = task_count;
-  }
-  // The top half is tasks taken.
-  const int shift = SearchWorker::kTasksTakenShift;
-  int tasks_taken = packed >> shift;
-  // The bottom is task count. The first shift moves the sign bit from the lower
-  // half to the hardware sign bit. The second shift lowers bits back to the
-  // original positions and duplicates the sign bit if it is set.
-  int tc = (packed << shift) >> shift;
-  return {packed, tasks_taken, tc};
-}
-
-[[maybe_unused]]
-bool IsTasksCompleted(const std::atomic<int>& task_count,
-                      const std::atomic<int>& completed_tasks) {
-  int tc = 0, nta = 0;
-  std::tie(std::ignore, nta, tc) = ReadTaskCount(task_count);
-  int ct = completed_tasks.load(std::memory_order_acquire);
-  return tc == ct || (nta == ct && tc == -1);
-}
 
 }  // namespace
 
@@ -1175,100 +1138,6 @@ Search::~Search() {
 // SearchWorker
 //////////////////////////////////////////////////////////////////////////////
 
-SearchWorker::~SearchWorker()
-{
-  {
-    // Tasks must be completed before destructor. If a gather tasks is running,
-    // it can increment task_count_ which would break the exit state.
-    assert(IsTasksCompleted(task_count_, completed_tasks_));
-    task_count_.fetch_or(kTaskCountSuspend, std::memory_order_release);
-    Mutex::Lock lock(picking_tasks_mutex_);
-    exiting_ = true;
-    task_added_.notify_all();
-  }
-  for (size_t i = 0; i < task_threads_.size(); i++) {
-    task_threads_[i].join();
-  }
-  LOGFILE << "Search worker destroyed.";
-}
-
-std::tuple<SearchWorker::PickTask*, int, int> SearchWorker::PickTaskToProcess() {
-  auto [packed_value, nta, tc] = ReadTaskCount(task_count_);
-
-  // Check if tasks are queued and try increment taken count.
-  while (nta < tc &&
-      !task_count_.compare_exchange_weak(packed_value, packed_value + kTasksTakenOne,
-                                         std::memory_order_acq_rel)) {
-    // Queue had tasks but another worker increment taken. We check
-    // if new work was added to the queue. Then we try to increment
-    // taken again.
-    std::tie(packed_value, nta, tc) = ReadTaskCount(packed_value);
-  }
-  // We incremented taken if nta and tc are different
-  if (nta < tc) {
-    return {picking_tasks_.data() + nta, nta, tc};
-  }
-  return {nullptr, nta, tc};
-}
-
-void SearchWorker::ProcessTask(PickTask* task, int id,
-                               std::vector<NodeToProcess>* receiver,
-                               TaskWorkspace* workspace) {
-  switch (task->task_type) {
-    case PickTask::kGathering: {
-      PickNodesToExtendTask(task->start_path, task->collision_limit,
-                            task->history, receiver,
-                            workspace);
-      break;
-    }
-    case PickTask::kProcessing: {
-      ProcessPickedTask(task->start_idx, task->end_idx);
-      break;
-    }
-  }
-  picking_tasks_.data()[id].complete = true;
-  completed_tasks_.fetch_add(1, std::memory_order_acq_rel);
-}
-
-void SearchWorker::RunTasks(int tid) {
-  while (true) {
-    PickTask* task = nullptr;
-    int id = 0;
-    int tc = 0;
-    {
-      int spins = 0;
-      while (true) {
-        std::tie(task, id, tc) = PickTaskToProcess();
-        if (task) {
-          break;
-        } else if (tc != -1) {
-          spins++;
-          if (spins >= 512) {
-            std::this_thread::yield();
-            spins = 0;
-          } else {
-            SpinloopPause();
-          }
-          continue;
-        }
-        spins = 0;
-        // Looks like sleep time.
-        Mutex::Lock lock(picking_tasks_mutex_);
-        // Refresh them now we have the lock.
-        int tc, nta;
-        std::tie(std::ignore, std::ignore, tc) = ReadTaskCount(task_count_);
-        if (tc != -1) continue;
-        if (exiting_) return;
-        task_added_.wait(lock.get_raw());
-        std::tie(std::ignore, nta, tc) = ReadTaskCount(task_count_);
-        if (nta >= tc && exiting_) return;
-      }
-    }
-    if (task != nullptr) {
-      ProcessTask(task, id, &(task->results), &(task_workspaces_[tid]));
-    }
-  }
-}
 
 void SearchWorker::ExecuteOneIteration() {
   // 1. Initialize internal structures.
@@ -1312,8 +1181,12 @@ void SearchWorker::ExecuteOneIteration() {
 
   // 2. Gather minibatch.
   GatherMinibatch();
-  assert(IsTasksCompleted(task_count_, completed_tasks_));
-  task_count_.fetch_or(kTaskCountSuspend, std::memory_order_release);
+  // The old hand-rolled scheduler suspended task workers here (a packed
+  // task_count_ flag) so they wouldn't spin-poll during RunNNComputation
+  // below with no work queued. TaskStealingPool needs no equivalent: its
+  // workers block on a real condvar (total_queued_ == 0) instead of
+  // spinning, so there's nothing to suspend between iterations (agora
+  // #41/#867 stage 3).
   search_->backend_waiting_counter_.fetch_add(1, std::memory_order_relaxed);
   // RunNNComputation() below can throw (a backend/device error) -- without
   // this, that skips the matching decrement below and leaves the counter
@@ -1465,7 +1338,7 @@ void SearchWorker::GatherMinibatch() {
 
       bool needs_wait = false;
       int ppt_start = new_start;
-      if (task_workers_ > 0 &&
+      if (task_pool_ &&
           non_collisions >= params_.GetMinimumWorkSizeForProcessing()) {
         const int num_tasks = std::clamp(
             non_collisions / params_.GetMinimumWorkPerTaskForProcessing(), 2,
@@ -1473,8 +1346,9 @@ void SearchWorker::GatherMinibatch() {
         // Round down, left overs can go to main thread so it waits less.
         int per_worker = non_collisions / num_tasks;
         needs_wait = true;
-        ResetTasks();
+        task_pool_->Reset();
         int found = 0;
+        std::vector<PickTask> new_tasks;
         for (int i = new_start; i < static_cast<int>(minibatch_.size()); i++) {
           auto& picked_node = minibatch_[i];
           if (picked_node.IsCollision()) {
@@ -1482,19 +1356,21 @@ void SearchWorker::GatherMinibatch() {
           }
           ++found;
           if (found == per_worker) {
-            picking_tasks_.emplace_back(ppt_start, i + 1);
-            task_count_.fetch_add(1, std::memory_order_acq_rel);
+            new_tasks.emplace_back(ppt_start, i + 1);
             ppt_start = i + 1;
             found = 0;
-            if (picking_tasks_.size() == static_cast<size_t>(num_tasks - 1)) {
+            if (new_tasks.size() == static_cast<size_t>(num_tasks - 1)) {
               break;
             }
           }
         }
+        if (!new_tasks.empty()) {
+          task_pool_->Submit(std::move(new_tasks));
+        }
       }
       ProcessPickedTask(ppt_start, static_cast<int>(minibatch_.size()));
       if (needs_wait) {
-        WaitForTasks();
+        task_pool_->WaitForAll();
       }
     }
     bool some_ooo = false;
@@ -1569,50 +1445,15 @@ void SearchWorker::ProcessPickedTask(int start_idx, int end_idx)
   }
 }
 
+// Round-wide budget preserved as-is from the old scheduler's picking_tasks_
+// reservation cap (agora #41/#867 stage 4).
 #define MAX_TASKS 256
-
-void SearchWorker::ResetTasks() {
-  // Tasks must be completed before reset.
-  assert(IsTasksCompleted(task_count_, completed_tasks_));
-  task_count_.store(0, std::memory_order_release);
-  completed_tasks_.store(0, std::memory_order_release);
-  picking_tasks_.clear();
-  // Reserve because resizing breaks pointers held by the task threads.
-  picking_tasks_.reserve(MAX_TASKS);
-}
-
-int SearchWorker::WaitForTasks() REQUIRES(search_->nodes_mutex_) {
-  // Process any outstanding tasks before checking if compelted. This avoids a
-  // long polling loop when PickNodesToExtend scheduled many tasks.
-  while (true) {
-    PickTask* task = nullptr;
-    int id = 0;
-    std::tie(task, id, std::ignore) = PickTaskToProcess();
-    if (task == nullptr) {
-      break;
-    }
-    ProcessTask(task, id, &minibatch_, &main_workspace_);
-  }
-  // Spin lock, other tasks should be done soon.
-  while (true) {
-    int completed = completed_tasks_.load(std::memory_order_acquire);
-    int todo, nta;
-    std::tie(std::ignore, nta, todo) = ReadTaskCount(task_count_);
-    std::ignore = nta;
-    assert(nta <= todo);
-    if (todo == completed) return completed;
-    SpinloopPause();
-  }
-}
 
 void SearchWorker::PickNodesToExtend(int collision_limit)
     REQUIRES(search_->nodes_mutex_) {
-  ResetTasks();
-  if (task_workers_ > 0 && !search_->backend_attributes_.runs_on_cpu) {
-    // While nothing is ready yet - wake the task runners so they are ready to
-    // receive quickly.
-    Mutex::Lock lock(picking_tasks_mutex_);
-    task_added_.notify_all();
+  if (task_pool_) {
+    task_pool_->Reset();
+    tasks_submitted_this_round_.store(0, std::memory_order_relaxed);
   }
   std::vector<Move> empty_movelist;
   history_.Trim(search_->played_history_.GetLength());
@@ -1620,12 +1461,28 @@ void SearchWorker::PickNodesToExtend(int collision_limit)
                         collision_limit, history_, &minibatch_,
                         &main_workspace_);
 
-  WaitForTasks();
-  for (int i = 0; i < static_cast<int>(picking_tasks_.size()); i++) {
-    for (int j = 0; j < static_cast<int>(picking_tasks_[i].results.size());
-         j++) {
-      minibatch_.emplace_back(std::move(picking_tasks_[i].results[j]));
+  if (task_pool_) {
+    // Same catch/drain/merge/rethrow shape as classic's PickNodesToExtend
+    // (review #866 P1-2): completed_tasks_ retains every task's results
+    // whether WaitForAll() throws or not, so draining must not be skipped
+    // on the throw path -- a sibling gathering task's real NodeToProcess
+    // results (and the virtual-loss reservations they represent) would
+    // otherwise be silently dropped instead of reaching minibatch_, where
+    // RunBlocking's catch -> CancelPendingMinibatchVisits() can see and
+    // release them.
+    std::exception_ptr pending_exception;
+    try {
+      task_pool_->WaitForAll();
+    } catch (...) {
+      pending_exception = std::current_exception();
     }
+    auto completed = task_pool_->DrainCompleted();
+    for (auto& task : completed) {
+      for (auto& result : task.results) {
+        minibatch_.emplace_back(std::move(result));
+      }
+    }
+    if (pending_exception) std::rethrow_exception(pending_exception);
   }
 }
 
@@ -1989,7 +1846,7 @@ void SearchWorker::PickNodesToExtendTask(
       for (int i = 1; i < std::distance(visits_to_perform.begin(), end); i++) {
         int child_limit = visits_to_perform[i].visits_;
         bool is_large_branch = visits_to_perform[i].large_branch_;
-        if (task_workers_ > 0 &&
+        if (task_pool_ &&
             ((is_large_main_branch && is_large_branch) ||
              ((is_large_main_branch || is_large_branch) &&
               child_limit > params_.GetMinimumWorkSizeForPicking()) ||
@@ -2003,19 +1860,24 @@ void SearchWorker::PickNodesToExtendTask(
               {child_node, child_repetitions, child_moves_left});
           // Don't split if not expanded or terminal.
           if (!visits_to_perform[i].stop_picking_) {
+            // Preserve the old scheduler's MAX_TASKS==256 round-wide budget
+            // (agora #41/#867 stage 4 -- explicitly NOT classic's
+            // per-invocation cap, which would change behavior). Claimed via
+            // CAS: multiple task-pool workers can be recursively submitting
+            // from here concurrently, same as the old picking_tasks_mutex_
+            // section this replaces.
             bool passed = false;
-            {
-              // Multiple writers, so need mutex here.
-              Mutex::Lock lock(picking_tasks_mutex_);
-              // Ensure not to exceed size of reservation.
-              if (picking_tasks_.size() < MAX_TASKS) {
-                picking_tasks_.emplace_back(full_path, history, child_limit);
-                task_count_.fetch_add(1, std::memory_order_acq_rel);
-                task_added_.notify_all();
+            int expected =
+                tasks_submitted_this_round_.load(std::memory_order_relaxed);
+            while (expected < MAX_TASKS) {
+              if (tasks_submitted_this_round_.compare_exchange_weak(
+                      expected, expected + 1, std::memory_order_acq_rel)) {
                 passed = true;
+                break;
               }
             }
             if (passed) {
+              task_pool_->Submit(PickTask(full_path, history, child_limit));
               visits_to_perform[i] = 0;
             }
           }
