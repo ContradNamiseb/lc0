@@ -1204,13 +1204,23 @@ void SearchWorker::ExecuteOneIteration() {
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 void SearchWorker::InitializeIteration() {
   LCTRACE_FUNCTION_SCOPE;
+  // Retire the PREVIOUS iteration's state before anything that can throw
+  // (review #867 P1-B): CreateComputation() is a real backend call (the
+  // original Level Zero crash this hardening effort started from was
+  // exactly this kind of failure) that can throw. minibatch_ used to be
+  // cleared AFTER it -- if it threw, the clear was skipped, so the worker's
+  // catch(...)-driven CancelPendingMinibatch() then walked the PREVIOUS
+  // iteration's already-backed-up entries (DoBackupUpdate already released
+  // their reservations) and double-cancelled/underflowed them.
+  // collisions_published_ has the same hazard: it must reflect "nothing
+  // published yet for the new iteration" before any throw, not after.
+  minibatch_.clear();
+  collisions_published_ = false;
   // Free the old computation before allocating a new one. This works better
   // when backend caches buffer allocations between computations.
   computation_.reset();
   computation_ = search_->backend_->CreateComputation();
-  minibatch_.clear();
   minibatch_.reserve(2 * target_minibatch_size_);
-  collisions_published_ = false;
 }
 
 void SearchWorker::CancelPendingMinibatch() {
@@ -1368,11 +1378,30 @@ void SearchWorker::GatherMinibatch() {
         task_pool_->Submit(std::move(new_tasks));
       }
     }
-    ProcessPickedTask(ppt_start, static_cast<int>(minibatch_.size()),
-                      &main_workspace_);
-    if (needs_wait) {
-      task_pool_->WaitForAll();
+    // Same guarded-region shape as PickNodesToExtend above (review #867
+    // P1-A): if the main-thread ProcessPickedTask slice throws, WaitForAll()
+    // below must still run before this function returns -- processing tasks
+    // already submitted are mutating minibatch_/tree state under this
+    // thread's held nodes_mutex_, and skipping the wait lets them keep
+    // running after unwinding releases it.
+    std::exception_ptr pending_exception;
+    try {
+      ProcessPickedTask(ppt_start, static_cast<int>(minibatch_.size()),
+                        &main_workspace_);
+    } catch (...) {
+      pending_exception = std::current_exception();
     }
+    if (needs_wait) {
+      try {
+        task_pool_->WaitForAll();
+      } catch (...) {
+        if (!pending_exception) pending_exception = std::current_exception();
+      }
+      // Processing tasks carry no results to merge, but draining still
+      // restores the pool's round bookkeeping for the next Reset()/round.
+      task_pool_->DrainCompleted();
+    }
+    if (pending_exception) std::rethrow_exception(pending_exception);
     bool some_ooo = false;
     for (int i = static_cast<int>(minibatch_.size()) - 1; i >= new_start; i--) {
       if (minibatch_[i].ooo_completed) {
@@ -1483,26 +1512,40 @@ void SearchWorker::PickNodesToExtend(int collision_limit) {
   // Since the tasks perform work which assumes they have the lock, even though
   // actually this thread does.
   SharedMutex::Lock lock(search_->nodes_mutex_);
-  PickNodesToExtendTask(search_->root_node_, 0, collision_limit, empty_movelist,
-                        &minibatch_, &main_workspace_);
-
+  // Single guarded region covering BOTH the main-thread picker call and the
+  // pool's own work (review #867 P1-A): the main call used to sit outside
+  // this guard entirely, so if IT threw -- after having already recursively
+  // submitted worker tasks -- WaitForAll()/DrainCompleted() below never ran.
+  // That's not just a lost-results bug: pool workers mutate tree state on
+  // the assumption nodes_mutex_ (held by THIS thread, above) protects them
+  // from other search workers. Unwinding past this function releases that
+  // lock via `lock`'s destructor while those pool workers could still be
+  // running, so another SearchWorker thread can start mutating the same
+  // tree concurrently with them -- a real data race, not just a leak.
+  // Draining is required even on the main-call throw path for the same
+  // reason as the existing pool-throw path below: a sibling task that
+  // finished cleanly still has real results/reservations that must reach
+  // minibatch_, or CancelPendingMinibatch() can't see and release them
+  // (review #866 P1-2, extended to cover this entry point too).
+  std::exception_ptr pending_exception;
+  try {
+    PickNodesToExtendTask(search_->root_node_, 0, collision_limit,
+                          empty_movelist, &minibatch_, &main_workspace_);
+  } catch (...) {
+    pending_exception = std::current_exception();
+  }
   if (task_pool_) {
     // WaitForAll() can rethrow a pool task's exception (review #863 f4).
     // completed_tasks_ still holds every task's results at that point --
     // WorkerLoop pushes a task onto it unconditionally, whether its executor
-    // threw or not -- but if we let the exception propagate straight out of
-    // this if-block, DrainCompleted() below never runs, so a NodeToProcess
-    // batch produced by a sibling task that finished cleanly is silently
-    // dropped instead of reaching minibatch_. RunBlocking's catch ->
-    // CancelPendingMinibatch() only releases what it can see in minibatch_,
-    // so those entries' virtual-loss reservations would leak for the rest of
-    // the search (review #866 P1-2). Drain and merge unconditionally, then
-    // rethrow.
-    std::exception_ptr pending_exception;
+    // threw or not. Always wait/drain regardless of whether the main call
+    // above already threw: the pool must reach quiescence before this
+    // function returns (see the comment above), and the main call's
+    // exception -- if any -- takes priority when both are set.
     try {
       task_pool_->WaitForAll();
     } catch (...) {
-      pending_exception = std::current_exception();
+      if (!pending_exception) pending_exception = std::current_exception();
     }
     auto completed = task_pool_->DrainCompleted();
     for (auto& task : completed) {
@@ -1510,8 +1553,8 @@ void SearchWorker::PickNodesToExtend(int collision_limit) {
         minibatch_.emplace_back(std::move(result));
       }
     }
-    if (pending_exception) std::rethrow_exception(pending_exception);
   }
+  if (pending_exception) std::rethrow_exception(pending_exception);
 }
 
 void SearchWorker::EnsureNodeTwoFoldCorrectForDepth(Node* child_node,
