@@ -1074,6 +1074,25 @@ if get_option('gtest')
     pb_files,
     include_directories: includes, link_with: lc0_lib, dependencies: [gtest] + deps),
     args: '--gtest_output=xml:poolequiv.xml', timeout: 120)
+
+  if get_option('dag_classic')
+    test('DagSearchPoolEquivalence',
+      executable('dag_pool_equivalence_test', 'src/search/dag_classic/pool_equivalence_test.cc',
+      'src/search/dag_classic/node.cc',
+      'src/search/dag_classic/search.cc',
+      'src/search/classic/params.cc',
+      'src/search/classic/stoppers/alphazero.cc',
+      'src/search/classic/stoppers/common.cc',
+      'src/search/classic/stoppers/factory.cc',
+      'src/search/classic/stoppers/legacy.cc',
+      'src/search/classic/stoppers/simple.cc',
+      'src/search/classic/stoppers/smooth.cc',
+      'src/search/classic/stoppers/stoppers.cc',
+      'src/search/classic/stoppers/timemgr.cc',
+      pb_files,
+      include_directories: includes, link_with: lc0_lib, dependencies: [gtest] + deps),
+      args: '--gtest_output=xml:dagpoolequiv.xml', timeout: 120)
+  endif
 endif
 
 
