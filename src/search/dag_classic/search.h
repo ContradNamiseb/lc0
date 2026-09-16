@@ -613,7 +613,7 @@ class SearchWorker {
   // failure because such entries never reach minibatch_, so neither
   // CancelPendingMinibatchVisits nor the GatherMinibatch cleanup can see
   // them. Runs under the caller's nodes_mutex_.
-  void CancelUnmergedResult(const NodeToProcess& entry);
+  void CancelUnmergedResult(const NodeToProcess& entry) noexcept;
   // Returns whether a node's bounds were set based on its children.
   bool MaybeSetBounds(Node* p, float m, uint32_t* n_to_fix, float* v_delta,
                       float* d_delta, float* m_delta) const;
@@ -622,7 +622,7 @@ class SearchWorker {
                              PositionHistory& history,
                              std::vector<NodeToProcess>* receiver,
                              TaskWorkspace* workspace);
-  void CancelCollisions();
+  void CancelCollisions() noexcept;
 
   // Check if the situation described by @depth under root and @position is a
   // safe two-fold or a draw by repetition and return the number of safe

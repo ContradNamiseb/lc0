@@ -1100,10 +1100,12 @@ void Search::Wait() {
   LOGFILE << "Search threads cleaned.";
 }
 
-void SearchWorker::CancelCollisions() {
+void SearchWorker::CancelCollisions() noexcept {
   for (auto& entry : minibatch_) {
     if (!entry.IsCollision()) continue;
-    auto path = entry.path;
+    // Read-only over the existing path: this runs on cleanup paths where an
+    // allocation could throw a second exception (review #885).
+    const auto& path = entry.path;
     for (auto it = ++(path.crbegin()); it != path.crend(); ++it) {
       std::get<0>(*it)->CancelScoreUpdate(entry.multivisit);
     }
@@ -1129,15 +1131,17 @@ void SearchWorker::CancelPendingMinibatchVisits() {
   minibatch_.clear();
 }
 
-void SearchWorker::CancelUnmergedResult(const NodeToProcess& entry) {
+void SearchWorker::CancelUnmergedResult(const NodeToProcess& entry) noexcept {
   if (entry.IsCollision()) {
-    // Same ancestors-only walk as CancelCollisions; entries reaching here
-    // never made it into minibatch_, so the GatherMinibatch cleanup cannot
-    // see them.
-    auto path = entry.path;
+    // Same ancestors-only walk as CancelCollisions, and read-only over the
+    // existing path: this recovery path runs after a failed merge reserve, so
+    // it must not allocate or throw a second exception (review #885) -- the
+    // path is referenced, never copied.
+    const auto& path = entry.path;
     for (auto it = ++(path.crbegin()); it != path.crend(); ++it) {
       std::get<0>(*it)->CancelScoreUpdate(entry.multivisit);
     }
+    TestOnlyRecordUnmergedCollisionCancelled();
     return;
   }
   for (auto it = entry.path.crbegin(); it != entry.path.crend(); ++it) {
@@ -1569,9 +1573,22 @@ void SearchWorker::PickNodesToExtend(int collision_limit)
     // allocation) before propagating -- dropping them would leak their tree
     // reservations.
     size_t incoming = 0;
-    for (const auto& task : completed) incoming += task.results.size();
+    bool has_collision = false;
+    for (const auto& task : completed) {
+      incoming += task.results.size();
+      for (const auto& result : task.results) {
+        has_collision = has_collision || result.IsCollision();
+      }
+    }
     try {
       if (incoming > 0) {
+        if (has_collision) {
+          // Focused seam (review #885): fires only when the drained batch
+          // contains a completed collision, so a test can prove the
+          // collision branch of the recovery walk actually ran.
+          TestOnlyMaybeThrowAt(
+              TestOnlyThrowSite::kBeforeMergeReserveWithCollision);
+        }
         TestOnlyMaybeThrowAt(TestOnlyThrowSite::kBeforeMergeReserve);
         minibatch_.reserve(minibatch_.size() + incoming);
       }

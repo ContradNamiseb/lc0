@@ -560,6 +560,60 @@ TEST_F(ReservationRollbackTest, MergeReserveFailureCancelsCompletedResults) {
   }
 }
 
+// ---- review #885: focused coverage for the collision recovery branch ------
+//
+// The seam fires only when the drained batch contains a completed collision,
+// so this test cannot pass without exercising CancelUnmergedResult's
+// collision walk; the counter proves it ran. The recovery path itself is
+// read-only over the existing path (no allocation), so a merge failure
+// caused by memory exhaustion cannot be compounded by the cleanup. The
+// peaked policy makes collisions routine in worker task results -- with a
+// uniform policy estimated_visits_to_change_best clamps to 1, the
+// visit+collision pair rarely forms, and the seam may never fire.
+TEST_F(ReservationRollbackTest, MergeReserveFailureCancelsCompletedCollision) {
+  OptionsParser options;
+  SharedBackendParams::Populate(&options);
+  SearchParams::Populate(&options);
+  options.GetMutableDefaultsOptions()->Set(SharedBackendParams::kNNCacheSizeId,
+                                           200000);
+  options.GetMutableDefaultsOptions()->Set(
+      SearchParams::kTaskWorkersPerSearchWorkerId, 4);
+  const auto option_dict = options.GetOptionsDict();
+
+  FakeBackend backend(/*peaked_policy=*/true);
+  NodeTree tree;
+  tree.ResetToPosition(ChessBoard::kStartposFen, {});
+  TranspositionTable tt;
+
+  auto stopper = std::make_unique<classic::ChainedSearchStopper>();
+  stopper->AddStopper(
+      std::make_unique<classic::VisitsStopper>(3000, false));
+
+  std::atomic<int> bestmove_count{0};
+  auto responder = std::make_unique<CallbackUciResponder>(
+      [&](const BestMoveInfo&) { ++bestmove_count; },
+      [](const std::vector<ThinkingInfo>&) {});
+
+  auto search = std::make_unique<Search>(
+      tree, &backend, std::move(responder), MoveList(),
+      std::chrono::steady_clock::now(), std::move(stopper),
+      /*infinite=*/false, /*ponder=*/false, option_dict, &tt, nullptr);
+
+  TestOnlyResetSeams();
+  TestOnlySetThrowCount(TestOnlyThrowSite::kBeforeMergeReserveWithCollision,
+                        0);
+  search->StartThreads(4);
+  search->Wait();
+
+  EXPECT_EQ(bestmove_count.load(), 1);
+  EXPECT_TRUE(TestOnlyWasThrowFired(
+      TestOnlyThrowSite::kBeforeMergeReserveWithCollision))
+      << "no merge with a completed collision was reached";
+  EXPECT_GT(TestOnlyUnmergedCollisionsCancelled(), 0)
+      << "the collision branch of the merge recovery did not run";
+  ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
+}
+
 }  // namespace
 }  // namespace dag_classic
 }  // namespace lczero
