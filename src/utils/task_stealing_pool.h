@@ -21,6 +21,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <random>
@@ -99,13 +100,29 @@ class TaskStealingPool {
     work_available_.notify_all();  // batch may need several workers.
   }
 
-  // Block until all submitted tasks complete.
-  // Uses condition variable instead of busy-spin.
+  // Block until all submitted tasks complete. If any executor threw, the
+  // first such exception is rethrown here on the caller's (owning search
+  // thread's) stack after every task has still finished and reached
+  // completed_tasks_ -- review #863 finding 4: the old behavior logged and
+  // swallowed the exception, reporting a task that may have partially
+  // mutated the tree (or recursively submitted children) as an ordinary
+  // success. Rethrowing here lets it land in the same
+  // catch(std::exception&)-driven cleanup path (CancelPendingMinibatch +
+  // Stop) as a synchronous failure on the main gather thread.
   void WaitForAll() {
-    std::unique_lock<std::mutex> lock(done_mutex_);
-    all_done_.wait(lock, [this]() {
-      return active_tasks_.load(std::memory_order_acquire) == 0;
-    });
+    {
+      std::unique_lock<std::mutex> lock(done_mutex_);
+      all_done_.wait(lock, [this]() {
+        return active_tasks_.load(std::memory_order_acquire) == 0;
+      });
+    }
+    std::exception_ptr to_throw;
+    {
+      std::lock_guard<std::mutex> lock(exception_mutex_);
+      to_throw = first_exception_;
+      first_exception_ = nullptr;
+    }
+    if (to_throw) std::rethrow_exception(to_throw);
   }
 
   // Drain all completed tasks (moves them out). Call after WaitForAll().
@@ -133,6 +150,14 @@ class TaskStealingPool {
     {
       std::lock_guard<std::mutex> lock(completed_mutex_);
       completed_tasks_.clear();
+    }
+    {
+      // Defensive: WaitForAll() normally drains and clears this, but a
+      // caller that skips WaitForAll() after Submit() (or bails out via its
+      // own exception first) must not carry a stale exception into the
+      // next round.
+      std::lock_guard<std::mutex> lock(exception_mutex_);
+      first_exception_ = nullptr;
     }
   }
 
@@ -280,13 +305,22 @@ class TaskStealingPool {
         // active_tasks_ count (that would hang the next WaitForAll under the
         // caller's lock) nor kill the worker thread (std::terminate) --
         // bookkeeping runs either way; the task's partial results still reach
-        // completed_tasks_ so the caller's undo/cancel logic sees them.
+        // completed_tasks_ so the caller's undo/cancel logic sees them. The
+        // first exception seen this round is also stashed and rethrown by
+        // WaitForAll() on the owning thread (review #863 finding 4) -- this
+        // is not just a log-and-continue: the executor may have already
+        // mutated shared tree state or recursively submitted children
+        // before throwing, so the caller must not treat this as success.
         try {
           executor_(task, tid);
         } catch (const std::exception& e) {
           CERR << "TaskStealingPool: executor threw: " << e.what();
+          std::lock_guard<std::mutex> elock(exception_mutex_);
+          if (!first_exception_) first_exception_ = std::current_exception();
         } catch (...) {
           CERR << "TaskStealingPool: executor threw a non-standard exception";
+          std::lock_guard<std::mutex> elock(exception_mutex_);
+          if (!first_exception_) first_exception_ = std::current_exception();
         }
         {
           std::lock_guard<std::mutex> lock(completed_mutex_);
@@ -323,6 +357,10 @@ class TaskStealingPool {
   // Storage for completed tasks (for DrainCompleted()).
   std::mutex completed_mutex_;
   std::vector<Task> completed_tasks_;
+
+  // First executor exception this round, rethrown by WaitForAll().
+  std::mutex exception_mutex_;
+  std::exception_ptr first_exception_;
 };
 
 }  // namespace lczero

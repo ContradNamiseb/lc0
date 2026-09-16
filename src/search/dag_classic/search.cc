@@ -674,8 +674,17 @@ void Search::MaybeTriggerStop(const classic::IterationStats& stats,
   Mutex::Lock lock(counters_mutex_);
   // Already responded bestmove, nothing to do here.
   if (bestmove_is_sent_) return;
-  // Don't stop when the root node is not yet expanded.
-  if (stats.total_nodes == 0) return;
+  // Don't let the stopper's own heuristics fire on an empty tree -- but if
+  // a stop was already requested (UCI `stop`, time limit, or a worker
+  // exception calling Search::Stop() after the very first NN batch
+  // failed), fall through instead of returning: with zero playouts no
+  // worker will ever gather more, so bailing out here leaves stop_ true
+  // forever with no bestmove ever sent (same hang as classic/search.cc,
+  // review #863 finding 3 -- WatchdogThread's polling loop cannot make
+  // total_nodes nonzero on its own).
+  if (stats.total_nodes == 0 && !stop_.load(std::memory_order_acquire)) {
+    return;
+  }
 
   if (!stop_.load(std::memory_order_acquire)) {
     const float delay = params_.GetGarbageCollectionDelay() / 100.0f;
@@ -1287,6 +1296,13 @@ void SearchWorker::ExecuteOneIteration() {
   assert(IsTasksCompleted(task_count_, completed_tasks_));
   task_count_.fetch_or(kTaskCountSuspend, std::memory_order_release);
   search_->backend_waiting_counter_.fetch_add(1, std::memory_order_relaxed);
+  // RunNNComputation() below can throw (a backend/device error) -- without
+  // this, that skips the matching decrement below and leaves the counter
+  // permanently inflated for the rest of the search (same leak as
+  // classic/search.cc, review #863 finding 3).
+  absl::Cleanup release_backend_waiting = [this] {
+    search_->backend_waiting_counter_.fetch_add(-1, std::memory_order_relaxed);
+  };
 
   if (params_.GetMaxConcurrentSearchers() != 0) {
     search_->pending_searchers_.fetch_add(1, std::memory_order_acq_rel);
@@ -1294,7 +1310,7 @@ void SearchWorker::ExecuteOneIteration() {
 
   // 4. Run NN computation.
   RunNNComputation();
-  search_->backend_waiting_counter_.fetch_add(-1, std::memory_order_relaxed);
+  std::move(release_backend_waiting).Invoke();
 
   // 5. Retrieve NN computations (and terminal values) into nodes.
   FetchMinibatchResults();

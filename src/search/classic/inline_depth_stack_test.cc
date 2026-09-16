@@ -13,8 +13,12 @@
 //  * InlineDepthStack must survive descents past its inline capacity
 //    (push 257 used to be an ASan-confirmed stack-buffer-overflow scribbling
 //    into adjacent CachedNodeData memory).
-//  * Node::CopyPolicy's strided (AoS) path must agree with the contiguous
-//    path for every edge count and must not touch neighboring fields.
+//  * Node::GetEdgeP() (the AoS per-edge accessor that replaced CopyPolicy's
+//    strided overload -- review #864 found that overload's pointer
+//    arithmetic past the single float subobject it was given, to reach
+//    sibling array-of-structs elements, was not standards-safe) must agree
+//    with CopyPolicy's contiguous path for every edge count and must not
+//    touch neighboring fields.
 // Compiled with -fno-access-control (meson) so the private nested types are
 // reachable, same convention as the review probes.
 
@@ -77,7 +81,7 @@ TEST(InlineDepthStack, DeepDescentAndReuse) {
   EXPECT_EQ(s.back(), 8);
 }
 
-TEST(CopyPolicyStrided, MatchesContiguousAndKeepsNeighbours) {
+TEST(CopyPolicyStrided, GetEdgePMatchesContiguousAndKeepsNeighbours) {
   for (int count : {1, 32, 218, 255}) {
     Node node(nullptr, 0);
     node.CreateEdges(MoveList(count));
@@ -92,7 +96,8 @@ TEST(CopyPolicyStrided, MatchesContiguousAndKeepsNeighbours) {
     for (auto& item : cache.children) item.utility = 123.0f;
     std::array<float, 256> plain{};
     node.CopyPolicy(count, plain.data());
-    node.CopyPolicy(count, &cache.children[0].policy, sizeof(ChildCache));
+    // Same loop search.cc uses at the CachedNodeData::children call site.
+    for (int i = 0; i < count; i++) cache.children[i].policy = node.GetEdgeP(i);
     for (int i = 0; i < 256; ++i) {
       EXPECT_EQ(cache.children[i].policy, plain[i]) << "count=" << count << " i=" << i;
       EXPECT_EQ(cache.children[i].utility, 123.0f) << "neighbour clobbered at i=" << i;
@@ -100,16 +105,74 @@ TEST(CopyPolicyStrided, MatchesContiguousAndKeepsNeighbours) {
   }
 }
 
-// CachedNodeData is deliberately NOT zero-initialized; this guards the
-// documentation of that contract: fresh scalars must have their declared
-// defaults (those DO have NSDMIs), and the struct must remain cheap to
-// construct by value (the old cache{} form memset ~7-9KB per gather task).
+// Guards CachedNodeData's scalar defaults (they have NSDMIs, so this holds
+// regardless of `{}` vs bare default-init -- review #864 found the earlier
+// claim that dropping `{}` avoided construction cost was false; every
+// ChildCache scalar still gets initialized either way. The actual fix for
+// that cost was moving CachedNodeData into TaskWorkspace so it's built once
+// per worker instead of once per gather task -- see search.h.)
 TEST(CachedNodeData, ScalarsDefaultStackStartsEmpty) {
   CachedNodeData cache;
   EXPECT_EQ(cache.cache_filled_idx, -1);
   EXPECT_EQ(cache.max_policy_entries_needed, 0);
   EXPECT_EQ(cache.puct_mult, 0.0f);
   EXPECT_EQ(cache.vtp_last_filled_cache.count, 0);
+}
+
+// CachedNodeData now lives in TaskWorkspace and is reused across calls
+// (review #864) instead of being freshly constructed per call. Simulates
+// two consecutive "levels" sharing one cache object -- a wide round filling
+// many children[] slots followed by a narrow round filling few -- and
+// checks the narrow round's own freshly-filled range is correct (not
+// stale from the wide round), matching what PickNodesToExtendTask's
+// per-level prep block (cache_filled_idx = -1, refill up to
+// max_policy_entries_needed) actually does.
+TEST(CachedNodeData, WorkspaceReuseDoesNotLeakBetweenCalls) {
+  SearchWorker::TaskWorkspace workspace;
+  Node wide(nullptr, 0);
+  wide.CreateEdges(MoveList(200));
+  {
+    int idx = 0;
+    for (auto& edge : wide.Edges()) edge.edge()->SetP(1.0f / (++idx + 1));
+  }
+  Node narrow(nullptr, 0);
+  narrow.CreateEdges(MoveList(5));
+  {
+    int idx = 0;
+    for (auto& edge : narrow.Edges()) edge.edge()->SetP(9.0f + idx++);
+  }
+
+  // Round 1: a wide "level" fills 200 entries, same as PickNodesToExtendTask
+  // does at the top of its per-level prep block.
+  auto& cache = workspace.cache;
+  cache.cache_filled_idx = -1;
+  cache.max_policy_entries_needed = 200;
+  for (int i = 0; i < cache.max_policy_entries_needed; i++) {
+    cache.children[i].policy = wide.GetEdgeP(i);
+    cache.children[i].utility = 111.0f;
+  }
+  ASSERT_FLOAT_EQ(cache.children[199].policy, wide.GetEdgeP(199));
+
+  // Round 2: a narrow "level" on the SAME reused cache -- exactly what
+  // happens descending into a child with far fewer legal moves.
+  cache.cache_filled_idx = -1;
+  cache.max_policy_entries_needed = 5;
+  for (int i = 0; i < cache.max_policy_entries_needed; i++) {
+    cache.children[i].policy = narrow.GetEdgeP(i);
+  }
+  for (int i = 0; i < 5; i++) {
+    EXPECT_FLOAT_EQ(cache.children[i].policy, narrow.GetEdgeP(i))
+        << "i=" << i << " -- round 2's own fill must win, not round 1's";
+  }
+  // Indices round 2 never touched (5..199) still hold round 1's stale
+  // values -- that's fine and expected: nothing in PickNodesToExtendTask
+  // reads children[i] for i >= cache.max_policy_entries_needed /
+  // cache_filled_idx, which round 2 reset to 5. This isn't a correctness
+  // gap, it's the documented write-before-read gating contract; assert it
+  // explicitly so a future change that narrows the gate incorrectly (reads
+  // past max_policy_entries_needed) has something to trip.
+  EXPECT_FLOAT_EQ(cache.children[199].policy, wide.GetEdgeP(199))
+      << "unread-this-round slot should still hold round 1's value";
 }
 
 }  // namespace
