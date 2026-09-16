@@ -25,10 +25,14 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <chrono>
+#include <condition_variable>
+#include <cstdlib>
 #include <functional>
 #include <list>
 #include <memory>
 #include <mutex>
+#include <thread>
 
 #include "sycl_common.h"
 #include "inputs_outputs.h"
@@ -648,6 +652,8 @@ class SyclNetwork : public Network {
     // P2). This can only observe a PRIOR batch's failure -- see the
     // post-batch wait_and_throw()+check further down for this batch's own.
     ThrowIfBackendFailed();
+    NoteGpuActivity();
+    EnsureKeepWarmStarted();
 
     // RAII, not raw lock()/unlock(): a synchronous SYCL throw anywhere below
     // (plausible for a device-loss error, which is exactly what this is
@@ -956,6 +962,12 @@ class SyclNetwork : public Network {
   }
 
   ~SyclNetwork() {
+    // Stop the keep-warm thread FIRST: it submits to sycl_queue_ and must be
+    // gone before any teardown below (and before the queue's lifetime ends).
+    keepwarm_stop_.store(true, std::memory_order_release);
+    keepwarm_cv_.notify_all();
+    if (keepwarm_thread_.joinable()) keepwarm_thread_.join();
+    if (keepwarm_buf_) sycl::free(keepwarm_buf_, *sycl_queue_);
     if (scratch_mem_) 
         sycl::free(scratch_mem_, *sycl_queue_);
     if (!multi_stream_) {
@@ -1038,6 +1050,91 @@ class SyclNetwork : public Network {
   // and throws a normal Exception there so the search stops gracefully
   // instead of the whole engine dying mid-game.
   std::atomic<bool> backend_failed_{false};
+
+  // ---------------------------------------------------------------------
+  // Keep-warm ping (agora #869, driver workaround).
+  // The FIRST zeCommandQueueExecuteCommandLists after several minutes of
+  // engine idle can fail synchronously at the driver level with
+  // ZE_RESULT_ERROR_UNKNOWN (deterministic repro: ~260s idle after a large
+  // search; clean at 0/60s). A trivial periodic submission keeps the queue
+  // from entering that state. LC0_SYCL_KEEPWARM_SEC sets the interval
+  // (default 60; 0 disables). Started lazily on the first eval so a
+  // constructor throw can never strand a joinable thread.
+  // ---------------------------------------------------------------------
+  std::once_flag keepwarm_once_;
+  std::thread keepwarm_thread_;
+  std::mutex keepwarm_mutex_;
+  std::condition_variable keepwarm_cv_;
+  std::atomic<bool> keepwarm_stop_{false};
+  std::atomic<int64_t> last_gpu_activity_ns_{0};
+  void* keepwarm_buf_ = nullptr;
+
+  static int KeepWarmIntervalSeconds() {
+    const char* s = std::getenv("LC0_SYCL_KEEPWARM_SEC");
+    if (!s) return 60;
+    const int v = std::atoi(s);
+    return v > 0 ? v : 0;
+  }
+
+  static int64_t SteadyNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  }
+
+  void NoteGpuActivity() {
+    last_gpu_activity_ns_.store(SteadyNowNs(), std::memory_order_release);
+  }
+
+  void KeepWarmLoop(int interval_s) {
+    const int64_t interval_ns = (int64_t)interval_s * 1000000000LL;
+    std::unique_lock<std::mutex> lk(keepwarm_mutex_);
+    while (!keepwarm_stop_.load(std::memory_order_acquire)) {
+      keepwarm_cv_.wait_for(lk, std::chrono::seconds(5));
+      if (keepwarm_stop_.load(std::memory_order_acquire)) break;
+      if (backend_failed_.load(std::memory_order_acquire)) break;
+      const int64_t now = SteadyNowNs();
+      const int64_t idle_since =
+          last_gpu_activity_ns_.load(std::memory_order_acquire);
+      if (now - idle_since < interval_ns) {
+        continue;  // real work happened recently; nothing to keep warm
+      }
+      try {
+        // Serialize with forwardEval(): same queue, same lock discipline.
+        std::lock_guard<std::mutex> forward_lock(lock_);
+        // Trivial enough to be free in practice, real enough to count as
+        // queue activity on the driver side.
+        sycl_queue_->memset(keepwarm_buf_, 0, 1).wait_and_throw();
+        NoteGpuActivity();
+        CERR << "[sycl-keepwarm] pinged idle GPU (no submissions for "
+             << (now - idle_since) / 1000000000LL << "s)\n";
+      } catch (const sycl::exception& e) {
+        // The ping found the device already gone; flag it sticky so the next
+        // search surfaces it through the normal graceful-stop path instead
+        // of retrying a dead queue.
+        backend_failed_.store(true, std::memory_order_release);
+        CERR << "[sycl-keepwarm] ping failed (" << e.what()
+             << ") -- marking backend failed.\n";
+        break;
+      }
+    }
+  }
+
+  void EnsureKeepWarmStarted() {
+    std::call_once(keepwarm_once_, [this]() {
+      const int interval_s = KeepWarmIntervalSeconds();
+      if (interval_s <= 0) return;
+      keepwarm_buf_ = sycl::malloc_device(64, *sycl_queue_);
+      if (!keepwarm_buf_) {
+        CERR << "[sycl-keepwarm] device alloc failed; disabled." << std::endl;
+        return;
+      }
+      NoteGpuActivity();
+      keepwarm_thread_ = std::thread([this, interval_s]() {
+        KeepWarmLoop(interval_s);
+      });
+    });
+  }
 
   // Throws if the async exception handler above has flagged the backend as
   // dead. Must be called after every wait_and_throw() (the only guaranteed
