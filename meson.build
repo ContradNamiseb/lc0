@@ -1160,6 +1160,11 @@ if get_option('gtest')
     executable('uciloop_test', 'src/chess/uciloop_test.cc', pb_files,
     include_directories: includes, link_with: lc0_lib, dependencies: gtest),
     args: '--gtest_output=xml:uciloop.xml', timeout: 90)
+
+  test('DagCachedNodeData',
+    executable('dag_cached_node_data_test', 'src/search/dag_classic/cached_node_data_test.cc', pb_files,
+    include_directories: includes, link_with: lc0_lib, dependencies: [gtest] + deps),
+    args: '--gtest_output=xml:dagcache.xml', timeout: 90)
 endif
 
 
