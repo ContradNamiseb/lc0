@@ -1474,7 +1474,11 @@ void SearchWorker::ProcessPickedTask(int start_idx, int end_idx)
 }
 
 // Round-wide budget preserved as-is from the old scheduler's picking_tasks_
-// reservation cap (agora #41/#867 stage 4).
+// reservation cap (agora #41/#867 stage 4). TryClaimRoundTaskSlot (utils/
+// round_task_slot.h) is the CAS claim itself, pulled out to a standalone
+// header so the exactly-N-succeed-then-fall-back behavior has direct test
+// coverage (agora #867/#868) without needing to drive a real search past
+// 256 split opportunities.
 #define MAX_TASKS 256
 
 void SearchWorker::PickNodesToExtend(int collision_limit)
@@ -1909,20 +1913,9 @@ void SearchWorker::PickNodesToExtendTask(
           if (!visits_to_perform[i].stop_picking_) {
             // Preserve the old scheduler's MAX_TASKS==256 round-wide budget
             // (agora #41/#867 stage 4 -- explicitly NOT classic's
-            // per-invocation cap, which would change behavior). Claimed via
-            // CAS: multiple task-pool workers can be recursively submitting
-            // from here concurrently, same as the old picking_tasks_mutex_
-            // section this replaces.
-            bool passed = false;
-            int expected =
-                tasks_submitted_this_round_.load(std::memory_order_relaxed);
-            while (expected < MAX_TASKS) {
-              if (tasks_submitted_this_round_.compare_exchange_weak(
-                      expected, expected + 1, std::memory_order_acq_rel)) {
-                passed = true;
-                break;
-              }
-            }
+            // per-invocation cap, which would change behavior).
+            bool passed =
+                TryClaimRoundTaskSlot(tasks_submitted_this_round_, MAX_TASKS);
             if (passed) {
               task_pool_->Submit(PickTask(full_path, history, child_limit));
               visits_to_perform[i] = 0;

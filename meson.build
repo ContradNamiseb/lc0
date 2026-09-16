@@ -1028,6 +1028,11 @@ if get_option('gtest')
     include_directories: includes, link_with: lc0_lib, dependencies: gtest),
     args: '--gtest_output=xml:taskpool.xml', timeout: 180)
 
+  test('RoundTaskSlot',
+    executable('round_task_slot_test', 'src/utils/round_task_slot_test.cc', pb_files,
+    include_directories: includes, link_with: lc0_lib, dependencies: gtest),
+    args: '--gtest_output=xml:roundtaskslot.xml', timeout: 60)
+
   test('DepthStackAndCache',
     executable('inline_depth_stack_test', 'src/search/classic/inline_depth_stack_test.cc', pb_files,
     include_directories: includes, link_with: lc0_lib, dependencies: gtest),
