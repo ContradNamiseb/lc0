@@ -250,15 +250,13 @@ class SearchWorker {
             TestOnlyMaybeThrowAt(TestOnlyThrowSite::kWorkerExecutor);
             switch (task.task_type) {
               case PickTask::kGathering:
-                g_testonly_gathering_tasks_executed.fetch_add(
-                    1, std::memory_order_relaxed);
+                TestOnlyRecordGatheringTaskExecuted();
                 PickNodesToExtendTask(task.start_path, task.collision_limit,
                                       task.history, &task.results,
                                       &task_workspaces_[tid]);
                 break;
               case PickTask::kProcessing:
-                g_testonly_processing_tasks_executed.fetch_add(
-                    1, std::memory_order_relaxed);
+                TestOnlyRecordProcessingTaskExecuted();
                 ProcessPickedTask(task.start_idx, task.end_idx);
                 break;
             }
@@ -545,14 +543,24 @@ class SearchWorker {
     // for the ancestor chain until it's promoted or handed to a task.
     std::vector<std::pair<Node*, int>> reservation_ledger;
     std::vector<std::pair<Node*, int>> level_reservations;
+    // Scratch for atomic promotion (review #878 finding 3): the child node
+    // handles are resolved here before the level's ownership is changed, so
+    // the promotion commit itself cannot throw.
+    std::vector<Node*> promoted_nodes;
     // One per worker (this workspace is), reused across every gather task
     // that worker runs -- see CachedNodeData's comment above.
     CachedNodeData cache;
     TaskWorkspace() {
-      current_path.reserve(30);
+      // The parallel vectors are reserved to the production warm-start size
+      // unless a test overrides it to force promotion growth deterministically
+      // (test-only, see testonly_throw_hook.h; -1 in production).
+      const int test_reserve = TestOnlyWorkspaceReserve();
+      const int parallel_reserve = test_reserve > 0 ? test_reserve : 30;
+      current_path.reserve(parallel_reserve);
       full_path.reserve(30);
-      reservation_ledger.reserve(30);
+      reservation_ledger.reserve(parallel_reserve);
       level_reservations.reserve(16);
+      promoted_nodes.reserve(16);
     }
   };
 

@@ -40,9 +40,16 @@ namespace {
 
 // Same deterministic, always-cache-hit computation as
 // pool_equivalence_test.cc's FakeComputation: the backend itself never
-// fails in this test, only the reservation hook does.
+// fails in this test, only the reservation hook does. The peaked mode
+// concentrates policy on the first legal move, which makes
+// estimated_visits_to_change_best large for unexpanded children, so a pick
+// hands them a multi-visit budget -- the precondition for the
+// visit-then-collision emission that review #878 finding 2 is about (with a
+// uniform policy that estimate is always clamped to 1 and the collision
+// half of the pair never materialises in practice).
 class FakeComputation : public BackendComputation {
  public:
+  explicit FakeComputation(bool peaked_policy) : peaked_(peaked_policy) {}
   size_t UsedBatchSize() const override { return used_; }
   AddInputResult AddInput(const EvalPosition& pos,
                           EvalResultPtr result) override {
@@ -50,10 +57,17 @@ class FakeComputation : public BackendComputation {
     if (result.d) *result.d = 1.0f;
     if (result.m) *result.m = 0.0f;
     if (!result.p.empty()) {
-      const float p = pos.legal_moves.empty()
-                          ? 0.0f
-                          : 1.0f / pos.legal_moves.size();
-      for (auto& v : result.p) v = p;
+      if (peaked_) {
+        const size_t n = result.p.size();
+        result.p[0] = n > 1 ? 0.9f : 1.0f;
+        const float rest = n > 1 ? 0.1f / static_cast<float>(n - 1) : 0.0f;
+        for (size_t i = 1; i < n; ++i) result.p[i] = rest;
+      } else {
+        const float p = pos.legal_moves.empty()
+                            ? 0.0f
+                            : 1.0f / pos.legal_moves.size();
+        for (auto& v : result.p) v = p;
+      }
     }
     ++used_;
     return FETCHED_IMMEDIATELY;
@@ -62,10 +76,14 @@ class FakeComputation : public BackendComputation {
 
  private:
   size_t used_ = 0;
+  const bool peaked_;
 };
 
 class FakeBackend : public Backend {
  public:
+  explicit FakeBackend(bool peaked_policy = false)
+      : peaked_(peaked_policy) {}
+
   BackendAttributes GetAttributes() const override {
     return BackendAttributes{.has_mlh = false,
                              .has_wdl = true,
@@ -75,7 +93,7 @@ class FakeBackend : public Backend {
                              .maximum_batch_size = 256};
   }
   std::unique_ptr<BackendComputation> CreateComputation() override {
-    return std::make_unique<FakeComputation>();
+    return std::make_unique<FakeComputation>(peaked_);
   }
   std::vector<EvalResult> EvaluateBatch(
       std::span<const EvalPosition>) override {
@@ -89,6 +107,9 @@ class FakeBackend : public Backend {
       const OptionsDict&) override {
     return UPDATE_OK;
   }
+
+ private:
+  const bool peaked_;
 };
 
 // Recurses the whole tree, not just the root -- a leak on some interior
@@ -243,7 +264,7 @@ TEST_F(ReservationRollbackTest, SubmittedTaskEntrySetupFailureLeavesNoReservatio
   EXPECT_EQ(bestmove_count.load(), 1);
   EXPECT_TRUE(TestOnlyWasThrowFired(TestOnlyThrowSite::kBeforeTaskEntrySetup))
       << "the armed submitted-task entry seam was never reached";
-  EXPECT_GT(g_testonly_gathering_tasks_executed.load(), 0)
+  EXPECT_GT(TestOnlyGatheringTasksExecuted(), 0)
       << "no worker task ever executed";
   ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
 }
@@ -292,8 +313,165 @@ TEST_F(ReservationRollbackTest, PooledPostSubmitThrowLeavesNoReservation) {
   EXPECT_EQ(bestmove_count.load(), 1);
   EXPECT_TRUE(TestOnlyWasThrowFired(TestOnlyThrowSite::kAfterSubmit))
       << "the armed post-submit seam was never reached";
-  EXPECT_GT(g_testonly_gathering_tasks_executed.load(), 0)
+  EXPECT_GT(TestOnlyGatheringTasksExecuted(), 0)
       << "no worker task ever executed";
+  ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
+}
+
+// ---- review #878 finding 2: partial emission double-owns a Visit ----------
+//
+// The seam fires between a successful Visit insertion and the collision
+// insertion that follows it in the same stop_picking entry, with a
+// multi-visit budget so both exist. The visit's share must already be
+// relinquished by the ledger when this throws; otherwise this call's catch
+// would cancel it once more and the emitted entry's own cancellation would
+// cancel it a second time. A peaked policy is required to reach this at all:
+// with uniform policy estimated_visits_to_change_best clamps to 1, so stop
+// entries always carry a single visit and the collision half never
+// materialises. The count sits well into the run so real search (verified by
+// the executor counters) happens before the throw lands.
+TEST_F(ReservationRollbackTest, PooledCollisionEmissionFailureLeavesNoReservation) {
+  OptionsParser options;
+  SharedBackendParams::Populate(&options);
+  SearchParams::Populate(&options);
+  options.GetMutableDefaultsOptions()->Set(SharedBackendParams::kNNCacheSizeId,
+                                           200000);
+  options.GetMutableDefaultsOptions()->Set(
+      SearchParams::kTaskWorkersPerSearchWorkerId, 4);
+  const auto option_dict = options.GetOptionsDict();
+
+  FakeBackend backend(/*peaked_policy=*/true);
+  NodeTree tree;
+  tree.ResetToPosition(ChessBoard::kStartposFen, {});
+  TranspositionTable tt;
+
+  auto stopper = std::make_unique<classic::ChainedSearchStopper>();
+  stopper->AddStopper(
+      std::make_unique<classic::VisitsStopper>(3000, false));
+
+  std::atomic<int> bestmove_count{0};
+  auto responder = std::make_unique<CallbackUciResponder>(
+      [&](const BestMoveInfo&) { ++bestmove_count; },
+      [](const std::vector<ThinkingInfo>&) {});
+
+  auto search = std::make_unique<Search>(
+      tree, &backend, std::move(responder), MoveList(),
+      std::chrono::steady_clock::now(), std::move(stopper),
+      /*infinite=*/false, /*ponder=*/false, option_dict, &tt, nullptr);
+
+  TestOnlyResetSeams();
+  TestOnlySetThrowCount(TestOnlyThrowSite::kBeforeEmission, 1200);
+  search->StartThreads(4);
+  search->Wait();
+
+  EXPECT_EQ(bestmove_count.load(), 1);
+  EXPECT_TRUE(TestOnlyWasThrowFired(TestOnlyThrowSite::kBeforeEmission))
+      << "the armed between-visit-and-collision seam was never reached";
+  EXPECT_GT(TestOnlyGatheringTasksExecuted(), 0)
+      << "no worker task ever executed";
+  ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
+}
+
+// ---- review #878 finding 3: promotion must commit atomically --------------
+//
+// The seam fires at the promotion's current_path growth point, before either
+// parallel vector or the level's ownership changes. A real search long enough
+// to need growth (the vectors start at 30 entries) must roll the whole level
+// back exactly once: the parent entry stays live, level_reservations stays
+// live, and the catch cancels both without double-cancelling any announced
+// child. Fired-asserted so a run that never needed growth fails loudly
+// instead of passing vacuously.
+TEST_F(ReservationRollbackTest, PromotionPathGrowthFailureLeavesNoReservation) {
+  OptionsParser options;
+  SharedBackendParams::Populate(&options);
+  SearchParams::Populate(&options);
+  options.GetMutableDefaultsOptions()->Set(SharedBackendParams::kNNCacheSizeId,
+                                           200000);
+  options.GetMutableDefaultsOptions()->Set(
+      SearchParams::kTaskWorkersPerSearchWorkerId, 0);
+  const auto option_dict = options.GetOptionsDict();
+
+  FakeBackend backend;
+  NodeTree tree;
+  tree.ResetToPosition(ChessBoard::kStartposFen, {});
+  TranspositionTable tt;
+
+  auto stopper = std::make_unique<classic::ChainedSearchStopper>();
+  stopper->AddStopper(
+      std::make_unique<classic::VisitsStopper>(3000, false));
+
+  std::atomic<int> bestmove_count{0};
+  auto responder = std::make_unique<CallbackUciResponder>(
+      [&](const BestMoveInfo&) { ++bestmove_count; },
+      [](const std::vector<ThinkingInfo>&) {});
+
+  auto search = std::make_unique<Search>(
+      tree, &backend, std::move(responder), MoveList(),
+      std::chrono::steady_clock::now(), std::move(stopper),
+      /*infinite=*/false, /*ponder=*/false, option_dict, &tt, nullptr);
+
+  TestOnlyResetSeams();
+  // Override the workspace's warm-start reserve so the very first wide
+  // promotion genuinely needs to grow the parallel vectors; hits=1 lets the
+  // first (multi-child) promotion succeed and throws at the next one, so
+  // rollback is exercised both before and after an attempted promotion.
+  TestOnlySetWorkspaceReserveOverride(4);
+  TestOnlySetThrowCount(TestOnlyThrowSite::kBeforePromotionPathGrowth, 1);
+  search->StartThreads(1);
+  search->Wait();
+
+  EXPECT_EQ(bestmove_count.load(), 1);
+  EXPECT_TRUE(
+      TestOnlyWasThrowFired(TestOnlyThrowSite::kBeforePromotionPathGrowth))
+      << "promotion never needed to grow current_path: the search did not "
+         "reach a wide/deep enough level to exercise the atomic commit";
+  ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
+}
+
+// Same scenario, arming the second capacity-growth point: current_path is
+// grown first (unarmed), then reservation_ledger's growth throws. Failure at
+// either site must leave the parallel vectors consistent.
+TEST_F(ReservationRollbackTest, PromotionLedgerGrowthFailureLeavesNoReservation) {
+  OptionsParser options;
+  SharedBackendParams::Populate(&options);
+  SearchParams::Populate(&options);
+  options.GetMutableDefaultsOptions()->Set(SharedBackendParams::kNNCacheSizeId,
+                                           200000);
+  options.GetMutableDefaultsOptions()->Set(
+      SearchParams::kTaskWorkersPerSearchWorkerId, 0);
+  const auto option_dict = options.GetOptionsDict();
+
+  FakeBackend backend;
+  NodeTree tree;
+  tree.ResetToPosition(ChessBoard::kStartposFen, {});
+  TranspositionTable tt;
+
+  auto stopper = std::make_unique<classic::ChainedSearchStopper>();
+  stopper->AddStopper(
+      std::make_unique<classic::VisitsStopper>(3000, false));
+
+  std::atomic<int> bestmove_count{0};
+  auto responder = std::make_unique<CallbackUciResponder>(
+      [&](const BestMoveInfo&) { ++bestmove_count; },
+      [](const std::vector<ThinkingInfo>&) {});
+
+  auto search = std::make_unique<Search>(
+      tree, &backend, std::move(responder), MoveList(),
+      std::chrono::steady_clock::now(), std::move(stopper),
+      /*infinite=*/false, /*ponder=*/false, option_dict, &tt, nullptr);
+
+  TestOnlyResetSeams();
+  // See the path-growth test: the first promotion succeeds (growing both
+  // vectors), then reservation_ledger's growth attempt throws.
+  TestOnlySetWorkspaceReserveOverride(4);
+  TestOnlySetThrowCount(TestOnlyThrowSite::kBeforePromotionLedgerGrowth, 1);
+  search->StartThreads(1);
+  search->Wait();
+
+  EXPECT_EQ(bestmove_count.load(), 1);
+  EXPECT_TRUE(
+      TestOnlyWasThrowFired(TestOnlyThrowSite::kBeforePromotionLedgerGrowth))
+      << "promotion never needed to grow reservation_ledger";
   ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
 }
 

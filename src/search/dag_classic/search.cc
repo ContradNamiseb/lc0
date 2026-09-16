@@ -1348,6 +1348,7 @@ void SearchWorker::GatherMinibatch() {
 
       bool needs_wait = false;
       int ppt_start = new_start;
+      std::exception_ptr pending_exception;
       if (task_pool_ &&
           non_collisions >= params_.GetMinimumWorkSizeForProcessing()) {
         const int num_tasks = std::clamp(
@@ -1375,7 +1376,16 @@ void SearchWorker::GatherMinibatch() {
           }
         }
         if (!new_tasks.empty()) {
-          task_pool_->Submit(std::move(new_tasks));
+          // A batch submission can fail partway (review #878 finding 4): the
+          // accepted prefix is queued and counted, so it still has to be
+          // waited on and drained before this scope exits. needs_wait is
+          // already set, so the guarded WaitForAll/DrainCompleted below
+          // covers it.
+          try {
+            task_pool_->Submit(std::move(new_tasks));
+          } catch (...) {
+            pending_exception = std::current_exception();
+          }
         }
       }
       // Same guarded-region shape as PickNodesToExtend above (review #867
@@ -1384,7 +1394,6 @@ void SearchWorker::GatherMinibatch() {
       // processing tasks already submitted are mutating minibatch_/tree
       // state under this thread's held nodes_mutex_, and skipping the wait
       // lets them keep running after unwinding releases it.
-      std::exception_ptr pending_exception;
       try {
         ProcessPickedTask(ppt_start, static_cast<int>(minibatch_.size()));
       } catch (...) {
@@ -1462,7 +1471,7 @@ void SearchWorker::ProcessPickedTask(int start_idx, int end_idx)
   // distinct from the gathering seams, plus the execution counter proving how
   // much real processing ran (pool tasks and main-thread slices both land
   // here).
-  g_testonly_processing_calls.fetch_add(1, std::memory_order_relaxed);
+  TestOnlyRecordProcessingCall();
   TestOnlyMaybeThrowAt(TestOnlyThrowSite::kProcessing);
   for (int i = start_idx; i < end_idx; i++) {
     auto& picked_node = minibatch_[i];
@@ -1748,6 +1757,15 @@ void SearchWorker::PickNodesToExtendTask(
       if (current_path.back().visit_child_) {
         cur_limit -= 1;
         receiver->push_back(NodeToProcess::Visit(full_path, history));
+        // The visit's share is now owned by that receiver entry (its future
+        // cancellation walks leaf-inclusive), so relinquish it in the ledger
+        // immediately. If it were still counted here, a throw while emitting
+        // the collision below would make this call's catch cancel it once
+        // more, and the emitted Visit entry's own cancellation would cancel
+        // it a second time (review #878 finding 2). The colliding share
+        // stays owned until its own insertion succeeds.
+        current_path.back().visit_child_ = 0;
+        current_path.back().visits_ -= 1;
       }
       // Create collisions here.
       if (cur_limit > 0) {
@@ -1756,8 +1774,15 @@ void SearchWorker::PickNodesToExtendTask(
             max_limit > cur_limit) {
           max_count = max_limit;
         }
+        // Test-only seam (#878 f2): between the successful Visit above and
+        // the collision insertion, with the colliding share still owned by
+        // the ledger entry.
+        TestOnlyMaybeThrowAt(TestOnlyThrowSite::kBeforeEmission);
         receiver->push_back(
             NodeToProcess::Collision(full_path, cur_limit, max_count));
+        // Collision share transferred too (leaf-exclusive cancellation); the
+        // entry is popped right below either way.
+        current_path.back().visits_ = 0;
       }
       bool saved_is_last_child;
       do {
@@ -2048,6 +2073,46 @@ void SearchWorker::PickNodesToExtendTask(
       auto rend = visits_to_perform.rend();
       auto rbegin = rend - std::distance(visits_to_perform.begin(), end);
       size_t size = current_path.size();
+      // Atomic promotion (review #878 finding 3): everything that can throw
+      // -- spawning the child handles and growing either parallel vector --
+      // happens BEFORE the parent entry gives up its ownership. Once both
+      // vectors have room and the handles exist, the commit loop only copies
+      // trivial values and cannot throw: either the whole level is promoted
+      // and level_reservations is released, or (on a throw above) the catch
+      // sees the still-live parent entry plus level_reservations and cancels
+      // exactly once. The old code zeroed the parent first, pushed
+      // current_path and reservation_ledger separately, and cleared
+      // level_reservations last, so a throw in between could lose the
+      // unpromoted ancestor share and/or double-cancel a promoted child
+      // through both ledgers.
+      auto& promoted_nodes = workspace->promoted_nodes;
+      promoted_nodes.clear();
+      size_t promoted = 0;
+      for (auto it = rbegin; it != rend; ++it) {
+        if (*it) ++promoted;
+      }
+      promoted_nodes.reserve(promoted);
+      for (auto it = rbegin; it != rend; ++it) {
+        if (!*it) continue;
+        // The node already exists (spawned when this child's visits were
+        // assigned); this is a lookup, but it is still done before ownership
+        // changes so even a spawn cannot invalidate the rollback state.
+        promoted_nodes.push_back(
+            cache.children[it->index_].iter.GetOrSpawnNode(node));
+      }
+      if (current_path.size() + promoted > current_path.capacity()) {
+        TestOnlyMaybeThrowAt(TestOnlyThrowSite::kBeforePromotionPathGrowth);
+        current_path.reserve(std::max(current_path.capacity() * 2,
+                                      current_path.size() + promoted));
+      }
+      if (reservation_ledger.size() + promoted >
+          reservation_ledger.capacity()) {
+        TestOnlyMaybeThrowAt(TestOnlyThrowSite::kBeforePromotionLedgerGrowth);
+        reservation_ledger.reserve(std::max(reservation_ledger.capacity() * 2,
+                                            reservation_ledger.size() +
+                                                promoted));
+      }
+      // Non-throwing commit from here down.
       // This level's own reservation is about to be fully redistributed to
       // whatever survives below (pushed onto current_path) or was handed
       // off to a task above -- zero it so the cleanup block on an exception
@@ -2061,12 +2126,12 @@ void SearchWorker::PickNodesToExtendTask(
       // itself is never appended to full_path here, only when the
       // traversal actually descends into it).
       const int child_ancestor_prefix_len = static_cast<int>(full_path.size());
+      size_t next = 0;
       for (auto it = rbegin; it != rend; ++it) {
         if (!*it) continue;
         current_path.push_back(*it);
-        reservation_ledger.emplace_back(
-            cache.children[it->index_].iter.GetOrSpawnNode(node),
-            child_ancestor_prefix_len);
+        reservation_ledger.emplace_back(promoted_nodes[next++],
+                                        child_ancestor_prefix_len);
       }
       if (current_path.size() != size) {
         current_path[size].last_child_ = true;
