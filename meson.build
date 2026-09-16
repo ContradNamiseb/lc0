@@ -1155,6 +1155,11 @@ if get_option('gtest')
     executable('inline_depth_stack_test', 'src/search/classic/inline_depth_stack_test.cc', pb_files,
     include_directories: includes, link_with: lc0_lib, dependencies: gtest),
     args: '--gtest_output=xml:depthstack.xml', timeout: 90)
+
+  test('UciLoopBestMove',
+    executable('uciloop_test', 'src/chess/uciloop_test.cc', pb_files,
+    include_directories: includes, link_with: lc0_lib, dependencies: gtest),
+    args: '--gtest_output=xml:uciloop.xml', timeout: 90)
 endif
 
 

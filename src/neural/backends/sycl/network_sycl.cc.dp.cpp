@@ -620,6 +620,12 @@ class SyclNetwork : public Network {
             // wait_and_throw(), not wait(): same delivery-guarantee reason
             // as forwardEval()'s post-batch wait -- see there.
             sycl_queue_->memset(mem, 0, maxSize).wait_and_throw();
+            // The delivery point above guarantees the async handler has
+            // already run if this memset triggered/observed a device
+            // failure -- without this check construction would otherwise
+            // sail on and hand back a network object backed by a dead
+            // device (review #866 P2).
+            ThrowIfBackendFailed();
       }
     }
 
@@ -634,7 +640,14 @@ class SyclNetwork : public Network {
   }
 
   void forwardEval(InputsOutputs* io, int batchSize) {
-
+    // Check the sticky failure flag before doing any work: without this, a
+    // caller queuing up behind an already-failed batch (multi_stream_, or
+    // simply the next iteration on the same worker) would submit and wait
+    // out an entire new batch on a device the runtime already gave up on,
+    // only to discover that at its own post-batch check below (review #866
+    // P2). This can only observe a PRIOR batch's failure -- see the
+    // post-batch wait_and_throw()+check further down for this batch's own.
+    ThrowIfBackendFailed();
 
     // RAII, not raw lock()/unlock(): a synchronous SYCL throw anywhere below
     // (plausible for a device-loss error, which is exactly what this is
@@ -919,12 +932,7 @@ class SyclNetwork : public Network {
     // letting the process die. wait_and_throw() above guarantees the
     // handler (which only sets this flag, deliberately not throwing itself
     // -- see the handler for why) has already run by this point.
-    if (backend_failed_.load(std::memory_order_acquire)) {
-      throw Exception(
-          "SYCL backend reported an asynchronous device error mid-batch "
-          "(see log above for detail, e.g. a driver TDR reset) -- aborting "
-          "this search rather than returning results computed from it.");
-    }
+    ThrowIfBackendFailed();
 
     if (wdl_) {
       // Value softmax done cpu side.
@@ -1025,11 +1033,28 @@ class SyclNetwork : public Network {
   // Set by the async SYCL exception handler (e.g. a Level Zero device-loss/
   // TDR reset) instead of calling std::terminate() there -- that handler can
   // run on a thread with no lc0 exception handler up its stack, so throwing
-  // or terminating from inside it is unsafe either way. forwardEval() checks
-  // this on the calling (search worker) thread, which does have one, and
-  // throws a normal Exception there so the search stops gracefully instead
-  // of the whole engine dying mid-game.
+  // or terminating from inside it is unsafe either way. ThrowIfBackendFailed()
+  // checks this on the calling (search worker) thread, which does have one,
+  // and throws a normal Exception there so the search stops gracefully
+  // instead of the whole engine dying mid-game.
   std::atomic<bool> backend_failed_{false};
+
+  // Throws if the async exception handler above has flagged the backend as
+  // dead. Must be called after every wait_and_throw() (the only guaranteed
+  // delivery point for that handler -- see forwardEval()'s post-batch call)
+  // to observe a fresh value, and additionally at forwardEval()'s own entry:
+  // without that second check, a caller queuing up behind an already-failed
+  // batch would submit and wait out an entire new batch on a device the
+  // runtime already gave up on before ever reaching its own post-batch check
+  // (review #866 P2).
+  void ThrowIfBackendFailed() const {
+    if (backend_failed_.load(std::memory_order_acquire)) {
+      throw Exception(
+          "SYCL backend reported an asynchronous device error (see log "
+          "above for detail, e.g. a driver TDR reset) -- aborting this "
+          "search rather than continuing on a dead device.");
+    }
+  }
 
 
   int numBlocks_;

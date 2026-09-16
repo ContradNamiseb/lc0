@@ -147,6 +147,47 @@ TEST(TaskStealingPool, WorkArrivesAfterRealSleep) {
   EXPECT_EQ(sum.load(), 13);
 }
 
+// The #866 P1-2 detector, at the level this pool actually guarantees:
+// completed_tasks_ retains EVERY task -- including ones that finished
+// cleanly -- whether or not WaitForAll() ends up throwing. This documents
+// (and pins) the calling convention search.cc's PickNodesToExtend() relies
+// on: a caller MUST still call DrainCompleted() when WaitForAll() throws, or
+// a sibling task's real results (here, its own `results` payload, mirroring
+// PickTask::results) are silently dropped even though the pool itself never
+// lost them.
+TEST(TaskStealingPool, CompletedResultsSurviveAThrowingSiblingUntilDrained) {
+  struct ResultTask {
+    int tag = 0;
+    std::vector<int> results;
+  };
+  TaskStealingPool<ResultTask> pool(4, [](ResultTask& t, int) {
+    if (t.tag == 13) throw std::runtime_error("injected executor failure");
+    t.results.push_back(t.tag * 10);
+  });
+  std::vector<ResultTask> tasks;
+  for (int i = 0; i < 20; ++i) tasks.push_back(ResultTask{i, {}});
+  pool.Submit(std::move(tasks));
+
+  // The caller-side pattern this test pins: catch, drain unconditionally,
+  // merge, THEN rethrow -- not WaitForAll() followed unconditionally by
+  // DrainCompleted(), which skips the drain entirely on the throwing path.
+  std::exception_ptr pending;
+  try {
+    pool.WaitForAll();
+  } catch (...) {
+    pending = std::current_exception();
+  }
+  auto completed = pool.DrainCompleted();
+  EXPECT_EQ(completed.size(), 20u);
+  int merged_results = 0;
+  for (auto& t : completed) merged_results += static_cast<int>(t.results.size());
+  // 19 successful tasks each produced one result; task 13 threw before
+  // appending its own.
+  EXPECT_EQ(merged_results, 19);
+  ASSERT_TRUE(pending != nullptr);
+  EXPECT_THROW(std::rethrow_exception(pending), std::runtime_error);
+}
+
 TEST(TaskStealingPool, StealUnderLoadPreservesCounts) {
   std::atomic<long long> sum{0};
   TaskStealingPool<int> pool(4, [&sum](int& t, int) {

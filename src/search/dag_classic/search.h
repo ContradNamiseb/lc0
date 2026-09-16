@@ -277,6 +277,13 @@ class SearchWorker {
       // emitted -- the game goes on and the log names the failure.
       std::cerr << "Unhandled exception in worker thread: " << e.what()
                 << std::endl;
+      // Release this worker's own abandoned real-visit reservations before
+      // signalling stop (review #866 P1-3) -- mirrors classic's
+      // CancelPendingMinibatch(). Collisions need no handling here:
+      // GatherMinibatch's own absl::Cleanup (cancel_collisions) already
+      // cancelled every collision the moment GatherMinibatch() itself
+      // returned or threw, unconditionally, on every exit path.
+      CancelPendingMinibatchVisits();
       search_->Stop();
     }
   }
@@ -290,6 +297,24 @@ class SearchWorker {
   // 6. Propagate the new nodes' information to all their parents in the tree.
   // 7. Update the Search's status and progress information.
   void ExecuteOneIteration();
+
+  // If an iteration is abandoned mid-flight (a backend exception, caught in
+  // RunBlocking() above), every non-collision entry still sitting in
+  // minibatch_ holds live n_in_flight_ reservations along its whole path
+  // (leaf included -- TryStartScoreUpdate() -- and every ancestor --
+  // IncrementNInFlight()) that DoBackupUpdate's FinalizeScoreUpdate will now
+  // never run for. Collisions are NOT handled here: unlike classic, dag_
+  // classic collisions are never transferred to a shared owner -- their
+  // ancestor reservations are cancelled unconditionally the moment
+  // GatherMinibatch() itself exits (its own absl::Cleanup), on every path,
+  // exception included -- so by the time this runs, any collision entries
+  // still physically present in minibatch_ have already been released, and
+  // walking them again here would double-cancel the same path (review #866
+  // P1-3). Real visits get no such per-call cleanup -- GatherMinibatch
+  // deliberately keeps them reserved across the rest of the iteration -- so
+  // without this they leak for the rest of the search on any failure
+  // between GatherMinibatch() returning and DoBackupUpdate() running.
+  void CancelPendingMinibatchVisits();
 
   // The same operations one by one:
   // 1. Initialize internal structures.
