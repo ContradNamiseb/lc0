@@ -70,6 +70,10 @@ enum class TestOnlyThrowSite : int {
   // Immediately before the destination reserve that merges drained task
   // results into minibatch_ (review #883).
   kBeforeMergeReserve,
+  // Variant of the above that fires only when the drained batch contains at
+  // least one completed collision, so a focused test can exercise the
+  // collision-recovery branch (review #885).
+  kBeforeMergeReserveWithCollision,
   // Top of the pool executor callback, before the task's own code runs.
   kWorkerExecutor,
   // Top of ProcessPickedTask, before it touches the batch.
@@ -117,6 +121,20 @@ static inline void TestOnlyRecordPostVisitRemainingShare(int share) {
 
 static inline int64_t TestOnlyPostVisitRemainingShare() {
   return g_testonly_post_visit_remaining_share.load(std::memory_order_relaxed);
+}
+
+// Collision entries cancelled by the merge-failure recovery path (review
+// #885): lets the focused test prove that branch actually ran.
+inline std::atomic<int64_t> g_testonly_unmerged_collisions_cancelled{0};
+
+static inline void TestOnlyRecordUnmergedCollisionCancelled() {
+  g_testonly_unmerged_collisions_cancelled.fetch_add(1,
+                                                     std::memory_order_relaxed);
+}
+
+static inline int64_t TestOnlyUnmergedCollisionsCancelled() {
+  return g_testonly_unmerged_collisions_cancelled.load(
+      std::memory_order_relaxed);
 }
 
 // The single counter array; address-stable for the process lifetime.
@@ -227,6 +245,8 @@ static inline void TestOnlyResetSeams() {
   g_testonly_workspace_reserve_override.store(-1, std::memory_order_relaxed);
   g_testonly_last_throw_in_pool_task.store(false, std::memory_order_relaxed);
   g_testonly_post_visit_remaining_share.store(-1, std::memory_order_relaxed);
+  g_testonly_unmerged_collisions_cancelled.store(0,
+                                                 std::memory_order_relaxed);
 }
 
 #else  // !LC0_TEST_INSTRUMENTATION
@@ -241,6 +261,7 @@ static inline void TestOnlyRecordProcessingTaskExecuted() {}
 static inline void TestOnlyRecordProcessingCall() {}
 static inline void TestOnlyMarkPoolTaskContext() {}
 static inline void TestOnlyRecordPostVisitRemainingShare(int) {}
+static inline void TestOnlyRecordUnmergedCollisionCancelled() {}
 static inline int TestOnlyWorkspaceReserve() { return -1; }
 
 #endif  // LC0_TEST_INSTRUMENTATION
