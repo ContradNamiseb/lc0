@@ -1640,18 +1640,51 @@ void SearchWorker::PickNodesToExtendTask(
   auto& moves_to_path = workspace->moves_to_path;
   moves_to_path = moves_to_node;
   cache.vtp_last_filled_cache.clear();
-  // Reservation rollback bookkeeping -- see the TaskWorkspace comment.
-  auto& ledger_buffer = workspace->ledger_buffer;
-  auto& reservation_ledger = workspace->reservation_ledger;
-  reservation_ledger.clear();
-  auto& ledger_last_filled = workspace->ledger_last_filled;
-  ledger_last_filled.clear();
-  // Root's own reservation (below) has no parent-level ledger entry to
-  // reconstruct it the way every other node's does, so it's tracked
-  // separately here and superseded (zeroed) once root's children exist --
-  // see the cleanup block for why.
-  Node* root_self_node = nullptr;
-  int root_self_amount = 0;
+  // Reservation-rollback ownership ledger -- see the TaskWorkspace comment.
+  auto& records = workspace->rollback_records;
+  records.clear();
+  // Bounded by two records per pick (TryStartScoreUpdate + IncrementNInFlight)
+  // plus one per ancestor for a submitted task's transferred coverage; sized
+  // up front so no record insertion below can allocate after an increment
+  // has been applied.
+  records.reserve(2 * collision_visit_limit + base_search_depth + 8);
+  auto add_record = [&records](Node* node, int amount) {
+    if (amount > 0) records.push_back({node, amount});
+  };
+  // Retirement is sum-based: decrement any records located at `node` (a node
+  // can carry a locally-picked record and, inside a submitted task, the
+  // transferred ancestor-coverage record).
+  auto retire_node = [&records](Node* node, int amount) {
+    for (auto& r : records) {
+      if (amount <= 0) break;
+      if (r.node != node || r.owned <= 0) continue;
+      const int take = std::min(r.owned, amount);
+      r.owned -= take;
+      amount -= take;
+    }
+  };
+  // An emitted entry's future cancellation walks its own node to root, so
+  // retire that same path now: rollback must never double-release an amount
+  // the receiver already owns. Collisions never cancel at their own node.
+  auto retire_path = [&retire_node, this](Node* from, int amount,
+                                          bool include_self) {
+    if (amount <= 0) return;
+    for (Node* n = include_self ? from : from->GetParent();
+         n != search_->root_node_->GetParent(); n = n->GetParent()) {
+      retire_node(n, amount);
+    }
+  };
+  // A submitted task's start node and its ancestors were reserved by the
+  // parent call's pick, which handed that ownership to the task (see the
+  // submit site); re-record the same coverage here so this call's rollback
+  // covers a task that throws before its first pick.
+  if (base_search_depth > 0) {
+    add_record(cur_node, collision_visit_limit);
+    for (Node* n = cur_node->GetParent();
+         n != search_->root_node_->GetParent(); n = n->GetParent()) {
+      add_record(n, collision_visit_limit);
+    }
+  }
 
   Node::Iterator best_edge;
   Node::Iterator second_best_edge;
@@ -1711,18 +1744,18 @@ void SearchWorker::PickNodesToExtendTask(
       if (cur_node->GetN() == 0 || cur_node->IsTerminal()) {
         if (root_node) {
           if (cur_node->TryStartScoreUpdate()) {
-            root_self_node = cur_node;
-            root_self_amount = 1;
+            add_record(cur_node, 1);
             cur_limit -= 1;
             output_receiver->push_back(NodeToProcess::Visit(
                 cur_node, static_cast<uint16_t>(current_path.size() +
                                                 base_search_depth)));
             completed_visits++;
-            root_self_amount = 0;
+            retire_path(cur_node, 1, /*include_self=*/true);
           }
         }
         // Visits are created elsewhere, just need the collisions here.
         if (cur_limit > 0) {
+          retire_path(cur_node, cur_limit, /*include_self=*/false);
           int max_count = 0;
           if (cur_limit == collision_visit_limit && base_search_depth == 0 &&
               max_limit > cur_limit) {
@@ -1742,8 +1775,7 @@ void SearchWorker::PickNodesToExtendTask(
       // as its not handled on the path to it, since there isn't one.
       if (root_node) {
         cur_node->IncrementNInFlight(cur_limit);
-        root_self_node = cur_node;
-        root_self_amount = cur_limit;
+        add_record(cur_node, cur_limit);
       }
 
       // ----- prepare caches for this level --------------------------------
@@ -1755,14 +1787,6 @@ void SearchWorker::PickNodesToExtendTask(
       } else {
         visits_to_perform.push_back(std::make_unique<std::array<int, 256>>());
       }
-      if (ledger_buffer.size() > 0) {
-        reservation_ledger.push_back(std::move(ledger_buffer.back()));
-        ledger_buffer.pop_back();
-      } else {
-        reservation_ledger.push_back(
-            std::make_unique<std::array<std::pair<Node*, int>, 256>>());
-      }
-      ledger_last_filled.push_back(-1);
       cache.vtp_last_filled_cache.push_back(-1);
 
       // Cache all constant UCT parameters.
@@ -1922,10 +1946,6 @@ void SearchWorker::PickNodesToExtendTask(
           auto* vtp_array = visits_to_perform.back().get()->data();
           std::fill(vtp_array + (cache.vtp_last_filled_cache.back() + 1),
                     vtp_array + best_idx + 1, 0);
-          auto* ledger_array = reservation_ledger.back().get()->data();
-          std::fill(ledger_array + (cache.vtp_last_filled_cache.back() + 1),
-                    ledger_array + best_idx + 1,
-                    std::pair<Node*, int>{nullptr, 0});
         }
         (*visits_to_perform.back())[best_idx] += new_visits;
         cur_limit -= new_visits;
@@ -1936,18 +1956,16 @@ void SearchWorker::PickNodesToExtendTask(
         EnsureNodeTwoFoldCorrectForDepth(
             child_node, current_path.size() + base_search_depth + 1 - 1);
 
-        auto& ledger_entry = (*reservation_ledger.back())[best_idx];
-        ledger_entry.first = child_node;
         bool decremented = false;
         if (child_node->TryStartScoreUpdate()) {
+          add_record(child_node, 1);
           cache.children[best_idx].n_started++;
           new_visits -= 1;
           decremented = true;
-          ledger_entry.second += 1;
           TestOnlyMaybeThrowAfterReservation();
           if (child_node->GetN() > 0 && !child_node->IsTerminal()) {
             child_node->IncrementNInFlight(new_visits);
-            ledger_entry.second += new_visits;
+            add_record(child_node, new_visits);
             cache.children[best_idx].n_started += new_visits;
           }
           cache.children[best_idx].uct_score =
@@ -1958,12 +1976,11 @@ void SearchWorker::PickNodesToExtendTask(
         if ((decremented &&
              (child_node->GetN() == 0 || child_node->IsTerminal()))) {
           // Reduce 1 for the visits_to_perform to ensure the collision created
-          // doesn't include this visit, and mirror the same reduction in the
-          // ledger -- this Visit is about to be pushed to output_receiver
-          // and become the standard CancelPendingMinibatch's responsibility,
-          // not the exception-path cleanup below's.
+          // doesn't include this visit. The Visit entry's own cancellation
+          // will walk child -> root, so retire that same path now: ownership
+          // of those reservations moves to CancelPendingMinibatch.
           (*visits_to_perform.back())[best_idx] -= 1;
-          ledger_entry.second -= 1;
+          retire_path(child_node, 1, /*include_self=*/true);
           output_receiver->push_back(NodeToProcess::Visit(
               child_node, static_cast<uint16_t>(current_path.size() + 1 +
                                                 base_search_depth)));
@@ -1976,15 +1993,9 @@ void SearchWorker::PickNodesToExtendTask(
         if (best_idx > cache.vtp_last_filled_cache.back() &&
             (*visits_to_perform.back())[best_idx] > 0) {
           cache.vtp_last_filled_cache.back() = best_idx;
-          ledger_last_filled.back() = best_idx;
         }
       }
       root_node = false;
-      // Root's own reservation is now fully redistributed among the
-      // children picked above (each with its own ledger entry) -- clear it
-      // so the cleanup block on an exception doesn't also treat it as still
-      // outstanding.
-      root_self_amount = 0;
       // ----- task splitting via pool -----
       // Submit subtree explorations directly to the task-stealing pool.
       if (task_pool_) {
@@ -2012,6 +2023,11 @@ void SearchWorker::PickNodesToExtendTask(
 
             passed_off += child_limit;
             (*visits_to_perform.back())[i] = 0;
+            // Hand this child's reservation, and the ancestors' coverage for
+            // it, to the submitted task (which re-records the same coverage
+            // in its own ledger); retire them here first so a throw after
+            // this point cannot cancel them too.
+            retire_path(child_node, child_limit, /*include_self=*/true);
             TestOnlyMaybeThrowAfterReservation();
           }
         }
@@ -2053,60 +2069,21 @@ void SearchWorker::PickNodesToExtendTask(
       current_path.pop_back();
       vtp_buffer.push_back(std::move(visits_to_perform.back()));
       visits_to_perform.pop_back();
-      ledger_buffer.push_back(std::move(reservation_ledger.back()));
-      reservation_ledger.pop_back();
-      ledger_last_filled.pop_back();
       cache.vtp_last_filled_cache.pop_back();
     }
   }  // end while (!current_path.empty())
   } catch (...) {
-    // Roll back every reservation this call made that never reached the
-    // output receiver or a submitted task, walking each still-live entry's
-    // own Node::GetParent() chain the same way CancelPendingMinibatch does
-    // for a real receiver entry (see the TaskWorkspace comment on
-    // reservation_ledger for the direct-vs-ancestor split below).
-    auto cancel_to_root = [this](Node* from, int amount, bool inclusive) {
-      if (amount <= 0) return;
-      Node* n = inclusive ? from : from->GetParent();
-      for (; n != search_->root_node_->GetParent(); n = n->GetParent()) {
-        n->CancelScoreUpdate(amount);
-      }
-    };
-    // Root's own reservation, if its children were never created (the
-    // exception hit before `root_self_amount = 0` above).
-    if (root_self_amount > 0) {
-      root_self_node->CancelScoreUpdate(root_self_amount);
-    }
-    // Every currently-open level: for each edge index still holding a
-    // nonzero visits_to_perform total (not yet turned into a receiver
-    // entry or handed to a submitted task), reservation_ledger's matching
-    // slot has (a) the resolved child node -- cache.children[] is reused
-    // per level so it can't be trusted for anything but the innermost one
-    // -- and (b) how much of that total was actually applied to the
-    // child's own n_in_flight_. The direct portion cancels at the child
-    // itself (leaf-inclusive, matching a real Visit entry); the remainder
-    // was never applied to the child -- only implied by whatever allocated
-    // it at the parent -- so it cancels ancestor-only from the child's
-    // parent up (matching a real Collision entry).
-    for (size_t level = 0; level < visits_to_perform.size(); ++level) {
-      auto& vtp = *visits_to_perform[level];
-      auto& ledger = *reservation_ledger[level];
-      // Bounded to what this level actually initialized -- everything past
-      // ledger_last_filled[level] is recycled-array leftover from a
-      // previous use of this same buffer slot, not this call's data.
-      for (int idx = 0; idx <= ledger_last_filled[level]; ++idx) {
-        int total = vtp[idx];
-        if (total == 0) continue;
-        auto [child_node, direct_amount] = ledger[idx];
-        cancel_to_root(child_node, direct_amount, /*inclusive=*/true);
-        cancel_to_root(child_node, total - direct_amount,
-                        /*inclusive=*/false);
-      }
+    // Cancel every still-owned reservation at its own node. Each record owns
+    // exactly the n_in_flight_ increments this call applied that have not
+    // been retired to a receiver entry or handed to a submitted task, so no
+    // node-to-root walk is needed and nothing can be released twice -- the
+    // increment made by the pick that threw is included, because its record
+    // was created before the throw seam runs.
+    for (auto& r : records) {
+      if (r.owned > 0) r.node->CancelScoreUpdate(r.owned);
     }
     current_path.clear();
     visits_to_perform.clear();
-    reservation_ledger.clear();
-    ledger_last_filled.clear();
     cache.vtp_last_filled_cache.clear();
     throw;
   }

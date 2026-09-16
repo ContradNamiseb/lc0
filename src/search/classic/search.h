@@ -492,31 +492,22 @@ class SearchWorker {
     std::vector<Move> moves_to_path;
     PositionHistory history;
 
-    // Reservation-rollback bookkeeping for PickNodesToExtendTask (agora
-    // #41/#872 P1): n_in_flight_ reservations made mid-traversal are not
-    // visible to CancelPendingMinibatch until they land in the output
-    // receiver, so an exception between reservation and emission would
-    // otherwise leak them. One entry per (level, edge index), parallel to
-    // visits_to_perform and recycled the same way via ledger_buffer -- each
-    // slot holds the resolved child Node* (visits_to_perform is only
-    // indexed by edge index, and cache.children[] is reused per level so it
-    // can't be trusted for an ancestor level once traversal has moved
-    // deeper) plus how much of that slot's visits_to_perform total was
-    // actually applied directly to the child's own n_in_flight_ (the rest
-    // is a would-be collision, never applied to the child, only implied by
-    // whatever allocated it at the parent -- see the cleanup block in
-    // PickNodesToExtendTask for how the two portions are cancelled
-    // differently).
-    std::vector<std::unique_ptr<std::array<std::pair<Node*, int>, 256>>>
-        ledger_buffer;
-    std::vector<std::unique_ptr<std::array<std::pair<Node*, int>, 256>>>
-        reservation_ledger;
-    // Mirrors cache.vtp_last_filled_cache but with per-level random access
-    // (InlineDepthStack only exposes the top), so exception cleanup can
-    // bound its scan of each open level's visits_to_perform/
-    // reservation_ledger to the indices that level actually initialized --
-    // everything past it is recycled-array leftover from a previous use.
-    std::vector<int> ledger_last_filled;
+    // Reservation-rollback ownership ledger for PickNodesToExtendTask (agora
+    // #41/#872 P1, reworked per review #874): one record per n_in_flight_
+    // increment this call applies, owning exactly that amount until it is
+    // retired to a receiver entry or handed to a submitted task. Rollback
+    // cancels each surviving record directly at its own node -- no
+    // node-to-root walks -- so every increment has a single owner across
+    // every transition (increment, emit, submit, exception) and none can be
+    // released twice or missed, including the increment made by the pick
+    // that throws. Reused per worker like the other buffers; capacity is
+    // reserved at call entry so recording a record can never allocate and
+    // fail after an increment has been applied.
+    struct RollbackRecord {
+      Node* node;
+      int owned;
+    };
+    std::vector<RollbackRecord> rollback_records;
 
     // One per worker (this workspace is), reused across every gather task
     // that worker runs -- see the comment on CachedNodeData above for why
@@ -534,9 +525,7 @@ class SearchWorker {
       current_path.reserve(30);
       moves_to_path.reserve(30);
       history.Reserve(30);
-      ledger_buffer.reserve(30);
-      reservation_ledger.reserve(30);
-      ledger_last_filled.reserve(30);
+      rollback_records.reserve(64);
     }
   };
 
