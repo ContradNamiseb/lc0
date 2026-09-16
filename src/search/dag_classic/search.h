@@ -45,6 +45,7 @@
 #include "syzygy/syzygy.h"
 #include "utils/logging.h"
 #include "utils/mutex.h"
+#include "utils/round_task_slot.h"
 #include "utils/task_stealing_pool.h"
 
 namespace lczero {
