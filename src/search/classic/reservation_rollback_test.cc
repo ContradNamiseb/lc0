@@ -31,6 +31,7 @@
 
 #include "chess/board.h"
 #include "chess/callbacks.h"
+#include "chess/position.h"
 #include "gtest/gtest.h"
 #include "neural/backend.h"
 #include "neural/shared_params.h"
@@ -111,10 +112,10 @@ void ExpectZeroNInFlightEverywhere(Node* node) {
 class ReservationRollbackTest : public ::testing::Test {
  protected:
   void TearDown() override {
-    // The hook is a process-global countdown -- always leave it disabled
-    // so a test that doesn't fully consume it can't bleed into the next
-    // test in this binary.
-    g_testonly_throw_after_reservations.store(-1, std::memory_order_relaxed);
+    // The seams are process-global counters -- always disable every site and
+    // zero the execution counters so a test that doesn't fully consume a
+    // countdown can't bleed into the next test in this binary.
+    TestOnlyResetSeams();
   }
 };
 
@@ -151,12 +152,13 @@ TEST_F(ReservationRollbackTest, SerialThrowMidTraversalLeavesNoReservation) {
   // Let a few reservations happen for real (root's own, plus at least one
   // child's TryStartScoreUpdate) before throwing -- nonempty pending local
   // work at the moment of the throw, not an empty-traversal edge case.
-  g_testonly_throw_after_reservations.store(5, std::memory_order_relaxed);
+  TestOnlySetThrowCount(TestOnlyThrowSite::kAfterReservation, 5);
 
   search->StartThreads(1);
   search->Wait();
 
   EXPECT_EQ(bestmove_count.load(), 1);
+  EXPECT_TRUE(TestOnlyWasThrowFired(TestOnlyThrowSite::kAfterReservation));
   ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
 }
 
@@ -195,12 +197,222 @@ TEST_F(ReservationRollbackTest, PooledThrowMidTraversalLeavesNoReservation) {
   // A bigger budget than the serial case: with several pool workers racing
   // to consume the same countdown, more reservations land before whichever
   // one crosses zero actually throws.
-  g_testonly_throw_after_reservations.store(30, std::memory_order_relaxed);
+  TestOnlySetThrowCount(TestOnlyThrowSite::kAfterReservation, 30);
 
   search->StartThreads(4);
   search->Wait();
 
   EXPECT_EQ(bestmove_count.load(), 1);
+  EXPECT_TRUE(TestOnlyWasThrowFired(TestOnlyThrowSite::kAfterReservation));
+  ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
+}
+
+// ---- review #876 finding 1: ledger capacity is not depth-bounded ----------
+//
+// A budget of 1 can walk an arbitrarily deep expanded chain, adding one
+// record per level, and retired records stay in the vector -- so the initial
+// reserve can never be treated as sufficient. Builds a single-child expanded
+// chain of `length` nodes (each N=1, so every pick descends rather than
+// branching) and terminates it with one unexpanded edge.
+void BuildExpandedChain(NodeTree* tree, int length) {
+  PositionHistory history;
+  history.Reset(ChessBoard(ChessBoard::kStartposFen), 0, 0);
+  Node* node = tree->GetCurrentHead();
+  for (int i = 0; i < length; ++i) {
+    const Move move = history.Last().GetBoard().GenerateLegalMoves()[0];
+    history.Append(move);
+    node->CreateEdges(MoveList{move});
+    auto edge = node->Edges();
+    Node* child = edge.GetOrSpawnNode(node);
+    child->TryStartScoreUpdate();
+    child->FinalizeScoreUpdate(0.0f, 1.0f, 0.0f, 1);
+    node = child;
+  }
+  const Move move = history.Last().GetBoard().GenerateLegalMoves()[0];
+  node->CreateEdges(MoveList{move});
+}
+
+// Throws at the ledger's capacity-growth point instead of at a reservation
+// seam. The chain is deeper than any initial reserve, so the walk must grow
+// the ledger; with capacity ensured before each increment, the failure is
+// raised while every applied increment still has its record, and the catch
+// restores zero N-in-flight everywhere.
+TEST_F(ReservationRollbackTest, DeepChainGrowthFailureLeavesNoReservation) {
+  OptionsParser options;
+  SharedBackendParams::Populate(&options);
+  SearchParams::Populate(&options);
+  options.GetMutableDefaultsOptions()->Set(SharedBackendParams::kNNCacheSizeId,
+                                           200000);
+  options.GetMutableDefaultsOptions()->Set(
+      SearchParams::kTaskWorkersPerSearchWorkerId, 0);
+  const auto option_dict = options.GetOptionsDict();
+
+  FakeBackend backend;
+  NodeTree tree;
+  tree.ResetToPosition(ChessBoard::kStartposFen, {});
+  BuildExpandedChain(&tree, /*length=*/64);
+
+  auto stopper = std::make_unique<ChainedSearchStopper>();
+  stopper->AddStopper(std::make_unique<VisitsStopper>(3000, false));
+
+  std::atomic<int> bestmove_count{0};
+  auto responder = std::make_unique<CallbackUciResponder>(
+      [&](const BestMoveInfo&) { ++bestmove_count; },
+      [](const std::vector<ThinkingInfo>&) {});
+
+  auto search = std::make_unique<Search>(
+      tree, &backend, std::move(responder), MoveList(),
+      std::chrono::steady_clock::now(), std::move(stopper),
+      /*infinite=*/false, /*ponder=*/false, option_dict, nullptr);
+
+  TestOnlySetThrowCount(TestOnlyThrowSite::kBeforeRecordGrowth, 0);
+  search->StartThreads(1);
+  search->Wait();
+
+  EXPECT_EQ(bestmove_count.load(), 1);
+  EXPECT_TRUE(TestOnlyWasThrowFired(TestOnlyThrowSite::kBeforeRecordGrowth))
+      << "the ledger never needed to grow: the chain did not exceed the "
+         "initial reserve, so this test would not cover finding 1";
+  ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
+}
+
+// ---- review #876 finding 2: retire only after the emission succeeded ------
+//
+// The seam sits immediately before the receiver insertion, so the throw
+// arrives while the ledger still owns the just-reserved amount. If the
+// emission path retired first, this would leak exactly the amount being
+// emitted (the root Visit's +1 on the first call).
+TEST_F(ReservationRollbackTest, EmissionFailureLeavesNoReservation) {
+  OptionsParser options;
+  SharedBackendParams::Populate(&options);
+  SearchParams::Populate(&options);
+  options.GetMutableDefaultsOptions()->Set(SharedBackendParams::kNNCacheSizeId,
+                                           200000);
+  options.GetMutableDefaultsOptions()->Set(
+      SearchParams::kTaskWorkersPerSearchWorkerId, 0);
+  const auto option_dict = options.GetOptionsDict();
+
+  FakeBackend backend;
+  NodeTree tree;
+  tree.ResetToPosition(ChessBoard::kStartposFen, {});
+
+  auto stopper = std::make_unique<ChainedSearchStopper>();
+  stopper->AddStopper(std::make_unique<VisitsStopper>(3000, false));
+
+  std::atomic<int> bestmove_count{0};
+  auto responder = std::make_unique<CallbackUciResponder>(
+      [&](const BestMoveInfo&) { ++bestmove_count; },
+      [](const std::vector<ThinkingInfo>&) {});
+
+  auto search = std::make_unique<Search>(
+      tree, &backend, std::move(responder), MoveList(),
+      std::chrono::steady_clock::now(), std::move(stopper),
+      /*infinite=*/false, /*ponder=*/false, option_dict, nullptr);
+
+  TestOnlySetThrowCount(TestOnlyThrowSite::kBeforeEmission, 0);
+  search->StartThreads(1);
+  search->Wait();
+
+  EXPECT_EQ(bestmove_count.load(), 1);
+  EXPECT_TRUE(TestOnlyWasThrowFired(TestOnlyThrowSite::kBeforeEmission))
+      << "no emission was attempted, so the retire-after-insertion ordering "
+         "was never exercised";
+  ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
+}
+
+// ---- review #876 finding 3: submitted tasks need an entry guard -----------
+//
+// The seam fires at the entry of a submitted task, before any of its
+// allocating setup and before its ledger records exist. The submitting call
+// has already retired its mirror of the inherited coverage, so this guard is
+// the only owner: it must cancel the coverage across every ancestor and the
+// child itself, and the counters prove a worker task really ran (the seam
+// cannot fire otherwise).
+TEST_F(ReservationRollbackTest, SubmittedTaskEntrySetupFailureLeavesNoReservation) {
+  OptionsParser options;
+  SharedBackendParams::Populate(&options);
+  SearchParams::Populate(&options);
+  options.GetMutableDefaultsOptions()->Set(SharedBackendParams::kNNCacheSizeId,
+                                           200000);
+  options.GetMutableDefaultsOptions()->Set(
+      SearchParams::kTaskWorkersPerSearchWorkerId, 4);
+  const auto option_dict = options.GetOptionsDict();
+
+  FakeBackend backend;
+  NodeTree tree;
+  tree.ResetToPosition(ChessBoard::kStartposFen, {});
+
+  auto stopper = std::make_unique<ChainedSearchStopper>();
+  stopper->AddStopper(std::make_unique<VisitsStopper>(3000, false));
+
+  std::atomic<int> bestmove_count{0};
+  auto responder = std::make_unique<CallbackUciResponder>(
+      [&](const BestMoveInfo&) { ++bestmove_count; },
+      [](const std::vector<ThinkingInfo>&) {});
+
+  auto search = std::make_unique<Search>(
+      tree, &backend, std::move(responder), MoveList(),
+      std::chrono::steady_clock::now(), std::move(stopper),
+      /*infinite=*/false, /*ponder=*/false, option_dict, nullptr);
+
+  TestOnlyResetSeams();
+  TestOnlySetThrowCount(TestOnlyThrowSite::kBeforeTaskEntrySetup, 0);
+  search->StartThreads(4);
+  search->Wait();
+
+  EXPECT_EQ(bestmove_count.load(), 1);
+  EXPECT_TRUE(TestOnlyWasThrowFired(TestOnlyThrowSite::kBeforeTaskEntrySetup))
+      << "the armed submitted-task entry seam was never reached";
+  EXPECT_GT(g_testonly_gathering_tasks_executed.load(), 0)
+      << "no worker task ever executed";
+  ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
+}
+
+// ---- review #874/#876: post-submit ownership transfer ---------------------
+//
+// The seam fires immediately after a successful Submit, with the parent's
+// level entry not yet zeroed. Without the transferred-share subtraction (and
+// without the retire-before-seam ordering at the submit site), the parent's
+// cleanup and the already-running submitted task would both cancel the
+// handed-off coverage, wrapping n_in_flight_ to a huge value instead of
+// reaching zero.
+TEST_F(ReservationRollbackTest, PooledPostSubmitThrowLeavesNoReservation) {
+  OptionsParser options;
+  SharedBackendParams::Populate(&options);
+  SearchParams::Populate(&options);
+  options.GetMutableDefaultsOptions()->Set(SharedBackendParams::kNNCacheSizeId,
+                                           200000);
+  options.GetMutableDefaultsOptions()->Set(
+      SearchParams::kTaskWorkersPerSearchWorkerId, 4);
+  const auto option_dict = options.GetOptionsDict();
+
+  FakeBackend backend;
+  NodeTree tree;
+  tree.ResetToPosition(ChessBoard::kStartposFen, {});
+
+  auto stopper = std::make_unique<ChainedSearchStopper>();
+  stopper->AddStopper(std::make_unique<VisitsStopper>(3000, false));
+
+  std::atomic<int> bestmove_count{0};
+  auto responder = std::make_unique<CallbackUciResponder>(
+      [&](const BestMoveInfo&) { ++bestmove_count; },
+      [](const std::vector<ThinkingInfo>&) {});
+
+  auto search = std::make_unique<Search>(
+      tree, &backend, std::move(responder), MoveList(),
+      std::chrono::steady_clock::now(), std::move(stopper),
+      /*infinite=*/false, /*ponder=*/false, option_dict, nullptr);
+
+  TestOnlyResetSeams();
+  TestOnlySetThrowCount(TestOnlyThrowSite::kAfterSubmit, 0);
+  search->StartThreads(4);
+  search->Wait();
+
+  EXPECT_EQ(bestmove_count.load(), 1);
+  EXPECT_TRUE(TestOnlyWasThrowFired(TestOnlyThrowSite::kAfterSubmit))
+      << "the armed post-submit seam was never reached";
+  EXPECT_GT(g_testonly_gathering_tasks_executed.load(), 0)
+      << "no worker task ever executed";
   ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
 }
 

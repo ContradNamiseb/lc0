@@ -1458,6 +1458,12 @@ void SearchWorker::GatherMinibatch() {
 void SearchWorker::ProcessPickedTask(int start_idx, int end_idx)
     REQUIRES(search_->nodes_mutex_) {
   LCTRACE_FUNCTION_SCOPE;
+  // Test-only seams (#876 f5), mirroring classic: a processing fault site
+  // distinct from the gathering seams, plus the execution counter proving how
+  // much real processing ran (pool tasks and main-thread slices both land
+  // here).
+  g_testonly_processing_calls.fetch_add(1, std::memory_order_relaxed);
+  TestOnlyMaybeThrowAt(TestOnlyThrowSite::kProcessing);
   for (int i = start_idx; i < end_idx; i++) {
     auto& picked_node = minibatch_[i];
     if (picked_node.IsCollision()) continue;
@@ -1614,6 +1620,39 @@ void SearchWorker::PickNodesToExtendTask(
   assert(path.size() == (size_t)history.GetLength() -
                             search_->played_history_.GetLength() + 1);
 
+  // Entry guard for a submitted task's inherited reservation (review #874,
+  // #876 finding 3): the submitting call retired its own mirror of this
+  // coverage when Submit succeeded (and subtracted the handed-off share from
+  // its own level entry until that level finished), so from this call's entry
+  // until the root entry below is recorded, this guard is the only owner. Any
+  // allocating setup in between can throw; if one does, the destructor
+  // cancels the coverage. Node has no GetParent() in a DAG, so the guard
+  // walks the submitted path instead of a parent chain.
+  struct EntryCoverageGuard {
+    const BackupPath* path;
+    int inherited_amount;  // 0 for the root call: nothing inherited
+    Node* own_visit_node;  // set if this call itself started a root visit
+    int own_visit_amount;
+    bool active;
+    ~EntryCoverageGuard() {
+      if (!active) return;
+      if (inherited_amount > 0) {
+        for (const auto& entry : *path) {
+          std::get<0>(entry)->CancelScoreUpdate(inherited_amount);
+        }
+      }
+      if (own_visit_amount > 0) {
+        own_visit_node->CancelScoreUpdate(own_visit_amount);
+      }
+    }
+  } coverage_guard{&path, path.size() > 1 ? collision_limit : 0, nullptr, 0,
+                    true};
+  if (path.size() > 1) {
+    // Test-only seam (#876 f3/f5): a submitted task's entry, before any of
+    // its allocating setup has run and before its ledger entry exists.
+    TestOnlyMaybeThrowAt(TestOnlyThrowSite::kBeforeTaskEntrySetup);
+  }
+
   auto& current_path = workspace->current_path;
   current_path.clear();
   auto& full_path = workspace->full_path;
@@ -1625,6 +1664,19 @@ void SearchWorker::PickNodesToExtendTask(
   reservation_ledger.clear();
   auto& level_reservations = workspace->level_reservations;
   level_reservations.clear();
+  // Grows the level-reservation vector if needed. May throw, so callers
+  // invoke it BEFORE the increment the new entry will own: every
+  // TryStartScoreUpdate/IncrementNInFlight in the pick loop commits its entry
+  // right after, and a growth failure between the two would orphan the
+  // increment (review #876 finding 1, DAG-side equivalent of the classic
+  // fix). The 16-entry reserve in TaskWorkspace is a warm start, not a bound.
+  auto ensure_level_capacity = [&level_reservations](size_t needed) {
+    if (level_reservations.size() + needed > level_reservations.capacity()) {
+      TestOnlyMaybeThrowOnRecordGrowth();
+      level_reservations.reserve(std::max(level_reservations.capacity() * 2,
+                                          level_reservations.size() + needed));
+    }
+  };
   // Sometimes receiver is reused, othertimes not, so only jump start if small.
   if (receiver->capacity() < 30) {
     receiver->reserve(receiver->size() + 30);
@@ -1656,10 +1708,20 @@ void SearchWorker::PickNodesToExtendTask(
   const bool stop_root =
       is_root_node && ShouldStopPickingHere(node, true, repetitions);
   const bool visit_root = stop_root && node->TryStartScoreUpdate();
+  // The TryStartScoreUpdate above is this call's own increment (root call
+  // only -- a submitted task's start node was already started by its parent);
+  // the guard owns it until the entry below records it.
+  coverage_guard.own_visit_node = node;
+  coverage_guard.own_visit_amount = visit_root ? 1 : 0;
   current_path.emplace_back(collision_limit, true, visit_root, stop_root, 0);
   // full_path currently ends AT root itself (full_path.back() == node), so
   // root's own ancestor prefix is everything before that.
   reservation_ledger.emplace_back(node, static_cast<int>(full_path.size()) - 1);
+  // The entry above now records this call's own reservation and the inherited
+  // coverage it was handed; a later throw is rolled back from
+  // current_path/reservation_ledger by the catch below, so the entry guard
+  // must give up ownership or the coverage would be cancelled twice.
+  coverage_guard.active = false;
   // take base sqrt(2) logarithm of root node for large subbranch N limit. It is
   // used to split tasks.
   const unsigned large_branch_limit =
@@ -1853,6 +1915,9 @@ void SearchWorker::PickNodesToExtendTask(
 
           // Add more visits to the branch.
           Node* child_node = best_edge.GetOrSpawnNode(/* parent */ node);
+          // One entry is committed right after the increment, so capacity
+          // must exist before it (#876 finding 1).
+          ensure_level_capacity(1);
           child_node->IncrementNInFlight(new_visits);
           level_reservations.emplace_back(child_node, new_visits);
           auto& child_cache = cache.children[best_idx];
@@ -1870,6 +1935,10 @@ void SearchWorker::PickNodesToExtendTask(
         full_path.push_back({child_node, child_repetitions, child_moves_left});
         visits_to_perform[best_idx].large_branch_ =
             child_node->GetN() > large_branch_limit;
+        // This branch can commit two entries (the TryStartScoreUpdate below
+        // and the IncrementNInFlight further down, which the throw seam runs
+        // between), so ensure capacity for both before either increment.
+        ensure_level_capacity(2);
         if (child_node->TryStartScoreUpdate()) {
           level_reservations.emplace_back(child_node, 1);
           TestOnlyMaybeThrowAfterReservation();
@@ -1956,7 +2025,20 @@ void SearchWorker::PickNodesToExtendTask(
                     return e.first == child_node;
                   });
               level_reservations.erase(new_end, level_reservations.end());
-              TestOnlyMaybeThrowAfterReservation();
+              // The submitted task also owns the ancestor coverage for this
+              // budget: its own receiver entries' cancellation walks the full
+              // path, and its own cleanup covers the ancestors if it fails
+              // before emitting anything. This level's entry still carries a
+              // copy of that coverage until it is zeroed after the split loop
+              // ("fully redistributed" below), so subtract the handed-off
+              // share now -- otherwise an exception at the post-submit seam
+              // would cancel the transferred portion here and again in the
+              // task (review #874 / #876 post-submit finding).
+              current_path.back().visits_ -= child_limit;
+              // Own site (#876 f5): distinct from the generic
+              // after-reservation seam, so a test can target exactly the
+              // post-submit window above.
+              TestOnlyMaybeThrowAt(TestOnlyThrowSite::kAfterSubmit);
             }
           }
           history.Pop();
