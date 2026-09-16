@@ -225,12 +225,8 @@ class SearchWorker {
       } else {
         int working_threads = std::max(
             search_->thread_count_.load(std::memory_order_acquire) - 1, 1);
-        // Signed arithmetic: hardware_concurrency()/working_threads == 0 used
-        // to wrap to UINT_MAX via the unsigned "- 1" and clamp to 4, giving
-        // low-core boxes four spinning helpers instead of zero (#858 f9).
-        const unsigned hw = std::thread::hardware_concurrency();
-        task_workers_ =
-            std::max(0, std::min(static_cast<int>(hw / working_threads) - 1, 4));
+        task_workers_ = std::min(
+            std::thread::hardware_concurrency() / working_threads - 1, 4U);
       }
     }
     if (task_workers_ > 0) {
