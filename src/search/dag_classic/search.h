@@ -434,11 +434,14 @@ class SearchWorker {
                   uint32_t max_count)
         : path(path),
           node(std::get<0>(path.back())),
-          eval(std::make_unique<EvalResult>()),
           multivisit(multivisit),
           maxvisit(max_count),
           is_collision(true),
           repetitions(0) {}
+    // Only visits are ever evaluated (collisions never touch eval -- every
+    // consumer is behind IsCollision/nn_queried guards), so allocate here
+    // rather than for every collision entry (mirrors classic's #859
+    // addition 5).
     NodeToProcess(const BackupPath& path, const PositionHistory& in_history)
         : path(path),
           node(std::get<0>(path.back())),
