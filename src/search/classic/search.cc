@@ -1224,39 +1224,43 @@ void SearchWorker::InitializeIteration() {
   minibatch_.reserve(2 * target_minibatch_size_);
 }
 
+void SearchWorker::CancelMinibatchEntry(const NodeToProcess& entry) {
+  Node* node = entry.node;
+  if (node == nullptr) return;
+  if (entry.IsCollision()) {
+    // If CollectCollisions() already ran this iteration, this same entry
+    // is also sitting in search_->shared_collisions_, and some worker's
+    // next successful DoBackupUpdate() (or the Search destructor) will
+    // cancel the whole of shared_collisions_ via CancelSharedCollisions().
+    // Cancelling it here too would walk the same ancestor chain twice --
+    // double-decrementing n_in_flight_ and corrupting it (review #866
+    // P1-1). Leave it for that single owner instead.
+    if (collisions_published_) return;
+    // Collisions never touched the leaf's own n_in_flight_ (that belongs
+    // to the original, separately-tracked visit already in flight) --
+    // only the ancestors were incremented during the path walk. Mirrors
+    // Search::CancelSharedCollisions / the some_ooo revert block above.
+    for (node = node->GetParent(); node != search_->root_node_->GetParent();
+         node = node->GetParent()) {
+      node->CancelScoreUpdate(entry.multivisit);
+    }
+  } else {
+    // A real visit: TryStartScoreUpdate() reserved the leaf itself, and
+    // IncrementNInFlight() reserved every ancestor on the way down.
+    // Release exactly what DoBackupUpdateSingleNode would have finalized,
+    // starting at the leaf -- but cancel instead of completing the visit,
+    // since it never actually ran.
+    for (Node* n = node; n != search_->root_node_->GetParent();
+         n = n->GetParent()) {
+      n->CancelScoreUpdate(entry.multivisit);
+    }
+  }
+}
+
 void SearchWorker::CancelPendingMinibatch() {
   SharedMutex::Lock lock(search_->nodes_mutex_);
   for (auto& entry : minibatch_) {
-    Node* node = entry.node;
-    if (node == nullptr) continue;
-    if (entry.IsCollision()) {
-      // If CollectCollisions() already ran this iteration, this same entry
-      // is also sitting in search_->shared_collisions_, and some worker's
-      // next successful DoBackupUpdate() (or the Search destructor) will
-      // cancel the whole of shared_collisions_ via CancelSharedCollisions().
-      // Cancelling it here too would walk the same ancestor chain twice --
-      // double-decrementing n_in_flight_ and corrupting it (review #866
-      // P1-1). Leave it for that single owner instead.
-      if (collisions_published_) continue;
-      // Collisions never touched the leaf's own n_in_flight_ (that belongs
-      // to the original, separately-tracked visit already in flight) --
-      // only the ancestors were incremented during the path walk. Mirrors
-      // Search::CancelSharedCollisions / the some_ooo revert block above.
-      for (node = node->GetParent(); node != search_->root_node_->GetParent();
-           node = node->GetParent()) {
-        node->CancelScoreUpdate(entry.multivisit);
-      }
-    } else {
-      // A real visit: TryStartScoreUpdate() reserved the leaf itself, and
-      // IncrementNInFlight() reserved every ancestor on the way down.
-      // Release exactly what DoBackupUpdateSingleNode would have finalized,
-      // starting at the leaf -- but cancel instead of completing the visit,
-      // since it never actually ran.
-      for (Node* n = node; n != search_->root_node_->GetParent();
-           n = n->GetParent()) {
-        n->CancelScoreUpdate(entry.multivisit);
-      }
-    }
+    CancelMinibatchEntry(entry);
   }
   minibatch_.clear();
 }
@@ -1564,6 +1568,29 @@ void SearchWorker::PickNodesToExtend(int collision_limit) {
       if (!pending_exception) pending_exception = std::current_exception();
     }
     auto completed = task_pool_->DrainCompleted();
+    // The merge is an ownership boundary too (review #883): after the drain
+    // these results have no other owner, and minibatch_.emplace_back can
+    // throw while growing. Reserve the aggregate destination capacity first;
+    // if that fails, cancel every still-owned result directly (no
+    // allocation) before propagating -- dropping them would leak their tree
+    // reservations, and the outer cleanup only ever sees minibatch_.
+    size_t incoming = 0;
+    for (const auto& task : completed) incoming += task.results.size();
+    try {
+      if (incoming > 0) {
+        TestOnlyMaybeThrowAt(TestOnlyThrowSite::kBeforeMergeReserve);
+        minibatch_.reserve(minibatch_.size() + incoming);
+      }
+    } catch (...) {
+      for (const auto& task : completed) {
+        for (const auto& result : task.results) {
+          CancelMinibatchEntry(result);
+        }
+      }
+      throw;
+    }
+    // The reserve above covered every element, and NodeToProcess is
+    // nothrow-move-constructible, so this merge cannot throw.
     for (auto& task : completed) {
       for (auto& result : task.results) {
         minibatch_.emplace_back(std::move(result));

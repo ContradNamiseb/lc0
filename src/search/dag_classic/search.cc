@@ -1129,6 +1129,22 @@ void SearchWorker::CancelPendingMinibatchVisits() {
   minibatch_.clear();
 }
 
+void SearchWorker::CancelUnmergedResult(const NodeToProcess& entry) {
+  if (entry.IsCollision()) {
+    // Same ancestors-only walk as CancelCollisions; entries reaching here
+    // never made it into minibatch_, so the GatherMinibatch cleanup cannot
+    // see them.
+    auto path = entry.path;
+    for (auto it = ++(path.crbegin()); it != path.crend(); ++it) {
+      std::get<0>(*it)->CancelScoreUpdate(entry.multivisit);
+    }
+    return;
+  }
+  for (auto it = entry.path.crbegin(); it != entry.path.crend(); ++it) {
+    std::get<0>(*it)->CancelScoreUpdate(entry.multivisit);
+  }
+}
+
 Search::~Search() {
   Abort();
   Wait();
@@ -1546,6 +1562,29 @@ void SearchWorker::PickNodesToExtend(int collision_limit)
       if (!pending_exception) pending_exception = std::current_exception();
     }
     auto completed = task_pool_->DrainCompleted();
+    // The merge is an ownership boundary too (review #883): after the drain
+    // these results have no other owner, and minibatch_.emplace_back can
+    // throw while growing. Reserve the aggregate destination capacity first;
+    // if that fails, cancel every still-owned result directly (no
+    // allocation) before propagating -- dropping them would leak their tree
+    // reservations.
+    size_t incoming = 0;
+    for (const auto& task : completed) incoming += task.results.size();
+    try {
+      if (incoming > 0) {
+        TestOnlyMaybeThrowAt(TestOnlyThrowSite::kBeforeMergeReserve);
+        minibatch_.reserve(minibatch_.size() + incoming);
+      }
+    } catch (...) {
+      for (const auto& task : completed) {
+        for (const auto& result : task.results) {
+          CancelUnmergedResult(result);
+        }
+      }
+      throw;
+    }
+    // The reserve above covered every element, and NodeToProcess is
+    // nothrow-move-constructible, so this merge cannot throw.
     for (auto& task : completed) {
       for (auto& result : task.results) {
         minibatch_.emplace_back(std::move(result));

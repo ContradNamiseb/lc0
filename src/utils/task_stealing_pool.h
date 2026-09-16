@@ -19,6 +19,7 @@
 #pragma once
 
 #include <atomic>
+#include <cassert>
 #include <condition_variable>
 #include <deque>
 #include <exception>
@@ -205,19 +206,20 @@ class TaskStealingPool {
     if (to_throw) std::rethrow_exception(to_throw);
   }
 
-  // Drain all completed tasks (moves them out). Call after WaitForAll().
-  //
-  // The allocation this needs happens HERE, on the caller's thread, where a
-  // failure is recoverable: if reserve() throws, completed_tasks_ is
-  // untouched, so a retry still sees every accepted task's payload. Moving
-  // the member vector out (as this used to) would drop its capacity and let
-  // the next worker completion allocate again (review #881).
+  // Drain all completed tasks (moves them out, O(1), no allocation). Call
+  // only after WaitForAll() with nothing accepted-but-unfinished (the
+  // documented drain contract): outstanding_completions_ is zero, so the
+  // whole vector can move out without touching the allocator, which is what
+  // makes a failure here impossible rather than merely recoverable (review
+  // #883). Losing the member's capacity is safe because every subsequent
+  // Submit reacquires its completion slot before the task becomes visible.
   std::vector<Task> DrainCompleted() {
     std::lock_guard<std::mutex> lock(completed_mutex_);
-    std::vector<Task> result;
-    result.reserve(completed_tasks_.size());
-    for (auto& task : completed_tasks_) result.push_back(std::move(task));
-    completed_tasks_.clear();  // keeps capacity for outstanding completions
+    assert(outstanding_completions_ == 0 &&
+           "DrainCompleted() requires quiescence: call it after WaitForAll() "
+           "with no concurrent Submit");
+    std::vector<Task> result = std::move(completed_tasks_);
+    completed_tasks_.clear();
     return result;
   }
 
@@ -308,11 +310,17 @@ class TaskStealingPool {
   // Reserve completion storage for `n` accepted tasks. May throw; callers
   // invoke it BEFORE the tasks become visible, so a failure here is still on
   // the submitting thread and rolls the acceptance back instead of killing a
-  // worker later. completed_mutex_ must be held.
+  // worker later. Grows geometrically when a new high-water mark is needed
+  // (review #883 P2: reserving the exact count on every increment relocated
+  // the vector repeatedly). completed_mutex_ must be held.
   void ReserveCompletionSlotsLocked(size_t n) {
-    TestOnlyMaybeThrowAt(TestOnlyThrowSite::kPoolCompletionReserve);
-    completed_tasks_.reserve(completed_tasks_.size() +
-                             outstanding_completions_ + n);
+    const size_t needed =
+        completed_tasks_.size() + outstanding_completions_ + n;
+    if (needed > completed_tasks_.capacity()) {
+      TestOnlyMaybeThrowAt(TestOnlyThrowSite::kPoolCompletionReserve);
+      completed_tasks_.reserve(
+          std::max(needed, completed_tasks_.capacity() * 2));
+    }
     outstanding_completions_ += n;
   }
 
@@ -520,8 +528,9 @@ class TaskStealingPool {
   // completed_tasks_.capacity() >= completed_tasks_.size() +
   // outstanding_completions_, so the worker-side completion push_back never
   // allocates. Slots are taken in Submit before the task is published and
-  // released by the worker when it stores the completed task; DrainCompleted
-  // clears without shrinking, so the capacity survives drains.
+  // released by the worker when it stores the completed task. DrainCompleted
+  // may move the whole vector out under its quiescence contract; every
+  // subsequent acceptance then reacquires capacity before publication.
   size_t outstanding_completions_ = 0;
 
   // First executor exception this round, rethrown by WaitForAll().

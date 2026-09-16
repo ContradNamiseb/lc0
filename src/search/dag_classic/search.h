@@ -607,6 +607,13 @@ class SearchWorker {
                                              float& d_delta, float& m_delta,
                                              bool& update_parent_bounds) const;
   void DoBackupUpdateSingleNode(const NodeToProcess& node_to_process);
+  // Cancels the reservations one completed-but-unmerged result still owns
+  // (review #883): visits use the leaf-inclusive path walk, collisions the
+  // ancestors-only walk CancelCollisions performs. Needed on a merge-reserve
+  // failure because such entries never reach minibatch_, so neither
+  // CancelPendingMinibatchVisits nor the GatherMinibatch cleanup can see
+  // them. Runs under the caller's nodes_mutex_.
+  void CancelUnmergedResult(const NodeToProcess& entry);
   // Returns whether a node's bounds were set based on its children.
   bool MaybeSetBounds(Node* p, float m, uint32_t* n_to_fix, float* v_delta,
                       float* d_delta, float* m_delta) const;

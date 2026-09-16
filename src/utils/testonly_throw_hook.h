@@ -67,6 +67,9 @@ enum class TestOnlyThrowSite : int {
   // insertion in the same stop_picking entry (review #881 P2). Distinct from
   // kBeforeEmission, which fires for collision-only entries too.
   kBeforeCollisionAfterVisit,
+  // Immediately before the destination reserve that merges drained task
+  // results into minibatch_ (review #883).
+  kBeforeMergeReserve,
   // Top of the pool executor callback, before the task's own code runs.
   kWorkerExecutor,
   // Top of ProcessPickedTask, before it touches the batch.
