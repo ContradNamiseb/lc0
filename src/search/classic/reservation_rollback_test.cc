@@ -363,7 +363,7 @@ TEST_F(ReservationRollbackTest, SubmittedTaskEntrySetupFailureLeavesNoReservatio
   EXPECT_EQ(bestmove_count.load(), 1);
   EXPECT_TRUE(TestOnlyWasThrowFired(TestOnlyThrowSite::kBeforeTaskEntrySetup))
       << "the armed submitted-task entry seam was never reached";
-  EXPECT_GT(g_testonly_gathering_tasks_executed.load(), 0)
+  EXPECT_GT(TestOnlyGatheringTasksExecuted(), 0)
       << "no worker task ever executed";
   ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
 }
@@ -411,7 +411,55 @@ TEST_F(ReservationRollbackTest, PooledPostSubmitThrowLeavesNoReservation) {
   EXPECT_EQ(bestmove_count.load(), 1);
   EXPECT_TRUE(TestOnlyWasThrowFired(TestOnlyThrowSite::kAfterSubmit))
       << "the armed post-submit seam was never reached";
-  EXPECT_GT(g_testonly_gathering_tasks_executed.load(), 0)
+  EXPECT_GT(TestOnlyGatheringTasksExecuted(), 0)
+      << "no worker task ever executed";
+  ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
+}
+
+// ---- review #878 finding 1: guard must precede the warm reserve -----------
+//
+// The seam fires at a submitted task's very first allocating step (the
+// ledger warm reserve), while the submitting call has already relinquished
+// its mirror of the inherited coverage. If the guard were constructed after
+// the reserve, that reserve throwing would lose the coverage outright; with
+// the guard constructed first, it cancels at entry. The width of the
+// all-allocated-node walker also checks unvisited children.
+TEST_F(ReservationRollbackTest, SubmittedTaskInitialReserveFailureLeavesNoReservation) {
+  OptionsParser options;
+  SharedBackendParams::Populate(&options);
+  SearchParams::Populate(&options);
+  options.GetMutableDefaultsOptions()->Set(SharedBackendParams::kNNCacheSizeId,
+                                           200000);
+  options.GetMutableDefaultsOptions()->Set(
+      SearchParams::kTaskWorkersPerSearchWorkerId, 4);
+  const auto option_dict = options.GetOptionsDict();
+
+  FakeBackend backend;
+  NodeTree tree;
+  tree.ResetToPosition(ChessBoard::kStartposFen, {});
+
+  auto stopper = std::make_unique<ChainedSearchStopper>();
+  stopper->AddStopper(std::make_unique<VisitsStopper>(3000, false));
+
+  std::atomic<int> bestmove_count{0};
+  auto responder = std::make_unique<CallbackUciResponder>(
+      [&](const BestMoveInfo&) { ++bestmove_count; },
+      [](const std::vector<ThinkingInfo>&) {});
+
+  auto search = std::make_unique<Search>(
+      tree, &backend, std::move(responder), MoveList(),
+      std::chrono::steady_clock::now(), std::move(stopper),
+      /*infinite=*/false, /*ponder=*/false, option_dict, nullptr);
+
+  TestOnlyResetSeams();
+  TestOnlySetThrowCount(TestOnlyThrowSite::kBeforeInitialReserve, 0);
+  search->StartThreads(4);
+  search->Wait();
+
+  EXPECT_EQ(bestmove_count.load(), 1);
+  EXPECT_TRUE(TestOnlyWasThrowFired(TestOnlyThrowSite::kBeforeInitialReserve))
+      << "the armed initial-reserve seam was never reached";
+  EXPECT_GT(TestOnlyGatheringTasksExecuted(), 0)
       << "no worker task ever executed";
   ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
 }

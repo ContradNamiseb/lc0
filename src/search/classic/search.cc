@@ -1349,6 +1349,7 @@ void SearchWorker::GatherMinibatch() {
 
     bool needs_wait = false;
     int ppt_start = new_start;
+    std::exception_ptr pending_exception;
     if (task_pool_ &&
         non_collisions >= params_.GetMinimumWorkSizeForProcessing()) {
       const int num_tasks = std::clamp(
@@ -1376,7 +1377,15 @@ void SearchWorker::GatherMinibatch() {
         }
       }
       if (!new_tasks.empty()) {
-        task_pool_->Submit(std::move(new_tasks));
+        // A batch submission can fail partway (review #878 finding 4): the
+        // accepted prefix is queued and counted, so it still has to be waited
+        // on and drained before this function unwinds. needs_wait is already
+        // set, so the guarded WaitForAll/DrainCompleted below covers it.
+        try {
+          task_pool_->Submit(std::move(new_tasks));
+        } catch (...) {
+          pending_exception = std::current_exception();
+        }
       }
     }
     // Same guarded-region shape as PickNodesToExtend above (review #867
@@ -1385,7 +1394,6 @@ void SearchWorker::GatherMinibatch() {
     // already submitted are mutating minibatch_/tree state under this
     // thread's held nodes_mutex_, and skipping the wait lets them keep
     // running after unwinding releases it.
-    std::exception_ptr pending_exception;
     try {
       ProcessPickedTask(ppt_start, static_cast<int>(minibatch_.size()),
                         &main_workspace_);
@@ -1469,9 +1477,8 @@ void SearchWorker::ProcessPickedTask(int start_idx, int end_idx,
   // Test-only seams (#876 f5): a processing fault site distinct from the
   // gathering seams, plus the execution counter proving how much real
   // processing ran (pool tasks and main-thread slices both land here).
-  g_testonly_processing_calls.fetch_add(1, std::memory_order_relaxed);
-  TestOnlyMaybeThrowAt(TestOnlyThrowSite::kProcessing);
-  auto& history = workspace->history;
+  TestOnlyRecordProcessingCall();
+  TestOnlyMaybeThrowAt(TestOnlyThrowSite::kProcessing);  auto& history = workspace->history;
   history = search_->played_history_;
 
   for (int i = start_idx; i < end_idx; i++) {
@@ -1665,6 +1672,37 @@ void SearchWorker::PickNodesToExtendTask(
           std::max(records.capacity() * 2, records.size() + needed));
     }
   };
+  // Entry guard for a submitted task's inherited start-node/ancestor coverage
+  // (review #876 finding 3, #878 finding 1): the submitting call retired its
+  // own mirror of this coverage when Submit succeeded (see the submit site),
+  // so from this call's entry until the ledger records below exist, this
+  // guard is the only owner. It is constructed HERE, before the first thing
+  // that can throw -- the warm reserve below included (#878 f1: with the
+  // guard after the reserve, a reserve failure would lose the inherited
+  // node/ancestor reservations outright). Every allocating setup step after
+  // this point can throw; if one does, the destructor cancels the coverage at
+  // each node directly. Classic nodes have GetParent(), so the walk needs
+  // neither a copied path nor any allocation, and constructing the guard
+  // itself cannot throw.
+  struct InheritedCoverageGuard {
+    Node* start;
+    Node* stop;  // root's parent (nullptr): cancel from start up to root.
+    int amount;
+    bool active;
+    ~InheritedCoverageGuard() {
+      if (!active) return;
+      for (Node* n = start; n != stop; n = n->GetParent()) {
+        n->CancelScoreUpdate(amount);
+      }
+    }
+  } inherited_guard{cur_node, search_->root_node_->GetParent(),
+                     collision_visit_limit, /*active=*/base_search_depth > 0};
+  if (base_search_depth > 0) {
+    // Test-only seam (#878 f1): the warm reserve below, before any record
+    // exists and while the guard is the only owner. Only a submitted task
+    // has inherited coverage at risk here.
+    TestOnlyMaybeThrowAt(TestOnlyThrowSite::kBeforeInitialReserve);
+  }
   records.reserve(2 * collision_visit_limit + base_search_depth + 8);
   // Retirement is sum-based: decrement any records located at `node` (a node
   // can carry a locally-picked record and, inside a submitted task, the
@@ -1689,30 +1727,9 @@ void SearchWorker::PickNodesToExtendTask(
       retire_node(n, amount);
     }
   };
-  // Entry guard for a submitted task's inherited start-node/ancestor coverage
-  // (review #876 finding 3): the submitting call retired its own mirror of
-  // this coverage when Submit succeeded (see the submit site), so from this
-  // call's entry until the ledger records below exist, this guard is the only
-  // owner. Every allocating setup step in between can throw; if one does, the
-  // destructor cancels the coverage at each node directly. Classic nodes have
-  // GetParent(), so the walk needs neither a copied path nor any allocation,
-  // and constructing the guard itself cannot throw.
-  struct InheritedCoverageGuard {
-    Node* start;
-    Node* stop;  // root's parent (nullptr): cancel from start up to root.
-    int amount;
-    bool active;
-    ~InheritedCoverageGuard() {
-      if (!active) return;
-      for (Node* n = start; n != stop; n = n->GetParent()) {
-        n->CancelScoreUpdate(amount);
-      }
-    }
-  } inherited_guard{cur_node, search_->root_node_->GetParent(),
-                     collision_visit_limit, /*active=*/base_search_depth > 0};
-  // Allocating setup starts here, with the guard live for every step of it:
-  // moves_to_path's assignment can throw, and so can the record-vector warm
-  // reserve and the receiver/current_path setup the try below covers.
+  // Allocating setup continues with the guard live for every step of it:
+  // moves_to_path's assignment and the receiver/current_path setup the try
+  // below covers can all throw.
   moves_to_path = moves_to_node;
   // Commit the inherited coverage to the ledger before any other allocating
   // setup. Capacity is ensured first (may throw -- the guard still owns), so

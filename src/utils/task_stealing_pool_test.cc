@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "utils/testonly_throw_hook.h"
 
 namespace lczero {
 namespace {
@@ -198,6 +199,88 @@ TEST(TaskStealingPool, StealUnderLoadPreservesCounts) {
   pool.Submit(std::move(v));
   pool.WaitForAll();
   EXPECT_EQ(sum.load(), 2000LL * 2001 / 2);
+}
+
+// Fault-injection fixture for the Submit publication rollback (#878 finding
+// 4): always leave every seam disarmed so an unexpectedly surviving countdown
+// cannot bleed into the next test in this binary.
+class PoolInsertFailureTest : public ::testing::Test {
+ protected:
+  void TearDown() override { TestOnlyResetSeams(); }
+};
+
+// A single-insertion failure must not strand a phantom active task (WaitForAll
+// would hang with nothing left to complete it), must reject the task, and must
+// leave the pool usable. Test timeouts bound the wait.
+TEST_F(PoolInsertFailureTest, SingleInsertionFailureRollsBackCounts) {
+  std::atomic<int> ran{0};
+  TaskStealingPool<int> pool(2, [&ran](int& t, int) { ran.fetch_add(t); });
+
+  TestOnlySetThrowCount(TestOnlyThrowSite::kPoolInsert, 0);
+  EXPECT_THROW(pool.Submit(7), TestOnlyInjectedReservationThrow);
+
+  // Must return promptly: the failed task is not active and was never queued.
+  pool.WaitForAll();
+  EXPECT_EQ(ran.load(), 0);
+  EXPECT_EQ(pool.CompletedCount(), 0);
+  EXPECT_EQ(pool.DrainCompleted().size(), 0u);
+
+  // The pool is still usable for a subsequent round.
+  TestOnlyResetSeams();
+  pool.Reset();
+  pool.Submit(5);
+  pool.WaitForAll();
+  EXPECT_EQ(ran.load(), 5);
+  EXPECT_EQ(pool.CompletedCount(), 1);
+}
+
+// Batch publication is prefix-transactional: on a kth-insertion failure the
+// already-queued prefix is ACCEPTED (counted, executed, drained), while the
+// failed element and the tail are REJECTED (not queued, counts rolled back,
+// still owned by the caller's vector -- their payloads were never moved).
+TEST_F(PoolInsertFailureTest, BatchInsertionFailurePublishesOnlyAcceptedPrefix) {
+  struct PayloadTask {
+    int tag = 0;
+    std::vector<int> payload;
+  };
+
+  std::atomic<int> ran{0};
+  std::atomic<long long> sum{0};
+  TaskStealingPool<PayloadTask> pool(4, [&ran, &sum](PayloadTask& t, int) {
+    ran.fetch_add(1);
+    sum.fetch_add(t.tag);
+  });
+
+  std::vector<PayloadTask> tasks;
+  for (int i = 0; i < 10; ++i) {
+    tasks.push_back(PayloadTask{i, std::vector<int>{i}});
+  }
+
+  // hits=3: insertions 0..2 succeed, insertion 3 throws.
+  TestOnlySetThrowCount(TestOnlyThrowSite::kPoolInsert, 3);
+  EXPECT_THROW(pool.Submit(std::move(tasks)), TestOnlyInjectedReservationThrow);
+
+  // Accepted prefix: queued, counted, runs to completion, drains.
+  pool.WaitForAll();
+  EXPECT_EQ(ran.load(), 3);
+  EXPECT_EQ(sum.load(), 0 + 1 + 2);
+  EXPECT_EQ(pool.DrainCompleted().size(), 3u);
+
+  // Rejection boundary: accepted elements were moved into the pool (payload
+  // emptied), rejected ones still own theirs.
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_TRUE(tasks[i].payload.empty()) << "element " << i;
+  }
+  for (int i = 3; i < 10; ++i) {
+    EXPECT_FALSE(tasks[i].payload.empty()) << "element " << i;
+  }
+
+  // A subsequent round works normally.
+  TestOnlyResetSeams();
+  pool.Reset();
+  pool.Submit(PayloadTask{7, std::vector<int>{7}});
+  pool.WaitForAll();
+  EXPECT_EQ(pool.CompletedCount(), 1);
 }
 
 }  // namespace

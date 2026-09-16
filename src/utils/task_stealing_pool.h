@@ -30,6 +30,7 @@
 
 #include "utils/logging.h"
 #include "utils/spinhelper.h"
+#include "utils/testonly_throw_hook.h"
 
 namespace lczero {
 
@@ -67,6 +68,15 @@ class TaskStealingPool {
   // evaluating its wait predicate can never miss the increment. Overcounting
   // for a few instructions is harmless; undercounting released WaitForAll
   // early while tree mutation continued outside nodes_mutex_.
+  //
+  // Exception safety (review #878 finding 4): if the queue insertion itself
+  // throws (allocation failure), the task was never published, so the counts
+  // raised for it are rolled back before the exception propagates -- a
+  // phantom active_tasks_ entry would otherwise hang WaitForAll forever with
+  // no task left to decrement it. Count-before-visibility is preserved:
+  // workers only gate on queue_size before locking the queue, and that is
+  // still raised after the counts, so a count-only transient can at most
+  // wake a worker that finds nothing.
   void Submit(Task&& task) {
     int target = LeastLoaded();
     {
@@ -78,15 +88,28 @@ class TaskStealingPool {
       // predicate check can never miss this task becoming available.
       total_queued_.fetch_add(1, std::memory_order_release);
     }
-    {
+    try {
       std::lock_guard<std::mutex> lock(workers_[target].queue_mutex);
+      TestOnlyMaybeThrowAt(TestOnlyThrowSite::kPoolInsert);
       workers_[target].local_queue.push_back(std::move(task));
+    } catch (...) {
+      RollBackUnpublished(1);
+      throw;
     }
     workers_[target].queue_size.fetch_add(1, std::memory_order_release);
     work_available_.notify_one();
   }
 
   // Submit a batch of tasks, distributed round-robin across workers.
+  //
+  // Failure ownership (review #878 finding 4): elements [0, published) are
+  // ACCEPTED -- queued, counted, and they will execute (their Task objects
+  // are moved-from in the caller's vector). The element whose insertion
+  // throws and every element after it are REJECTED -- not queued, their
+  // counts rolled back, and their Task objects are untouched, still owned by
+  // the caller's vector after the exception. A partially published batch is
+  // safe to unwind through: the accepted prefix is real work the caller must
+  // still drain via WaitForAll()/DrainCompleted(), like any single Submit.
   void Submit(std::vector<Task>&& tasks) {
     if (tasks.empty()) return;
     int n = static_cast<int>(tasks.size());
@@ -95,13 +118,24 @@ class TaskStealingPool {
       active_tasks_.fetch_add(n, std::memory_order_release);
       total_queued_.fetch_add(n, std::memory_order_release);
     }
-    for (int i = 0; i < n; i++) {
-      int target = i % num_workers_;
-      {
-        std::lock_guard<std::mutex> lock(workers_[target].queue_mutex);
-        workers_[target].local_queue.push_back(std::move(tasks[i]));
+    int published = 0;
+    try {
+      for (int i = 0; i < n; i++) {
+        int target = i % num_workers_;
+        {
+          std::lock_guard<std::mutex> lock(workers_[target].queue_mutex);
+          TestOnlyMaybeThrowAt(TestOnlyThrowSite::kPoolInsert);
+          workers_[target].local_queue.push_back(std::move(tasks[i]));
+        }
+        workers_[target].queue_size.fetch_add(1, std::memory_order_release);
+        ++published;
       }
-      workers_[target].queue_size.fetch_add(1, std::memory_order_release);
+    } catch (...) {
+      RollBackUnpublished(n - published);
+      // The end-of-batch notify below is skipped on this path; wake workers
+      // for the accepted prefix so it still executes.
+      if (published > 0) work_available_.notify_all();
+      throw;
     }
     work_available_.notify_all();  // batch may need several workers.
   }
@@ -206,6 +240,22 @@ class TaskStealingPool {
     std::mutex queue_mutex;
     std::atomic<int> queue_size{0};
   };
+
+  // Undo the counts for work that was counted but never queued (an insertion
+  // failed). Waiters on active_tasks_ == 0 must not be left sleeping on a
+  // phantom count that no worker will ever complete: if this brings the
+  // count to zero with no task outstanding, wake them. Lock order here is
+  // wait_mutex_ -> done_mutex_; no other path takes the two in the opposite
+  // order (worker completions notify all_done_ under done_mutex_ alone).
+  void RollBackUnpublished(int count) {
+    if (count <= 0) return;
+    std::lock_guard<std::mutex> wait_lock(wait_mutex_);
+    total_queued_.fetch_sub(count, std::memory_order_release);
+    if (active_tasks_.fetch_sub(count, std::memory_order_acq_rel) == count) {
+      std::lock_guard<std::mutex> done_lock(done_mutex_);
+      all_done_.notify_all();
+    }
+  }
 
   // Find the worker with the fewest queued tasks.
   int LeastLoaded() const {

@@ -246,16 +246,14 @@ class SearchWorker {
             TestOnlyMaybeThrowAt(TestOnlyThrowSite::kWorkerExecutor);
             switch (task.task_type) {
               case PickTask::kGathering:
-                g_testonly_gathering_tasks_executed.fetch_add(
-                    1, std::memory_order_relaxed);
+                TestOnlyRecordGatheringTaskExecuted();
                 PickNodesToExtendTask(task.start, task.base_depth,
                                       task.collision_limit, task.moves_to_base,
                                       &(task.results),
                                       &(task_workspaces_[tid]));
                 break;
               case PickTask::kProcessing:
-                g_testonly_processing_tasks_executed.fetch_add(
-                    1, std::memory_order_relaxed);
+                TestOnlyRecordProcessingTaskExecuted();
                 ProcessPickedTask(task.start_idx, task.end_idx,
                                   &(task_workspaces_[tid]));
                 break;

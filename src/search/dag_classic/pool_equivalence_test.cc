@@ -194,23 +194,23 @@ RunResult RunFixedVisitSearch(int task_workers, int visits, int threads,
       /*infinite=*/false, /*ponder=*/false, option_dict, &tt, nullptr);
 
   const int64_t gathering_before =
-      g_testonly_gathering_tasks_executed.load(std::memory_order_relaxed);
+      TestOnlyGatheringTasksExecuted();
   const int64_t processing_tasks_before =
-      g_testonly_processing_tasks_executed.load(std::memory_order_relaxed);
+      TestOnlyProcessingTasksExecuted();
   const int64_t processing_calls_before =
-      g_testonly_processing_calls.load(std::memory_order_relaxed);
+      TestOnlyProcessingCalls();
 
   search->StartThreads(threads);
   search->Wait();
 
   result.gathering_executed =
-      g_testonly_gathering_tasks_executed.load(std::memory_order_relaxed) -
+      TestOnlyGatheringTasksExecuted() -
       gathering_before;
   result.processing_executed =
-      g_testonly_processing_tasks_executed.load(std::memory_order_relaxed) -
+      TestOnlyProcessingTasksExecuted() -
       processing_tasks_before;
   result.processing_calls =
-      g_testonly_processing_calls.load(std::memory_order_relaxed) -
+      TestOnlyProcessingCalls() -
       processing_calls_before;
   result.root_n_in_flight = tree.GetCurrentHead()->GetNInFlight();
   result.total_playouts = search->GetTotalPlayouts();

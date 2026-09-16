@@ -1025,6 +1025,7 @@ if get_option('gtest')
 
   test('TaskStealingPool',
     executable('task_stealing_pool_test', 'src/utils/task_stealing_pool_test.cc', pb_files,
+    cpp_args: '-DLC0_TEST_INSTRUMENTATION',
     include_directories: includes, link_with: lc0_lib, dependencies: gtest),
     args: '--gtest_output=xml:taskpool.xml', timeout: 180)
 
@@ -1077,6 +1078,7 @@ if get_option('gtest')
     'src/search/classic/stoppers/stoppers.cc',
     'src/search/classic/stoppers/timemgr.cc',
     pb_files,
+    cpp_args: '-DLC0_TEST_INSTRUMENTATION',
     include_directories: includes, link_with: lc0_lib, dependencies: [gtest] + deps),
     args: '--gtest_output=xml:poolequiv.xml', timeout: 120)
 
@@ -1093,6 +1095,7 @@ if get_option('gtest')
     'src/search/classic/stoppers/stoppers.cc',
     'src/search/classic/stoppers/timemgr.cc',
     pb_files,
+    cpp_args: '-DLC0_TEST_INSTRUMENTATION',
     include_directories: includes, link_with: lc0_lib, dependencies: [gtest] + deps),
     args: '--gtest_output=xml:reservationrollback.xml', timeout: 120)
 
@@ -1128,6 +1131,7 @@ if get_option('gtest')
       'src/search/classic/stoppers/stoppers.cc',
       'src/search/classic/stoppers/timemgr.cc',
       pb_files,
+      cpp_args: '-DLC0_TEST_INSTRUMENTATION',
       include_directories: includes, link_with: lc0_lib, dependencies: [gtest] + deps),
       args: '--gtest_output=xml:dagpoolequiv.xml', timeout: 120)
 
@@ -1145,6 +1149,7 @@ if get_option('gtest')
       'src/search/classic/stoppers/stoppers.cc',
       'src/search/classic/stoppers/timemgr.cc',
       pb_files,
+      cpp_args: '-DLC0_TEST_INSTRUMENTATION',
       include_directories: includes, link_with: lc0_lib, dependencies: [gtest] + deps),
       args: '--gtest_output=xml:dagreservationrollback.xml', timeout: 120)
   endif
