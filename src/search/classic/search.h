@@ -573,6 +573,11 @@ class SearchWorker {
   NodeToProcess PickNodeToExtend(int collision_limit);
   int PrefetchIntoCache(Node* node, int budget, bool is_odd_depth);
   void DoBackupUpdateSingleNode(const NodeToProcess& node_to_process);
+  // Cancels the reservations one receiver entry still owns (the walk
+  // CancelPendingMinibatch performs per entry). Also used for
+  // completed-but-unmerged results when the merge reserve fails (review
+  // #883); callers hold nodes_mutex_ or are the owning search thread.
+  void CancelMinibatchEntry(const NodeToProcess& entry);
   // Returns whether a node's bounds were set based on its children.
   bool MaybeSetBounds(Node* p, float m, int* n_to_fix, float* v_delta,
                       float* d_delta, float* m_delta) const;

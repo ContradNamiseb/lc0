@@ -464,6 +464,83 @@ TEST_F(ReservationRollbackTest, SubmittedTaskInitialReserveFailureLeavesNoReserv
   ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
 }
 
+// ---- review #883: merge-reserve failure must cancel, not drop -------------
+//
+// Pooled gathering with real completed results: inject a failure at the
+// destination-merge reserve. After the drain those results have no other
+// owner, so the failure path must cancel each one's reservations directly --
+// dropping them would leak N-in-flight for the rest of the search. The
+// search must still emit exactly one bestmove with every allocated node at
+// zero, and a fresh search must run normally afterwards.
+TEST_F(ReservationRollbackTest, MergeReserveFailureCancelsCompletedResults) {
+  OptionsParser options;
+  SharedBackendParams::Populate(&options);
+  SearchParams::Populate(&options);
+  options.GetMutableDefaultsOptions()->Set(SharedBackendParams::kNNCacheSizeId,
+                                           200000);
+  options.GetMutableDefaultsOptions()->Set(
+      SearchParams::kTaskWorkersPerSearchWorkerId, 4);
+  const auto option_dict = options.GetOptionsDict();
+
+  {
+    FakeBackend backend;
+    NodeTree tree;
+    tree.ResetToPosition(ChessBoard::kStartposFen, {});
+
+    auto stopper = std::make_unique<ChainedSearchStopper>();
+    stopper->AddStopper(std::make_unique<VisitsStopper>(3000, false));
+
+    std::atomic<int> bestmove_count{0};
+    auto responder = std::make_unique<CallbackUciResponder>(
+        [&](const BestMoveInfo&) { ++bestmove_count; },
+        [](const std::vector<ThinkingInfo>&) {});
+
+    auto search = std::make_unique<Search>(
+        tree, &backend, std::move(responder), MoveList(),
+        std::chrono::steady_clock::now(), std::move(stopper),
+        /*infinite=*/false, /*ponder=*/false, option_dict, nullptr);
+
+    TestOnlyResetSeams();
+    TestOnlySetThrowCount(TestOnlyThrowSite::kBeforeMergeReserve, 0);
+    search->StartThreads(4);
+    search->Wait();
+
+    EXPECT_EQ(bestmove_count.load(), 1);
+    EXPECT_TRUE(TestOnlyWasThrowFired(TestOnlyThrowSite::kBeforeMergeReserve))
+        << "the merge reserve was never reached with completed results";
+    EXPECT_GT(TestOnlyGatheringTasksExecuted(), 0)
+        << "no worker task ever executed";
+    ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
+  }
+
+  // A subsequent search is unaffected.
+  {
+    FakeBackend backend;
+    NodeTree tree;
+    tree.ResetToPosition(ChessBoard::kStartposFen, {});
+
+    auto stopper = std::make_unique<ChainedSearchStopper>();
+    stopper->AddStopper(std::make_unique<VisitsStopper>(3000, false));
+
+    std::atomic<int> bestmove_count{0};
+    auto responder = std::make_unique<CallbackUciResponder>(
+        [&](const BestMoveInfo&) { ++bestmove_count; },
+        [](const std::vector<ThinkingInfo>&) {});
+
+    auto search = std::make_unique<Search>(
+        tree, &backend, std::move(responder), MoveList(),
+        std::chrono::steady_clock::now(), std::move(stopper),
+        /*infinite=*/false, /*ponder=*/false, option_dict, nullptr);
+
+    TestOnlyResetSeams();
+    search->StartThreads(4);
+    search->Wait();
+
+    EXPECT_EQ(bestmove_count.load(), 1);
+    ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
+  }
+}
+
 }  // namespace
 }  // namespace classic
 }  // namespace lczero

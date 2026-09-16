@@ -261,10 +261,10 @@ TEST_F(PoolInsertFailureTest, CompletionReserveFailureRollsBackAcceptance) {
   EXPECT_EQ(pool.DrainCompleted().size(), 4u);
 }
 
-// Capacity survives drains (review #881): DrainCompleted() must not drop the
-// member vector's capacity, or a later worker completion would allocate again.
-// Pinned behaviorally across submit/wait/drain rounds with partial-result
-// payloads.
+// Capacity is reacquired per acceptance (review #883): DrainCompleted()
+// deliberately moves the whole vector out under its quiescence contract, so
+// each round's Submit must reserve fresh completion slots. Pinned
+// behaviorally across submit/wait/drain rounds with partial-result payloads.
 TEST_F(PoolInsertFailureTest, CompletionCapacitySurvivesDrains) {
   std::atomic<int> ran{0};
   TaskStealingPool<PoolPayloadTask> pool(4, [&ran](PoolPayloadTask& t, int) {
