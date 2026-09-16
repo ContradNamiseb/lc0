@@ -284,7 +284,17 @@ void StringUciResponder::SendId() {
 
 void StringUciResponder::OutputBestMove(BestMoveInfo* info) {
   const bool c960 = IsChess960();
-  std::string res = "bestmove " + info->bestmove.ToString(c960);
+  // A default-constructed Move() (from/to both a1) is what a search that
+  // never got a single playout leaves final_bestmove_ at (e.g. the very
+  // first NN batch throwing before any node was ever visited) -- Move's own
+  // ToString() has no special case for it and would print the syntactically
+  // legal-looking but meaningless "a1a1". A GUI can read that as a real,
+  // illegal move and forfeit the game instead of seeing the UCI null move.
+  // Serialize it as the protocol's actual null move, "0000", instead
+  // (review #866 P1).
+  std::string res = "bestmove " +
+                    (info->bestmove.is_null() ? "0000"
+                                               : info->bestmove.ToString(c960));
   if (!info->ponder.is_null()) res += " ponder " + info->ponder.ToString(c960);
   if (info->player != -1) res += " player " + std::to_string(info->player);
   if (info->game_id != -1) res += " gameid " + std::to_string(info->game_id);

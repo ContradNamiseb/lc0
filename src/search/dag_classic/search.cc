@@ -1146,6 +1146,25 @@ void SearchWorker::CancelCollisions() {
   }
 }
 
+void SearchWorker::CancelPendingMinibatchVisits() {
+  SharedMutex::Lock lock(search_->nodes_mutex_);
+  for (auto& entry : minibatch_) {
+    // Collisions are already handled by GatherMinibatch's own absl::Cleanup,
+    // which runs unconditionally (including on the exception path that got
+    // us here) the moment GatherMinibatch() itself exits. Cancelling them
+    // again would double-cancel the same ancestor chain.
+    if (entry.IsCollision()) continue;
+    // Unlike CancelCollisions()'s ancestors-only walk, a real visit's own
+    // leaf reservation (TryStartScoreUpdate()) also needs releasing, so the
+    // walk is leaf-inclusive: start at path.crbegin() (the leaf), not
+    // ++path.crbegin().
+    for (auto it = entry.path.crbegin(); it != entry.path.crend(); ++it) {
+      std::get<0>(*it)->CancelScoreUpdate(entry.multivisit);
+    }
+  }
+  minibatch_.clear();
+}
+
 Search::~Search() {
   Abort();
   Wait();

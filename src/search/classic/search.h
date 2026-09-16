@@ -563,6 +563,15 @@ class SearchWorker {
   Search* const search_;
   // List of nodes to process.
   std::vector<NodeToProcess> minibatch_;
+  // Set once this iteration's CollectCollisions() has copied minibatch_'s
+  // collision entries into the shared, cross-worker search_->shared_
+  // collisions_ (which some worker's later DoBackupUpdate(), or the Search
+  // destructor, will cancel via CancelSharedCollisions()). Reset at the top
+  // of every iteration. CancelPendingMinibatch()'s exception path must
+  // consult this: once true, those same entries are already owned by
+  // shared_collisions_, and cancelling them again locally would double-
+  // cancel the same ancestor chain (review #866 P1-1).
+  bool collisions_published_ = false;
   std::unique_ptr<BackendComputation> computation_;
   int task_workers_;
   int target_minibatch_size_;

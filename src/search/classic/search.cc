@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <exception>
 #include <iomanip>
 #include <iostream>
 #include <iterator>
@@ -635,9 +636,10 @@ void Search::MaybeTriggerStop(const IterationStats& stats,
   // every ~100ms but has no way to make total_nodes nonzero itself, so
   // that's a permanent hang, not just a delay (review #863 finding 3).
   // EnsureBestMoveKnown() already handles an unexpanded root safely (it
-  // just leaves final_bestmove_ at its default Move(), which serializes to
-  // a syntactically valid if nonsensical "a1a1" rather than crashing) --
-  // better a degenerate response than a hung GUI.
+  // just leaves final_bestmove_ at its default Move(), which
+  // StringUciResponder::OutputBestMove now serializes as the UCI null move
+  // "0000" rather than the nonsensical "a1a1" it used to produce -- review
+  // #866) -- better a degenerate response than a hung or misled GUI.
   if (stats.total_nodes == 0 && !stop_.load(std::memory_order_acquire)) {
     return;
   }
@@ -1208,6 +1210,7 @@ void SearchWorker::InitializeIteration() {
   computation_ = search_->backend_->CreateComputation();
   minibatch_.clear();
   minibatch_.reserve(2 * target_minibatch_size_);
+  collisions_published_ = false;
 }
 
 void SearchWorker::CancelPendingMinibatch() {
@@ -1216,6 +1219,14 @@ void SearchWorker::CancelPendingMinibatch() {
     Node* node = entry.node;
     if (node == nullptr) continue;
     if (entry.IsCollision()) {
+      // If CollectCollisions() already ran this iteration, this same entry
+      // is also sitting in search_->shared_collisions_, and some worker's
+      // next successful DoBackupUpdate() (or the Search destructor) will
+      // cancel the whole of shared_collisions_ via CancelSharedCollisions().
+      // Cancelling it here too would walk the same ancestor chain twice --
+      // double-decrementing n_in_flight_ and corrupting it (review #866
+      // P1-1). Leave it for that single owner instead.
+      if (collisions_published_) continue;
       // Collisions never touched the leaf's own n_in_flight_ (that belongs
       // to the original, separately-tracked visit already in flight) --
       // only the ancestors were incremented during the path walk. Mirrors
@@ -1476,13 +1487,30 @@ void SearchWorker::PickNodesToExtend(int collision_limit) {
                         &minibatch_, &main_workspace_);
 
   if (task_pool_) {
-    task_pool_->WaitForAll();
+    // WaitForAll() can rethrow a pool task's exception (review #863 f4).
+    // completed_tasks_ still holds every task's results at that point --
+    // WorkerLoop pushes a task onto it unconditionally, whether its executor
+    // threw or not -- but if we let the exception propagate straight out of
+    // this if-block, DrainCompleted() below never runs, so a NodeToProcess
+    // batch produced by a sibling task that finished cleanly is silently
+    // dropped instead of reaching minibatch_. RunBlocking's catch ->
+    // CancelPendingMinibatch() only releases what it can see in minibatch_,
+    // so those entries' virtual-loss reservations would leak for the rest of
+    // the search (review #866 P1-2). Drain and merge unconditionally, then
+    // rethrow.
+    std::exception_ptr pending_exception;
+    try {
+      task_pool_->WaitForAll();
+    } catch (...) {
+      pending_exception = std::current_exception();
+    }
     auto completed = task_pool_->DrainCompleted();
     for (auto& task : completed) {
       for (auto& result : task.results) {
         minibatch_.emplace_back(std::move(result));
       }
     }
+    if (pending_exception) std::rethrow_exception(pending_exception);
   }
 }
 
@@ -2040,6 +2068,10 @@ void SearchWorker::CollectCollisions() {
                                                node_to_process.multivisit);
     }
   }
+  // From here on, every collision entry still in minibatch_ is also owned
+  // by search_->shared_collisions_ -- CancelPendingMinibatch()'s exception
+  // path must not cancel them a second time (review #866 P1-1).
+  collisions_published_ = true;
 }
 
 // 3. Prefetch into cache.

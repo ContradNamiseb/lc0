@@ -72,6 +72,11 @@ class TaskStealingPool {
     {
       std::lock_guard<std::mutex> lock(wait_mutex_);
       active_tasks_.fetch_add(1, std::memory_order_release);
+      // Published under the same lock/before-notify protocol as
+      // active_tasks_ above (review #866 P2): total_queued_ is what the
+      // sleep predicate in WorkerLoop actually waits on, so an idle worker's
+      // predicate check can never miss this task becoming available.
+      total_queued_.fetch_add(1, std::memory_order_release);
     }
     {
       std::lock_guard<std::mutex> lock(workers_[target].queue_mutex);
@@ -88,6 +93,7 @@ class TaskStealingPool {
     {
       std::lock_guard<std::mutex> lock(wait_mutex_);
       active_tasks_.fetch_add(n, std::memory_order_release);
+      total_queued_.fetch_add(n, std::memory_order_release);
     }
     for (int i = 0; i < n; i++) {
       int target = i % num_workers_;
@@ -136,15 +142,27 @@ class TaskStealingPool {
   // Reset counters for a new round of work.
   void Reset() {
     // All tasks should be complete before calling Reset. A nonzero
-    // active_tasks_ here means an earlier WaitForAll() returned while work
-    // was in flight (that was the #858 publish race) -- restore the counter
-    // rather than poison every later round with a phantom that hangs or
-    // instant-releases forever, and say so loudly.
-    const int leftover = active_tasks_.exchange(0, std::memory_order_acq_rel);
+    // active_tasks_ here means a round is genuinely still in flight (an
+    // earlier WaitForAll() returned early -- that was the #858 publish
+    // race -- or a caller simply skipped WaitForAll()). Forcing it to 0
+    // with exchange(), as this used to do, doesn't restore anything: it
+    // just discards the count while real tasks are still running, so a
+    // live worker's later fetch_sub(1) on completion (WorkerLoop) underflows
+    // the counter negative, corrupting every subsequent round's exit
+    // condition (review #866 P2) -- worse than the hang it was trying to
+    // avoid. Wait for the round to actually finish instead of lying about
+    // it; this reuses WaitForAll()'s own exit condition so it returns
+    // immediately in the (overwhelmingly common) already-idle case.
+    int leftover = active_tasks_.load(std::memory_order_acquire);
     if (leftover != 0) {
-      CERR << "TaskStealingPool::Reset with " << leftover
-           << " tasks still counted active: an earlier WaitForAll() returned"
-              " early. Counter restored; investigate the submit protocol.";
+      CERR << "TaskStealingPool::Reset called with " << leftover
+           << " tasks still counted active: waiting for the round to finish"
+              " for real instead of zeroing a live counter; investigate the"
+              " submit/wait protocol.";
+      std::unique_lock<std::mutex> lock(done_mutex_);
+      all_done_.wait(lock, [this]() {
+        return active_tasks_.load(std::memory_order_acquire) == 0;
+      });
     }
     completed_.store(0, std::memory_order_release);
     {
@@ -213,6 +231,7 @@ class TaskStealingPool {
     out = std::move(workers_[tid].local_queue.back());
     workers_[tid].local_queue.pop_back();
     workers_[tid].queue_size.fetch_sub(1, std::memory_order_release);
+    total_queued_.fetch_sub(1, std::memory_order_relaxed);
     return true;
   }
 
@@ -241,6 +260,7 @@ class TaskStealingPool {
       out = std::move(workers_[victim].local_queue.front());
       workers_[victim].local_queue.pop_front();
       workers_[victim].queue_size.fetch_sub(1, std::memory_order_release);
+      total_queued_.fetch_sub(1, std::memory_order_relaxed);
       return true;
     }
     return false;
@@ -286,10 +306,23 @@ class TaskStealingPool {
             // wait_mutex_ before notifying, so the predicate can never be
             // missed (the old timed wait existed only to recover from that
             // lost-wakeup race -- review #858 finding 8).
+            //
+            // The predicate is total_queued_ > 0, not active_tasks_ > 0
+            // (review #866 P2): active_tasks_ stays positive for the entire
+            // round, including while the round's last task is actually
+            // executing and every queue is empty -- with that as the
+            // predicate, every idle worker's wait() returns immediately
+            // (predicate still true), fails to pop/steal, and goes straight
+            // back through the spin+yield phases into another immediate-
+            // return wait, i.e. a CPU busy-spin for as long as that one task
+            // runs. total_queued_ tracks tasks actually sitting in a queue
+            // (incremented alongside active_tasks_ in Submit before
+            // publish, decremented by TryPopOwn/TrySteal on removal), so it
+            // is zero exactly when there is nothing left to wake up for.
             std::unique_lock<std::mutex> lock(wait_mutex_);
             work_available_.wait(lock, [this]() {
               return shutdown_.load(std::memory_order_acquire) ||
-                     active_tasks_.load(std::memory_order_acquire) > 0;
+                     total_queued_.load(std::memory_order_acquire) > 0;
             });
             if (shutdown_.load(std::memory_order_acquire) &&
                 active_tasks_.load(std::memory_order_acquire) == 0) {
@@ -343,6 +376,12 @@ class TaskStealingPool {
   std::vector<std::thread> threads_;
 
   std::atomic<int> active_tasks_{0};
+  // Tasks currently sitting in some worker's queue, as opposed to
+  // active_tasks_ (submitted but not yet drained into completed_tasks_,
+  // which stays positive while the last task is actually executing with
+  // nothing queued). This is what WorkerLoop's sleep predicate waits on --
+  // see there (review #866 P2).
+  std::atomic<int> total_queued_{0};
   std::atomic<int> completed_{0};
   std::atomic<bool> shutdown_{false};
 
