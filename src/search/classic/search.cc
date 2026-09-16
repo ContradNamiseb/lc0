@@ -1466,6 +1466,11 @@ void SearchWorker::GatherMinibatch() {
 void SearchWorker::ProcessPickedTask(int start_idx, int end_idx,
                                      TaskWorkspace* workspace) {
   LCTRACE_FUNCTION_SCOPE;
+  // Test-only seams (#876 f5): a processing fault site distinct from the
+  // gathering seams, plus the execution counter proving how much real
+  // processing ran (pool tasks and main-thread slices both land here).
+  g_testonly_processing_calls.fetch_add(1, std::memory_order_relaxed);
+  TestOnlyMaybeThrowAt(TestOnlyThrowSite::kProcessing);
   auto& history = workspace->history;
   history = search_->played_history_;
 
@@ -1638,19 +1643,29 @@ void SearchWorker::PickNodesToExtendTask(
   auto& current_path = workspace->current_path;
   current_path.clear();
   auto& moves_to_path = workspace->moves_to_path;
-  moves_to_path = moves_to_node;
   cache.vtp_last_filled_cache.clear();
   // Reservation-rollback ownership ledger -- see the TaskWorkspace comment.
   auto& records = workspace->rollback_records;
   records.clear();
-  // Bounded by two records per pick (TryStartScoreUpdate + IncrementNInFlight)
-  // plus one per ancestor for a submitted task's transferred coverage; sized
-  // up front so no record insertion below can allocate after an increment
-  // has been applied.
-  records.reserve(2 * collision_visit_limit + base_search_depth + 8);
   auto add_record = [&records](Node* node, int amount) {
     if (amount > 0) records.push_back({node, amount});
   };
+  // Grows the record vector if needed. May throw, so every caller invokes it
+  // BEFORE the increment the new record will own. The initial reserve below
+  // is a warm start, not a bound: a budget of 1 can walk an arbitrarily deep
+  // expanded chain adding a record per level, and retired records stay in the
+  // vector, so no depth-independent capacity is sufficient (review #876
+  // finding 1). Called before an increment, a growth failure leaves every
+  // already-applied increment with its record, so the catch rolls them all
+  // back; called after one, that increment would be unrecorded and leak.
+  auto ensure_record_capacity = [&records](size_t needed) {
+    if (records.size() + needed > records.capacity()) {
+      TestOnlyMaybeThrowOnRecordGrowth();
+      records.reserve(
+          std::max(records.capacity() * 2, records.size() + needed));
+    }
+  };
+  records.reserve(2 * collision_visit_limit + base_search_depth + 8);
   // Retirement is sum-based: decrement any records located at `node` (a node
   // can carry a locally-picked record and, inside a submitted task, the
   // transferred ancestor-coverage record).
@@ -1674,18 +1689,61 @@ void SearchWorker::PickNodesToExtendTask(
       retire_node(n, amount);
     }
   };
-  // A submitted task's start node and its ancestors were reserved by the
-  // parent call's pick, which handed that ownership to the task (see the
-  // submit site); re-record the same coverage here so this call's rollback
-  // covers a task that throws before its first pick.
+  // Entry guard for a submitted task's inherited start-node/ancestor coverage
+  // (review #876 finding 3): the submitting call retired its own mirror of
+  // this coverage when Submit succeeded (see the submit site), so from this
+  // call's entry until the ledger records below exist, this guard is the only
+  // owner. Every allocating setup step in between can throw; if one does, the
+  // destructor cancels the coverage at each node directly. Classic nodes have
+  // GetParent(), so the walk needs neither a copied path nor any allocation,
+  // and constructing the guard itself cannot throw.
+  struct InheritedCoverageGuard {
+    Node* start;
+    Node* stop;  // root's parent (nullptr): cancel from start up to root.
+    int amount;
+    bool active;
+    ~InheritedCoverageGuard() {
+      if (!active) return;
+      for (Node* n = start; n != stop; n = n->GetParent()) {
+        n->CancelScoreUpdate(amount);
+      }
+    }
+  } inherited_guard{cur_node, search_->root_node_->GetParent(),
+                     collision_visit_limit, /*active=*/base_search_depth > 0};
+  // Allocating setup starts here, with the guard live for every step of it:
+  // moves_to_path's assignment can throw, and so can the record-vector warm
+  // reserve and the receiver/current_path setup the try below covers.
+  moves_to_path = moves_to_node;
+  // Commit the inherited coverage to the ledger before any other allocating
+  // setup. Capacity is ensured first (may throw -- the guard still owns), so
+  // the add loops themselves cannot throw; either all inherited records exist
+  // (and the guard is dismissed below, the ledger taking over) or none do
+  // (and the guard cancels the coverage on the way out).
   if (base_search_depth > 0) {
+    TestOnlyMaybeThrowAt(TestOnlyThrowSite::kBeforeTaskEntrySetup);
+    int coverage_nodes = 0;
+    for (Node* n = cur_node; n != search_->root_node_->GetParent();
+         n = n->GetParent()) {
+      ++coverage_nodes;
+    }
+    ensure_record_capacity(static_cast<size_t>(coverage_nodes));
     add_record(cur_node, collision_visit_limit);
     for (Node* n = cur_node->GetParent();
          n != search_->root_node_->GetParent(); n = n->GetParent()) {
       add_record(n, collision_visit_limit);
     }
   }
+  inherited_guard.active = false;
 
+  // Everything from here down can leave a partial reservation behind if it
+  // throws (agora #41/#872 P1): n_in_flight_ increments made for a node that
+  // hasn't yet produced a receiver entry (Visit/Collision) or been handed to
+  // a submitted task are invisible to CancelPendingMinibatch, which only
+  // walks emitted entries. The try starts here, above the receiver reserve
+  // and the rest of the entry setup, so a throw during setup rolls back
+  // through the same records as a throw mid-traversal -- see the cleanup
+  // block below.
+  try {
   Node::Iterator best_edge;
   Node::Iterator second_best_edge;
 
@@ -1719,13 +1777,6 @@ void SearchWorker::PickNodesToExtendTask(
 
   current_path.push_back(-1);  // “need to select children” marker
 
-  // Everything from here down can leave a partial reservation behind if it
-  // throws mid-traversal (agora #41/#872 P1): n_in_flight_ increments made
-  // for a node that hasn't yet produced a receiver entry (Visit/Collision)
-  // or been handed to a submitted task are invisible to
-  // CancelPendingMinibatch, which only walks emitted entries. Roll those
-  // back here before propagating -- see the cleanup block below.
-  try {
   while (current_path.size() > 0) {
     // First prepare visits_to_perform.
     if (current_path.back() == -1) {
@@ -1743,9 +1794,11 @@ void SearchWorker::PickNodesToExtendTask(
       // a collision of appropriate size and pop current_path.
       if (cur_node->GetN() == 0 || cur_node->IsTerminal()) {
         if (root_node) {
+          ensure_record_capacity(1);
           if (cur_node->TryStartScoreUpdate()) {
             add_record(cur_node, 1);
             cur_limit -= 1;
+            TestOnlyMaybeThrowAt(TestOnlyThrowSite::kBeforeEmission);
             output_receiver->push_back(NodeToProcess::Visit(
                 cur_node, static_cast<uint16_t>(current_path.size() +
                                                 base_search_depth)));
@@ -1755,17 +1808,23 @@ void SearchWorker::PickNodesToExtendTask(
         }
         // Visits are created elsewhere, just need the collisions here.
         if (cur_limit > 0) {
-          retire_path(cur_node, cur_limit, /*include_self=*/false);
           int max_count = 0;
           if (cur_limit == collision_visit_limit && base_search_depth == 0 &&
               max_limit > cur_limit) {
             max_count = max_limit;
           }
+          TestOnlyMaybeThrowAt(TestOnlyThrowSite::kBeforeEmission);
           output_receiver->push_back(NodeToProcess::Collision(
               cur_node,
               static_cast<uint16_t>(current_path.size() + base_search_depth),
               cur_limit, max_count));
           completed_visits += cur_limit;
+          // Ownership of the ancestor coverage passes to the receiver entry
+          // only once that entry exists: if the push above throws, the ledger
+          // still owns it and the catch cancels it (review #876 finding 2).
+          // Retiring before the insertion would leave the amount owned by
+          // neither side.
+          retire_path(cur_node, cur_limit, /*include_self=*/false);
         }
         cur_node = cur_node->GetParent();
         current_path.pop_back();
@@ -1774,6 +1833,7 @@ void SearchWorker::PickNodesToExtendTask(
       // Root node is again special - needs its n in flight updated separately
       // as its not handled on the path to it, since there isn't one.
       if (root_node) {
+        ensure_record_capacity(1);
         cur_node->IncrementNInFlight(cur_limit);
         add_record(cur_node, cur_limit);
       }
@@ -1956,6 +2016,12 @@ void SearchWorker::PickNodesToExtendTask(
         EnsureNodeTwoFoldCorrectForDepth(
             child_node, current_path.size() + base_search_depth + 1 - 1);
 
+        // This pick can add two records (the TryStartScoreUpdate below, and
+        // the IncrementNInFlight further down that the throw seam runs
+        // before), so ensure capacity for both before either increment: a
+        // growth failure here leaves nothing applied, while growing after an
+        // increment would orphan it (review #876 finding 1).
+        ensure_record_capacity(2);
         bool decremented = false;
         if (child_node->TryStartScoreUpdate()) {
           add_record(child_node, 1);
@@ -1976,19 +2042,23 @@ void SearchWorker::PickNodesToExtendTask(
         if ((decremented &&
              (child_node->GetN() == 0 || child_node->IsTerminal()))) {
           // Reduce 1 for the visits_to_perform to ensure the collision created
-          // doesn't include this visit. The Visit entry's own cancellation
-          // will walk child -> root, so retire that same path now: ownership
-          // of those reservations moves to CancelPendingMinibatch.
+          // doesn't include this visit. Build the receiver entry locally and
+          // insert it before retiring the corresponding ledger records: the
+          // entry's future cancellation will walk child -> root, so ownership
+          // of those reservations moves to CancelPendingMinibatch -- but only
+          // once the entry exists. If the build or the insertion throws, the
+          // ledger still owns the coverage and the catch cancels it; retiring
+          // first would leave it owned by neither side (review #876 f2).
           (*visits_to_perform.back())[best_idx] -= 1;
-          retire_path(child_node, 1, /*include_self=*/true);
-          output_receiver->push_back(NodeToProcess::Visit(
+          NodeToProcess visit_entry = NodeToProcess::Visit(
               child_node, static_cast<uint16_t>(current_path.size() + 1 +
-                                                base_search_depth)));
+                                                base_search_depth));
+          visit_entry.moves_to_visit = moves_to_path;
+          visit_entry.moves_to_visit.push_back(best_edge.GetMove());
+          TestOnlyMaybeThrowAt(TestOnlyThrowSite::kBeforeEmission);
+          output_receiver->push_back(std::move(visit_entry));
           completed_visits++;
-          output_receiver->back().moves_to_visit.reserve(moves_to_path.size() +
-                                                         1);
-          output_receiver->back().moves_to_visit = moves_to_path;
-          output_receiver->back().moves_to_visit.push_back(best_edge.GetMove());
+          retire_path(child_node, 1, /*include_self=*/true);
         }
         if (best_idx > cache.vtp_last_filled_cache.back() &&
             (*visits_to_perform.back())[best_idx] > 0) {
@@ -2028,7 +2098,12 @@ void SearchWorker::PickNodesToExtendTask(
             // in its own ledger); retire them here first so a throw after
             // this point cannot cancel them too.
             retire_path(child_node, child_limit, /*include_self=*/true);
-            TestOnlyMaybeThrowAfterReservation();
+            // Own site (#876 f5): this used to share the generic
+            // after-reservation countdown, so a test targeting the
+            // post-submit seam could not distinguish it from a mid-pick
+            // throw; the submitted task re-records the coverage it owns, so
+            // only this site can catch a parent/child double-transfer.
+            TestOnlyMaybeThrowAt(TestOnlyThrowSite::kAfterSubmit);
           }
         }
       }

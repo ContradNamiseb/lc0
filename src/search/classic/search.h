@@ -47,6 +47,7 @@
 #include "utils/mutex.h"
 #include "utils/spinhelper.h"
 #include "utils/task_stealing_pool.h"
+#include "utils/testonly_throw_hook.h"
 
 namespace lczero {
 namespace classic {
@@ -238,14 +239,23 @@ class SearchWorker {
       }
       task_pool_ = std::make_unique<TaskStealingPool<PickTask>>(
           task_workers_, [this](PickTask& task, int tid) {
+            // Test-only seams (#876 f5): a worker-executor fault site before
+            // the task's own code runs, and per-type execution counters that
+            // prove these callbacks actually executed while a pool round was
+            // in flight (tree size/shape alone does not).
+            TestOnlyMaybeThrowAt(TestOnlyThrowSite::kWorkerExecutor);
             switch (task.task_type) {
               case PickTask::kGathering:
+                g_testonly_gathering_tasks_executed.fetch_add(
+                    1, std::memory_order_relaxed);
                 PickNodesToExtendTask(task.start, task.base_depth,
                                       task.collision_limit, task.moves_to_base,
                                       &(task.results),
                                       &(task_workspaces_[tid]));
                 break;
               case PickTask::kProcessing:
+                g_testonly_processing_tasks_executed.fetch_add(
+                    1, std::memory_order_relaxed);
                 ProcessPickedTask(task.start_idx, task.end_idx,
                                   &(task_workspaces_[tid]));
                 break;

@@ -41,6 +41,7 @@
 #include "search/classic/stoppers/stoppers.h"
 #include "search/dag_classic/params.h"
 #include "utils/optionsparser.h"
+#include "utils/testonly_throw_hook.h"
 
 namespace lczero {
 namespace dag_classic {
@@ -156,6 +157,10 @@ struct RunResult {
   uint32_t root_n_in_flight = 0xffffffffu;  // poisoned until set
   int64_t total_playouts = 0;
   TreeShape shape;
+  // Test-only execution-counter deltas proving which task paths ran.
+  int64_t gathering_executed = 0;
+  int64_t processing_executed = 0;
+  int64_t processing_calls = 0;
 };
 
 RunResult RunFixedVisitSearch(int task_workers, int visits, int threads,
@@ -188,9 +193,25 @@ RunResult RunFixedVisitSearch(int task_workers, int visits, int threads,
       std::chrono::steady_clock::now(), std::move(stopper),
       /*infinite=*/false, /*ponder=*/false, option_dict, &tt, nullptr);
 
+  const int64_t gathering_before =
+      g_testonly_gathering_tasks_executed.load(std::memory_order_relaxed);
+  const int64_t processing_tasks_before =
+      g_testonly_processing_tasks_executed.load(std::memory_order_relaxed);
+  const int64_t processing_calls_before =
+      g_testonly_processing_calls.load(std::memory_order_relaxed);
+
   search->StartThreads(threads);
   search->Wait();
 
+  result.gathering_executed =
+      g_testonly_gathering_tasks_executed.load(std::memory_order_relaxed) -
+      gathering_before;
+  result.processing_executed =
+      g_testonly_processing_tasks_executed.load(std::memory_order_relaxed) -
+      processing_tasks_before;
+  result.processing_calls =
+      g_testonly_processing_calls.load(std::memory_order_relaxed) -
+      processing_calls_before;
   result.root_n_in_flight = tree.GetCurrentHead()->GetNInFlight();
   result.total_playouts = search->GetTotalPlayouts();
   WalkTreeShape(tree.GetCurrentHead(), /*depth=*/0, &result.shape);
@@ -205,6 +226,11 @@ TEST(DagSearchPoolEquivalence, SerialConvergesCleanly) {
   EXPECT_GE(r.total_playouts, 5000);
   EXPECT_GE(r.shape.visited_nodes, 500);
   EXPECT_GE(r.shape.max_depth, 4);
+  // task_workers=0 never constructs the pool, so nothing may reach the
+  // executor; processing still has to run (inline on the search thread).
+  EXPECT_EQ(r.gathering_executed, 0);
+  EXPECT_EQ(r.processing_executed, 0);
+  EXPECT_GT(r.processing_calls, 0);
 }
 
 TEST(DagSearchPoolEquivalence, PooledConvergesCleanly) {
@@ -220,6 +246,12 @@ TEST(DagSearchPoolEquivalence, PooledConvergesCleanly) {
   // unproven "constructing worker threads is not evidence they executed."
   EXPECT_GE(r.shape.visited_nodes, 500);
   EXPECT_GE(r.shape.max_depth, 4);
+  // review #876 f5: the executor counters themselves, not the tree shape,
+  // prove worker tasks actually ran -- gathering picks on worker threads, and
+  // the batched processing tasks the pool submits for larger batches.
+  EXPECT_GT(r.gathering_executed, 0);
+  EXPECT_GT(r.processing_executed, 0);
+  EXPECT_GT(r.processing_calls, 0);
 }
 
 // Not a strict node-for-node match (thread scheduling can pick a slightly
@@ -240,6 +272,12 @@ TEST(DagSearchPoolEquivalence, SerialAndPooledConvergeToComparablePlayouts) {
   EXPECT_EQ(pooled.root_n_in_flight, 0u);
   EXPECT_GE(serial.shape.visited_nodes, 500);
   EXPECT_GE(pooled.shape.visited_nodes, 500);
+  // Executor counters: the serial config must never reach the pool executor,
+  // the pooled one must have run both task types.
+  EXPECT_EQ(serial.gathering_executed, 0);
+  EXPECT_GT(pooled.gathering_executed, 0);
+  EXPECT_GT(serial.processing_calls, 0);
+  EXPECT_GT(pooled.processing_calls, 0);
 
   const double ratio = static_cast<double>(pooled.total_playouts) /
                        static_cast<double>(serial.total_playouts);
@@ -260,6 +298,10 @@ TEST(DagSearchPoolEquivalence, DefaultHeuristicOnCpuBackendResolvesToSerial) {
   EXPECT_GE(r.total_playouts, 5000);
   EXPECT_GE(r.shape.visited_nodes, 500);
   EXPECT_GE(r.shape.max_depth, 4);
+  // -1 on a CPU backend collapses to 0 workers (no pool), per the heuristic.
+  EXPECT_EQ(r.gathering_executed, 0);
+  EXPECT_EQ(r.processing_executed, 0);
+  EXPECT_GT(r.processing_calls, 0);
 }
 
 TEST(DagSearchPoolEquivalence, DefaultHeuristicOnGpuBackendResolvesToPooled) {
@@ -270,6 +312,9 @@ TEST(DagSearchPoolEquivalence, DefaultHeuristicOnGpuBackendResolvesToPooled) {
   EXPECT_GE(r.total_playouts, 5000);
   EXPECT_GE(r.shape.visited_nodes, 500);
   EXPECT_GE(r.shape.max_depth, 4);
+  // A pool was actually constructed and its workers executed tasks.
+  EXPECT_GT(r.gathering_executed, 0);
+  EXPECT_GT(r.processing_calls, 0);
 }
 
 }  // namespace
