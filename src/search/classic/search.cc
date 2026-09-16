@@ -1398,7 +1398,9 @@ void SearchWorker::GatherMinibatch() {
       ProcessPickedTask(ppt_start, static_cast<int>(minibatch_.size()),
                         &main_workspace_);
     } catch (...) {
-      pending_exception = std::current_exception();
+      // Preserve the first failure: a Submit error captured above takes
+      // priority (review #881 minor).
+      if (!pending_exception) pending_exception = std::current_exception();
     }
     if (needs_wait) {
       try {
@@ -1478,7 +1480,8 @@ void SearchWorker::ProcessPickedTask(int start_idx, int end_idx,
   // gathering seams, plus the execution counter proving how much real
   // processing ran (pool tasks and main-thread slices both land here).
   TestOnlyRecordProcessingCall();
-  TestOnlyMaybeThrowAt(TestOnlyThrowSite::kProcessing);  auto& history = workspace->history;
+  TestOnlyMaybeThrowAt(TestOnlyThrowSite::kProcessing);
+  auto& history = workspace->history;
   history = search_->played_history_;
 
   for (int i = start_idx; i < end_idx; i++) {

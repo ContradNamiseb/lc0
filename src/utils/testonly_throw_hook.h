@@ -59,6 +59,14 @@ enum class TestOnlyThrowSite : int {
   // A queue insertion in TaskStealingPool::Submit, before the task is
   // published (#878 f4).
   kPoolInsert,
+  // The completion-slot reserve in TaskStealingPool (review #881): the
+  // acceptance-time allocation that keeps worker-side completion publication
+  // nonallocating.
+  kPoolCompletionReserve,
+  // Immediately before a collision insertion that follows a successful Visit
+  // insertion in the same stop_picking entry (review #881 P2). Distinct from
+  // kBeforeEmission, which fires for collision-only entries too.
+  kBeforeCollisionAfterVisit,
   // Top of the pool executor callback, before the task's own code runs.
   kWorkerExecutor,
   // Top of ProcessPickedTask, before it touches the batch.
@@ -80,6 +88,33 @@ struct TestOnlyThrowCounters {
     for (auto& c : count) c.store(-1, std::memory_order_relaxed);
   }
 };
+
+// Context of the most recent seam throw (review #881 P2): recorded so a
+// targeted test can state WHERE its call failed instead of merely that some
+// worker task ran at some point. Pool executor threads mark this at task
+// entry; TestOnlyMaybeThrowAt snapshots it when it throws.
+inline thread_local bool t_testonly_in_pool_task = false;
+inline std::atomic<bool> g_testonly_last_throw_in_pool_task{false};
+
+static inline void TestOnlyMarkPoolTaskContext() {
+  t_testonly_in_pool_task = true;
+}
+
+static inline bool TestOnlyLastThrowInPoolTask() {
+  return g_testonly_last_throw_in_pool_task.load(std::memory_order_relaxed);
+}
+
+// Remaining collision share at the post-visit seam (review #881 P2): the seam
+// may only fire with a share still left after the Visit was emitted.
+inline std::atomic<int64_t> g_testonly_post_visit_remaining_share{-1};
+
+static inline void TestOnlyRecordPostVisitRemainingShare(int share) {
+  g_testonly_post_visit_remaining_share.store(share, std::memory_order_relaxed);
+}
+
+static inline int64_t TestOnlyPostVisitRemainingShare() {
+  return g_testonly_post_visit_remaining_share.load(std::memory_order_relaxed);
+}
 
 // The single counter array; address-stable for the process lifetime.
 inline TestOnlyThrowCounters g_testonly_throw_counters;
@@ -105,6 +140,8 @@ static inline void TestOnlyMaybeThrowAt(TestOnlyThrowSite site) {
   if (counter.fetch_sub(1, std::memory_order_relaxed) == 0) {
     g_testonly_throw_fired[static_cast<int>(site)].store(
         true, std::memory_order_relaxed);
+    g_testonly_last_throw_in_pool_task.store(t_testonly_in_pool_task,
+                                             std::memory_order_relaxed);
     throw TestOnlyInjectedReservationThrow{};
   }
 }
@@ -185,6 +222,8 @@ static inline void TestOnlyResetSeams() {
   g_testonly_processing_tasks_executed.store(0, std::memory_order_relaxed);
   g_testonly_processing_calls.store(0, std::memory_order_relaxed);
   g_testonly_workspace_reserve_override.store(-1, std::memory_order_relaxed);
+  g_testonly_last_throw_in_pool_task.store(false, std::memory_order_relaxed);
+  g_testonly_post_visit_remaining_share.store(-1, std::memory_order_relaxed);
 }
 
 #else  // !LC0_TEST_INSTRUMENTATION
@@ -197,6 +236,8 @@ static inline void TestOnlyMaybeThrowOnRecordGrowth() {}
 static inline void TestOnlyRecordGatheringTaskExecuted() {}
 static inline void TestOnlyRecordProcessingTaskExecuted() {}
 static inline void TestOnlyRecordProcessingCall() {}
+static inline void TestOnlyMarkPoolTaskContext() {}
+static inline void TestOnlyRecordPostVisitRemainingShare(int) {}
 static inline int TestOnlyWorkspaceReserve() { return -1; }
 
 #endif  // LC0_TEST_INSTRUMENTATION

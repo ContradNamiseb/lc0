@@ -26,6 +26,7 @@
 #include <mutex>
 #include <random>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include "utils/logging.h"
@@ -44,6 +45,19 @@ template <typename Task>
 class TaskStealingPool {
  public:
   using Executor = std::function<void(Task&, int)>;
+
+  // Worker-thread publication paths move tasks with no recovery path on the
+  // worker side (an exception there escapes into std::thread and calls
+  // terminate), so the lifecycle contract is enforced at compile time
+  // (review #881).
+  static_assert(std::is_nothrow_move_constructible_v<Task>,
+                "TaskStealingPool requires Task to be nothrow move "
+                "constructible: queue pops and completion publication must "
+                "not throw on worker threads");
+  static_assert(std::is_nothrow_move_assignable_v<Task>,
+                "TaskStealingPool requires Task to be nothrow move "
+                "assignable: TryPopOwn/TrySteal assign into a worker-local "
+                "Task");
 
   // Creates a pool with `num_workers` threads. The `executor` callback
   // is invoked for each task, receiving the task and the worker's thread id.
@@ -77,6 +91,12 @@ class TaskStealingPool {
   // workers only gate on queue_size before locking the queue, and that is
   // still raised after the counts, so a count-only transient can at most
   // wake a worker that finds nothing.
+  //
+  // Completion storage (review #881): the slot the worker will publish this
+  // task into is reserved BEFORE the task becomes visible, so the
+  // worker-side completion push_back can never allocate. A failure at that
+  // reservation is still on the submitting thread and rolls the acceptance
+  // back like any other pre-publication failure.
   void Submit(Task&& task) {
     int target = LeastLoaded();
     {
@@ -88,11 +108,21 @@ class TaskStealingPool {
       // predicate check can never miss this task becoming available.
       total_queued_.fetch_add(1, std::memory_order_release);
     }
+    bool slot_reserved = false;
     try {
+      {
+        std::lock_guard<std::mutex> lock(completed_mutex_);
+        ReserveCompletionSlotsLocked(1);
+        slot_reserved = true;
+      }
       std::lock_guard<std::mutex> lock(workers_[target].queue_mutex);
       TestOnlyMaybeThrowAt(TestOnlyThrowSite::kPoolInsert);
       workers_[target].local_queue.push_back(std::move(task));
     } catch (...) {
+      if (slot_reserved) {
+        std::lock_guard<std::mutex> lock(completed_mutex_);
+        DropCompletionSlotsLocked(1);
+      }
       RollBackUnpublished(1);
       throw;
     }
@@ -119,7 +149,13 @@ class TaskStealingPool {
       total_queued_.fetch_add(n, std::memory_order_release);
     }
     int published = 0;
+    bool slots_reserved = false;
     try {
+      {
+        std::lock_guard<std::mutex> lock(completed_mutex_);
+        ReserveCompletionSlotsLocked(static_cast<size_t>(n));
+        slots_reserved = true;
+      }
       for (int i = 0; i < n; i++) {
         int target = i % num_workers_;
         {
@@ -131,6 +167,10 @@ class TaskStealingPool {
         ++published;
       }
     } catch (...) {
+      if (slots_reserved) {
+        std::lock_guard<std::mutex> lock(completed_mutex_);
+        DropCompletionSlotsLocked(static_cast<size_t>(n - published));
+      }
       RollBackUnpublished(n - published);
       // The end-of-batch notify below is skipped on this path; wake workers
       // for the accepted prefix so it still executes.
@@ -166,10 +206,18 @@ class TaskStealingPool {
   }
 
   // Drain all completed tasks (moves them out). Call after WaitForAll().
+  //
+  // The allocation this needs happens HERE, on the caller's thread, where a
+  // failure is recoverable: if reserve() throws, completed_tasks_ is
+  // untouched, so a retry still sees every accepted task's payload. Moving
+  // the member vector out (as this used to) would drop its capacity and let
+  // the next worker completion allocate again (review #881).
   std::vector<Task> DrainCompleted() {
     std::lock_guard<std::mutex> lock(completed_mutex_);
-    std::vector<Task> result = std::move(completed_tasks_);
-    completed_tasks_.clear();
+    std::vector<Task> result;
+    result.reserve(completed_tasks_.size());
+    for (auto& task : completed_tasks_) result.push_back(std::move(task));
+    completed_tasks_.clear();  // keeps capacity for outstanding completions
     return result;
   }
 
@@ -256,6 +304,21 @@ class TaskStealingPool {
       all_done_.notify_all();
     }
   }
+
+  // Reserve completion storage for `n` accepted tasks. May throw; callers
+  // invoke it BEFORE the tasks become visible, so a failure here is still on
+  // the submitting thread and rolls the acceptance back instead of killing a
+  // worker later. completed_mutex_ must be held.
+  void ReserveCompletionSlotsLocked(size_t n) {
+    TestOnlyMaybeThrowAt(TestOnlyThrowSite::kPoolCompletionReserve);
+    completed_tasks_.reserve(completed_tasks_.size() +
+                             outstanding_completions_ + n);
+    outstanding_completions_ += n;
+  }
+
+  // Release slots for work that will never publish a completion (a rejected
+  // or rolled-back acceptance). completed_mutex_ must be held.
+  void DropCompletionSlotsLocked(size_t n) { outstanding_completions_ -= n; }
 
   // Find the worker with the fewest queued tasks.
   int LeastLoaded() const {
@@ -407,6 +470,12 @@ class TaskStealingPool {
         }
         {
           std::lock_guard<std::mutex> lock(completed_mutex_);
+          // Cannot allocate: every accepted task had a completion slot
+          // reserved before it was published (review #881), and Task is
+          // nothrow-move-constructible (static_assert above). The payload
+          // therefore always reaches DrainCompleted on the owning thread,
+          // even after an executor throw.
+          --outstanding_completions_;
           completed_tasks_.push_back(std::move(task));
         }
         completed_.fetch_add(1, std::memory_order_release);
@@ -446,6 +515,14 @@ class TaskStealingPool {
   // Storage for completed tasks (for DrainCompleted()).
   std::mutex completed_mutex_;
   std::vector<Task> completed_tasks_;
+  // Accepted tasks whose completion slot is reserved but not yet filled;
+  // guarded by completed_mutex_. Invariant (review #881):
+  // completed_tasks_.capacity() >= completed_tasks_.size() +
+  // outstanding_completions_, so the worker-side completion push_back never
+  // allocates. Slots are taken in Submit before the task is published and
+  // released by the worker when it stores the completed task; DrainCompleted
+  // clears without shrinking, so the capacity survives drains.
+  size_t outstanding_completions_ = 0;
 
   // First executor exception this round, rethrown by WaitForAll().
   std::mutex exception_mutex_;

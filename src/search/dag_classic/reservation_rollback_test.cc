@@ -360,13 +360,20 @@ TEST_F(ReservationRollbackTest, PooledCollisionEmissionFailureLeavesNoReservatio
       /*infinite=*/false, /*ponder=*/false, option_dict, &tt, nullptr);
 
   TestOnlyResetSeams();
-  TestOnlySetThrowCount(TestOnlyThrowSite::kBeforeEmission, 1200);
+  TestOnlySetThrowCount(TestOnlyThrowSite::kBeforeCollisionAfterVisit, 1400);
   search->StartThreads(4);
   search->Wait();
 
   EXPECT_EQ(bestmove_count.load(), 1);
-  EXPECT_TRUE(TestOnlyWasThrowFired(TestOnlyThrowSite::kBeforeEmission))
-      << "the armed between-visit-and-collision seam was never reached";
+  EXPECT_TRUE(
+      TestOnlyWasThrowFired(TestOnlyThrowSite::kBeforeCollisionAfterVisit))
+      << "the armed post-visit/before-collision seam was never reached";
+  // The dedicated seam only exists in the post-visit window, and it records
+  // the collision share left when the throw happened.
+  EXPECT_GT(TestOnlyPostVisitRemainingShare(), 0);
+  // Context of the actual failing call (review #881 P2), not merely that some
+  // worker ran somewhere: this armed hit landed in a pool task.
+  EXPECT_TRUE(TestOnlyLastThrowInPoolTask());
   EXPECT_GT(TestOnlyGatheringTasksExecuted(), 0)
       << "no worker task ever executed";
   ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
