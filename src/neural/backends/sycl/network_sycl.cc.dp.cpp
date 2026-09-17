@@ -675,12 +675,6 @@ class SyclNetwork : public Network {
 
     
 //#if DPCT_COMPAT_RT_VERSION >= 11000
-    const int pre_transform_tensor_size =
-        batchSize * numFilters_ * 8 * 8 * sizeof(DataType);
-    const int transformed_tensor_size = pre_transform_tensor_size * 36 / 16;
-    const int res_block_mem =
-        transformed_tensor_size * 2 + pre_transform_tensor_size;
-
     //cudaStreamAttrValue stream_attribute = {};
     //stream_attribute.accessPolicyWindow.base_ptr = tensor_mem[2];
     //stream_attribute.accessPolicyWindow.num_bytes = res_block_mem;

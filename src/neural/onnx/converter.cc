@@ -77,8 +77,6 @@ class Converter {
   size_t NumEncBlocks() const { return src_.weights().encoder().size(); }
   void CopyGenericFields(pblczero::Net* dst);
   void GenerateOnnx(pblczero::OnnxModel* onnx);
-  void FillValueInfo(pblczero::ValueInfoProto* vip, const std::string& name,
-                     std::initializer_list<int> dims);
 
   std::string MakeConvBlock(OnnxBuilder* builder,
                             const MultiHeadWeights::ConvBlock&,
@@ -161,8 +159,6 @@ class Converter {
   void MakeMovesLeftHead(pblczero::OnnxModel* onnx, OnnxBuilder* builder,
                          const std::string& input,
                          const MultiHeadWeights& weights);
-
-  void AddStdInitializers(OnnxBuilder* builder);
 
   pblczero::TensorProto::DataType GetDataType() const;
   std::unique_ptr<OnnxConst> GetWeghtsConverter(
