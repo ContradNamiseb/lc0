@@ -45,6 +45,9 @@
 #include "syzygy/syzygy.h"
 #include "utils/logging.h"
 #include "utils/mutex.h"
+#include "utils/round_task_slot.h"
+#include "utils/task_stealing_pool.h"
+#include "utils/testonly_throw_hook.h"
 
 namespace lczero {
 namespace dag_classic {
@@ -217,11 +220,6 @@ class Search {
 class SearchWorker {
  public:
   static constexpr int kMaxMovesInPosition = 218;
-  static constexpr int kTaskCountDigits = std::numeric_limits<int>::digits + 1;
-  static constexpr int kTasksTakenShift = kTaskCountDigits/2;
-  static constexpr int kTasksTakenOne = 1 << kTasksTakenShift;
-  // Suspend is -1 for the low half.
-  static constexpr int kTaskCountSuspend = kTasksTakenOne - 1;
 
   SearchWorker(Search* search, const SearchParams& params)
       : search_(search),
@@ -235,17 +233,42 @@ class SearchWorker {
       } else {
         int working_threads = std::max(
             search_->thread_count_.load(std::memory_order_acquire) - 1, 1);
-        task_workers_ = std::min(
-            std::thread::hardware_concurrency() / working_threads - 1, 4U);
+        // Signed arithmetic: hardware_concurrency()/working_threads == 0 used
+        // to wrap to UINT_MAX via the unsigned "- 1" and clamp to 4, giving
+        // low-core boxes four spinning helpers instead of zero (mirrors
+        // classic #858 f9).
+        const unsigned hw = std::thread::hardware_concurrency();
+        task_workers_ = std::max(
+            0, std::min(static_cast<int>(hw / working_threads) - 1, 4));
       }
     }
-    for (int i = 0; i < task_workers_; i++) {
-      task_workspaces_.emplace_back();
-      task_threads_.emplace_back([this, i]() {
-          LOGFILE << "Task worker " << i << " starting.";
-          this->RunTasks(i);
-          LOGFILE << "Task worker " << i << " exiting.";
-        });
+    if (task_workers_ > 0) {
+      for (int i = 0; i < task_workers_; i++) {
+        task_workspaces_.emplace_back();
+      }
+      task_pool_ = std::make_unique<TaskStealingPool<PickTask>>(
+          task_workers_, [this](PickTask& task, int tid) {
+            // Test-only seams (#876 f5): a worker-executor fault site before
+            // the task's own code runs, and per-type execution counters that
+            // prove these callbacks actually executed while a pool round was
+            // in flight (tree size/shape alone does not). The context mark
+            // lets a seam throw record that it happened in a pool task
+            // (review #881 P2).
+            TestOnlyMarkPoolTaskContext();
+            TestOnlyMaybeThrowAt(TestOnlyThrowSite::kWorkerExecutor);
+            switch (task.task_type) {
+              case PickTask::kGathering:
+                TestOnlyRecordGatheringTaskExecuted();
+                PickNodesToExtendTask(task.start_path, task.collision_limit,
+                                      task.history, &task.results,
+                                      &task_workspaces_[tid]);
+                break;
+              case PickTask::kProcessing:
+                TestOnlyRecordProcessingTaskExecuted();
+                ProcessPickedTask(task.start_idx, task.end_idx);
+                break;
+            }
+          });
     }
     target_minibatch_size_ = params_.GetMiniBatchSize();
     if (target_minibatch_size_ == 0) {
@@ -257,7 +280,11 @@ class SearchWorker {
                                      target_minibatch_size_));
   }
 
-  ~SearchWorker();
+  ~SearchWorker() {
+    if (task_pool_) {
+      task_pool_->Shutdown();
+    }
+  }
 
   // Runs iterations while needed.
   void RunBlocking() {
@@ -269,9 +296,22 @@ class SearchWorker {
         ExecuteOneIteration();
       } while (search_->IsSearchActive());
     } catch (std::exception& e) {
+      // A failing backend must not kill the engine mid-game: the old
+      // abort() here turned a lone Level Zero UR_RESULT_ERROR_UNKNOWN
+      // (2026-09 gameplay crash class) into a dead engine the GUI kept
+      // waiting on. Stop exactly like a UCI `stop`: this worker's part is
+      // over, the other workers wrap up, and the best move still gets
+      // emitted -- the game goes on and the log names the failure.
       std::cerr << "Unhandled exception in worker thread: " << e.what()
                 << std::endl;
-      abort();
+      // Release this worker's own abandoned real-visit reservations before
+      // signalling stop (review #866 P1-3) -- mirrors classic's
+      // CancelPendingMinibatch(). Collisions need no handling here:
+      // GatherMinibatch's own absl::Cleanup (cancel_collisions) already
+      // cancelled every collision the moment GatherMinibatch() itself
+      // returned or threw, unconditionally, on every exit path.
+      CancelPendingMinibatchVisits();
+      search_->Stop();
     }
   }
 
@@ -284,6 +324,24 @@ class SearchWorker {
   // 6. Propagate the new nodes' information to all their parents in the tree.
   // 7. Update the Search's status and progress information.
   void ExecuteOneIteration();
+
+  // If an iteration is abandoned mid-flight (a backend exception, caught in
+  // RunBlocking() above), every non-collision entry still sitting in
+  // minibatch_ holds live n_in_flight_ reservations along its whole path
+  // (leaf included -- TryStartScoreUpdate() -- and every ancestor --
+  // IncrementNInFlight()) that DoBackupUpdate's FinalizeScoreUpdate will now
+  // never run for. Collisions are NOT handled here: unlike classic, dag_
+  // classic collisions are never transferred to a shared owner -- their
+  // ancestor reservations are cancelled unconditionally the moment
+  // GatherMinibatch() itself exits (its own absl::Cleanup), on every path,
+  // exception included -- so by the time this runs, any collision entries
+  // still physically present in minibatch_ have already been released, and
+  // walking them again here would double-cancel the same path (review #866
+  // P1-3). Real visits get no such per-call cleanup -- GatherMinibatch
+  // deliberately keeps them reserved across the rest of the iteration -- so
+  // without this they leak for the rest of the search on any failure
+  // between GatherMinibatch() returning and DoBackupUpdate() running.
+  void CancelPendingMinibatchVisits();
 
   // The same operations one by one:
   // 1. Initialize internal structures.
@@ -381,11 +439,14 @@ class SearchWorker {
                   uint32_t max_count)
         : path(path),
           node(std::get<0>(path.back())),
-          eval(std::make_unique<EvalResult>()),
           multivisit(multivisit),
           maxvisit(max_count),
           is_collision(true),
           repetitions(0) {}
+    // Only visits are ever evaluated (collisions never touch eval -- every
+    // consumer is behind IsCollision/nn_queried guards), so allocate here
+    // rather than for every collision entry (mirrors classic's #859
+    // addition 5).
     NodeToProcess(const BackupPath& path, const PositionHistory& in_history)
         : path(path),
           node(std::get<0>(path.back())),
@@ -445,19 +506,51 @@ class SearchWorker {
     std::array<Node::Iterator, 256> cur_iters;
     std::vector<CurrentPath> current_path;
     BackupPath full_path;
+    // Reservation-rollback bookkeeping for PickNodesToExtendTask (agora
+    // #41/#872 P1): n_in_flight_ reservations made mid-traversal are not
+    // visible to CancelPendingMinibatchVisits until they land in the output
+    // receiver, so an exception between reservation and emission would
+    // otherwise leak them. reservation_ledger runs parallel to current_path
+    // (same push/pop sites): (node, ancestor_prefix_len), where
+    // ancestor_prefix_len is how many entries at the FRONT of full_path (as
+    // it stood when this entry was pushed) are that node's ancestors --
+    // Node has no GetParent() here (a DAG node can have several), so
+    // rollback has to walk the same path-slice CancelPendingMinibatchVisits
+    // does instead of a parent chain. A zero current_path[i].visits_ marks
+    // that slot superseded-by-its-own-children rather than live.
+    // level_reservations holds the current, not-yet-promoted level's picks
+    // (Node*, amount) -- these are cancelled directly on their own node, no
+    // path walk, since the still-live parent entry above already accounts
+    // for the ancestor chain until it's promoted or handed to a task.
+    std::vector<std::pair<Node*, int>> reservation_ledger;
+    std::vector<std::pair<Node*, int>> level_reservations;
+    // Scratch for atomic promotion (review #878 finding 3): the child node
+    // handles are resolved here before the level's ownership is changed, so
+    // the promotion commit itself cannot throw.
+    std::vector<Node*> promoted_nodes;
     TaskWorkspace() {
-      current_path.reserve(30);
+      // The parallel vectors are reserved to the production warm-start size
+      // unless a test overrides it to force promotion growth deterministically
+      // (test-only, see testonly_throw_hook.h; -1 in production).
+      const int test_reserve = TestOnlyWorkspaceReserve();
+      const int parallel_reserve = test_reserve > 0 ? test_reserve : 30;
+      current_path.reserve(parallel_reserve);
       full_path.reserve(30);
+      reservation_ledger.reserve(parallel_reserve);
+      level_reservations.reserve(16);
+      promoted_nodes.reserve(16);
     }
   };
 
   struct PickTask {
     enum PickTaskType { kGathering, kProcessing };
-    PickTaskType task_type;
+    // Deterministic default so a default-constructed pool scratch task can
+    // never execute a garbage switch arm (the pool only runs moved-in tasks,
+    // but don't make the next reader re-prove it -- mirrors classic #859).
+    PickTaskType task_type = kGathering;
 
     // For task type gathering.
     BackupPath start_path;
-    Node* start;
     int collision_limit;
     PositionHistory history;
     std::vector<NodeToProcess> results;
@@ -466,17 +559,15 @@ class SearchWorker {
     int start_idx;
     int end_idx;
 
-    bool complete = false;
-
     PickTask(const BackupPath& start_path, const PositionHistory& in_history,
              int collision_limit)
         : task_type(kGathering),
           start_path(start_path),
-          start(std::get<0>(start_path.back())),
           collision_limit(collision_limit),
           history(in_history) {}
     PickTask(int start_idx, int end_idx)
         : task_type(kProcessing), start_idx(start_idx), end_idx(end_idx) {}
+    PickTask() = default;
   };
 
   NodeToProcess PickNodeToExtend(int collision_limit);
@@ -491,6 +582,13 @@ class SearchWorker {
                                              float& d_delta, float& m_delta,
                                              bool& update_parent_bounds) const;
   void DoBackupUpdateSingleNode(const NodeToProcess& node_to_process);
+  // Cancels the reservations one completed-but-unmerged result still owns
+  // (review #883): visits use the leaf-inclusive path walk, collisions the
+  // ancestors-only walk CancelCollisions performs. Needed on a merge-reserve
+  // failure because such entries never reach minibatch_, so neither
+  // CancelPendingMinibatchVisits nor the GatherMinibatch cleanup can see
+  // them. Runs under the caller's nodes_mutex_.
+  void CancelUnmergedResult(const NodeToProcess& entry) noexcept;
   // Returns whether a node's bounds were set based on its children.
   bool MaybeSetBounds(Node* p, float m, uint32_t* n_to_fix, float* v_delta,
                       float* d_delta, float* m_delta) const;
@@ -499,7 +597,7 @@ class SearchWorker {
                              PositionHistory& history,
                              std::vector<NodeToProcess>* receiver,
                              TaskWorkspace* workspace);
-  void CancelCollisions();
+  void CancelCollisions() noexcept;
 
   // Check if the situation described by @depth under root and @position is a
   // safe two-fold or a draw by repetition and return the number of safe
@@ -510,14 +608,6 @@ class SearchWorker {
   void ProcessPickedTask(int batch_start, int batch_end);
   void ExtendNode(NodeToProcess& picked_node);
   void FetchSingleNodeResult(NodeToProcess* node_to_process);
-  std::tuple<PickTask*, int, int> PickTaskToProcess();
-  void ProcessTask(PickTask* task, int id,
-                   std::vector<NodeToProcess>* receiver,
-                   TaskWorkspace* workspace);
-  void RunTasks(int tid);
-  void ResetTasks();
-  // Returns how many tasks there were.
-  int WaitForTasks();
 
   Search* const search_;
   // List of nodes to process.
@@ -530,23 +620,21 @@ class SearchWorker {
   PositionHistory history_;
   int number_out_of_order_ = 0;
   const SearchParams& params_;
-  std::unique_ptr<Node> precached_node_;
   const bool moves_left_support_;
   classic::IterationStats iteration_stats_;
   classic::StoppersHints latest_time_manager_hints_;
 
-  // Multigather task related fields.
-
-  Mutex picking_tasks_mutex_;
-  std::vector<PickTask> picking_tasks_;
-  // A packed atomic. LSB half is task_count_. MSB half is tasks_taken_.
-  std::atomic<int> task_count_ = kTaskCountSuspend;
-  std::atomic<int> completed_tasks_ = 0;
-  std::condition_variable task_added_;
-  std::vector<std::thread> task_threads_;
+  // Task-stealing pool and workspaces.
+  std::unique_ptr<TaskStealingPool<PickTask>> task_pool_;
   std::vector<TaskWorkspace> task_workspaces_;
   TaskWorkspace main_workspace_;
-  bool exiting_ = false;
+  // Round-wide cap on recursively-submitted kGathering tasks, preserving
+  // the old scheduler's MAX_TASKS==256 budget (agora #41/#867 stage 4 --
+  // explicitly NOT classic's per-invocation cap, which would change
+  // behavior). Reset at the top of every PickNodesToExtend() call, claimed
+  // via CAS in PickNodesToExtendTask since multiple task-pool workers can
+  // be recursively submitting concurrently.
+  std::atomic<int> tasks_submitted_this_round_{0};
 };
 
 }  // namespace dag_classic

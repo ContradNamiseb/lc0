@@ -33,6 +33,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <exception>
 #include <iomanip>
 #include <iostream>
 #include <iterator>
@@ -43,6 +44,7 @@
 #include "utils/fastmath.h"
 #include "utils/random.h"
 #include "utils/spinhelper.h"
+#include "utils/testonly_throw_hook.h"
 #include "utils/trace.h"
 
 namespace lczero {
@@ -148,44 +150,6 @@ class MEvaluator {
   float parent_m_ = 0.0f;
   bool parent_within_threshold_ = false;
 };
-
-// Unpack task_count_ atomic which holds both task_count_ and tasks_taken_. It
-// can unpack a value from an already read value or load it from the atomic
-// variable.
-// Variables are packed together because there is a potential race between task
-// workers and ResetTasks. A task worker can read tasks_taken_ and task_count
-// to a local register. A task worker can be suspended by kernel before tries
-// to acquire work. Other threads can process all tasks and main thread resets
-// tasks before the suspended thread resumes. The suspended thread now manages
-// to acquire work based on stale values if the stale tasks_taken was zero.
-// Packed values avoid the race because compare exchange is checking both when
-// incrementing tasks_taken_.
-template<typename T>
-std::tuple<int, int, int> ReadTaskCount(T& task_count) {
-  int packed;
-  if constexpr(std::is_same_v<T, std::atomic<int>>) {
-    packed = task_count.load(std::memory_order_acquire);
-  } else {
-    packed = task_count;
-  }
-  // The top half is tasks taken.
-  const int shift = SearchWorker::kTasksTakenShift;
-  int tasks_taken = packed >> shift;
-  // The bottom is task count. The first shift moves the sign bit from the lower
-  // half to the hardware sign bit. The second shift lowers bits back to the
-  // original positions and duplicates the sign bit if it is set.
-  int tc = (packed << shift) >> shift;
-  return {packed, tasks_taken, tc};
-}
-
-[[maybe_unused]]
-bool IsTasksCompleted(const std::atomic<int>& task_count,
-                      const std::atomic<int>& completed_tasks) {
-  int tc = 0, nta = 0;
-  std::tie(std::ignore, nta, tc) = ReadTaskCount(task_count);
-  int ct = completed_tasks.load(std::memory_order_acquire);
-  return tc == ct || (nta == ct && tc == -1);
-}
 
 }  // namespace
 
@@ -674,8 +638,17 @@ void Search::MaybeTriggerStop(const classic::IterationStats& stats,
   Mutex::Lock lock(counters_mutex_);
   // Already responded bestmove, nothing to do here.
   if (bestmove_is_sent_) return;
-  // Don't stop when the root node is not yet expanded.
-  if (stats.total_nodes == 0) return;
+  // Don't let the stopper's own heuristics fire on an empty tree -- but if
+  // a stop was already requested (UCI `stop`, time limit, or a worker
+  // exception calling Search::Stop() after the very first NN batch
+  // failed), fall through instead of returning: with zero playouts no
+  // worker will ever gather more, so bailing out here leaves stop_ true
+  // forever with no bestmove ever sent (same hang as classic/search.cc,
+  // review #863 finding 3 -- WatchdogThread's polling loop cannot make
+  // total_nodes nonzero on its own).
+  if (stats.total_nodes == 0 && !stop_.load(std::memory_order_acquire)) {
+    return;
+  }
 
   if (!stop_.load(std::memory_order_acquire)) {
     const float delay = params_.GetGarbageCollectionDelay() / 100.0f;
@@ -1127,13 +1100,52 @@ void Search::Wait() {
   LOGFILE << "Search threads cleaned.";
 }
 
-void SearchWorker::CancelCollisions() {
+void SearchWorker::CancelCollisions() noexcept {
   for (auto& entry : minibatch_) {
     if (!entry.IsCollision()) continue;
-    auto path = entry.path;
+    // Read-only over the existing path: this runs on cleanup paths where an
+    // allocation could throw a second exception (review #885).
+    const auto& path = entry.path;
     for (auto it = ++(path.crbegin()); it != path.crend(); ++it) {
       std::get<0>(*it)->CancelScoreUpdate(entry.multivisit);
     }
+  }
+}
+
+void SearchWorker::CancelPendingMinibatchVisits() {
+  SharedMutex::Lock lock(search_->nodes_mutex_);
+  for (auto& entry : minibatch_) {
+    // Collisions are already handled by GatherMinibatch's own absl::Cleanup,
+    // which runs unconditionally (including on the exception path that got
+    // us here) the moment GatherMinibatch() itself exits. Cancelling them
+    // again would double-cancel the same ancestor chain.
+    if (entry.IsCollision()) continue;
+    // Unlike CancelCollisions()'s ancestors-only walk, a real visit's own
+    // leaf reservation (TryStartScoreUpdate()) also needs releasing, so the
+    // walk is leaf-inclusive: start at path.crbegin() (the leaf), not
+    // ++path.crbegin().
+    for (auto it = entry.path.crbegin(); it != entry.path.crend(); ++it) {
+      std::get<0>(*it)->CancelScoreUpdate(entry.multivisit);
+    }
+  }
+  minibatch_.clear();
+}
+
+void SearchWorker::CancelUnmergedResult(const NodeToProcess& entry) noexcept {
+  if (entry.IsCollision()) {
+    // Same ancestors-only walk as CancelCollisions, and read-only over the
+    // existing path: this recovery path runs after a failed merge reserve, so
+    // it must not allocate or throw a second exception (review #885) -- the
+    // path is referenced, never copied.
+    const auto& path = entry.path;
+    for (auto it = ++(path.crbegin()); it != path.crend(); ++it) {
+      std::get<0>(*it)->CancelScoreUpdate(entry.multivisit);
+    }
+    TestOnlyRecordUnmergedCollisionCancelled();
+    return;
+  }
+  for (auto it = entry.path.crbegin(); it != entry.path.crend(); ++it) {
+    std::get<0>(*it)->CancelScoreUpdate(entry.multivisit);
   }
 }
 
@@ -1147,100 +1159,6 @@ Search::~Search() {
 // SearchWorker
 //////////////////////////////////////////////////////////////////////////////
 
-SearchWorker::~SearchWorker()
-{
-  {
-    // Tasks must be completed before destructor. If a gather tasks is running,
-    // it can increment task_count_ which would break the exit state.
-    assert(IsTasksCompleted(task_count_, completed_tasks_));
-    task_count_.fetch_or(kTaskCountSuspend, std::memory_order_release);
-    Mutex::Lock lock(picking_tasks_mutex_);
-    exiting_ = true;
-    task_added_.notify_all();
-  }
-  for (size_t i = 0; i < task_threads_.size(); i++) {
-    task_threads_[i].join();
-  }
-  LOGFILE << "Search worker destroyed.";
-}
-
-std::tuple<SearchWorker::PickTask*, int, int> SearchWorker::PickTaskToProcess() {
-  auto [packed_value, nta, tc] = ReadTaskCount(task_count_);
-
-  // Check if tasks are queued and try increment taken count.
-  while (nta < tc &&
-      !task_count_.compare_exchange_weak(packed_value, packed_value + kTasksTakenOne,
-                                         std::memory_order_acq_rel)) {
-    // Queue had tasks but another worker increment taken. We check
-    // if new work was added to the queue. Then we try to increment
-    // taken again.
-    std::tie(packed_value, nta, tc) = ReadTaskCount(packed_value);
-  }
-  // We incremented taken if nta and tc are different
-  if (nta < tc) {
-    return {picking_tasks_.data() + nta, nta, tc};
-  }
-  return {nullptr, nta, tc};
-}
-
-void SearchWorker::ProcessTask(PickTask* task, int id,
-                               std::vector<NodeToProcess>* receiver,
-                               TaskWorkspace* workspace) {
-  switch (task->task_type) {
-    case PickTask::kGathering: {
-      PickNodesToExtendTask(task->start_path, task->collision_limit,
-                            task->history, receiver,
-                            workspace);
-      break;
-    }
-    case PickTask::kProcessing: {
-      ProcessPickedTask(task->start_idx, task->end_idx);
-      break;
-    }
-  }
-  picking_tasks_.data()[id].complete = true;
-  completed_tasks_.fetch_add(1, std::memory_order_acq_rel);
-}
-
-void SearchWorker::RunTasks(int tid) {
-  while (true) {
-    PickTask* task = nullptr;
-    int id = 0;
-    int tc = 0;
-    {
-      int spins = 0;
-      while (true) {
-        std::tie(task, id, tc) = PickTaskToProcess();
-        if (task) {
-          break;
-        } else if (tc != -1) {
-          spins++;
-          if (spins >= 512) {
-            std::this_thread::yield();
-            spins = 0;
-          } else {
-            SpinloopPause();
-          }
-          continue;
-        }
-        spins = 0;
-        // Looks like sleep time.
-        Mutex::Lock lock(picking_tasks_mutex_);
-        // Refresh them now we have the lock.
-        int tc, nta;
-        std::tie(std::ignore, std::ignore, tc) = ReadTaskCount(task_count_);
-        if (tc != -1) continue;
-        if (exiting_) return;
-        task_added_.wait(lock.get_raw());
-        std::tie(std::ignore, nta, tc) = ReadTaskCount(task_count_);
-        if (nta >= tc && exiting_) return;
-      }
-    }
-    if (task != nullptr) {
-      ProcessTask(task, id, &(task->results), &(task_workspaces_[tid]));
-    }
-  }
-}
 
 void SearchWorker::ExecuteOneIteration() {
   // 1. Initialize internal structures.
@@ -1284,9 +1202,20 @@ void SearchWorker::ExecuteOneIteration() {
 
   // 2. Gather minibatch.
   GatherMinibatch();
-  assert(IsTasksCompleted(task_count_, completed_tasks_));
-  task_count_.fetch_or(kTaskCountSuspend, std::memory_order_release);
+  // The old hand-rolled scheduler suspended task workers here (a packed
+  // task_count_ flag) so they wouldn't spin-poll during RunNNComputation
+  // below with no work queued. TaskStealingPool needs no equivalent: its
+  // workers block on a real condvar (total_queued_ == 0) instead of
+  // spinning, so there's nothing to suspend between iterations (agora
+  // #41/#867 stage 3).
   search_->backend_waiting_counter_.fetch_add(1, std::memory_order_relaxed);
+  // RunNNComputation() below can throw (a backend/device error) -- without
+  // this, that skips the matching decrement below and leaves the counter
+  // permanently inflated for the rest of the search (same leak as
+  // classic/search.cc, review #863 finding 3).
+  absl::Cleanup release_backend_waiting = [this] {
+    search_->backend_waiting_counter_.fetch_add(-1, std::memory_order_relaxed);
+  };
 
   if (params_.GetMaxConcurrentSearchers() != 0) {
     search_->pending_searchers_.fetch_add(1, std::memory_order_acq_rel);
@@ -1294,7 +1223,7 @@ void SearchWorker::ExecuteOneIteration() {
 
   // 4. Run NN computation.
   RunNNComputation();
-  search_->backend_waiting_counter_.fetch_add(-1, std::memory_order_relaxed);
+  std::move(release_backend_waiting).Invoke();
 
   // 5. Retrieve NN computations (and terminal values) into nodes.
   FetchMinibatchResults();
@@ -1325,11 +1254,20 @@ void SearchWorker::ExecuteOneIteration() {
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 void SearchWorker::InitializeIteration() {
   LCTRACE_FUNCTION_SCOPE;
+  // Retire the PREVIOUS iteration's state before anything that can throw
+  // (review #867 P1-B, mirrors classic's identical fix): CreateComputation()
+  // is a real backend call (the original Level Zero crash this hardening
+  // effort started from was exactly this kind of failure) that can throw.
+  // minibatch_ used to be cleared AFTER it -- if it threw, the clear was
+  // skipped, so the worker's catch(...)-driven CancelPendingMinibatchVisits()
+  // then walked the PREVIOUS iteration's already-backed-up entries
+  // (DoBackupUpdate already released their reservations) and
+  // double-cancelled/underflowed them.
+  minibatch_.clear();
   // Free the old computation before allocating a new one. This works better
   // when backend caches buffer allocations between computations.
   computation_.reset();
   computation_ = search_->backend_->CreateComputation();
-  minibatch_.clear();
   minibatch_.reserve(2 * target_minibatch_size_);
 }
 
@@ -1430,7 +1368,8 @@ void SearchWorker::GatherMinibatch() {
 
       bool needs_wait = false;
       int ppt_start = new_start;
-      if (task_workers_ > 0 &&
+      std::exception_ptr pending_exception;
+      if (task_pool_ &&
           non_collisions >= params_.GetMinimumWorkSizeForProcessing()) {
         const int num_tasks = std::clamp(
             non_collisions / params_.GetMinimumWorkPerTaskForProcessing(), 2,
@@ -1438,8 +1377,9 @@ void SearchWorker::GatherMinibatch() {
         // Round down, left overs can go to main thread so it waits less.
         int per_worker = non_collisions / num_tasks;
         needs_wait = true;
-        ResetTasks();
+        task_pool_->Reset();
         int found = 0;
+        std::vector<PickTask> new_tasks;
         for (int i = new_start; i < static_cast<int>(minibatch_.size()); i++) {
           auto& picked_node = minibatch_[i];
           if (picked_node.IsCollision()) {
@@ -1447,20 +1387,51 @@ void SearchWorker::GatherMinibatch() {
           }
           ++found;
           if (found == per_worker) {
-            picking_tasks_.emplace_back(ppt_start, i + 1);
-            task_count_.fetch_add(1, std::memory_order_acq_rel);
+            new_tasks.emplace_back(ppt_start, i + 1);
             ppt_start = i + 1;
             found = 0;
-            if (picking_tasks_.size() == static_cast<size_t>(num_tasks - 1)) {
+            if (new_tasks.size() == static_cast<size_t>(num_tasks - 1)) {
               break;
             }
           }
         }
+        if (!new_tasks.empty()) {
+          // A batch submission can fail partway (review #878 finding 4): the
+          // accepted prefix is queued and counted, so it still has to be
+          // waited on and drained before this scope exits. needs_wait is
+          // already set, so the guarded WaitForAll/DrainCompleted below
+          // covers it.
+          try {
+            task_pool_->Submit(std::move(new_tasks));
+          } catch (...) {
+            pending_exception = std::current_exception();
+          }
+        }
       }
-      ProcessPickedTask(ppt_start, static_cast<int>(minibatch_.size()));
+      // Same guarded-region shape as PickNodesToExtend above (review #867
+      // P1-A): if the main-thread ProcessPickedTask slice throws,
+      // WaitForAll() below must still run before this scope exits --
+      // processing tasks already submitted are mutating minibatch_/tree
+      // state under this thread's held nodes_mutex_, and skipping the wait
+      // lets them keep running after unwinding releases it.
+      try {
+        ProcessPickedTask(ppt_start, static_cast<int>(minibatch_.size()));
+      } catch (...) {
+        // Preserve the first failure: a Submit error captured above takes
+        // priority (review #881 minor).
+        if (!pending_exception) pending_exception = std::current_exception();
+      }
       if (needs_wait) {
-        WaitForTasks();
+        try {
+          task_pool_->WaitForAll();
+        } catch (...) {
+          if (!pending_exception) pending_exception = std::current_exception();
+        }
+        // Processing tasks carry no results to merge, but draining still
+        // restores the pool's round bookkeeping for the next Reset()/round.
+        task_pool_->DrainCompleted();
       }
+      if (pending_exception) std::rethrow_exception(pending_exception);
     }
     bool some_ooo = false;
     for (int i = static_cast<int>(minibatch_.size()) - 1; i >= new_start; i--) {
@@ -1518,6 +1489,12 @@ void SearchWorker::GatherMinibatch() {
 void SearchWorker::ProcessPickedTask(int start_idx, int end_idx)
     REQUIRES(search_->nodes_mutex_) {
   LCTRACE_FUNCTION_SCOPE;
+  // Test-only seams (#876 f5), mirroring classic: a processing fault site
+  // distinct from the gathering seams, plus the execution counter proving how
+  // much real processing ran (pool tasks and main-thread slices both land
+  // here).
+  TestOnlyRecordProcessingCall();
+  TestOnlyMaybeThrowAt(TestOnlyThrowSite::kProcessing);
   for (int i = start_idx; i < end_idx; i++) {
     auto& picked_node = minibatch_[i];
     if (picked_node.IsCollision()) continue;
@@ -1534,64 +1511,104 @@ void SearchWorker::ProcessPickedTask(int start_idx, int end_idx)
   }
 }
 
+// Round-wide budget preserved as-is from the old scheduler's picking_tasks_
+// reservation cap (agora #41/#867 stage 4). TryClaimRoundTaskSlot (utils/
+// round_task_slot.h) is the CAS claim itself, pulled out to a standalone
+// header so the exactly-N-succeed-then-fall-back behavior has direct test
+// coverage (agora #867/#868) without needing to drive a real search past
+// 256 split opportunities.
 #define MAX_TASKS 256
-
-void SearchWorker::ResetTasks() {
-  // Tasks must be completed before reset.
-  assert(IsTasksCompleted(task_count_, completed_tasks_));
-  task_count_.store(0, std::memory_order_release);
-  completed_tasks_.store(0, std::memory_order_release);
-  picking_tasks_.clear();
-  // Reserve because resizing breaks pointers held by the task threads.
-  picking_tasks_.reserve(MAX_TASKS);
-}
-
-int SearchWorker::WaitForTasks() REQUIRES(search_->nodes_mutex_) {
-  // Process any outstanding tasks before checking if compelted. This avoids a
-  // long polling loop when PickNodesToExtend scheduled many tasks.
-  while (true) {
-    PickTask* task = nullptr;
-    int id = 0;
-    std::tie(task, id, std::ignore) = PickTaskToProcess();
-    if (task == nullptr) {
-      break;
-    }
-    ProcessTask(task, id, &minibatch_, &main_workspace_);
-  }
-  // Spin lock, other tasks should be done soon.
-  while (true) {
-    int completed = completed_tasks_.load(std::memory_order_acquire);
-    int todo, nta;
-    std::tie(std::ignore, nta, todo) = ReadTaskCount(task_count_);
-    std::ignore = nta;
-    assert(nta <= todo);
-    if (todo == completed) return completed;
-    SpinloopPause();
-  }
-}
 
 void SearchWorker::PickNodesToExtend(int collision_limit)
     REQUIRES(search_->nodes_mutex_) {
-  ResetTasks();
-  if (task_workers_ > 0 && !search_->backend_attributes_.runs_on_cpu) {
-    // While nothing is ready yet - wake the task runners so they are ready to
-    // receive quickly.
-    Mutex::Lock lock(picking_tasks_mutex_);
-    task_added_.notify_all();
+  if (task_pool_) {
+    task_pool_->Reset();
+    tasks_submitted_this_round_.store(0, std::memory_order_relaxed);
   }
   std::vector<Move> empty_movelist;
   history_.Trim(search_->played_history_.GetLength());
-  PickNodesToExtendTask({std::make_tuple(search_->root_node_, 0, 0)},
-                        collision_limit, history_, &minibatch_,
-                        &main_workspace_);
 
-  WaitForTasks();
-  for (int i = 0; i < static_cast<int>(picking_tasks_.size()); i++) {
-    for (int j = 0; j < static_cast<int>(picking_tasks_[i].results.size());
-         j++) {
-      minibatch_.emplace_back(std::move(picking_tasks_[i].results[j]));
+  // Single guarded region covering BOTH the main-thread picker call and the
+  // pool's own work (review #867 P1-A, mirrors classic's identical fix):
+  // the main call used to sit outside this guard entirely, so if IT threw
+  // -- after having already recursively submitted worker tasks -- the
+  // WaitForAll()/DrainCompleted() below never ran. That's not just a
+  // lost-results bug: pool workers mutate tree state on the assumption
+  // nodes_mutex_ (held by our caller) protects them from other search
+  // workers. Unwinding past this function releases that lock while those
+  // pool workers could still be running, so another SearchWorker thread can
+  // start mutating the same tree concurrently with them -- a real data
+  // race, not just a leak. Draining is required even on the main-call throw
+  // path for the same reason as the existing pool-throw path below: a
+  // sibling task that finished cleanly still has real results/reservations
+  // that must reach minibatch_, or CancelPendingMinibatchVisits() can't see
+  // and release them.
+  std::exception_ptr pending_exception;
+  try {
+    PickNodesToExtendTask({std::make_tuple(search_->root_node_, 0, 0)},
+                          collision_limit, history_, &minibatch_,
+                          &main_workspace_);
+  } catch (...) {
+    pending_exception = std::current_exception();
+  }
+
+  if (task_pool_) {
+    // WaitForAll() can rethrow a pool task's exception (review #863 f4, via
+    // classic). completed_tasks_ still holds every task's results at that
+    // point -- WorkerLoop pushes a task onto it unconditionally, whether
+    // its executor threw or not. Always wait/drain regardless of whether
+    // the main call above already threw: the pool must reach quiescence
+    // before this function returns (see the comment above), and the main
+    // call's exception -- if any -- takes priority when both are set.
+    try {
+      task_pool_->WaitForAll();
+    } catch (...) {
+      if (!pending_exception) pending_exception = std::current_exception();
+    }
+    auto completed = task_pool_->DrainCompleted();
+    // The merge is an ownership boundary too (review #883): after the drain
+    // these results have no other owner, and minibatch_.emplace_back can
+    // throw while growing. Reserve the aggregate destination capacity first;
+    // if that fails, cancel every still-owned result directly (no
+    // allocation) before propagating -- dropping them would leak their tree
+    // reservations.
+    size_t incoming = 0;
+    bool has_collision = false;
+    for (const auto& task : completed) {
+      incoming += task.results.size();
+      for (const auto& result : task.results) {
+        has_collision = has_collision || result.IsCollision();
+      }
+    }
+    try {
+      if (incoming > 0) {
+        if (has_collision) {
+          // Focused seam (review #885): fires only when the drained batch
+          // contains a completed collision, so a test can prove the
+          // collision branch of the recovery walk actually ran.
+          TestOnlyMaybeThrowAt(
+              TestOnlyThrowSite::kBeforeMergeReserveWithCollision);
+        }
+        TestOnlyMaybeThrowAt(TestOnlyThrowSite::kBeforeMergeReserve);
+        minibatch_.reserve(minibatch_.size() + incoming);
+      }
+    } catch (...) {
+      for (const auto& task : completed) {
+        for (const auto& result : task.results) {
+          CancelUnmergedResult(result);
+        }
+      }
+      throw;
+    }
+    // The reserve above covered every element, and NodeToProcess is
+    // nothrow-move-constructible, so this merge cannot throw.
+    for (auto& task : completed) {
+      for (auto& result : task.results) {
+        minibatch_.emplace_back(std::move(result));
+      }
     }
   }
+  if (pending_exception) std::rethrow_exception(pending_exception);
 }
 
 // Check if the situation described by @depth under root and @position is a
@@ -1670,12 +1687,63 @@ void SearchWorker::PickNodesToExtendTask(
   assert(path.size() == (size_t)history.GetLength() -
                             search_->played_history_.GetLength() + 1);
 
+  // Entry guard for a submitted task's inherited reservation (review #874,
+  // #876 finding 3): the submitting call retired its own mirror of this
+  // coverage when Submit succeeded (and subtracted the handed-off share from
+  // its own level entry until that level finished), so from this call's entry
+  // until the root entry below is recorded, this guard is the only owner. Any
+  // allocating setup in between can throw; if one does, the destructor
+  // cancels the coverage. Node has no GetParent() in a DAG, so the guard
+  // walks the submitted path instead of a parent chain.
+  struct EntryCoverageGuard {
+    const BackupPath* path;
+    int inherited_amount;  // 0 for the root call: nothing inherited
+    Node* own_visit_node;  // set if this call itself started a root visit
+    int own_visit_amount;
+    bool active;
+    ~EntryCoverageGuard() {
+      if (!active) return;
+      if (inherited_amount > 0) {
+        for (const auto& entry : *path) {
+          std::get<0>(entry)->CancelScoreUpdate(inherited_amount);
+        }
+      }
+      if (own_visit_amount > 0) {
+        own_visit_node->CancelScoreUpdate(own_visit_amount);
+      }
+    }
+  } coverage_guard{&path, path.size() > 1 ? collision_limit : 0, nullptr, 0,
+                    true};
+  if (path.size() > 1) {
+    // Test-only seam (#876 f3/f5): a submitted task's entry, before any of
+    // its allocating setup has run and before its ledger entry exists.
+    TestOnlyMaybeThrowAt(TestOnlyThrowSite::kBeforeTaskEntrySetup);
+  }
+
   auto& current_path = workspace->current_path;
   current_path.clear();
   auto& full_path = workspace->full_path;
   full_path = path;
   assert(full_path.size() > 0);
   auto [node, repetitions, moves_left] = full_path.back();
+  // Reservation rollback bookkeeping -- see the TaskWorkspace comment.
+  auto& reservation_ledger = workspace->reservation_ledger;
+  reservation_ledger.clear();
+  auto& level_reservations = workspace->level_reservations;
+  level_reservations.clear();
+  // Grows the level-reservation vector if needed. May throw, so callers
+  // invoke it BEFORE the increment the new entry will own: every
+  // TryStartScoreUpdate/IncrementNInFlight in the pick loop commits its entry
+  // right after, and a growth failure between the two would orphan the
+  // increment (review #876 finding 1, DAG-side equivalent of the classic
+  // fix). The 16-entry reserve in TaskWorkspace is a warm start, not a bound.
+  auto ensure_level_capacity = [&level_reservations](size_t needed) {
+    if (level_reservations.size() + needed > level_reservations.capacity()) {
+      TestOnlyMaybeThrowOnRecordGrowth();
+      level_reservations.reserve(std::max(level_reservations.capacity() * 2,
+                                          level_reservations.size() + needed));
+    }
+  };
   // Sometimes receiver is reused, othertimes not, so only jump start if small.
   if (receiver->capacity() < 30) {
     receiver->reserve(receiver->size() + 30);
@@ -1707,12 +1775,35 @@ void SearchWorker::PickNodesToExtendTask(
   const bool stop_root =
       is_root_node && ShouldStopPickingHere(node, true, repetitions);
   const bool visit_root = stop_root && node->TryStartScoreUpdate();
+  // The TryStartScoreUpdate above is this call's own increment (root call
+  // only -- a submitted task's start node was already started by its parent);
+  // the guard owns it until the entry below records it.
+  coverage_guard.own_visit_node = node;
+  coverage_guard.own_visit_amount = visit_root ? 1 : 0;
   current_path.emplace_back(collision_limit, true, visit_root, stop_root, 0);
+  // full_path currently ends AT root itself (full_path.back() == node), so
+  // root's own ancestor prefix is everything before that.
+  reservation_ledger.emplace_back(node, static_cast<int>(full_path.size()) - 1);
+  // The entry above now records this call's own reservation and the inherited
+  // coverage it was handed; a later throw is rolled back from
+  // current_path/reservation_ledger by the catch below, so the entry guard
+  // must give up ownership or the coverage would be cancelled twice.
+  coverage_guard.active = false;
   // take base sqrt(2) logarithm of root node for large subbranch N limit. It is
   // used to split tasks.
   const unsigned large_branch_limit =
       std::bit_width(search_->root_node_->GetN()) * 2;
 
+  // Everything from here down can leave a partial reservation behind if it
+  // throws mid-traversal (agora #41/#872 P1): n_in_flight_ increments made
+  // for a node that hasn't yet produced a receiver entry (Visit/Collision)
+  // or been handed to a submitted task are invisible to
+  // CancelPendingMinibatchVisits, which only walks emitted entries. Roll
+  // those back here before propagating, using the same per-entry
+  // node-to-root walk CancelPendingMinibatchVisits uses for a real entry --
+  // see the cleanup block below for why each entry needs that walk, not a
+  // direct cancel on its own node.
+  try {
   while (current_path.size() > 0) {
     assert(full_path.size() >= path.size());
     // First prepare visits_to_perform.
@@ -1721,9 +1812,20 @@ void SearchWorker::PickNodesToExtendTask(
     // First check if node is terminal or not-expanded.  If either than create
     // a collision of appropriate size and pop current_path.
     if (current_path.back().stop_picking_) {
+      bool emitted_visit = false;
       if (current_path.back().visit_child_) {
         cur_limit -= 1;
         receiver->push_back(NodeToProcess::Visit(full_path, history));
+        // The visit's share is now owned by that receiver entry (its future
+        // cancellation walks leaf-inclusive), so relinquish it in the ledger
+        // immediately. If it were still counted here, a throw while emitting
+        // the collision below would make this call's catch cancel it once
+        // more, and the emitted Visit entry's own cancellation would cancel
+        // it a second time (review #878 finding 2). The colliding share
+        // stays owned until its own insertion succeeds.
+        current_path.back().visit_child_ = 0;
+        current_path.back().visits_ -= 1;
+        emitted_visit = true;
       }
       // Create collisions here.
       if (cur_limit > 0) {
@@ -1732,13 +1834,30 @@ void SearchWorker::PickNodesToExtendTask(
             max_limit > cur_limit) {
           max_count = max_limit;
         }
+        if (emitted_visit) {
+          // Dedicated seam (review #881 P2): only reachable when a Visit was
+          // just inserted AND a collision share remains -- the exact window
+          // the split-ownership fix protects. It records the remaining share
+          // so the regression test asserts this post-visit context instead
+          // of merely that some emission happened somewhere.
+          TestOnlyRecordPostVisitRemainingShare(cur_limit);
+          TestOnlyMaybeThrowAt(
+              TestOnlyThrowSite::kBeforeCollisionAfterVisit);
+        } else {
+          // Collision-only entry: the generic emission seam.
+          TestOnlyMaybeThrowAt(TestOnlyThrowSite::kBeforeEmission);
+        }
         receiver->push_back(
             NodeToProcess::Collision(full_path, cur_limit, max_count));
+        // Collision share transferred too (leaf-exclusive cancellation); the
+        // entry is popped right below either way.
+        current_path.back().visits_ = 0;
       }
       bool saved_is_last_child;
       do {
         saved_is_last_child = current_path.back().last_child_;
         current_path.pop_back();
+        reservation_ledger.pop_back();
         if (current_path.size() == 0) break;
         history.Pop();
         full_path.pop_back();
@@ -1829,7 +1948,8 @@ void SearchWorker::PickNodesToExtendTask(
             // If root move filter exists, make sure move is in the list.
             if (!root_move_filter.empty() &&
                 std::find(root_move_filter.begin(), root_move_filter.end(),
-                          cur_iters[idx].GetMove()) == root_move_filter.end()) {
+                          cur_iters[idx].GetMove()) ==
+                    root_move_filter.end()) {
               continue;
             }
           }
@@ -1887,7 +2007,11 @@ void SearchWorker::PickNodesToExtendTask(
 
           // Add more visits to the branch.
           Node* child_node = best_edge.GetOrSpawnNode(/* parent */ node);
+          // One entry is committed right after the increment, so capacity
+          // must exist before it (#876 finding 1).
+          ensure_level_capacity(1);
           child_node->IncrementNInFlight(new_visits);
+          level_reservations.emplace_back(child_node, new_visits);
           current_nstarted[best_idx] += new_visits;
           current_score[best_idx] = cur_iters[best_idx].GetP() * puct_mult /
                                         (1 + current_nstarted[best_idx]) +
@@ -1902,7 +2026,13 @@ void SearchWorker::PickNodesToExtendTask(
         full_path.push_back({child_node, child_repetitions, child_moves_left});
         visits_to_perform[best_idx].large_branch_ =
             child_node->GetN() > large_branch_limit;
+        // This branch can commit two entries (the TryStartScoreUpdate below
+        // and the IncrementNInFlight further down, which the throw seam runs
+        // between), so ensure capacity for both before either increment.
+        ensure_level_capacity(2);
         if (child_node->TryStartScoreUpdate()) {
+          level_reservations.emplace_back(child_node, 1);
+          TestOnlyMaybeThrowAfterReservation();
           current_nstarted[best_idx]++;
           new_visits -= 1;
           if (ShouldStopPickingHere(child_node, false, child_repetitions)) {
@@ -1910,6 +2040,7 @@ void SearchWorker::PickNodesToExtendTask(
             visits_to_perform[best_idx].stop_picking_ = 1;
           } else {
             child_node->IncrementNInFlight(new_visits);
+            level_reservations.emplace_back(child_node, new_visits);
             current_nstarted[best_idx] += new_visits;
           }
           current_score[best_idx] = cur_iters[best_idx].GetP() * puct_mult /
@@ -1949,7 +2080,7 @@ void SearchWorker::PickNodesToExtendTask(
       for (int i = 1; i < std::distance(visits_to_perform.begin(), end); i++) {
         int child_limit = visits_to_perform[i].visits_;
         bool is_large_branch = visits_to_perform[i].large_branch_;
-        if (task_workers_ > 0 &&
+        if (task_pool_ &&
             ((is_large_main_branch && is_large_branch) ||
              ((is_large_main_branch || is_large_branch) &&
               child_limit > params_.GetMinimumWorkSizeForPicking()) ||
@@ -1963,20 +2094,41 @@ void SearchWorker::PickNodesToExtendTask(
               {child_node, child_repetitions, child_moves_left});
           // Don't split if not expanded or terminal.
           if (!visits_to_perform[i].stop_picking_) {
-            bool passed = false;
-            {
-              // Multiple writers, so need mutex here.
-              Mutex::Lock lock(picking_tasks_mutex_);
-              // Ensure not to exceed size of reservation.
-              if (picking_tasks_.size() < MAX_TASKS) {
-                picking_tasks_.emplace_back(full_path, history, child_limit);
-                task_count_.fetch_add(1, std::memory_order_acq_rel);
-                task_added_.notify_all();
-                passed = true;
-              }
-            }
+            // Preserve the old scheduler's MAX_TASKS==256 round-wide budget
+            // (agora #41/#867 stage 4 -- explicitly NOT classic's
+            // per-invocation cap, which would change behavior).
+            bool passed =
+                TryClaimRoundTaskSlot(tasks_submitted_this_round_, MAX_TASKS);
             if (passed) {
+              task_pool_->Submit(PickTask(full_path, history, child_limit));
               visits_to_perform[i] = 0;
+              // Ownership of this child's reservation transfers to the
+              // submitted task, which rolls it back itself on its own
+              // throw -- it's no longer this call's responsibility. This
+              // has to happen before the test-only throw seam below: a
+              // throw before the ownership transfer completes would leave
+              // both this call's cleanup and the already-running submitted
+              // task racing to cancel the same reservation.
+              auto new_end = std::remove_if(
+                  level_reservations.begin(), level_reservations.end(),
+                  [child_node](const std::pair<Node*, int>& e) {
+                    return e.first == child_node;
+                  });
+              level_reservations.erase(new_end, level_reservations.end());
+              // The submitted task also owns the ancestor coverage for this
+              // budget: its own receiver entries' cancellation walks the full
+              // path, and its own cleanup covers the ancestors if it fails
+              // before emitting anything. This level's entry still carries a
+              // copy of that coverage until it is zeroed after the split loop
+              // ("fully redistributed" below), so subtract the handed-off
+              // share now -- otherwise an exception at the post-submit seam
+              // would cancel the transferred portion here and again in the
+              // task (review #874 / #876 post-submit finding).
+              current_path.back().visits_ -= child_limit;
+              // Own site (#876 f5): distinct from the generic
+              // after-reservation seam, so a test can target exactly the
+              // post-submit window above.
+              TestOnlyMaybeThrowAt(TestOnlyThrowSite::kAfterSubmit);
             }
           }
           history.Pop();
@@ -1986,13 +2138,73 @@ void SearchWorker::PickNodesToExtendTask(
       auto rend = visits_to_perform.rend();
       auto rbegin = rend - std::distance(visits_to_perform.begin(), end);
       size_t size = current_path.size();
-      std::copy_if(rbegin, rend, std::back_inserter(current_path),
-                   [](CurrentPath& v) {
-                     return !!v;
-                   });
+      // Atomic promotion (review #878 finding 3): everything that can throw
+      // -- spawning the child handles and growing either parallel vector --
+      // happens BEFORE the parent entry gives up its ownership. Once both
+      // vectors have room and the handles exist, the commit loop only copies
+      // trivial values and cannot throw: either the whole level is promoted
+      // and level_reservations is released, or (on a throw above) the catch
+      // sees the still-live parent entry plus level_reservations and cancels
+      // exactly once. The old code zeroed the parent first, pushed
+      // current_path and reservation_ledger separately, and cleared
+      // level_reservations last, so a throw in between could lose the
+      // unpromoted ancestor share and/or double-cancel a promoted child
+      // through both ledgers.
+      auto& promoted_nodes = workspace->promoted_nodes;
+      promoted_nodes.clear();
+      size_t promoted = 0;
+      for (auto it = rbegin; it != rend; ++it) {
+        if (*it) ++promoted;
+      }
+      promoted_nodes.reserve(promoted);
+      for (auto it = rbegin; it != rend; ++it) {
+        if (!*it) continue;
+        // The node already exists (spawned when this child's visits were
+        // assigned); this is a lookup, but it is still done before ownership
+        // changes so even a spawn cannot invalidate the rollback state.
+        promoted_nodes.push_back(
+            cur_iters[it->index_].GetOrSpawnNode(node));
+      }
+      if (current_path.size() + promoted > current_path.capacity()) {
+        TestOnlyMaybeThrowAt(TestOnlyThrowSite::kBeforePromotionPathGrowth);
+        current_path.reserve(std::max(current_path.capacity() * 2,
+                                      current_path.size() + promoted));
+      }
+      if (reservation_ledger.size() + promoted >
+          reservation_ledger.capacity()) {
+        TestOnlyMaybeThrowAt(TestOnlyThrowSite::kBeforePromotionLedgerGrowth);
+        reservation_ledger.reserve(std::max(reservation_ledger.capacity() * 2,
+                                            reservation_ledger.size() +
+                                                promoted));
+      }
+      // Non-throwing commit from here down.
+      // This level's own reservation is about to be fully redistributed to
+      // whatever survives below (pushed onto current_path) or was handed
+      // off to a task above -- zero it so the cleanup block on an exception
+      // doesn't also treat it as still outstanding (current_path[i].visits_
+      // == 0 marks a superseded/dead entry, matching the sentinel-zero
+      // convention CurrentPath::operator bool already uses).
+      current_path.back().visits_ = 0;
+      // All the children pushed below share this same parent, so they
+      // share the same ancestor prefix: everything currently in full_path
+      // (which still ends at `node`, this level's parent -- the child
+      // itself is never appended to full_path here, only when the
+      // traversal actually descends into it).
+      const int child_ancestor_prefix_len = static_cast<int>(full_path.size());
+      size_t next = 0;
+      for (auto it = rbegin; it != rend; ++it) {
+        if (!*it) continue;
+        current_path.push_back(*it);
+        reservation_ledger.emplace_back(promoted_nodes[next++],
+                                        child_ancestor_prefix_len);
+      }
       if (current_path.size() != size) {
         current_path[size].last_child_ = true;
       }
+      // Everything still in level_reservations at this point was either
+      // promoted above (now tracked via current_path/reservation_ledger) or
+      // handed off to a task -- this level's traversal is done with it.
+      level_reservations.clear();
       // Fall through to select the first child.
     }
     // Prepare state for the next node to be processed. The parent node
@@ -2010,6 +2222,55 @@ void SearchWorker::PickNodesToExtendTask(
           GetRepetitions(full_path.size(), history.Last());
       full_path.push_back({node, repetitions, moves_left});
     }
+  }
+  } catch (...) {
+    // Roll back every reservation this call made that never reached the
+    // output receiver or a submitted task, using the same path-slice walk
+    // CancelPendingMinibatchVisits performs for a real receiver entry (Node
+    // has no GetParent() in a DAG -- a node can have several -- so this
+    // walks the ancestor prefix of full_path recorded alongside each
+    // reservation_ledger entry instead of a parent chain; see the
+    // TaskWorkspace comment for why level_reservations doesn't need this).
+    auto cancel_prefix = [&full_path](int prefix_len, int amount) {
+      if (amount <= 0) return;
+      for (int j = 0; j < prefix_len; ++j) {
+        std::get<0>(full_path[j])->CancelScoreUpdate(amount);
+      }
+    };
+    // This level's not-yet-promoted picks were reserved directly on their
+    // own node only -- the still-live ancestor entry below (not yet
+    // superseded, since promotion for this level hasn't happened) already
+    // accounts for the rest of the chain up to root.
+    for (auto& entry : level_reservations) {
+      entry.first->CancelScoreUpdate(entry.second);
+    }
+    level_reservations.clear();
+    // Everything still on the stack: current_path[i].visits_ == 0 marks an
+    // entry superseded by its own already-pushed children (nothing to
+    // cancel there -- its share is fully covered by those children's own
+    // walks). A live non-leaf entry had its full amount applied at its own
+    // node and every ancestor. A live leaf-shaped (stop_picking_) entry is
+    // split the same way a real Visit/Collision receiver entry would be:
+    // up to 1 visit walked leaf-inclusive, the remainder (a would-be
+    // collision) walked leaf-exclusive (ancestors only).
+    for (size_t i = 0; i < current_path.size(); ++i) {
+      const auto& entry = current_path[i];
+      if (entry.visits_ == 0) continue;
+      auto [n, prefix_len] = reservation_ledger[i];
+      if (entry.stop_picking_) {
+        int visit_amount = entry.visit_child_ ? 1 : 0;
+        if (visit_amount > 0) n->CancelScoreUpdate(visit_amount);
+        cancel_prefix(prefix_len, visit_amount);
+        cancel_prefix(prefix_len,
+                       static_cast<int>(entry.visits_) - visit_amount);
+      } else {
+        n->CancelScoreUpdate(static_cast<int>(entry.visits_));
+        cancel_prefix(prefix_len, static_cast<int>(entry.visits_));
+      }
+    }
+    current_path.clear();
+    reservation_ledger.clear();
+    throw;
   }
   assert(!starting_from_root ||
          history.GetLength() == search_->played_history_.GetLength());
