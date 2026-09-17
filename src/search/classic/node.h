@@ -189,6 +189,17 @@ class Node {
     }
   }
 
+  // Single-edge policy accessor, for callers writing into a non-contiguous
+  // (e.g. array-of-structs) destination where CopyPolicy's contiguous
+  // std::min(...)-bounded write doesn't fit. i must be < GetNumEdges().
+  // (Review #864: the previous strided CopyPolicy(..., stride) overload did
+  // char*-cast pointer arithmetic past the bounds of the single float
+  // subobject it was given to reach sibling array-of-structs elements --
+  // works on this compiler, but not standards-safe pointer provenance. This
+  // is the same one GetP() per edge, just typed and bounds-obvious at the
+  // call site instead.)
+  float GetEdgeP(int i) const { return edges_[i].GetP(); }
+
   // Makes the node terminal and sets it's score.
   void MakeTerminal(GameResult result, float plies_left = 0.0f,
                     Terminal type = Terminal::EndOfGame);
