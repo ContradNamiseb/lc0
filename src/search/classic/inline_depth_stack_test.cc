@@ -9,12 +9,12 @@
 */
 
 // Boundary tests for the classic-search picking cache structures, encoding
-// the probes from the agora #857 release review:
+// the probes from the release review:
 //  * InlineDepthStack must survive descents past its inline capacity
 //    (push 257 used to be an ASan-confirmed stack-buffer-overflow scribbling
 //    into adjacent CachedNodeData memory).
 //  * Node::GetEdgeP() (the AoS per-edge accessor that replaced CopyPolicy's
-//    strided overload -- review #864 found that overload's pointer
+//    strided overload -- that overload's pointer
 //    arithmetic past the single float subobject it was given, to reach
 //    sibling array-of-structs elements, was not standards-safe) must agree
 //    with CopyPolicy's contiguous path for every edge count and must not
@@ -106,7 +106,7 @@ TEST(CopyPolicyStrided, GetEdgePMatchesContiguousAndKeepsNeighbours) {
 }
 
 // Guards CachedNodeData's scalar defaults (they have NSDMIs, so this holds
-// regardless of `{}` vs bare default-init -- review #864 found the earlier
+// regardless of `{}` vs bare default-init -- found the earlier
 // claim that dropping `{}` avoided construction cost was false; every
 // ChildCache scalar still gets initialized either way. The actual fix for
 // that cost was moving CachedNodeData into TaskWorkspace so it's built once
@@ -120,7 +120,7 @@ TEST(CachedNodeData, ScalarsDefaultStackStartsEmpty) {
 }
 
 // CachedNodeData now lives in TaskWorkspace and is reused across calls
-// (review #864) instead of being freshly constructed per call. Simulates
+// instead of being freshly constructed per call. Simulates
 // two consecutive "levels" sharing one cache object -- a wide round filling
 // many children[] slots followed by a narrow round filling few -- and
 // checks the narrow round's own freshly-filled range is correct (not

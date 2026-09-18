@@ -192,7 +192,7 @@ class Node {
   // Single-edge policy accessor, for callers writing into a non-contiguous
   // (e.g. array-of-structs) destination where CopyPolicy's contiguous
   // std::min(...)-bounded write doesn't fit. i must be < GetNumEdges().
-  // (Review #864: the previous strided CopyPolicy(..., stride) overload did
+  // the previous strided CopyPolicy(..., stride) overload did
   // char*-cast pointer arithmetic past the bounds of the single float
   // subobject it was given to reach sibling array-of-structs elements --
   // works on this compiler, but not standards-safe pointer provenance. This

@@ -1581,7 +1581,7 @@ void SearchWorker::PickNodesToExtendTask(
   // TODO: pre-reserve visits_to_perform for expected depth and likely maximum
   // width. Maybe even do so outside of lock scope.
   // Cached per-level data lives in the workspace (one per worker), not a
-  // per-call local -- review #864: a local here paid a ~14KB stack frame +
+  // per-call local -- a local here paid a ~14KB stack frame +
   // 256-entry NSDMI init on every call regardless of the dropped `{}`.
   // Reused across calls the same way vtp_buffer/visits_to_perform below
   // already are.
@@ -1692,7 +1692,7 @@ void SearchWorker::PickNodesToExtendTask(
       // Write policy values straight into the AoS cache, one typed field
       // access per edge -- no temp buffer, and no pointer arithmetic past
       // the bounds of what CopyPolicy's old stride parameter was actually
-      // given (review #864).
+      // given.
       for (int i = 0; i < cache.max_policy_entries_needed; i++) {
         cache.children[i].policy = node->GetEdgeP(i);
       }

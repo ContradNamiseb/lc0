@@ -8,8 +8,8 @@
   (at your option) any later version.
 */
 
-// Coverage for dag_classic's ported AoS picking cache (agora #41/#867 stage
-// 1 -- classic's CachedNodeData/ChildCache refactor applied to dag_classic's
+// Coverage for dag_classic's ported AoS picking cache (classic's
+// CachedNodeData/ChildCache refactor applied to dag_classic's
 // PickNodesToExtendTask, replacing the four parallel SoA arrays
 // current_util/current_score/current_nstarted/cur_iters). The cache now
 // lives in TaskWorkspace, reused across every level within one gather call
@@ -44,7 +44,7 @@ TEST(CachedNodeData, ChildCacheDefaultsAreZero) {
 
 TEST(CachedNodeData, WorkspaceConstructsWithoutASearchWorker) {
   // TaskWorkspace must remain default-constructible standalone -- the pool
-  // migration (stage 3) will need one-per-worker instances built the same
+  // migration will need one-per-worker instances built the same
   // way classic's are.
   TaskWorkspace workspace;
   EXPECT_EQ(workspace.current_path.capacity() >= 30, true);

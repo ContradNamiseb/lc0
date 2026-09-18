@@ -443,7 +443,7 @@ class SearchWorker {
   // Per-child picking scratch, keyed by ORIGINAL edge index (not the sorted
   // order visits_to_perform ends up in -- CurrentPath::index_ is what lets
   // the two stay correlated after visits_to_perform is sorted by visit
-  // count). Ported from classic's AoS refactor (agora #857/#864): replaces
+  // count). Ported from classic's AoS refactor: replaces
   // four parallel std::array<float/int,256>/cur_iters arrays that were
   // separately indexed by the same idx on every access in the UCT scan
   // below, trading four scattered cache lines per child for one.

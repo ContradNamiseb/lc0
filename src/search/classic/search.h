@@ -342,7 +342,7 @@ class SearchWorker {
       NodeToProcess np(node, depth, false, 1, 0);
       // Only visits are ever evaluated (collisions never touch eval -- every
       // consumer is behind IsCollision/nn_queried guards), so allocate here
-      // rather than for every collision entry (#859 addition 5).
+      // rather than for every collision entry.
       np.eval = std::make_unique<EvalResult>();
       return np;
     }
@@ -369,7 +369,7 @@ class SearchWorker {
   // This stack is indexed by DESCENT DEPTH within one gather task -- which
   // nothing bounds at 256 (current_path/visits_to_perform are unbounded
   // vectors, and deep lines occur in real reused trees). The old fixed
-  // array overflowed at push 257 (ASan-confirmed, agora #857 P1); entries
+  // array overflowed at push 257 (ASan-confirmed); entries
   // past the inline capacity now spill to `overflow`, keeping the inline
   // array hot for every ordinary tree.
   struct InlineDepthStack {
@@ -415,7 +415,7 @@ class SearchWorker {
   // gating discipline covers vtp_last_filled_cache (push -1 per level), and
   // it holds whether this object is reused across levels within one call
   // (always true) or across calls (true now that it lives in TaskWorkspace
-  // below instead of being a per-call local -- review #864: a bare local
+  // below instead of being a per-call local -- a bare local
   // `CachedNodeData cache;` here does NOT skip construction despite the
   // dropped `{}` -- every ChildCache scalar has an NSDMI, so the compiler
   // still emits a ~14KB stack frame and a 256-entry init loop on every call
