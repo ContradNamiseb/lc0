@@ -8,16 +8,16 @@
   (at your option) any later version.
 */
 
-// Serial-vs-pooled equivalence coverage for review #867/#868: TaskWorkers=0
+// Serial-vs-pooled equivalence coverage for: TaskWorkers=0
 // (all picking/processing done inline on the search thread, task_pool_ is
 // never constructed) and TaskWorkers>0 (work split across a TaskStealingPool)
 // are two different code paths through the same PickNodesToExtend/
 // GatherMinibatch logic. This asserts both converge cleanly to the same
-// visit budget with zero leaked N-in-flight -- codex-sol's re-review
-// (agora #867) asked for this as validation before approving the
+// visit budget with zero leaked N-in-flight -- an earlier review
+// asked for this as validation before approving the
 // TaskStealingPool migration.
 //
-// review #872 point 2: the original version of this test used
+// the original version of this test used
 // recommended_batch_size=1 and a one-visit collision budget, so
 // AddInput always returned FETCHED_IMMEDIATELY, classic's gather split
 // never triggered (child_limit never exceeded MinimumWorkSizeForPicking),
@@ -251,11 +251,11 @@ TEST(SearchPoolEquivalence, PooledConvergesCleanly) {
   // The real proof the pool path did search work rather than degenerating
   // into pure collisions: with real batching and 4 task workers, a shallow
   // or sparse tree here means gathering/processing tasks never actually
-  // ran real picks, only what codex-sol's #872 review flagged as an
+  // ran real picks, only what an earlier review flagged as an
   // unproven "constructing worker threads is not evidence they executed."
   EXPECT_GE(r.shape.visited_nodes, 500);
   EXPECT_GE(r.shape.max_depth, 4);
-  // review #876 f5: the executor counters themselves, not the tree shape,
+  // the executor counters themselves, not the tree shape,
   // prove worker tasks actually ran -- gathering picks on worker threads, and
   // the batched processing tasks the pool submits for larger batches.
   EXPECT_GT(r.gathering_executed, 0);

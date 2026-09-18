@@ -8,13 +8,13 @@
   (at your option) any later version.
 */
 
-// Fault-injection coverage for review #872 P1: n_in_flight_ reservations
+// Fault-injection coverage for: n_in_flight_ reservations
 // made mid-traversal inside PickNodesToExtendTask (a fresh
 // TryStartScoreUpdate(), or a successful hand-off to the task pool) were
 // invisible to CancelPendingMinibatch until they landed in a receiver
 // entry -- an exception in the gap between reservation and emission would
 // otherwise leak them, distinct from (and not covered by) the earlier
-// #868 fix, which only made sure the pool itself was drained/rethrown
+// fix, which only made sure the pool itself was drained/rethrown
 // correctly around an exception already in a receiver entry.
 //
 // This uses the g_testonly_throw_after_reservations seam
@@ -207,7 +207,7 @@ TEST_F(ReservationRollbackTest, PooledThrowMidTraversalLeavesNoReservation) {
   ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
 }
 
-// ---- review #876 finding 1: ledger capacity is not depth-bounded ----------
+// ---- ledger capacity is not depth-bounded ----------
 //
 // A budget of 1 can walk an arbitrarily deep expanded chain, adding one
 // record per level, and retired records stay in the vector -- so the initial
@@ -272,11 +272,11 @@ TEST_F(ReservationRollbackTest, DeepChainGrowthFailureLeavesNoReservation) {
   EXPECT_EQ(bestmove_count.load(), 1);
   EXPECT_TRUE(TestOnlyWasThrowFired(TestOnlyThrowSite::kBeforeRecordGrowth))
       << "the ledger never needed to grow: the chain did not exceed the "
-         "initial reserve, so this test would not cover finding 1";
+         "initial reserve, so this test would not cover the growth path";
   ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
 }
 
-// ---- review #876 finding 2: retire only after the emission succeeded ------
+// ---- retire only after the emission succeeded ------
 //
 // The seam sits immediately before the receiver insertion, so the throw
 // arrives while the ledger still owns the just-reserved amount. If the
@@ -320,7 +320,7 @@ TEST_F(ReservationRollbackTest, EmissionFailureLeavesNoReservation) {
   ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
 }
 
-// ---- review #876 finding 3: submitted tasks need an entry guard -----------
+// ---- submitted tasks need an entry guard -----------
 //
 // The seam fires at the entry of a submitted task, before any of its
 // allocating setup and before its ledger records exist. The submitting call
@@ -368,7 +368,7 @@ TEST_F(ReservationRollbackTest, SubmittedTaskEntrySetupFailureLeavesNoReservatio
   ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
 }
 
-// ---- review #874/#876: post-submit ownership transfer ---------------------
+// ---- post-submit ownership transfer ---------------------
 //
 // The seam fires immediately after a successful Submit, with the parent's
 // level entry not yet zeroed. Without the transferred-share subtraction (and
@@ -416,7 +416,7 @@ TEST_F(ReservationRollbackTest, PooledPostSubmitThrowLeavesNoReservation) {
   ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
 }
 
-// ---- review #878 finding 1: guard must precede the warm reserve -----------
+// ---- guard must precede the warm reserve -----------
 //
 // The seam fires at a submitted task's very first allocating step (the
 // ledger warm reserve), while the submitting call has already relinquished
@@ -464,7 +464,7 @@ TEST_F(ReservationRollbackTest, SubmittedTaskInitialReserveFailureLeavesNoReserv
   ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
 }
 
-// ---- review #883: merge-reserve failure must cancel, not drop -------------
+// ---- merge-reserve failure must cancel, not drop -------------
 //
 // Pooled gathering with real completed results: inject a failure at the
 // destination-merge reserve. After the drain those results have no other

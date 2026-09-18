@@ -20,12 +20,12 @@
 // defined, which meson.build does for the test executables whose sources
 // include this header. Production targets (lc0.exe) compile the stub
 // overloads below instead, so the search/pool hot paths carry no shared
-// atomic RMW and no extra branches (review #878 finding 5) -- "test-only by
+// atomic RMW and no extra branches -- "test-only
 // naming" is not enough when the call site executes per pick and per task.
 //
 // The seams are per-site counters so a test arms exactly the location it
 // means to exercise, instead of racing one process-wide countdown whose
-// winning site is whichever thread/level gets there first (#876 finding 5).
+// winning site is whichever thread/level gets there first.
 // Each site starts disabled (-1, one relaxed load per call site); a
 // non-negative value N makes that site throw on its (N+1)-th hit, i.e. after
 // N earlier hits were consumed.
@@ -34,45 +34,45 @@ namespace lczero {
 
 enum class TestOnlyThrowSite : int {
   // Immediately after an n_in_flight_ increment made mid-traversal (classic
-  // and dag_classic). The original #872 P1 seam.
+  // and dag_classic). The original seam.
   kAfterReservation = 0,
   // Immediately before a receiver push_back, simulating the emission itself
-  // failing while the rollback ledger still owns the coverage (#876 f2).
+  // failing while the rollback ledger still owns the coverage.
   kBeforeEmission,
   // Immediately after a successful pool Submit, while the submitting call
-  // still holds its own mirror of the handed-off coverage (#874/#876 f4).
+  // still holds its own mirror of the handed-off coverage.
   kAfterSubmit,
   // Entry of a submitted task, after its entry guard exists but before any
-  // allocating setup (#876 f3).
+  // allocating setup.
   kBeforeTaskEntrySetup,
   // A rollback-record/level-reservation capacity growth point, before the
-  // growth allocates (#876 f1: a growth failure must not orphan an increment
+  // growth allocates (: a growth failure must not orphan an increment
   // that has already been applied).
   kBeforeRecordGrowth,
   // The classic task's warm ledger reserve at call entry, before the entry
-  // guard would previously have been constructed (#878 f1).
+  // guard would previously have been constructed.
   kBeforeInitialReserve,
   // DAG promotion's current_path/reservation_ledger growth points, before
-  // either vector changes (#878 f3).
+  // either vector changes.
   kBeforePromotionPathGrowth,
   kBeforePromotionLedgerGrowth,
   // A queue insertion in TaskStealingPool::Submit, before the task is
-  // published (#878 f4).
+  // published.
   kPoolInsert,
-  // The completion-slot reserve in TaskStealingPool (review #881): the
+  // The completion-slot reserve in TaskStealingPool: the
   // acceptance-time allocation that keeps worker-side completion publication
   // nonallocating.
   kPoolCompletionReserve,
   // Immediately before a collision insertion that follows a successful Visit
-  // insertion in the same stop_picking entry (review #881 P2). Distinct from
+  // insertion in the same stop_picking entry. Distinct
   // kBeforeEmission, which fires for collision-only entries too.
   kBeforeCollisionAfterVisit,
   // Immediately before the destination reserve that merges drained task
-  // results into minibatch_ (review #883).
+  // results into minibatch_.
   kBeforeMergeReserve,
   // Variant of the above that fires only when the drained batch contains at
   // least one completed collision, so a focused test can exercise the
-  // collision-recovery branch (review #885).
+  // collision-recovery branch.
   kBeforeMergeReserveWithCollision,
   // Top of the pool executor callback, before the task's own code runs.
   kWorkerExecutor,
@@ -96,7 +96,7 @@ struct TestOnlyThrowCounters {
   }
 };
 
-// Context of the most recent seam throw (review #881 P2): recorded so a
+// Context of the most recent seam throw: recorded so a
 // targeted test can state WHERE its call failed instead of merely that some
 // worker task ran at some point. Pool executor threads mark this at task
 // entry; TestOnlyMaybeThrowAt snapshots it when it throws.
@@ -111,7 +111,7 @@ static inline bool TestOnlyLastThrowInPoolTask() {
   return g_testonly_last_throw_in_pool_task.load(std::memory_order_relaxed);
 }
 
-// Remaining collision share at the post-visit seam (review #881 P2): the seam
+// Remaining collision share at the post-visit seam: the seam
 // may only fire with a share still left after the Visit was emitted.
 inline std::atomic<int64_t> g_testonly_post_visit_remaining_share{-1};
 
@@ -123,8 +123,8 @@ static inline int64_t TestOnlyPostVisitRemainingShare() {
   return g_testonly_post_visit_remaining_share.load(std::memory_order_relaxed);
 }
 
-// Collision entries cancelled by the merge-failure recovery path (review
-// #885): lets the focused test prove that branch actually ran.
+// Collision entries cancelled by the merge-failure recovery path, so the
+// focused test can prove that branch actually ran.
 inline std::atomic<int64_t> g_testonly_unmerged_collisions_cancelled{0};
 
 static inline void TestOnlyRecordUnmergedCollisionCancelled() {

@@ -236,7 +236,7 @@ class SearchWorker {
         // Signed arithmetic: hardware_concurrency()/working_threads == 0 used
         // to wrap to UINT_MAX via the unsigned "- 1" and clamp to 4, giving
         // low-core boxes four spinning helpers instead of zero (mirrors
-        // classic #858 f9).
+        // classic).
         const unsigned hw = std::thread::hardware_concurrency();
         task_workers_ = std::max(
             0, std::min(static_cast<int>(hw / working_threads) - 1, 4));
@@ -248,12 +248,11 @@ class SearchWorker {
       }
       task_pool_ = std::make_unique<TaskStealingPool<PickTask>>(
           task_workers_, [this](PickTask& task, int tid) {
-            // Test-only seams (#876 f5): a worker-executor fault site before
+            // Test-only seams: a worker-executor fault site before
             // the task's own code runs, and per-type execution counters that
             // prove these callbacks actually executed while a pool round was
             // in flight (tree size/shape alone does not). The context mark
             // lets a seam throw record that it happened in a pool task
-            // (review #881 P2).
             TestOnlyMarkPoolTaskContext();
             TestOnlyMaybeThrowAt(TestOnlyThrowSite::kWorkerExecutor);
             switch (task.task_type) {
@@ -305,7 +304,7 @@ class SearchWorker {
       std::cerr << "Unhandled exception in worker thread: " << e.what()
                 << std::endl;
       // Release this worker's own abandoned real-visit reservations before
-      // signalling stop (review #866 P1-3) -- mirrors classic's
+      // signalling stop -- mirrors classic's
       // CancelPendingMinibatch(). Collisions need no handling here:
       // GatherMinibatch's own absl::Cleanup (cancel_collisions) already
       // cancelled every collision the moment GatherMinibatch() itself
@@ -336,8 +335,8 @@ class SearchWorker {
   // GatherMinibatch() itself exits (its own absl::Cleanup), on every path,
   // exception included -- so by the time this runs, any collision entries
   // still physically present in minibatch_ have already been released, and
-  // walking them again here would double-cancel the same path (review #866
-  // P1-3). Real visits get no such per-call cleanup -- GatherMinibatch
+  // walking them again here would double-cancel the same path
+  // . Real visits get no such per-call cleanup -- GatherMinibatch
   // deliberately keeps them reserved across the rest of the iteration -- so
   // without this they leak for the rest of the search on any failure
   // between GatherMinibatch() returning and DoBackupUpdate() running.
@@ -445,8 +444,7 @@ class SearchWorker {
           repetitions(0) {}
     // Only visits are ever evaluated (collisions never touch eval -- every
     // consumer is behind IsCollision/nn_queried guards), so allocate here
-    // rather than for every collision entry (mirrors classic's #859
-    // addition 5).
+    // rather than for every collision entry (same convention as classic).
     NodeToProcess(const BackupPath& path, const PositionHistory& in_history)
         : path(path),
           node(std::get<0>(path.back())),
@@ -506,8 +504,8 @@ class SearchWorker {
     std::array<Node::Iterator, 256> cur_iters;
     std::vector<CurrentPath> current_path;
     BackupPath full_path;
-    // Reservation-rollback bookkeeping for PickNodesToExtendTask (agora
-    // #41/#872 P1): n_in_flight_ reservations made mid-traversal are not
+    // Reservation-rollback bookkeeping for PickNodesToExtendTask
+    // n_in_flight_ reservations made mid-traversal are not
     // visible to CancelPendingMinibatchVisits until they land in the output
     // receiver, so an exception between reservation and emission would
     // otherwise leak them. reservation_ledger runs parallel to current_path
@@ -524,7 +522,7 @@ class SearchWorker {
     // for the ancestor chain until it's promoted or handed to a task.
     std::vector<std::pair<Node*, int>> reservation_ledger;
     std::vector<std::pair<Node*, int>> level_reservations;
-    // Scratch for atomic promotion (review #878 finding 3): the child node
+    // Scratch for atomic promotion: the child node
     // handles are resolved here before the level's ownership is changed, so
     // the promotion commit itself cannot throw.
     std::vector<Node*> promoted_nodes;
@@ -546,7 +544,7 @@ class SearchWorker {
     enum PickTaskType { kGathering, kProcessing };
     // Deterministic default so a default-constructed pool scratch task can
     // never execute a garbage switch arm (the pool only runs moved-in tasks,
-    // but don't make the next reader re-prove it -- mirrors classic #859).
+    // but don't make the next reader re-prove it).
     PickTaskType task_type = kGathering;
 
     // For task type gathering.
@@ -583,7 +581,7 @@ class SearchWorker {
                                              bool& update_parent_bounds) const;
   void DoBackupUpdateSingleNode(const NodeToProcess& node_to_process);
   // Cancels the reservations one completed-but-unmerged result still owns
-  // (review #883): visits use the leaf-inclusive path walk, collisions the
+  // visits use the leaf-inclusive path walk, collisions the
   // ancestors-only walk CancelCollisions performs. Needed on a merge-reserve
   // failure because such entries never reach minibatch_, so neither
   // CancelPendingMinibatchVisits nor the GatherMinibatch cleanup can see
@@ -629,9 +627,8 @@ class SearchWorker {
   std::vector<TaskWorkspace> task_workspaces_;
   TaskWorkspace main_workspace_;
   // Round-wide cap on recursively-submitted kGathering tasks, preserving
-  // the old scheduler's MAX_TASKS==256 budget (agora #41/#867 stage 4 --
-  // explicitly NOT classic's per-invocation cap, which would change
-  // behavior). Reset at the top of every PickNodesToExtend() call, claimed
+  // the old scheduler's MAX_TASKS==256 budget (explicitly NOT classic's
+  // per-invocation cap, which would change behavior). Reset at the top of every PickNodesToExtend() call, claimed
   // via CAS in PickNodesToExtendTask since multiple task-pool workers can
   // be recursively submitting concurrently.
   std::atomic<int> tasks_submitted_this_round_{0};

@@ -8,8 +8,8 @@
   (at your option) any later version.
 */
 
-// dag_classic mirror of classic/backend_failure_test.cc (agora #867 P1-B /
-// #872): a real Backend::CreateComputation() failure between two
+// dag_classic mirror of classic/backend_failure_test.cc
+// a real Backend::CreateComputation() failure between two
 // iterations used to hit a stale-state bug -- InitializeIteration()
 // cleared minibatch_ AFTER the throwing CreateComputation() call, so a
 // throw on iteration N skipped the clear and left iteration (N-1)'s
@@ -111,7 +111,7 @@ class ThrowAfterNBackend : public Backend {
 // ComputeBlocking() itself once the batch reaches a real size -- unlike
 // FakeSuccessComputation above, this exercises the path where pooled tasks
 // have actually added work to the same in-flight computation before it
-// fails (review #872 point 3: FETCHED_IMMEDIATELY-everywhere never reaches
+// fails (: FETCHED_IMMEDIATELY-everywhere never reaches
 // a real ComputeBlocking() failure).
 class RealBatchThenThrowComputation : public BackendComputation {
  public:

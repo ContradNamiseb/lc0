@@ -50,7 +50,6 @@ class TaskStealingPool {
   // Worker-thread publication paths move tasks with no recovery path on the
   // worker side (an exception there escapes into std::thread and calls
   // terminate), so the lifecycle contract is enforced at compile time
-  // (review #881).
   static_assert(std::is_nothrow_move_constructible_v<Task>,
                 "TaskStealingPool requires Task to be nothrow move "
                 "constructible: queue pops and completion publication must "
@@ -78,13 +77,13 @@ class TaskStealingPool {
   TaskStealingPool& operator=(const TaskStealingPool&) = delete;
 
   // Submit a single task. Distributes to the least-loaded worker.
-  // Publish protocol (review #858/#859): active_tasks_ is incremented BEFORE
+  // Publish protocol: active_tasks_ is incremented BEFORE
   // the task becomes visible in any queue, and under wait_mutex_ so a worker
   // evaluating its wait predicate can never miss the increment. Overcounting
   // for a few instructions is harmless; undercounting released WaitForAll
   // early while tree mutation continued outside nodes_mutex_.
   //
-  // Exception safety (review #878 finding 4): if the queue insertion itself
+  // Exception safety: if the queue insertion itself
   // throws (allocation failure), the task was never published, so the counts
   // raised for it are rolled back before the exception propagates -- a
   // phantom active_tasks_ entry would otherwise hang WaitForAll forever with
@@ -93,7 +92,7 @@ class TaskStealingPool {
   // still raised after the counts, so a count-only transient can at most
   // wake a worker that finds nothing.
   //
-  // Completion storage (review #881): the slot the worker will publish this
+  // Completion storage: the slot the worker will publish this
   // task into is reserved BEFORE the task becomes visible, so the
   // worker-side completion push_back can never allocate. A failure at that
   // reservation is still on the submitting thread and rolls the acceptance
@@ -104,7 +103,7 @@ class TaskStealingPool {
       std::lock_guard<std::mutex> lock(wait_mutex_);
       active_tasks_.fetch_add(1, std::memory_order_release);
       // Published under the same lock/before-notify protocol as
-      // active_tasks_ above (review #866 P2): total_queued_ is what the
+      // active_tasks_ above: total_queued_ is what the
       // sleep predicate in WorkerLoop actually waits on, so an idle worker's
       // predicate check can never miss this task becoming available.
       total_queued_.fetch_add(1, std::memory_order_release);
@@ -133,7 +132,7 @@ class TaskStealingPool {
 
   // Submit a batch of tasks, distributed round-robin across workers.
   //
-  // Failure ownership (review #878 finding 4): elements [0, published) are
+  // Failure ownership: elements [0, published) are
   // ACCEPTED -- queued, counted, and they will execute (their Task objects
   // are moved-from in the caller's vector). The element whose insertion
   // throws and every element after it are REJECTED -- not queued, their
@@ -184,7 +183,7 @@ class TaskStealingPool {
   // Block until all submitted tasks complete. If any executor threw, the
   // first such exception is rethrown here on the caller's (owning search
   // thread's) stack after every task has still finished and reached
-  // completed_tasks_ -- review #863 finding 4: the old behavior logged and
+  // completed_tasks_ --: the old behavior logged
   // swallowed the exception, reporting a task that may have partially
   // mutated the tree (or recursively submitted children) as an ordinary
   // success. Rethrowing here lets it land in the same
@@ -210,8 +209,8 @@ class TaskStealingPool {
   // only after WaitForAll() with nothing accepted-but-unfinished (the
   // documented drain contract): outstanding_completions_ is zero, so the
   // whole vector can move out without touching the allocator, which is what
-  // makes a failure here impossible rather than merely recoverable (review
-  // #883). Losing the member's capacity is safe because every subsequent
+  // makes a failure here impossible rather than merely recoverable.
+  // Losing the member's capacity is safe because every subsequent
   // Submit reacquires its completion slot before the task becomes visible.
   std::vector<Task> DrainCompleted() {
     std::lock_guard<std::mutex> lock(completed_mutex_);
@@ -227,13 +226,13 @@ class TaskStealingPool {
   void Reset() {
     // All tasks should be complete before calling Reset. A nonzero
     // active_tasks_ here means a round is genuinely still in flight (an
-    // earlier WaitForAll() returned early -- that was the #858 publish
+    // earlier WaitForAll() returned early -- that was the publish
     // race -- or a caller simply skipped WaitForAll()). Forcing it to 0
     // with exchange(), as this used to do, doesn't restore anything: it
     // just discards the count while real tasks are still running, so a
     // live worker's later fetch_sub(1) on completion (WorkerLoop) underflows
     // the counter negative, corrupting every subsequent round's exit
-    // condition (review #866 P2) -- worse than the hang it was trying to
+    // condition -- worse than the hang it was trying to
     // avoid. Wait for the round to actually finish instead of lying about
     // it; this reuses WaitForAll()'s own exit condition so it returns
     // immediately in the (overwhelmingly common) already-idle case.
@@ -311,7 +310,7 @@ class TaskStealingPool {
   // invoke it BEFORE the tasks become visible, so a failure here is still on
   // the submitting thread and rolls the acceptance back instead of killing a
   // worker later. Grows geometrically when a new high-water mark is needed
-  // (review #883 P2: reserving the exact count on every increment relocated
+  // (: reserving the exact count on every increment relocated
   // the vector repeatedly). completed_mutex_ must be held.
   void ReserveCompletionSlotsLocked(size_t n) {
     const size_t needed =
@@ -360,7 +359,7 @@ class TaskStealingPool {
   bool TrySteal(int thief_tid, Task& out) {
     // Start from a cheap per-thread pseudo-random offset to avoid a thundering
     // herd on worker 0. (mt19937 + a distribution object per attempt showed up
-    // as real cost in the spin loops -- review #859.)
+    // as real cost in the spin loops)
     thread_local uint32_t rng = 2654435761u * static_cast<uint32_t>(
                                      reinterpret_cast<uintptr_t>(&rng)) +
                                  1013904223u;
@@ -426,10 +425,10 @@ class TaskStealingPool {
             // now, not a 100us poll: Submit/Shutdown publish state under
             // wait_mutex_ before notifying, so the predicate can never be
             // missed (the old timed wait existed only to recover from that
-            // lost-wakeup race -- review #858 finding 8).
+            // lost-wakeup race).
             //
             // The predicate is total_queued_ > 0, not active_tasks_ > 0
-            // (review #866 P2): active_tasks_ stays positive for the entire
+            // active_tasks_ stays positive for the entire
             // round, including while the round's last task is actually
             // executing and every queue is empty -- with that as the
             // predicate, every idle worker's wait() returns immediately
@@ -461,7 +460,7 @@ class TaskStealingPool {
         // bookkeeping runs either way; the task's partial results still reach
         // completed_tasks_ so the caller's undo/cancel logic sees them. The
         // first exception seen this round is also stashed and rethrown by
-        // WaitForAll() on the owning thread (review #863 finding 4) -- this
+        // WaitForAll() on the owning thread -- this
         // is not just a log-and-continue: the executor may have already
         // mutated shared tree state or recursively submitted children
         // before throwing, so the caller must not treat this as success.
@@ -479,7 +478,7 @@ class TaskStealingPool {
         {
           std::lock_guard<std::mutex> lock(completed_mutex_);
           // Cannot allocate: every accepted task had a completion slot
-          // reserved before it was published (review #881), and Task is
+          // reserved before it was published, and Task is
           // nothrow-move-constructible (static_assert above). The payload
           // therefore always reaches DrainCompleted on the owning thread,
           // even after an executor throw.
@@ -507,7 +506,7 @@ class TaskStealingPool {
   // active_tasks_ (submitted but not yet drained into completed_tasks_,
   // which stays positive while the last task is actually executing with
   // nothing queued). This is what WorkerLoop's sleep predicate waits on --
-  // see there (review #866 P2).
+  // see there.
   std::atomic<int> total_queued_{0};
   std::atomic<int> completed_{0};
   std::atomic<bool> shutdown_{false};
@@ -524,7 +523,7 @@ class TaskStealingPool {
   std::mutex completed_mutex_;
   std::vector<Task> completed_tasks_;
   // Accepted tasks whose completion slot is reserved but not yet filled;
-  // guarded by completed_mutex_. Invariant (review #881):
+  // guarded by completed_mutex_. Invariant:
   // completed_tasks_.capacity() >= completed_tasks_.size() +
   // outstanding_completions_, so the worker-side completion push_back never
   // allocates. Slots are taken in Submit before the task is published and

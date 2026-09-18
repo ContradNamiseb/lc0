@@ -8,8 +8,8 @@
   (at your option) any later version.
 */
 
-// Tests for TaskStealingPool, motivated by the classic-search refactor review
-// (agora #858): the publish-before-count race in Submit() let WaitForAll()
+// Tests for TaskStealingPool, motivated by the classic-search refactor:
+// the publish-before-count race in Submit() let WaitForAll()
 // return while tasks were still mutating the tree under the caller's
 // exclusive lock, and a throwing executor killed the worker thread and
 // stranded the counter. Both are regression-tested here.
@@ -57,7 +57,7 @@ TEST(TaskStealingPool, SingleSubmitsRoundTrip) {
   EXPECT_EQ(pool.CompletedCount(), 30);
 }
 
-// The #858 finding 1 detector. A parent task submits children from INSIDE
+// The detector. A parent task submits children from INSIDE
 // the executor and then lingers; with the old protocol (push to queue, then
 // count) a thief could finish a child and drive active_tasks_ transiently to
 // zero before the parent's increment landed, releasing WaitForAll early
@@ -96,7 +96,7 @@ TEST(TaskStealingPool, SubmitFromTaskNeverReleasesWaitEarly) {
   EXPECT_EQ(the_pool.CompletedCount(), kParents * (1 + kChildren));
 }
 
-// The #858 finding 2 companion: an executor exception used to escape into
+// The companion: an executor exception used to escape into
 // the std::thread (terminate) and/or strand active_tasks_ (hang WaitForAll
 // while the caller holds nodes_mutex_). Now the pool must absorb it, keep
 // waiting correctness, and stay usable.
@@ -110,7 +110,7 @@ TEST(TaskStealingPool, ThrowingExecutorDoesNotStrandWaitOrKillPool) {
   for (int i = 0; i < 20; ++i) v.push_back(i);
   pool.Submit(std::move(v));
   // WaitForAll() now rethrows the executor's exception on the caller's own
-  // stack (review #863 finding 4: silently marking a partially-mutated task
+  // stack (: silently marking a partially-mutated task
   // as a plain success was the bug, not just "does WaitForAll hang"), but
   // every task -- including ones queued/stolen after the throwing one --
   // must still have run and reached completed_tasks_ first.
@@ -148,7 +148,7 @@ TEST(TaskStealingPool, WorkArrivesAfterRealSleep) {
   EXPECT_EQ(sum.load(), 13);
 }
 
-// The #866 P1-2 detector, at the level this pool actually guarantees:
+// The detector, at the level this pool actually guarantees:
 // completed_tasks_ retains EVERY task -- including ones that finished
 // cleanly -- whether or not WaitForAll() ends up throwing. This documents
 // (and pins) the calling convention search.cc's PickNodesToExtend() relies
@@ -201,8 +201,8 @@ TEST(TaskStealingPool, StealUnderLoadPreservesCounts) {
   EXPECT_EQ(sum.load(), 2000LL * 2001 / 2);
 }
 
-// Fault-injection fixture for the Submit publication rollback (#878 finding
-// 4) and the completion-publication contract (#881): always leave every seam
+// Fault-injection fixture for the Submit publication rollback (finding
+// 4) and the completion-publication contract: always leave every seam
 // disarmed so an unexpectedly surviving countdown cannot bleed into the next
 // test in this binary.
 class PoolInsertFailureTest : public ::testing::Test {
@@ -216,7 +216,7 @@ struct PoolPayloadTask {
   std::vector<int> payload;
 };
 
-// review #881: completion publication must not allocate on worker threads.
+// completion publication must not allocate on worker threads.
 // The completion slot is reserved at acceptance, on the submitting thread, so
 // a failure there rejects the task cleanly -- no phantom counts -- while
 // already-accepted peers keep their payloads and drain normally.
@@ -261,7 +261,7 @@ TEST_F(PoolInsertFailureTest, CompletionReserveFailureRollsBackAcceptance) {
   EXPECT_EQ(pool.DrainCompleted().size(), 4u);
 }
 
-// Capacity is reacquired per acceptance (review #883): DrainCompleted()
+// Capacity is reacquired per acceptance: DrainCompleted()
 // deliberately moves the whole vector out under its quiescence contract, so
 // each round's Submit must reserve fresh completion slots. Pinned
 // behaviorally across submit/wait/drain rounds with partial-result payloads.

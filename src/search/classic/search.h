@@ -227,7 +227,7 @@ class SearchWorker {
             search_->thread_count_.load(std::memory_order_acquire) - 1, 1);
         // Signed arithmetic: hardware_concurrency()/working_threads == 0 used
         // to wrap to UINT_MAX via the unsigned "- 1" and clamp to 4, giving
-        // low-core boxes four spinning helpers instead of zero (#858 f9).
+        // low-core boxes four spinning helpers instead of zero.
         const unsigned hw = std::thread::hardware_concurrency();
         task_workers_ =
             std::max(0, std::min(static_cast<int>(hw / working_threads) - 1, 4));
@@ -239,12 +239,11 @@ class SearchWorker {
       }
       task_pool_ = std::make_unique<TaskStealingPool<PickTask>>(
           task_workers_, [this](PickTask& task, int tid) {
-            // Test-only seams (#876 f5): a worker-executor fault site before
+            // Test-only seams: a worker-executor fault site before
             // the task's own code runs, and per-type execution counters that
             // prove these callbacks actually executed while a pool round was
             // in flight (tree size/shape alone does not). The context mark
             // lets a seam throw record that it happened in a pool task
-            // (review #881 P2).
             TestOnlyMarkPoolTaskContext();
             TestOnlyMaybeThrowAt(TestOnlyThrowSite::kWorkerExecutor);
             switch (task.task_type) {
@@ -298,7 +297,7 @@ class SearchWorker {
       std::cerr << "Unhandled exception in worker thread: " << e.what()
                 << std::endl;
       // Release this worker's own abandoned virtual-loss reservations
-      // before signalling stop (review #863 finding 3) -- otherwise they
+      // before signalling stop -- otherwise they
       // leak for the rest of the search, skewing every other worker's UCT
       // selection and risking Search::Wait()'s ZeroNInFlight() check.
       CancelPendingMinibatch();
@@ -323,7 +322,7 @@ class SearchWorker {
   // DoBackupUpdateSingleNode's own leaf-to-root walk but cancelling instead
   // of completing the visit. Without this, those reservations leak for the
   // rest of the search: they skew UCT selection for every other worker and
-  // can trip Search::Wait()'s ZeroNInFlight() expectation (review #863).
+  // can trip Search::Wait()'s ZeroNInFlight() expectation.
   void CancelPendingMinibatch();
 
   // The same operations one by one:
@@ -390,7 +389,7 @@ class SearchWorker {
       NodeToProcess np(node, depth, false, 1, 0);
       // Only visits are ever evaluated (collisions never touch eval -- every
       // consumer is behind IsCollision/nn_queried guards), so allocate here
-      // rather than for every collision entry (#859 addition 5).
+      // rather than for every collision entry.
       np.eval = std::make_unique<EvalResult>();
       return np;
     }
@@ -425,8 +424,8 @@ class SearchWorker {
     PositionHistory history;
     std::vector<int> vtp_last_filled;
 
-    // Reservation-rollback ownership ledger for PickNodesToExtendTask (agora
-    // #41/#872 P1, reworked per review #874): one record per n_in_flight_
+    // Reservation-rollback ownership ledger for PickNodesToExtendTask
+    // one record per n_in_flight_
     // increment this call applies, owning exactly that amount until it is
     // retired to a receiver entry or handed to a submitted task. Rollback
     // cancels each surviving record directly at its own node -- no
@@ -457,7 +456,7 @@ class SearchWorker {
     enum PickTaskType { kGathering, kProcessing };
     // Deterministic default so a default-constructed pool scratch task can
     // never execute a garbage switch arm (the pool only runs moved-in tasks,
-    // but don't make the next reader re-prove it -- #859).
+    // but don't make the next reader re-prove it).
     PickTaskType task_type = kGathering;
 
     // For task type gathering.
@@ -488,8 +487,8 @@ class SearchWorker {
   void DoBackupUpdateSingleNode(const NodeToProcess& node_to_process);
   // Cancels the reservations one receiver entry still owns (the walk
   // CancelPendingMinibatch performs per entry). Also used for
-  // completed-but-unmerged results when the merge reserve fails (review
-  // #883); callers hold nodes_mutex_ or are the owning search thread.
+  // completed-but-unmerged results when the merge reserve fails; callers
+  // hold nodes_mutex_ or are the owning search thread.
   void CancelMinibatchEntry(const NodeToProcess& entry);
   // Returns whether a node's bounds were set based on its children.
   bool MaybeSetBounds(Node* p, float m, int* n_to_fix, float* v_delta,
@@ -517,7 +516,7 @@ class SearchWorker {
   // of every iteration. CancelPendingMinibatch()'s exception path must
   // consult this: once true, those same entries are already owned by
   // shared_collisions_, and cancelling them again locally would double-
-  // cancel the same ancestor chain (review #866 P1-1).
+  // cancel the same ancestor chain.
   bool collisions_published_ = false;
   std::unique_ptr<BackendComputation> computation_;
   int task_workers_;

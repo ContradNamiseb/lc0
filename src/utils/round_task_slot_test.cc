@@ -8,7 +8,7 @@
   (at your option) any later version.
 */
 
-// Coverage for review #867/#868's request: "exactly 256 successful claims
+// Coverage for 's request: "exactly 256 successful claims
 // and a 257th local fallback." TryClaimRoundTaskSlot is dag_classic's
 // MAX_TASKS==256 round-wide budget (search.cc), pulled out here so its
 // exact-cap behavior under real concurrent contention has direct test

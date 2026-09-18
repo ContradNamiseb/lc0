@@ -291,7 +291,6 @@ void StringUciResponder::OutputBestMove(BestMoveInfo* info) {
   // legal-looking but meaningless "a1a1". A GUI can read that as a real,
   // illegal move and forfeit the game instead of seeing the UCI null move.
   // Serialize it as the protocol's actual null move, "0000", instead
-  // (review #866 P1).
   std::string res = "bestmove " +
                     (info->bestmove.is_null() ? "0000"
                                                : info->bestmove.ToString(c960));

@@ -8,14 +8,14 @@
   (at your option) any later version.
 */
 
-// dag_classic mirror of classic/pool_equivalence_test.cc (agora #867/#868):
+// dag_classic mirror of classic/pool_equivalence_test.cc:
 // TaskWorkers=0 (serial, task_pool_ never constructed) and TaskWorkers>0
 // (pooled) are separate code paths through the same PickNodesToExtend/
 // GatherMinibatch logic, ported onto dag_classic this session. Also covers
 // TaskWorkers=-1 (the actual UCI default) on both branches of its
 // runs_on_cpu heuristic -- real games run with -1, not an explicit count.
 //
-// review #872 point 2: the original version of this test used
+// the original version of this test used
 // recommended_batch_size=1 and a one-visit collision budget, so AddInput
 // always returned FETCHED_IMMEDIATELY, the gather split never triggered,
 // and the pooled/serial comparison was only a loose total-playout ratio --
@@ -242,11 +242,11 @@ TEST(DagSearchPoolEquivalence, PooledConvergesCleanly) {
   // The real proof the pool path did search work rather than degenerating
   // into pure collisions: with real batching and 4 task workers, a shallow
   // or sparse tree here means gathering/processing tasks never actually
-  // ran real picks, only what codex-sol's #872 review flagged as an
+  // ran real picks, only what an earlier review flagged as an
   // unproven "constructing worker threads is not evidence they executed."
   EXPECT_GE(r.shape.visited_nodes, 500);
   EXPECT_GE(r.shape.max_depth, 4);
-  // review #876 f5: the executor counters themselves, not the tree shape,
+  // the executor counters themselves, not the tree shape,
   // prove worker tasks actually ran -- gathering picks on worker threads, and
   // the batched processing tasks the pool submits for larger batches.
   EXPECT_GT(r.gathering_executed, 0);

@@ -635,12 +635,12 @@ void Search::MaybeTriggerStop(const IterationStats& stats,
   // iteration that ever ran), so returning here would leave stop_ true
   // forever with no bestmove ever sent -- WatchdogThread's loop calls this
   // every ~100ms but has no way to make total_nodes nonzero itself, so
-  // that's a permanent hang, not just a delay (review #863 finding 3).
+  // that's a permanent hang, not just a delay.
   // EnsureBestMoveKnown() already handles an unexpanded root safely (it
   // just leaves final_bestmove_ at its default Move(), which
   // StringUciResponder::OutputBestMove now serializes as the UCI null move
-  // "0000" rather than the nonsensical "a1a1" it used to produce -- review
-  // #866) -- better a degenerate response than a hung or misled GUI.
+  // "0000" rather than the nonsensical "a1a1" it used to produce -- better
+  // a degenerate response than a hung or misled GUI.
   if (stats.total_nodes == 0 && !stop_.load(std::memory_order_acquire)) {
     return;
   }
@@ -1152,7 +1152,7 @@ void SearchWorker::ExecuteOneIteration() {
   // RunNNComputation() below can throw (a backend/device error) -- without
   // this, that skips the matching decrement below and leaves the counter
   // permanently inflated for the rest of the search, throwing off the
-  // thread-idling heuristic in GatherMinibatch that reads it (review #863).
+  // thread-idling heuristic in GatherMinibatch that reads it.
   absl::Cleanup release_backend_waiting = [this] {
     search_->backend_waiting_counter_.fetch_add(-1, std::memory_order_relaxed);
   };
@@ -1206,7 +1206,7 @@ void SearchWorker::ExecuteOneIteration() {
 void SearchWorker::InitializeIteration() {
   LCTRACE_FUNCTION_SCOPE;
   // Retire the PREVIOUS iteration's state before anything that can throw
-  // (review #867 P1-B): CreateComputation() is a real backend call (the
+  // CreateComputation() is a real backend call (the
   // original Level Zero crash this hardening effort started from was
   // exactly this kind of failure) that can throw. minibatch_ used to be
   // cleared AFTER it -- if it threw, the clear was skipped, so the worker's
@@ -1233,8 +1233,8 @@ void SearchWorker::CancelMinibatchEntry(const NodeToProcess& entry) {
     // next successful DoBackupUpdate() (or the Search destructor) will
     // cancel the whole of shared_collisions_ via CancelSharedCollisions().
     // Cancelling it here too would walk the same ancestor chain twice --
-    // double-decrementing n_in_flight_ and corrupting it (review #866
-    // P1-1). Leave it for that single owner instead.
+    // double-decrementing n_in_flight_ and corrupting it
+    // . Leave it for that single owner instead.
     if (collisions_published_) return;
     // Collisions never touched the leaf's own n_in_flight_ (that belongs
     // to the original, separately-tracked visit already in flight) --
@@ -1381,7 +1381,7 @@ void SearchWorker::GatherMinibatch() {
         }
       }
       if (!new_tasks.empty()) {
-        // A batch submission can fail partway (review #878 finding 4): the
+        // A batch submission can fail partway: the
         // accepted prefix is queued and counted, so it still has to be waited
         // on and drained before this function unwinds. needs_wait is already
         // set, so the guarded WaitForAll/DrainCompleted below covers it.
@@ -1392,8 +1392,8 @@ void SearchWorker::GatherMinibatch() {
         }
       }
     }
-    // Same guarded-region shape as PickNodesToExtend above (review #867
-    // P1-A): if the main-thread ProcessPickedTask slice throws, WaitForAll()
+    // Same guarded-region shape as PickNodesToExtend above
+    // if the main-thread ProcessPickedTask slice throws, WaitForAll()
     // below must still run before this function returns -- processing tasks
     // already submitted are mutating minibatch_/tree state under this
     // thread's held nodes_mutex_, and skipping the wait lets them keep
@@ -1403,7 +1403,7 @@ void SearchWorker::GatherMinibatch() {
                         &main_workspace_);
     } catch (...) {
       // Preserve the first failure: a Submit error captured above takes
-      // priority (review #881 minor).
+      // priority (minor).
       if (!pending_exception) pending_exception = std::current_exception();
     }
     if (needs_wait) {
@@ -1480,7 +1480,7 @@ void SearchWorker::GatherMinibatch() {
 void SearchWorker::ProcessPickedTask(int start_idx, int end_idx,
                                      TaskWorkspace* workspace) {
   LCTRACE_FUNCTION_SCOPE;
-  // Test-only seams (#876 f5): a processing fault site distinct from the
+  // Test-only seams: a processing fault site distinct from the
   // gathering seams, plus the execution counter proving how much real
   // processing ran (pool tasks and main-thread slices both land here).
   TestOnlyRecordProcessingCall();
@@ -1533,7 +1533,7 @@ void SearchWorker::PickNodesToExtend(int collision_limit) {
   // actually this thread does.
   SharedMutex::Lock lock(search_->nodes_mutex_);
   // Single guarded region covering BOTH the main-thread picker call and the
-  // pool's own work (review #867 P1-A): the main call used to sit outside
+  // pool's own work: the main call used to sit outside
   // this guard entirely, so if IT threw -- after having already recursively
   // submitted worker tasks -- WaitForAll()/DrainCompleted() below never ran.
   // That's not just a lost-results bug: pool workers mutate tree state on
@@ -1546,7 +1546,7 @@ void SearchWorker::PickNodesToExtend(int collision_limit) {
   // reason as the existing pool-throw path below: a sibling task that
   // finished cleanly still has real results/reservations that must reach
   // minibatch_, or CancelPendingMinibatch() can't see and release them
-  // (review #866 P1-2, extended to cover this entry point too).
+  // (extended to cover this entry point too).
   std::exception_ptr pending_exception;
   try {
     PickNodesToExtendTask(search_->root_node_, 0, collision_limit,
@@ -1555,7 +1555,7 @@ void SearchWorker::PickNodesToExtend(int collision_limit) {
     pending_exception = std::current_exception();
   }
   if (task_pool_) {
-    // WaitForAll() can rethrow a pool task's exception (review #863 f4).
+    // WaitForAll() can rethrow a pool task's exception.
     // completed_tasks_ still holds every task's results at that point --
     // WorkerLoop pushes a task onto it unconditionally, whether its executor
     // threw or not. Always wait/drain regardless of whether the main call
@@ -1568,7 +1568,7 @@ void SearchWorker::PickNodesToExtend(int collision_limit) {
       if (!pending_exception) pending_exception = std::current_exception();
     }
     auto completed = task_pool_->DrainCompleted();
-    // The merge is an ownership boundary too (review #883): after the drain
+    // The merge is an ownership boundary too: after the drain
     // these results have no other owner, and minibatch_.emplace_back can
     // throw while growing. Reserve the aggregate destination capacity first;
     // if that fails, cancel every still-owned result directly (no
@@ -1657,7 +1657,7 @@ void SearchWorker::PickNodesToExtendTask(
   // NOTE (thread safety): the NO_THREAD_SAFETY_ANALYSIS on this function is
   // only sound because the pool protocol guarantees WaitForAll cannot
   // release before every published task finished (count-before-publish in
-  // TaskStealingPool::Submit, fixed for review #858 finding 1) -- which is
+  // TaskStealingPool::Submit) -- which is
   // what keeps this function's tree mutation inside the exclusive
   // nodes_mutex_ the caller holds.
   // -----------------------------------------------------------------------
@@ -1697,8 +1697,8 @@ void SearchWorker::PickNodesToExtendTask(
   // BEFORE the increment the new record will own. The initial reserve below
   // is a warm start, not a bound: a budget of 1 can walk an arbitrarily deep
   // expanded chain adding a record per level, and retired records stay in the
-  // vector, so no depth-independent capacity is sufficient (review #876
-  // finding 1). Called before an increment, a growth failure leaves every
+  // vector, so no depth-independent capacity is sufficient
+  // . Called before an increment, a growth failure leaves every
   // already-applied increment with its record, so the catch rolls them all
   // back; called after one, that increment would be unrecorded and leak.
   auto ensure_record_capacity = [&records](size_t needed) {
@@ -1709,11 +1709,11 @@ void SearchWorker::PickNodesToExtendTask(
     }
   };
   // Entry guard for a submitted task's inherited start-node/ancestor coverage
-  // (review #876 finding 3, #878 finding 1): the submitting call retired its
+  // the submitting call retired its
   // own mirror of this coverage when Submit succeeded (see the submit site),
   // so from this call's entry until the ledger records below exist, this
   // guard is the only owner. It is constructed HERE, before the first thing
-  // that can throw -- the warm reserve below included (#878 f1: with the
+  // that can throw -- the warm reserve below included (: with the
   // guard after the reserve, a reserve failure would lose the inherited
   // node/ancestor reservations outright). Every allocating setup step after
   // this point can throw; if one does, the destructor cancels the coverage at
@@ -1734,7 +1734,7 @@ void SearchWorker::PickNodesToExtendTask(
   } inherited_guard{cur_node, search_->root_node_->GetParent(),
                      collision_visit_limit, /*active=*/base_search_depth > 0};
   if (base_search_depth > 0) {
-    // Test-only seam (#878 f1): the warm reserve below, before any record
+    // Test-only seam: the warm reserve below, before any record
     // exists and while the guard is the only owner. Only a submitted task
     // has inherited coverage at risk here.
     TestOnlyMaybeThrowAt(TestOnlyThrowSite::kBeforeInitialReserve);
@@ -1789,7 +1789,7 @@ void SearchWorker::PickNodesToExtendTask(
   inherited_guard.active = false;
 
   // Everything from here down can leave a partial reservation behind if it
-  // throws (agora #41/#872 P1): n_in_flight_ increments made for a node that
+  // throws: n_in_flight_ increments made for a node that
   // hasn't yet produced a receiver entry (Visit/Collision) or been handed to
   // a submitted task are invisible to CancelPendingMinibatch, which only
   // walks emitted entries. The try starts here, above the receiver reserve
@@ -1874,7 +1874,7 @@ void SearchWorker::PickNodesToExtendTask(
           completed_visits += cur_limit;
           // Ownership of the ancestor coverage passes to the receiver entry
           // only once that entry exists: if the push above throws, the ledger
-          // still owns it and the catch cancels it (review #876 finding 2).
+          // still owns it and the catch cancels it.
           // Retiring before the insertion would leave the amount owned by
           // neither side.
           retire_path(cur_node, cur_limit, /*include_self=*/false);
@@ -1924,7 +1924,6 @@ void SearchWorker::PickNodesToExtendTask(
       // the weirdness: an EVEN sum is the ODD argument (origin/master
       // ((size + base) % 2 == 0) ? odd_draw_score : even_draw_score). The
       // inverted parity was silently wrong for any nonzero draw score
-      // (review #858 finding 3).
       const bool odd_depth =
           ((current_path.size() + base_search_depth) % 2 == 0);
       const float draw_score = search_->GetDrawScore(odd_depth);
@@ -2061,7 +2060,7 @@ void SearchWorker::PickNodesToExtendTask(
         // the IncrementNInFlight further down that the throw seam runs
         // before), so ensure capacity for both before either increment: a
         // growth failure here leaves nothing applied, while growing after an
-        // increment would orphan it (review #876 finding 1).
+        // increment would orphan it.
         ensure_record_capacity(2);
         bool decremented = false;
         if (child_node->TryStartScoreUpdate()) {
@@ -2088,7 +2087,7 @@ void SearchWorker::PickNodesToExtendTask(
           // of those reservations moves to CancelPendingMinibatch -- but only
           // once the entry exists. If the build or the insertion throws, the
           // ledger still owns the coverage and the catch cancels it; retiring
-          // first would leave it owned by neither side (review #876 f2).
+          // first would leave it owned by neither side.
           (*visits_to_perform.back())[best_idx] -= 1;
           NodeToProcess visit_entry = NodeToProcess::Visit(
               child_node, static_cast<uint16_t>(current_path.size() + 1 +
@@ -2137,7 +2136,7 @@ void SearchWorker::PickNodesToExtendTask(
             // in its own ledger); retire them here first so a throw after
             // this point cannot cancel them too.
             retire_path(child_node, child_limit, /*include_self=*/true);
-            // Own site (#876 f5): this used to share the generic
+            // Own site: this used to share the generic
             // after-reservation countdown, so a test targeting the
             // post-submit seam could not distinguish it from a mid-pick
             // throw; the submitted task re-records the coverage it owns, so
@@ -2313,7 +2312,7 @@ void SearchWorker::CollectCollisions() {
   }
   // From here on, every collision entry still in minibatch_ is also owned
   // by search_->shared_collisions_ -- CancelPendingMinibatch()'s exception
-  // path must not cancel them a second time (review #866 P1-1).
+  // path must not cancel them a second time.
   collisions_published_ = true;
 }
 

@@ -8,9 +8,9 @@
   (at your option) any later version.
 */
 
-// Regression coverage for the agora #866 P1-4 finding: a search that
+// Regression coverage for the finding: a search that
 // aborted before any playout ever ran (a worker exception on the very
-// first NN batch, review #863/#864) leaves final_bestmove_ at its default-
+// first NN batch) leaves final_bestmove_ at its default-
 // constructed Move() -- StringUciResponder::OutputBestMove must serialize
 // that as the UCI null move "0000", not let Move::ToString() print the
 // syntactically legal-looking but meaningless "a1a1", which a GUI could

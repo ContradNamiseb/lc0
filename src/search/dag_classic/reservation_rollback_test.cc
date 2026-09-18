@@ -8,8 +8,8 @@
   (at your option) any later version.
 */
 
-// dag_classic mirror of classic/reservation_rollback_test.cc (agora
-// #41/#872 P1): n_in_flight_ reservations made mid-traversal inside
+// dag_classic mirror of classic/reservation_rollback_test.cc
+// n_in_flight_ reservations made mid-traversal inside
 // PickNodesToExtendTask (a fresh TryStartScoreUpdate(), or a successful
 // hand-off to the task pool) were invisible to CancelPendingMinibatchVisits
 // until they landed in a receiver entry -- an exception in the gap between
@@ -44,7 +44,7 @@ namespace {
 // concentrates policy on the first legal move, which makes
 // estimated_visits_to_change_best large for unexpanded children, so a pick
 // hands them a multi-visit budget -- the precondition for the
-// visit-then-collision emission that review #878 finding 2 is about (with a
+// visit-then-collision emission that is about (with a
 // uniform policy that estimate is always clamped to 1 and the collision
 // half of the pair never materialises in practice).
 class FakeComputation : public BackendComputation {
@@ -220,7 +220,7 @@ TEST_F(ReservationRollbackTest, PooledThrowMidTraversalLeavesNoReservation) {
   ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
 }
 
-// ---- review #876 finding 3 / #874: DAG submitted-task entry guard ---------
+// ----: DAG submitted-task entry guard ---------
 //
 // The seam fires at the entry of a submitted task, before its path copy and
 // before its root ledger entry exist. The submitting call already released
@@ -269,7 +269,7 @@ TEST_F(ReservationRollbackTest, SubmittedTaskEntrySetupFailureLeavesNoReservatio
   ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
 }
 
-// ---- review #874/#876: DAG post-submit ownership transfer -----------------
+// ---- DAG post-submit ownership transfer -----------------
 //
 // The seam fires immediately after a successful Submit, in the window where
 // the level's current_path.back().visits_ has not yet been zeroed. Without
@@ -318,7 +318,7 @@ TEST_F(ReservationRollbackTest, PooledPostSubmitThrowLeavesNoReservation) {
   ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
 }
 
-// ---- review #878 finding 2: partial emission double-owns a Visit ----------
+// ---- partial emission double-owns a Visit ----------
 //
 // The seam fires between a successful Visit insertion and the collision
 // insertion that follows it in the same stop_picking entry, with a
@@ -371,7 +371,7 @@ TEST_F(ReservationRollbackTest, PooledCollisionEmissionFailureLeavesNoReservatio
   // The dedicated seam only exists in the post-visit window, and it records
   // the collision share left when the throw happened.
   EXPECT_GT(TestOnlyPostVisitRemainingShare(), 0);
-  // Context of the actual failing call (review #881 P2), not merely that some
+  // Context of the actual failing call, not merely that some
   // worker ran somewhere: this armed hit landed in a pool task.
   EXPECT_TRUE(TestOnlyLastThrowInPoolTask());
   EXPECT_GT(TestOnlyGatheringTasksExecuted(), 0)
@@ -379,7 +379,7 @@ TEST_F(ReservationRollbackTest, PooledCollisionEmissionFailureLeavesNoReservatio
   ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
 }
 
-// ---- review #878 finding 3: promotion must commit atomically --------------
+// ---- promotion must commit atomically --------------
 //
 // The seam fires at the promotion's current_path growth point, before either
 // parallel vector or the level's ownership changes. A real search long enough
@@ -482,7 +482,7 @@ TEST_F(ReservationRollbackTest, PromotionLedgerGrowthFailureLeavesNoReservation)
   ExpectZeroNInFlightEverywhere(tree.GetCurrentHead());
 }
 
-// ---- review #883: merge-reserve failure must cancel, not drop -------------
+// ---- merge-reserve failure must cancel, not drop -------------
 //
 // dag_classic mirror of the classic test. Collisions reaching this path are
 // cancelled by CancelUnmergedResult's ancestors-only walk because they never
@@ -560,7 +560,7 @@ TEST_F(ReservationRollbackTest, MergeReserveFailureCancelsCompletedResults) {
   }
 }
 
-// ---- review #885: focused coverage for the collision recovery branch ------
+// ---- focused coverage for the collision recovery branch ------
 //
 // The seam fires only when the drained batch contains a completed collision,
 // so this test cannot pass without exercising CancelUnmergedResult's

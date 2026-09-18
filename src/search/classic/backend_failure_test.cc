@@ -8,7 +8,7 @@
   (at your option) any later version.
 */
 
-// Also covers review #872 point 3: a backend that always returns
+// Also covers: a backend that always returns
 // FETCHED_IMMEDIATELY from AddInput() never exercises a real
 // ComputeBlocking() failure, since nothing ever reaches it with pooled
 // tasks having actually contributed to the batch. RealBatchThenThrowBackend
@@ -16,7 +16,7 @@
 // itself, with task_workers>0 so the batch is built from real pooled-task
 // contributions, not just the main thread's own picks.
 //
-// Fault-injection coverage for review #867 P1-B: a real Backend::
+// Fault-injection coverage for: a real Backend::
 // CreateComputation() failure (the original motivating case was a Level
 // Zero device exception mid-game) between two iterations used to hit a
 // stale-state bug -- InitializeIteration() cleared minibatch_ AFTER the
