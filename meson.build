@@ -1174,12 +1174,16 @@ if get_option('gtest')
 
   test('DepthStackAndCache',
     executable('inline_depth_stack_test', 'src/search/classic/inline_depth_stack_test.cc', pb_files,
-    include_directories: includes, link_with: lc0_lib, dependencies: gtest),
+    include_directories: includes, link_with: lc0_lib, dependencies: gtest,
+    # The test probes SearchWorker's private picking-cache structures and
+    # documents that it builds with access control disabled.
+    cpp_args: '-fno-access-control'),
     args: '--gtest_output=xml:depthstack.xml', timeout: 90)
 
   test('DagCachedNodeData',
     executable('dag_cached_node_data_test', 'src/search/dag_classic/cached_node_data_test.cc', pb_files,
-    include_directories: includes, link_with: lc0_lib, dependencies: [gtest] + deps),
+    include_directories: includes, link_with: lc0_lib, dependencies: [gtest] + deps,
+    cpp_args: '-fno-access-control'),
     args: '--gtest_output=xml:dagcache.xml', timeout: 90)
 endif
 
