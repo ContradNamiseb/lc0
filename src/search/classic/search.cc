@@ -1485,6 +1485,12 @@ void SearchWorker::ProcessPickedTask(int start_idx, int end_idx,
 
 #define MAX_TASKS 100
 
+// Upper bound on splits ONE PickNodesToExtendTask invocation may submit to
+// the pool. Without it a single deep task can keep splitting for its entire
+// descent and flood the shared picking_tasks_ list, starving every other
+// task of slots and serializing the round on the widest subtree. Tunable.
+static constexpr int kMaxSplitsPerTask = 100;  // matches the round-wide MAX_TASKS cap
+
 void SearchWorker::ResetTasks() {
   task_count_.store(0, std::memory_order_release);
   tasks_taken_.store(0, std::memory_order_release);
@@ -1585,6 +1591,8 @@ void SearchWorker::PickNodesToExtendTask(
   // 256-entry NSDMI init on every call regardless of the dropped `{}`.
   // Reused across calls the same way vtp_buffer/visits_to_perform below
   // already are.
+  // Splits submitted by THIS invocation so far (kMaxSplitsPerTask cap).
+  int splits_submitted = 0;
   auto& cache = workspace->cache;
   auto& vtp_buffer = workspace->vtp_buffer;
   auto& visits_to_perform = workspace->visits_to_perform;
@@ -1860,6 +1868,10 @@ void SearchWorker::PickNodesToExtendTask(
       // tree walk to get there.
       for (int i = 0; i <= cache.vtp_last_filled_cache.back(); i++) {
         int child_limit = (*visits_to_perform.back())[i];
+        // Stop splitting once this task has submitted its share; the
+        // remaining visits are picked by this task itself. Checked before
+        // anything else so nothing is evaluated or spawned once capped.
+        if (splits_submitted >= kMaxSplitsPerTask) break;
         if (task_workers_ > 0 &&
             child_limit > params_.GetMinimumWorkSizeForPicking() &&
             child_limit <
@@ -1886,6 +1898,7 @@ void SearchWorker::PickNodesToExtendTask(
               task_count_.fetch_add(1, std::memory_order_acq_rel);
               task_added_.notify_all();
               passed = true;
+              ++splits_submitted;
               passed_off += child_limit;
             }
           }
