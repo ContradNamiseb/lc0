@@ -435,6 +435,18 @@ void Node::SetLowNode(std::shared_ptr<LowNode> low_node) {
   low_node->AddParent();
   low_node_ = low_node;
 }
+
+void Node::InitFromLowNode() {
+  assert(low_node_);
+  assert(n_ == 0);
+  if (low_node_->GetN() == 0) return;
+  // Values are stored from the OPPONENT's perspective on the LowNode
+  // (low node of a transposition is the parent's view), so WL flips.
+  n_ = low_node_->GetN();
+  wl_ = -low_node_->GetWL();
+  d_ = low_node_->GetD();
+  m_ = low_node_->GetM() + 1;
+}
 void Node::UnsetLowNode() {
   if (low_node_) low_node_->RemoveParent();
   low_node_.reset();

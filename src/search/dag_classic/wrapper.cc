@@ -139,10 +139,23 @@ void DagClassicSearch::StartSearch(const GoParams& params) {
   const size_t kAvgCacheItemSize =
       3 * sizeof(float) + sizeof(std::unique_ptr<float[]>) +
       sizeof(float[classic::MemoryWatchingStopper::kAvgMovesPerPosition]);
+  // H4 fix: the retention keeps whole SUBTREES alive (a retained ancestor's
+  // child_ chain), so sizing it by the retention vector's length undercounted
+  // by ~2000x (measured: 14 vector entries -> 306k live LowNodes). Use the
+  // live-LowNode counter with a per-payload size that includes its share of
+  // subtree Nodes and Edges. The path-tree term above stays as-is; its own
+  // LowNodes are conservatively double-counted here, which errs toward the
+  // stopper reacting early rather than late.
+  const size_t kAvgLivePayloadSize =
+      sizeof(LowNode) +
+      classic::MemoryWatchingStopper::kAvgMovesPerPosition *
+          (sizeof(Edge) + sizeof(Node));
   size_t total_memory =
       tree_.get()->GetCurrentHead()->GetN() * kAvgNodeSize +
       (sizeof(TranspositionTable::value_type) + 1) * tt_.bucket_count() +
-      tt_retention_.size() * kAvgNodeSize +
+      static_cast<size_t>(
+          LiveLowNodeCount().load(std::memory_order_relaxed)) *
+          kAvgLivePayloadSize +
       cache_size * kAvgCacheItemSize;
   auto stopper = time_manager_->GetStopper(
       params, tree_.get()->HeadPosition(), total_memory, kAvgNodeSize,

@@ -370,6 +370,14 @@ class Node {
   const std::shared_ptr<LowNode>& GetLowNode() const { return low_node_; }
 
   void SetLowNode(std::shared_ptr<LowNode> low_node);
+  // Cross-move adoption: import the adopted LowNode's accumulated statistics
+  // into a fresh node (n_/wl_/d_/m_) so the node and its payload AGREE about
+  // how much tree lies beneath them. Without this the node starts at N=0
+  // while children edges and 15k visits live on the LowNode -- PUCT inputs
+  // diverge within one playout (node weight 1/2 vs LowNode weight 1/15001)
+  // and ShouldStopPickingHere's wl check can permanently stall picking at
+  // transpositions. Only valid when node has no visits yet (n_ == 0).
+  void InitFromLowNode();
   void UnsetLowNode();
 
   // Debug information about the node.
@@ -481,7 +489,24 @@ class Node {
 // Check that Node still fits into an expected cache line size.
 static_assert(sizeof(Node) <= 64, "Node is too large");
 
-class LowNode {
+// Total live LowNodes across all searches and any retention holding them.
+// Inline accessor with a function-local static: one counter, all TUs.
+inline std::atomic<int64_t>& LiveLowNodeCount() {
+  static std::atomic<int64_t> count{0};
+  return count;
+}
+
+// Accounting mixin: every LowNode construction (any overload, including the
+// copy ctor) and every destruction adjusts the live counter, so the memory
+// estimate can use the TRUE payload footprint. The cross-move retention
+// keeps whole subtrees alive (a retained ancestor's child_ chain), which a
+// retention-VECTOR-length estimate cannot see.
+struct LowNodeCounted {
+  LowNodeCounted() { LiveLowNodeCount().fetch_add(1, std::memory_order_relaxed); }
+  ~LowNodeCounted() { LiveLowNodeCount().fetch_sub(1, std::memory_order_relaxed); }
+};
+
+class LowNode : private LowNodeCounted {
  public:
   LowNode()
       : terminal_type_(Terminal::NonTerminal),

@@ -2202,6 +2202,23 @@ void SearchWorker::ExtendNode(NodeToProcess& picked_node) {
   if (tt_iter != search_->tt_->end()) {
     picked_node.tt_low_node = tt_iter->second.lock();
   }
+  // H3 fix: adoption-site clean filter, scoped to CROSS-MOVE adoption. A
+  // payload from a previous Search generation may carry path-dependent
+  // marks -- terminal status set off a 50-move/two-fold circumstance, or
+  // bounds proven under the previous search's path -- none of which hold in
+  // this search's context. The retention-site filter cannot catch these on
+  // descendants that ride a retained ancestor's child chain, so the check
+  // must live here. Refusing falls through to a fresh evaluation, and the
+  // backup path overwrites the stale TT entry (see
+  // DoBackupUpdateSingleNode). Within-search adoptions keep upstream
+  // semantics: their marks are necessarily current.
+  if (picked_node.tt_low_node &&
+      picked_node.tt_low_node->GetGen() != 0 &&
+      picked_node.tt_low_node->GetGen() != search_->gen_ &&
+      (picked_node.tt_low_node->IsTerminal() ||
+       picked_node.tt_low_node->GetBounds() != kCleanRetentionBounds)) {
+    picked_node.tt_low_node.reset();
+  }
   if (picked_node.tt_low_node) {
     assert(!tt_iter->second.expired());
     picked_node.is_tt_hit = true;
@@ -2378,6 +2395,15 @@ void SearchWorker::DoBackupUpdateSingleNode(
       if (!tt_low_node) {
         tt_iter->second = node_to_process.tt_low_node;
         node_to_process.node->SetLowNode(node_to_process.tt_low_node);
+      } else if (tt_low_node->GetGen() != 0 &&
+                 tt_low_node->GetGen() != search_->gen_) {
+        // Fix 3: this node evaluated FRESH (nn_queried) and found a payload
+        // from an older generation. The fresh evaluation reflects the
+        // current search context; adopting the stale payload would drag its
+        // path-dependent marks back in (and would silently re-adopt an entry
+        // the adoption-site filter just refused). Overwrite it.
+        tt_iter->second = node_to_process.tt_low_node;
+        node_to_process.node->SetLowNode(node_to_process.tt_low_node);
       } else {
         assert(!tt_iter->second.expired());
         node_to_process.node->SetLowNode(tt_low_node);
@@ -2385,6 +2411,28 @@ void SearchWorker::DoBackupUpdateSingleNode(
     }
   } else if (node_to_process.is_tt_hit) {
     node_to_process.node->SetLowNode(node_to_process.tt_low_node);
+  }
+
+  // H1 fix: a node that adopted a payload from a PREVIOUS search generation
+  // must import that payload's accumulated statistics. Without it the node
+  // reports N=0 while ~15k visits and the whole child edge set live on the
+  // LowNode: PUCT inputs diverge within one playout (node weight 1/2 vs
+  // LowNode weight 1/15001) and ShouldStopPickingHere's wl check can
+  // permanently stall picking at transposed nodes. Scoped to cross-move
+  // adoption; within-search transpositions keep upstream's n_to_fix model.
+  {
+    Node* adopted = node_to_process.node;
+    const auto& ln = adopted->GetLowNode();
+    if (adopted->GetN() == 0 && ln && ln->GetN() > 0 && ln->GetGen() != 0 &&
+        ln->GetGen() != search_->gen_) {
+      adopted->InitFromLowNode();
+      if (adopted == search_->root_node_) {
+        // The constructor captured initial_visits_ from a fresh root (N=0).
+        // Now that the root carries the inherited visits, count them toward
+        // the node budget and node reporting, as classic's tree reuse does.
+        search_->initial_visits_ = adopted->GetN();
+      }
+    }
   }
 
   auto [n, nr, nm] = path.back();
