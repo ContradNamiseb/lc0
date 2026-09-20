@@ -175,6 +175,10 @@ class Search {
   // pruning (see the Search constructor), owned by the wrapper so they
   // outlive the per-move Search and the between-moves tree trim.
   std::vector<std::shared_ptr<LowNode>>* tt_retention_ = nullptr;
+  // Guards tt_retention_ pushes: ExtendNode runs concurrently on pool
+  // threads, and an unguarded vector push there corrupts the heap (found
+  // as a crash 800ms into the first fastchess game, threads>1).
+  std::mutex tt_retention_mutex_;
   SyzygyTablebase* syzygy_tb_;
   // Fixed positions which happened before the search.
   const PositionHistory& played_history_;

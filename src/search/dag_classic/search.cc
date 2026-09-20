@@ -2154,7 +2154,11 @@ void SearchWorker::ExtendNode(NodeToProcess& picked_node) {
     picked_node.tt_low_node = std::make_shared<LowNode>(legal_moves);
     // Track every created LowNode so the retention prune in the next
     // Search constructor can decide which ones survive the tree trim.
+    // ExtendNode runs on multiple pool threads concurrently -- the push
+    // must hold the retention mutex or the vector corrupts.
     if (search_->tt_retention_ != nullptr) {
+      std::lock_guard<std::mutex> retention_lock(
+          search_->tt_retention_mutex_);
       search_->tt_retention_->push_back(picked_node.tt_low_node);
     }
     picked_node.nn_queried = true;
