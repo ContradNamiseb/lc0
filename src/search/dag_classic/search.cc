@@ -202,6 +202,12 @@ constexpr size_t kMaxRetainedLowNodes = 500'000;
 // and are the prime suspect for the first persistence match's regression.
 constexpr Bounds kCleanRetentionBounds{GameResult::BLACK_WON,
                                        GameResult::WHITE_WON};
+
+// Monotonic search generation id for TT-hit provenance diagnostics.
+uint64_t NextSearchGen() {
+  static std::atomic<uint64_t> gen{1};
+  return gen.fetch_add(1, std::memory_order_relaxed);
+}
 }  // namespace
 
 Search::Search(const NodeTree& tree, Backend* backend,
@@ -214,6 +220,7 @@ Search::Search(const NodeTree& tree, Backend* backend,
                std::vector<std::shared_ptr<LowNode>>* tt_retention,
                SyzygyTablebase* syzygy_tb)
     : ok_to_respond_bestmove_(!infinite && !ponder),
+      gen_(NextSearchGen()),
       stopper_(std::move(stopper)),
       root_node_(tree.GetCurrentHead()),
       tt_(tt),
@@ -278,23 +285,20 @@ Search::Search(const NodeTree& tree, Backend* backend,
          << dropped_unclean << " unclean dropped).";
   }
 
-  // Retention diagnostics (TTPERSIST only, cheap; see the members' comment):
-  // (a) build the retained-identity set for hit provenance, (b) count how
-  // many retained nodes the TT map actually still holds a key for -- the
-  // direct test of "the retained root is never found on revisit".
-  if (tt_retention_ != nullptr && !tt_retention_->empty()) {
-    for (const auto& n : *tt_retention_) {
-      if (n) diag_retained_set_.insert(n.get());
-    }
+  // Retention diagnostics (TTPERSIST only, cheap): count non-expired TT
+  // entries created by OLDER search generations -- the pool of adoptable
+  // cross-move nodes, including subtree descendants of retained ancestors.
+  if (tt_retention_ != nullptr) {
     for (const auto& kv : *tt_) {
       if (kv.second.expired()) continue;
       auto locked = kv.second.lock();
-      if (locked && diag_retained_set_.count(locked.get()) > 0) {
-        ++diag_retained_findable_;
+      if (locked && locked->GetGen() != 0 && locked->GetGen() != gen_) {
+        ++diag_crossmove_entries_;
       }
     }
-    CERR << "TT diag: retention " << diag_retained_set_.size()
-         << " node(s), findable in TT map " << diag_retained_findable_ << ".";
+    CERR << "TT diag: cross-move adoptable TT entries "
+         << diag_crossmove_entries_ << " (retention vector "
+         << tt_retention_->size() << ").";
   }
 
   // Evict expired entries from the transposition table.
@@ -2197,11 +2201,13 @@ void SearchWorker::ExtendNode(NodeToProcess& picked_node) {
     assert(!tt_iter->second.expired());
     picked_node.is_tt_hit = true;
     search_->tt_hits_.fetch_add(1, std::memory_order_relaxed);
-    if (search_->diag_retained_set_.count(picked_node.tt_low_node.get()) > 0) {
+    if (picked_node.tt_low_node->GetGen() != 0 &&
+        picked_node.tt_low_node->GetGen() != search_->gen_) {
       search_->tt_hits_from_retention_.fetch_add(1, std::memory_order_relaxed);
     }
   } else {
     picked_node.tt_low_node = std::make_shared<LowNode>(legal_moves);
+    picked_node.tt_low_node->SetGen(search_->gen_);
     // Track every created LowNode so the retention prune in the next
     // Search constructor can decide which ones survive the tree trim.
     // ExtendNode runs on multiple pool threads concurrently -- the push

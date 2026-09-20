@@ -554,6 +554,11 @@ class LowNode {
   bool IsTerminal() const { return terminal_type_ != Terminal::NonTerminal; }
   Bounds GetBounds() const { return {lower_bound_, upper_bound_}; }
   Terminal GetTerminalType() const { return terminal_type_; }
+  // Diagnostics: the Search generation that created this LowNode. A TT hit
+  // on a node from an older generation is cross-move reuse (includes
+  // subtree descendants kept alive by a retained ancestor's child chain).
+  uint64_t GetGen() const { return diag_gen_; }
+  void SetGen(uint64_t gen) { diag_gen_ = gen; }
 
   uint8_t GetNumEdges() const { return num_edges_; }
   // Gets pointer to the start of the edge array.
@@ -656,6 +661,9 @@ class LowNode {
   // 1 byte fields.
   // Number of edges in @edges_.
   uint8_t num_edges_ = 0;
+  // Diagnostics field (see GetGen); last among the scalars to stay off the
+  // hot path's cache lines.
+  uint64_t diag_gen_ = 0;
   // Bit fields using parts of uint8_t fields initialized in the constructor.
   // Whether or not this node end game (with a winning of either sides or draw).
   Terminal terminal_type_ : 2;
