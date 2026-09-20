@@ -446,7 +446,19 @@ void Search::SendUciInfo(const classic::IterationStats& stats)
   if (stats.time_since_first_batch) {
     const auto time_since_first_batch_ms = stats.time_since_first_batch;
     if (time_since_first_batch_ms > 0) {
-      common_info.nps = total_playouts_ * 1000 / time_since_first_batch_ms;
+      // nps is the rate of the value reported in `nodes`, and `nodes`
+      // includes inherited visits (initial_visits_). Dividing only fresh
+      // playouts made the two fields mutually inconsistent (nodes/time
+      // != nps) and hid cross-move reuse from every log and benchmark:
+      // a search that adopts a 15k-node tree reported ~1.5k nps while
+      // `nodes` said 15k+. Both fields now share one numerator and the
+      // move clock as denominator, so nps == nodes/time by construction.
+      // (Numerator written as the sum, not common_info.nodes, so the
+      // per_pv_counters mode -- which skips setting nodes -- keeps a
+      // meaningful nps.)
+      const int64_t total_nodes = total_playouts_ + initial_visits_;
+      common_info.nps =
+          total_nodes * 1000 / std::max<int64_t>(1, common_info.time);
       common_info.eps = network_evaluations_ * 1000 / time_since_first_batch_ms;
     }
   }
