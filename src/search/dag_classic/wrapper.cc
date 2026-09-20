@@ -79,6 +79,9 @@ class DagClassicSearch : public SearchBase {
   std::unique_ptr<Search> search_;
   std::unique_ptr<NodeTree> tree_;
   TranspositionTable tt_;
+  // Strong references to LowNodes kept across moves (pruned by the Search
+  // constructor: >= kMinVisitsToRetain visits, capped count).
+  std::vector<std::shared_ptr<LowNode>> tt_retention_;
   std::optional<std::chrono::steady_clock::time_point> move_start_time_;
 };
 
@@ -105,6 +108,7 @@ void DagClassicSearch::NewGame() {
   LOGFILE << "New game.";
   search_.reset();
   tt_.clear();
+  tt_retention_.clear();
   tree_.reset();
   time_manager_ = classic::MakeTimeManager(*options_);
 }
@@ -138,6 +142,7 @@ void DagClassicSearch::StartSearch(const GoParams& params) {
   size_t total_memory =
       tree_.get()->GetCurrentHead()->GetN() * kAvgNodeSize +
       (sizeof(TranspositionTable::value_type) + 1) * tt_.bucket_count() +
+      tt_retention_.size() * kAvgNodeSize +
       cache_size * kAvgCacheItemSize;
   auto stopper = time_manager_->GetStopper(
       params, tree_.get()->HeadPosition(), total_memory, kAvgNodeSize,
@@ -146,7 +151,7 @@ void DagClassicSearch::StartSearch(const GoParams& params) {
       *tree_, backend_, std::move(forwarder),
       StringsToMovelist(params.searchmoves, tree_->HeadPosition().GetBoard()),
       *move_start_time_, std::move(stopper), params.infinite, params.ponder,
-      *options_, &tt_, syzygy_tb_);
+      *options_, &tt_, &tt_retention_, syzygy_tb_);
 
   LOGFILE << "Timer started at "
           << FormatTime(SteadyClockToSystemClock(*move_start_time_));

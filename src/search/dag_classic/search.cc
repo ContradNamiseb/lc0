@@ -189,17 +189,29 @@ bool IsTasksCompleted(const std::atomic<int>& task_count,
 
 }  // namespace
 
+namespace {
+// Cross-move TT persistence: keep strong references to LowNodes with at
+// least this many visits so they survive the between-moves tree trim;
+// less-searched ones are dropped and left to garbage collection.
+constexpr uint32_t kMinVisitsToRetain = 50;
+// Hard cap on retained LowNodes (memory bound; pruned least-visited-first).
+constexpr size_t kMaxRetainedLowNodes = 500'000;
+}  // namespace
+
 Search::Search(const NodeTree& tree, Backend* backend,
                std::unique_ptr<UciResponder> uci_responder,
                const MoveList& searchmoves,
                std::chrono::steady_clock::time_point start_time,
                std::unique_ptr<classic::SearchStopper> stopper, bool infinite,
-               bool ponder, const OptionsDict& options, TranspositionTable* tt,
+               bool ponder, const OptionsDict& options,
+               TranspositionTable* tt,
+               std::vector<std::shared_ptr<LowNode>>* tt_retention,
                SyzygyTablebase* syzygy_tb)
     : ok_to_respond_bestmove_(!infinite && !ponder),
       stopper_(std::move(stopper)),
       root_node_(tree.GetCurrentHead()),
       tt_(tt),
+      tt_retention_(tt_retention),
       syzygy_tb_(syzygy_tb),
       played_history_(tree.GetPositionHistory()),
       backend_(backend),
@@ -212,6 +224,34 @@ Search::Search(const NodeTree& tree, Backend* backend,
           searchmoves_, syzygy_tb_, played_history_,
           params_.GetSyzygyFastPlay(), &tb_hits_, &root_is_in_dtz_)),
       uci_responder_(std::move(uci_responder)) {
+  // Cross-move transposition persistence: prune the wrapper's retention
+  // list first (drop LowNodes below the visit threshold, then cap by
+  // keeping the most-visited). Survivors keep their TT entries alive past
+  // the tree trim, so this search re-attaches to previously-searched
+  // transpositions through the normal is_tt_hit path.
+  if (tt_retention_ != nullptr && !tt_retention_->empty()) {
+    auto& keep = *tt_retention_;
+    const size_t before = keep.size();
+    keep.erase(std::remove_if(keep.begin(), keep.end(),
+                              [](const std::shared_ptr<LowNode>& n) {
+                                return n->GetN() < kMinVisitsToRetain;
+                              }),
+               keep.end());
+    size_t kept_visits = 0;
+    for (const auto& n : keep) kept_visits += n->GetN();
+    if (keep.size() > kMaxRetainedLowNodes) {
+      std::nth_element(
+          keep.begin(), keep.begin() + kMaxRetainedLowNodes, keep.end(),
+          [](const std::shared_ptr<LowNode>& a,
+             const std::shared_ptr<LowNode>& b) {
+            return a->GetN() > b->GetN();
+          });
+      keep.resize(kMaxRetainedLowNodes);
+    }
+    CERR << "TT persistence: retained " << keep.size() << " node(s) / "
+         << kept_visits << " visit(s) (from " << before << " tracked).";
+  }
+
   // Evict expired entries from the transposition table.
   // Garbage collection may lead to expiration at any time so this is not
   // enough to prevent expired entries later during the search.
@@ -1138,6 +1178,9 @@ void SearchWorker::CancelCollisions() {
 }
 
 Search::~Search() {
+  CERR << "TT summary: hits " << tt_hits_.load(std::memory_order_relaxed)
+       << ", playouts " << total_playouts_ << ", evals "
+       << network_evaluations_ << ".";
   Abort();
   Wait();
   LOGFILE << "Search destroyed.";
@@ -2106,8 +2149,14 @@ void SearchWorker::ExtendNode(NodeToProcess& picked_node) {
   if (picked_node.tt_low_node) {
     assert(!tt_iter->second.expired());
     picked_node.is_tt_hit = true;
+    search_->tt_hits_.fetch_add(1, std::memory_order_relaxed);
   } else {
     picked_node.tt_low_node = std::make_shared<LowNode>(legal_moves);
+    // Track every created LowNode so the retention prune in the next
+    // Search constructor can decide which ones survive the tree trim.
+    if (search_->tt_retention_ != nullptr) {
+      search_->tt_retention_->push_back(picked_node.tt_low_node);
+    }
     picked_node.nn_queried = true;
     picked_node.eval->p.resize(legal_moves.size());
     picked_node.is_cache_hit = computation_->AddInput(

@@ -60,6 +60,7 @@ class Search {
          std::chrono::steady_clock::time_point start_time,
          std::unique_ptr<classic::SearchStopper> stopper, bool infinite,
          bool ponder, const OptionsDict& options, TranspositionTable* tt,
+         std::vector<std::shared_ptr<LowNode>>* tt_retention,
          SyzygyTablebase* syzygy_tb);
 
   ~Search();
@@ -170,6 +171,10 @@ class Search {
 
   Node* root_node_;
   TranspositionTable* tt_;
+  // Cross-move TT persistence: strong references to LowNodes that survived
+  // pruning (see the Search constructor), owned by the wrapper so they
+  // outlive the per-move Search and the between-moves tree trim.
+  std::vector<std::shared_ptr<LowNode>>* tt_retention_ = nullptr;
   SyzygyTablebase* syzygy_tb_;
   // Fixed positions which happened before the search.
   const PositionHistory& played_history_;
@@ -184,6 +189,9 @@ class Search {
   bool root_is_in_dtz_ = false;
   // tb_hits_ must be initialized before root_move_filter_.
   std::atomic<int> tb_hits_{0};
+  // Transposition-table hits this search (ExtendNode adopting an existing
+  // shared LowNode). There was no TT visibility before this counter.
+  std::atomic<uint64_t> tt_hits_{0};
   const MoveList root_move_filter_;
 
   mutable SharedMutex nodes_mutex_;
