@@ -278,6 +278,25 @@ Search::Search(const NodeTree& tree, Backend* backend,
          << dropped_unclean << " unclean dropped).";
   }
 
+  // Retention diagnostics (TTPERSIST only, cheap; see the members' comment):
+  // (a) build the retained-identity set for hit provenance, (b) count how
+  // many retained nodes the TT map actually still holds a key for -- the
+  // direct test of "the retained root is never found on revisit".
+  if (tt_retention_ != nullptr && !tt_retention_->empty()) {
+    for (const auto& n : *tt_retention_) {
+      if (n) diag_retained_set_.insert(n.get());
+    }
+    for (const auto& kv : *tt_) {
+      if (kv.second.expired()) continue;
+      auto locked = kv.second.lock();
+      if (locked && diag_retained_set_.count(locked.get()) > 0) {
+        ++diag_retained_findable_;
+      }
+    }
+    CERR << "TT diag: retention " << diag_retained_set_.size()
+         << " node(s), findable in TT map " << diag_retained_findable_ << ".";
+  }
+
   // Evict expired entries from the transposition table.
   // Garbage collection may lead to expiration at any time so this is not
   // enough to prevent expired entries later during the search.
@@ -1205,7 +1224,9 @@ void SearchWorker::CancelCollisions() {
 
 Search::~Search() {
   CERR << "TT summary: hits " << tt_hits_.load(std::memory_order_relaxed)
-       << ", playouts " << total_playouts_ << ", evals "
+       << " (from retention "
+       << tt_hits_from_retention_.load(std::memory_order_relaxed)
+       << "), playouts " << total_playouts_ << ", evals "
        << network_evaluations_ << ".";
   Abort();
   Wait();
@@ -2176,6 +2197,9 @@ void SearchWorker::ExtendNode(NodeToProcess& picked_node) {
     assert(!tt_iter->second.expired());
     picked_node.is_tt_hit = true;
     search_->tt_hits_.fetch_add(1, std::memory_order_relaxed);
+    if (search_->diag_retained_set_.count(picked_node.tt_low_node.get()) > 0) {
+      search_->tt_hits_from_retention_.fetch_add(1, std::memory_order_relaxed);
+    }
   } else {
     picked_node.tt_low_node = std::make_shared<LowNode>(legal_moves);
     // Track every created LowNode so the retention prune in the next

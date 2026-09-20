@@ -28,6 +28,7 @@
 #pragma once
 
 #include <array>
+#include <unordered_set>
 #include <condition_variable>
 #include <functional>
 #include <optional>
@@ -179,6 +180,14 @@ class Search {
   // threads, and an unguarded vector push there corrupts the heap (found
   // as a crash 800ms into the first fastchess game, threads>1).
   std::mutex tt_retention_mutex_;
+
+  // ---- retention diagnostics (one TTPERSIST-only line per move) ----
+  // Identity set of nodes retained at construction; a TT hit whose LowNode
+  // is in this set is TRUE cross-move reuse (vs a within-search hit).
+  std::unordered_set<const LowNode*> diag_retained_set_;
+  std::atomic<uint64_t> tt_hits_from_retention_{0};
+  // Retained nodes whose hash the TT map holds at construction time.
+  uint64_t diag_retained_findable_ = 0;
   SyzygyTablebase* syzygy_tb_;
   // Fixed positions which happened before the search.
   const PositionHistory& played_history_;
