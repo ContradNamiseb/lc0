@@ -193,7 +193,12 @@ namespace {
 // Cross-move TT persistence: keep strong references to LowNodes with at
 // least this many visits so they survive the between-moves tree trim;
 // less-searched ones are dropped and left to garbage collection.
-constexpr uint32_t kMinVisitsToRetain = 1000;
+// NOTE (2026-09-20): retaining ONE node keeps its whole child_ chain alive,
+// so each survivor can drag an entire subtree (measured: 14 retained
+// vector entries -> 7,303 alive TT entries). The threshold therefore
+// decides how much of the previous tree survives, not just a node count:
+// raised to 10000 so only deep, high-confidence nodes anchor retention.
+constexpr uint32_t kMinVisitsToRetain = 10000;
 // Hard cap on retained LowNodes (memory bound; pruned least-visited-first).
 constexpr size_t kMaxRetainedLowNodes = 500'000;
 // A "clean" retained node carries only position-determined data: not
