@@ -193,9 +193,15 @@ namespace {
 // Cross-move TT persistence: keep strong references to LowNodes with at
 // least this many visits so they survive the between-moves tree trim;
 // less-searched ones are dropped and left to garbage collection.
-constexpr uint32_t kMinVisitsToRetain = 50;
+constexpr uint32_t kMinVisitsToRetain = 1000;
 // Hard cap on retained LowNodes (memory bound; pruned least-visited-first).
 constexpr size_t kMaxRetainedLowNodes = 500'000;
+// A "clean" retained node carries only position-determined data: not
+// terminal, still at the full bounds window. Terminal marks and proven
+// bounds can be path-dependent (two-fold repetitions, sticky endgames)
+// and are the prime suspect for the first persistence match's regression.
+constexpr Bounds kCleanRetentionBounds{GameResult::BLACK_WON,
+                                       GameResult::WHITE_WON};
 }  // namespace
 
 Search::Search(const NodeTree& tree, Backend* backend,
@@ -232,9 +238,28 @@ Search::Search(const NodeTree& tree, Backend* backend,
   if (tt_retention_ != nullptr && !tt_retention_->empty()) {
     auto& keep = *tt_retention_;
     const size_t before = keep.size();
+    // Retention filter. A survivor must be CLEAN: its value may only be
+    // position-determined eval data. Two stored fields are not purely
+    // position-determined and can be stale across moves:
+    //  * terminal_type_ -- a previous search may have marked the node
+    //    terminal off a path-dependent two-fold repetition (or a sticky
+    //    endgame), and an adopting node copies the mark via
+    //    MaybeAdjustForTerminalOrTransposition;
+    //  * proven bounds -- propagated up from such marks.
+    // Both were suspected of poisoning the first persistence match
+    // (dag-orig beat TTPERSIST 4-0-8 with no outcome correlation to hit
+    // rate). Retain only non-terminal nodes still at the full window.
+    size_t dropped_unclean = 0;
     keep.erase(std::remove_if(keep.begin(), keep.end(),
-                              [](const std::shared_ptr<LowNode>& n) {
-                                return n->GetN() < kMinVisitsToRetain;
+                              [&dropped_unclean](
+                                  const std::shared_ptr<LowNode>& n) {
+                                if (n->GetN() < kMinVisitsToRetain) return true;
+                                if (n->IsTerminal() ||
+                                    n->GetBounds() != kCleanRetentionBounds) {
+                                  ++dropped_unclean;
+                                  return true;
+                                }
+                                return false;
                               }),
                keep.end());
     size_t kept_visits = 0;
@@ -249,7 +274,8 @@ Search::Search(const NodeTree& tree, Backend* backend,
       keep.resize(kMaxRetainedLowNodes);
     }
     CERR << "TT persistence: retained " << keep.size() << " node(s) / "
-         << kept_visits << " visit(s) (from " << before << " tracked).";
+         << kept_visits << " visit(s) (from " << before << " tracked; "
+         << dropped_unclean << " unclean dropped).";
   }
 
   // Evict expired entries from the transposition table.
