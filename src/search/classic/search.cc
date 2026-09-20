@@ -1491,6 +1491,11 @@ void SearchWorker::ProcessPickedTask(int start_idx, int end_idx,
 // task of slots and serializing the round on the widest subtree. Tunable.
 static constexpr int kMaxSplitsPerTask = 100;  // matches the round-wide MAX_TASKS cap
 
+// Bound on the per-worker level-entry memo (policy/utility reuse across
+// level entries). ~1.8KB per entry worst case, so 16384 entries is roughly
+// 28MB per search worker; cleared wholesale (not evicted) when exceeded.
+constexpr int kMaxPickMemoEntries = 16384;
+
 void SearchWorker::ResetTasks() {
   task_count_.store(0, std::memory_order_release);
   tasks_taken_.store(0, std::memory_order_release);
@@ -1697,41 +1702,82 @@ void SearchWorker::PickNodesToExtendTask(
                      node->GetNStarted() + cur_limit + 2);
       }
 
-      // Write policy values straight into the AoS cache, one typed field
-      // access per edge -- no temp buffer, and no pointer arithmetic past
-      // the bounds of what CopyPolicy's old stride parameter was actually
-      // given.
-      for (int i = 0; i < cache.max_policy_entries_needed; i++) {
-        cache.children[i].policy = node->GetEdgeP(i);
-      }
-      for (int i = 0; i < cache.max_policy_entries_needed; i++) {
-        cache.children[i].utility = std::numeric_limits<float>::lowest();
-      }
-      // Root depth is 1 here, while for GetDrawScore() it's 0-based, that's why
-      // the weirdness.
-      const float draw_score = ((current_path.size() + base_depth) % 2 == 0)
-                                   ? odd_draw_score
-                                   : even_draw_score;
-      m_evaluator.SetParent(node);
+      // Level-entry memo (more node reuse): if this node was entered
+      // before and no backup has moved through it since (N unchanged),
+      // restore the cached policy/utility/visited_pol instead of
+      // recomputing them. Values restored here are bit-identical to what
+      // the recompute below would produce for the same N.
       float visited_pol = 0.0f;
-      for (Node* child : node->VisitedNodes()) {
-        int index = child->Index();
-        // Read the policy from the parent's live edge array rather than
-        // from the capped cache copy: a visited child whose index is beyond
-        // max_policy_entries_needed would otherwise read a stale ChildCache
-        // slot left by a previous level and corrupt visited_pol/FPU.
-        // (Same fix as dag_classic's child->GetP(); classic's Node does not
-        // expose GetP, so go through the parent by the child's edge index.)
-        visited_pol += node->GetEdgeP(index);
-        float q = child->GetQ(draw_score);
-        cache.children[index].utility = q + m_evaluator.GetMUtility(child, q);
-      }
-      const float fpu =
-          GetFpu(params_, node, is_root_node, draw_score, visited_pol);
-      for (int i = 0; i < cache.max_policy_entries_needed; i++) {
-        if (cache.children[i].utility ==
-            std::numeric_limits<float>::lowest()) {
-          cache.children[i].utility = fpu + m_evaluator.GetDefaultMUtility();
+      auto& memo = workspace->pick_memo;
+      auto memo_it = memo.find(node);
+      const uint32_t memo_stamp = node->GetN();
+      if (memo_it != memo.end() &&
+          memo_it->second.stamp_n == memo_stamp &&
+          memo_it->second.policy.size() >=
+              static_cast<size_t>(cache.max_policy_entries_needed)) {
+        const auto& e = memo_it->second;
+        for (int i = 0; i < cache.max_policy_entries_needed; i++) {
+          cache.children[i].policy = e.policy[i];
+          cache.children[i].utility = e.utility[i];
+        }
+        visited_pol = e.visited_pol;
+      } else {
+        memo_it = memo.end();  // save below re-inserts with fresh values
+        // Write policy values straight into the AoS cache, one typed field
+        // access per edge -- no temp buffer, and no pointer arithmetic past
+        // the bounds of what CopyPolicy's old stride parameter was actually
+        // given.
+        for (int i = 0; i < cache.max_policy_entries_needed; i++) {
+          cache.children[i].policy = node->GetEdgeP(i);
+        }
+        for (int i = 0; i < cache.max_policy_entries_needed; i++) {
+          cache.children[i].utility = std::numeric_limits<float>::lowest();
+        }
+        // Root depth is 1 here, while for GetDrawScore() it's 0-based,
+        // that's why the weirdness.
+        const float draw_score = ((current_path.size() + base_depth) % 2 == 0)
+                                     ? odd_draw_score
+                                     : even_draw_score;
+        m_evaluator.SetParent(node);
+        for (Node* child : node->VisitedNodes()) {
+          int index = child->Index();
+          // Read the policy from the parent's live edge array rather than
+          // from the capped cache copy: a visited child whose index is
+          // beyond max_policy_entries_needed would otherwise read a stale
+          // ChildCache slot left by a previous level and corrupt
+          // visited_pol/FPU.
+          visited_pol += node->GetEdgeP(index);
+          float q = child->GetQ(draw_score);
+          cache.children[index].utility =
+              q + m_evaluator.GetMUtility(child, q);
+        }
+        const float fpu =
+            GetFpu(params_, node, is_root_node, draw_score, visited_pol);
+        for (int i = 0; i < cache.max_policy_entries_needed; i++) {
+          if (cache.children[i].utility ==
+              std::numeric_limits<float>::lowest()) {
+            cache.children[i].utility =
+                fpu + m_evaluator.GetDefaultMUtility();
+          }
+        }
+        // Save for future entries. Full-edge arrays so a later entry with
+        // the same N but a larger max_policy_entries_needed still hits;
+        // slots beyond this entry's cap carry the FPU fill value they
+        // would have received anyway.
+        if (memo.size() > static_cast<size_t>(kMaxPickMemoEntries)) {
+          memo.clear();
+        }
+        auto& e = memo[node];
+        e.stamp_n = memo_stamp;
+        e.visited_pol = visited_pol;
+        const int num_edges = node->GetNumEdges();
+        e.policy.resize(num_edges);
+        e.utility.resize(num_edges);
+        for (int i = 0; i < num_edges; i++) {
+          e.policy[i] = node->GetEdgeP(i);
+          e.utility[i] = (i < cache.max_policy_entries_needed)
+                             ? cache.children[i].utility
+                             : fpu + m_evaluator.GetDefaultMUtility();
         }
       }
 

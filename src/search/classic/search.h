@@ -44,6 +44,7 @@
 #include "search/classic/stoppers/timemgr.h"
 #include "syzygy/syzygy.h"
 #include "utils/logging.h"
+#include "absl/container/flat_hash_map.h"
 #include "utils/mutex.h"
 
 namespace lczero {
@@ -465,6 +466,22 @@ class SearchWorker {
     // top of every level's prep block), so a previous call's leftover
     // contents are never observed.
     CachedNodeData cache;
+
+    // Level-entry memo (more node reuse): policy is immutable per node
+    // within a search, and utility/visited_pol only change when a backup
+    // moves through the node (its N changes). On a stamp match the policy
+    // copy, the visited-children walk and the FPU computation are skipped
+    // for that level entry. Keyed by node pointer: the workspace (and so
+    // the memo) is rebuilt every search, and nodes are freed only via the
+    // garbage collector after the tree trim, so keys stay valid for the
+    // memo's lifetime. Cleared wholesale when the entry bound is hit.
+    struct PickMemoEntry {
+      uint32_t stamp_n = 0;
+      float visited_pol = 0.0f;
+      std::vector<float> policy;   // num_edges entries
+      std::vector<float> utility;  // num_edges entries (fpu-filled tail)
+    };
+    absl::flat_hash_map<Node*, PickMemoEntry> pick_memo;
 
     TaskWorkspace() {
       vtp_buffer.reserve(30);
