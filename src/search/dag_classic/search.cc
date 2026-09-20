@@ -311,6 +311,29 @@ Search::Search(const NodeTree& tree, Backend* backend,
   // enough to prevent expired entries later during the search.
   absl::erase_if(*tt_, [](const auto& item) { return item.second.expired(); });
 
+  // Zero-race root adoption (peer review #918): adopt the retained ROOT
+  // payload HERE, before worker threads launch. Then initial_visits_ is
+  // known to the time manager and stoppers from t=0 (the backup-site import
+  // alone left a window where a stopper could read a stale 0) and playout 1
+  // picks a child instead of visiting the root as a fresh leaf. Same
+  // cleanliness gates as the ExtendNode adoption site.
+  if (root_node_->GetN() == 0 && !root_node_->GetLowNode()) {
+    const uint64_t root_hash =
+        played_history_.HashLast(params_.GetCacheHistoryLength() + 1);
+    auto root_it = tt_->find(root_hash);
+    if (root_it != tt_->end()) {
+      auto cand = root_it->second.lock();
+      if (cand && cand->GetN() > 0 && cand->GetGen() != 0 &&
+          cand->GetGen() != gen_ && !cand->IsTerminal() &&
+          cand->GetBounds() == kCleanRetentionBounds) {
+        root_node_->SetLowNode(cand);
+        root_node_->InitFromLowNode();
+        initial_visits_ = root_node_->GetN();
+        CERR << "TT root adopted in ctor: N=" << initial_visits_;
+      }
+    }
+  }
+
   LOGFILE << "Transposition table garbage collection done.";
 
   if (params_.GetMaxConcurrentSearchers() != 0) {
