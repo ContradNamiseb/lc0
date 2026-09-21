@@ -246,6 +246,14 @@ class SyclNetworkComputation : public NetworkComputation {
   ~SyclNetworkComputation();
 
   void AddInput(InputPlanes&& input) override {
+    // The staging buffers are sized for max_batch; a larger batch would
+    // write outside the host USM allocation (S3).
+    const int max_batch = network_->GetMaxBatchSize();
+    if (batch_size_ >= max_batch) {
+      throw Exception(
+          "SYCL backend: AddInput would exceed max_batch capacity (" +
+          std::to_string(max_batch) + ").");
+    }
     const auto iter_mask =
         &inputs_outputs_->input_masks_mem_shared_[batch_size_ * kInputPlanes];
     const auto iter_val =
@@ -322,12 +330,20 @@ class SyclNetwork : public Network {
                  nf.network() == NF::NETWORK_KDA_HYBRID_WITH_MULTIHEADFORMAT;
 
     max_batch_size_ = options.GetOrDefault<int>("max_batch", 1024);
+    if (max_batch_size_ <= 0) {
+      throw Exception("max_batch must be positive, got " +
+                      std::to_string(max_batch_size_) + ".");
+    }
     // min_batch_size_ is chosen as 4 as it is common that for sizes less than
     // 4 that there is no performance gain, but there is variance in the
     // outputs, which means that there is extra non-determinism in some
     // scenarios, including using the multiplexing backend.
     min_batch_size_ =
         options.GetOrDefault<int>("min_batch", std::min(4, max_batch_size_));
+    if (min_batch_size_ <= 0) {
+      throw Exception("min_batch must be positive, got " +
+                      std::to_string(min_batch_size_) + ".");
+    }
     if (max_batch_size_ < min_batch_size_)
       throw Exception("Max batch must not be less than min_batch setting.");
 
@@ -347,17 +363,30 @@ class SyclNetwork : public Network {
 
     // Get context.
     sycl::context context{devices[gpu_id_]};
-    auto exceptions_handler = [](sycl::exception_list exceptions) {
+    // Async errors are delivered to this handler, and returning from it
+    // consumes them for wait_and_throw() callers -- the old "print and let
+    // wait_and_throw catch it" comment was wrong. Capture the first error in
+    // a state shared with the network, which rethrows it at the blocking
+    // boundary (S2). The handler itself stays noexcept.
+    auto async_error_state = async_error_state_;
+    auto exceptions_handler = [async_error_state](
+                                  sycl::exception_list exceptions) {
       for (std::exception_ptr const& e : exceptions) {
+        try {
+          async_error_state->Capture(e);
+        } catch (...) {
+          // Never let the handler throw (destructor-time callbacks).
+        }
         try {
           std::rethrow_exception(e);
         } catch (sycl::exception const& e) {
           std::cerr << "Caught asynchronous SYCL exception:\n"
                     << e.what() << std::endl;
-          // Do not rethrow, just print to allow wait_and_throw to catch it!
         } catch (std::exception const& e) {
           std::cerr << "Caught asynchronous std::exception:\n"
                     << e.what() << std::endl;
+        } catch (...) {
+          std::cerr << "Caught asynchronous unknown exception." << std::endl;
         }
       }
     };
@@ -374,6 +403,19 @@ class SyclNetwork : public Network {
 
     // Select GPU to run on (for *the current* thread).
     multi_stream_ = options.GetOrDefault<bool>("multi_stream", false);
+    if (multi_stream_ &&
+        std::getenv("LC0_TEST_SYCL_ALLOW_MULTI_STREAM") == nullptr) {
+      // Review item 4 finding: concurrent evaluations on one network in this
+      // mode are unqualified and currently crash (access violation,
+      // KdaParity.SyclSimultaneousComputationsMatchSerial reproduces it
+      // deterministically). Fail loudly by default; the test-only env hook
+      // above lets the qualifier test exercise the experimental path while
+      // it is being fixed. The default mode serializes with lock_ and is
+      // safe.
+      throw Exception(
+          "SYCL multi_stream is not supported: concurrent evaluations on one "
+          "network are unsafe in this mode. Use multi_stream=false.");
+    }
 
     // layout used by cuda backend is nchw.
     has_tensor_cores_ = false;
@@ -739,6 +781,16 @@ class SyclNetwork : public Network {
     if (!multi_stream_) guard.lock();
 
     try {
+    // Fail fast if the network is already failed; then (test-only) inject a
+    // synthetic async error so the propagation path is deterministic -- a
+    // real device fault cannot be produced on demand safely.
+    RethrowAsyncError();
+    if (std::getenv("LC0_TEST_SYCL_INJECT_ASYNC_ERROR") != nullptr) {
+      async_error_state_->Capture(std::make_exception_ptr(sycl::exception(
+          sycl::make_error_code(sycl::errc::runtime),
+          "injected async error (test)")));
+      RethrowAsyncError();
+    }
 
 #ifdef DEBUG_RAW_NPS
     auto t_start = std::chrono::high_resolution_clock::now();
@@ -1021,6 +1073,9 @@ class SyclNetwork : public Network {
     }
 
     event.wait_and_throw();
+    // wait_and_throw() delivers async errors to the queue handler, which
+    // consumes them; rethrow whatever it captured before any output is used.
+    RethrowAsyncError();
 
     if (wdl_) {
       // Value softmax done cpu side.
@@ -1048,6 +1103,14 @@ class SyclNetwork : public Network {
   }
 
 
+  // Rethrows the first async error reported by the queue handler, if any.
+  // Called at the computation boundary so a failed computation can never be
+  // observed as successful output. The policy is fail-closed and sticky:
+  // once any async error is seen, the network keeps failing here.
+  void RethrowAsyncError() const {
+    if (auto error = async_error_state_->Get()) std::rethrow_exception(error);
+  }
+
   ~SyclNetwork() {
     if (!multi_stream_) {
       if (offset_pointers_) sycl::free(offset_pointers_, *sycl_queue_);
@@ -1069,10 +1132,15 @@ class SyclNetwork : public Network {
   int GetMiniBatchSize() const override {
     // Default mini-batch size tuned for SYCL CPU host execution
     constexpr int kCpuDefaultMiniBatchSize = 47;
-    if (!device_cache_.is_gpu) return kCpuDefaultMiniBatchSize;
-    // Simple heuristic that seems to work for a wide range of GPUs.
-    return 2 * device_cache_.max_compute_units;
+    const int recommended = device_cache_.is_gpu
+                                ? 2 * device_cache_.max_compute_units
+                                : kCpuDefaultMiniBatchSize;
+    // The recommendation must fit the configured hard capacity: the host
+    // staging buffers are sized for max_batch_size_ (S3).
+    return std::clamp(recommended, min_batch_size_, max_batch_size_);
   }
+
+  int GetMaxBatchSize() const override { return max_batch_size_; }
 
   std::unique_ptr<NetworkComputation> NewComputation() override {
     return std::make_unique<SyclNetworkComputation<DataType>>(this, wdl_,
@@ -1110,6 +1178,24 @@ class SyclNetwork : public Network {
                                           // tower
   bool multi_stream_;                     // run multiple parallel network evals
   bool allow_cache_opt_;  // try to fit residual block activations in L2 cache
+
+  // First async error reported by the queue handler, captured so the
+  // blocking boundary can rethrow it (see RethrowAsyncError). Shared because
+  // the handler is owned by the queue and must not dangle.
+  struct AsyncErrorState {
+    std::mutex mutex;
+    std::exception_ptr error;
+    void Capture(std::exception_ptr e) {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (!error) error = e;
+    }
+    std::exception_ptr Get() {
+      std::lock_guard<std::mutex> lock(mutex);
+      return error;
+    }
+  };
+  std::shared_ptr<AsyncErrorState> async_error_state_ =
+      std::make_shared<AsyncErrorState>();
 
   // Currently only one NN Eval can happen a time (we can fix this if needed
   // by allocating more memory).

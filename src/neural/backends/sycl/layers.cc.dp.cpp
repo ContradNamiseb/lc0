@@ -2345,7 +2345,7 @@ void allocAndUpload(DataType** gpu_dest, std::vector<float> cpu_src,
 
   auto deleter = [&sycl_queue](DataType* ptr) { sycl::free(ptr, sycl_queue); };
   std::unique_ptr<DataType, decltype(deleter)> ptr_guard(
-      (DataType*)sycl::malloc_device(size, sycl_queue), deleter);
+      checkedMallocDevice<DataType>(cpu_src.size(), sycl_queue), deleter);
 
   sycl_queue.memcpy(scratch, &cpu_src[0], cpu_src.size() * sizeof(float))
       .wait();
@@ -2460,6 +2460,77 @@ EncoderBlock<DataType>::EncoderBlock(
       sycl_queue_(sycl_queue) {
   ffn_dense1_size_ = cpu_weights.ffn.dense1_b.size();
   ffn_dense2_size_ = cpu_weights.ffn.dense2_b.size();
+
+  // S6: validate the whole encoder contract before allocating anything.
+  // The FFN GEMMs and layer-norm kernels assume exact matrix dimensions and
+  // full-width gamma/beta vectors; a truncated nonempty gamma would be read
+  // over the embedding width, and the FFN bias check below used to test only
+  // pointer presence.
+  {
+    auto require_size = [](const std::vector<float>& v, size_t expected,
+                           const char* what) {
+      if (v.size() != expected) {
+        throw Exception(std::string("Invalid ") + what + ": got " +
+                        std::to_string(v.size()) + " values, expected " +
+                        std::to_string(expected) + ".");
+      }
+    };
+    if (ffn_dense1_size_ <= 0 || ffn_dense2_size_ != embedding_op_size_) {
+      throw Exception("Invalid FFN dimensions: dense1 width " +
+                      std::to_string(ffn_dense1_size_) +
+                      ", dense2 width " + std::to_string(ffn_dense2_size_) +
+                      ", embedding " + std::to_string(embedding_op_size_) +
+                      ".");
+    }
+    // addBiasBatched processes four channels per work-item and rejects
+    // widths that are not a multiple of 4; the FFN and embedding widths
+    // were not covered by the KDA-specific divisibility guards (S6).
+    if (embedding_op_size_ % 4 != 0 || ffn_dense1_size_ % 4 != 0) {
+      throw Exception(
+          "Encoder widths must be divisible by 4 for addBiasBatched: "
+          "embedding " +
+          std::to_string(embedding_op_size_) + ", FFN " +
+          std::to_string(ffn_dense1_size_) + ".");
+    }
+    require_size(cpu_weights.ffn.dense1_w,
+                 static_cast<size_t>(embedding_op_size_) * ffn_dense1_size_,
+                 "FFN dense1_w");
+    require_size(cpu_weights.ffn.dense1_b, ffn_dense1_size_, "FFN dense1_b");
+    require_size(cpu_weights.ffn.dense2_w,
+                 static_cast<size_t>(ffn_dense1_size_) * embedding_op_size_,
+                 "FFN dense2_w");
+    require_size(cpu_weights.ffn.dense2_b, embedding_op_size_, "FFN dense2_b");
+    require_size(cpu_weights.ln1_gammas, embedding_op_size_, "LN1 gammas");
+    require_size(cpu_weights.ln1_betas, embedding_op_size_, "LN1 betas");
+    require_size(cpu_weights.ln2_gammas, embedding_op_size_, "LN2 gammas");
+    require_size(cpu_weights.ln2_betas, embedding_op_size_, "LN2 betas");
+    if (!std::isfinite(default_eps_) || default_eps_ <= 0.0f) {
+      throw Exception("Invalid default epsilon: " +
+                      std::to_string(default_eps_) + ".");
+    }
+    if (is_kda_ &&
+        (!std::isfinite(kda_rms_norm_epsilon_) ||
+         kda_rms_norm_epsilon_ < 0.0f)) {
+      // Finite and nonnegative: 0 is the proto default and a valid plain RMS
+      // norm (BLAS computes sqrt(sum_squares / value_depth + eps) with the
+      // same field), as shipped nets like kda-t1-55050 do; negative or
+      // non-finite would poison the sqrt.
+      throw Exception("Invalid kda.rms_norm_epsilon: " +
+                      std::to_string(kda_rms_norm_epsilon_) + ".");
+    }
+  }
+
+  // Constructor-unwind guard (S4): every device buffer this constructor
+  // allocates is released if anything below throws, because the destructor
+  // does not run for an object whose construction failed. Disarmed once
+  // construction completes (the destructor then owns the buffers).
+  struct UnwindGuard {
+    EncoderBlock* self;
+    bool armed = true;
+    ~UnwindGuard() {
+      if (armed) self->ReleaseDeviceBuffers();
+    }
+  } unwind_guard{this};
 
   if (is_kda_) {
     if (kda_key_dim_ <= 0 || kda_value_dim_ <= 0 || kda_gate_rank_ <= 0) {
@@ -2615,6 +2686,18 @@ EncoderBlock<DataType>::EncoderBlock(
                        static_cast<size_t>(embedding_op_size_));
     }
 
+    // addBiasBatched() rejects a fused bias wider than 2048 channels (S6);
+    // a load-time diagnostic beats an eval-time throw after a full
+    // successful-looking load.
+    if ((!cpu_weights.kda.q_b.empty() || !cpu_weights.kda.k_b.empty() ||
+         !cpu_weights.kda.v_b.empty()) &&
+        2 * key_depth + value_depth > 2048) {
+      throw Exception(
+          "KDA fused QKV bias width (" +
+          std::to_string(2 * key_depth + value_depth) +
+          ") exceeds the addBiasBatched kernel limit (2048).");
+    }
+
     allocAndUpload<DataType>(&kda_q_w, cpu_weights.kda.q_w, scratch,
                              sycl_queue_);
     allocAndUpload<DataType>(&kda_q_b, cpu_weights.kda.q_b, scratch,
@@ -2670,8 +2753,7 @@ EncoderBlock<DataType>::EncoderBlock(
 
     const int qkv_depth = 2 * key_depth + value_depth;
     size_t qkv_w_elements = static_cast<size_t>(qkv_depth) * embedding_op_size_;
-    kda_qkv_w = static_cast<DataType*>(sycl::malloc_device(
-        qkv_w_elements * sizeof(DataType), sycl_queue_));
+    kda_qkv_w = checkedMallocDevice<DataType>(qkv_w_elements, sycl_queue_);
     sycl_queue_.memcpy(kda_qkv_w, kda_q_w,
                        cpu_weights.kda.q_w.size() * sizeof(DataType));
     sycl_queue_.memcpy(kda_qkv_w + cpu_weights.kda.q_w.size(), kda_k_w,
@@ -2681,8 +2763,8 @@ EncoderBlock<DataType>::EncoderBlock(
         kda_v_w, cpu_weights.kda.v_w.size() * sizeof(DataType));
 
     if (kda_q_b && kda_k_b && kda_v_b) {
-      kda_qkv_b = static_cast<DataType*>(
-          sycl::malloc_device(qkv_depth * sizeof(DataType), sycl_queue_));
+      kda_qkv_b =
+          checkedMallocDevice<DataType>(qkv_depth, sycl_queue_);
       sycl_queue_.memcpy(kda_qkv_b, kda_q_b,
                          cpu_weights.kda.q_b.size() * sizeof(DataType));
       sycl_queue_.memcpy(kda_qkv_b + cpu_weights.kda.q_b.size(), kda_k_b,
@@ -2690,13 +2772,36 @@ EncoderBlock<DataType>::EncoderBlock(
       sycl_queue_.memcpy(
           kda_qkv_b + cpu_weights.kda.q_b.size() + cpu_weights.kda.k_b.size(),
           kda_v_b, cpu_weights.kda.v_b.size() * sizeof(DataType));
+    } else if (kda_q_b || kda_k_b || kda_v_b) {
+      // Partially present bias set (review S1): the fused path below is taken
+      // whenever the fused weights exist, so building the fused bias only when
+      // ALL three exist silently dropped every present slice. Absent slices
+      // are zero-filled, which makes addBiasBatched's add-then-activate
+      // elementwise identical to BLAS applying each projection's bias -- or
+      // no bias, plus activation -- independently.
+      kda_qkv_b =
+          checkedMallocDevice<DataType>(qkv_depth, sycl_queue_);
+      sycl_queue_.memset(kda_qkv_b, 0, qkv_depth * sizeof(DataType));
+      if (kda_q_b) {
+        sycl_queue_.memcpy(kda_qkv_b, kda_q_b,
+                           static_cast<size_t>(key_depth) * sizeof(DataType));
+      }
+      if (kda_k_b) {
+        sycl_queue_.memcpy(kda_qkv_b + key_depth, kda_k_b,
+                           static_cast<size_t>(key_depth) * sizeof(DataType));
+      }
+      if (kda_v_b) {
+        sycl_queue_.memcpy(kda_qkv_b + 2 * key_depth, kda_v_b,
+                           static_cast<size_t>(value_depth) *
+                               sizeof(DataType));
+      }
     }
 
     if (kda_output_gate_ && !cpu_weights.kda.gate_a_w.empty()) {
       size_t decay_gate_a_elements =
           static_cast<size_t>(2 * kda_gate_rank_) * embedding_op_size_;
-      kda_decay_gate_a_w = static_cast<DataType*>(sycl::malloc_device(
-          decay_gate_a_elements * sizeof(DataType), sycl_queue_));
+      kda_decay_gate_a_w =
+          checkedMallocDevice<DataType>(decay_gate_a_elements, sycl_queue_);
       sycl_queue_.memcpy(
           kda_decay_gate_a_w, kda_decay_a_w,
           cpu_weights.kda.decay_a_w.size() * sizeof(DataType));
@@ -2704,15 +2809,25 @@ EncoderBlock<DataType>::EncoderBlock(
           kda_decay_gate_a_w + cpu_weights.kda.decay_a_w.size(), kda_gate_a_w,
           cpu_weights.kda.gate_a_w.size() * sizeof(DataType));
 
-      if (kda_decay_a_b && kda_gate_a_b) {
-        kda_decay_gate_a_b = static_cast<DataType*>(sycl::malloc_device(
-            (2 * kda_gate_rank_) * sizeof(DataType), sycl_queue_));
-        sycl_queue_.memcpy(
-            kda_decay_gate_a_b, kda_decay_a_b,
-            cpu_weights.kda.decay_a_b.size() * sizeof(DataType));
-        sycl_queue_.memcpy(
-            kda_decay_gate_a_b + cpu_weights.kda.decay_a_b.size(),
-            kda_gate_a_b, cpu_weights.kda.gate_a_b.size() * sizeof(DataType));
+      if (kda_decay_a_b || kda_gate_a_b) {
+        // Same partial-presence fix as the fused QKV bias above (review S1):
+        // the fused decay/gate-A path is taken whenever the fused weights
+        // exist, so an absent half must be zero-filled rather than dropping
+        // the present half. ACTIVATION_NONE + zero is exactly "no bias".
+        kda_decay_gate_a_b =
+            checkedMallocDevice<DataType>(2 * kda_gate_rank_, sycl_queue_);
+        sycl_queue_.memset(kda_decay_gate_a_b, 0,
+                           (2 * kda_gate_rank_) * sizeof(DataType));
+        if (kda_decay_a_b) {
+          sycl_queue_.memcpy(kda_decay_gate_a_b, kda_decay_a_b,
+                             static_cast<size_t>(kda_gate_rank_) *
+                                 sizeof(DataType));
+        }
+        if (kda_gate_a_b) {
+          sycl_queue_.memcpy(kda_decay_gate_a_b + kda_gate_rank_, kda_gate_a_b,
+                             static_cast<size_t>(kda_gate_rank_) *
+                                 sizeof(DataType));
+        }
       }
     }
   } else {
@@ -2746,7 +2861,8 @@ EncoderBlock<DataType>::EncoderBlock(
 
     size_t elements = cpu_weights.mha.q_w.size();
     size_t size = elements * sizeof(DataType) * 3;
-    mha_qkv_w = (DataType*)sycl::malloc_device(size, sycl_queue_);
+    mha_qkv_w =
+        checkedMallocDevice<DataType>(size / sizeof(DataType), sycl_queue_);
     sycl_queue_.memcpy(mha_qkv_w, mha_q_w, size / 3);
     sycl_queue_.memcpy(mha_qkv_w + elements, mha_k_w, size / 3);
     sycl_queue_.memcpy(mha_qkv_w + elements * 2, mha_v_w, size / 3);
@@ -2757,8 +2873,15 @@ EncoderBlock<DataType>::EncoderBlock(
           elements != cpu_weights.mha.v_b.size()) {
         throw Exception("MHA Q/K/V bias dimensions differ.");
       }
+      // addBiasBatched() limit (S6), same as the KDA fused bias above.
+      if (elements * 3 > 2048) {
+        throw Exception(
+            "MHA fused QKV bias width (" + std::to_string(elements * 3) +
+            ") exceeds the addBiasBatched kernel limit (2048).");
+      }
       size = elements * sizeof(DataType) * 3;
-      mha_qkv_b = (DataType*)sycl::malloc_device(size, sycl_queue_);
+      mha_qkv_b =
+          checkedMallocDevice<DataType>(size / sizeof(DataType), sycl_queue_);
       sycl_queue_.memcpy(mha_qkv_b, mha_q_b, size / 3);
       sycl_queue_.memcpy(mha_qkv_b + elements, mha_k_b, size / 3);
       sycl_queue_.memcpy(mha_qkv_b + elements * 2, mha_v_b, size / 3);
@@ -2827,6 +2950,7 @@ EncoderBlock<DataType>::EncoderBlock(
     // GPU memory already allocated in AttentionBody.
     smol_global = smolgen_global_scratch;
   }
+  unwind_guard.armed = false;
 }
 
 template <typename DataType>
@@ -3700,29 +3824,30 @@ AttentionPolicyHead<DataType>::~AttentionPolicyHead() {
   // encoder_weights_ is managed by std::unique_ptr
 }
 
+// Frees every device buffer this block owns. Null-tolerant: it also runs
+// from the constructor's unwind guard, where only the buffers allocated so
+// far are non-null (S4).
 template <typename DataType>
-EncoderBlock<DataType>::~EncoderBlock() {
-  sycl::free(mha_q_w, sycl_queue_);
-  sycl::free(mha_q_b, sycl_queue_);
-  sycl::free(mha_k_w, sycl_queue_);
-  sycl::free(mha_k_b, sycl_queue_);
-  sycl::free(mha_v_w, sycl_queue_);
-  sycl::free(mha_v_b, sycl_queue_);
-  sycl::free(mha_qkv_w, sycl_queue_);
-  sycl::free(mha_qkv_b, sycl_queue_);
-  sycl::free(mha_dense_w, sycl_queue_);
-  sycl::free(mha_dense_b, sycl_queue_);
-  sycl::free(ln1_gammas, sycl_queue_);
-  sycl::free(ln1_betas, sycl_queue_);
-  sycl::free(ffn_dense1_w, sycl_queue_);
-  sycl::free(ffn_dense1_b, sycl_queue_);
-  sycl::free(ffn_dense2_w, sycl_queue_);
-  sycl::free(ffn_dense2_b, sycl_queue_);
-  sycl::free(ln2_gammas, sycl_queue_);
-  sycl::free(ln2_betas, sycl_queue_);
-  // The SYCL spec requires sycl::free's pointer to come from a USM
-  // allocation; pure-MHA layers leave every kda_* member null, so guard
-  // each one rather than rely on it being a no-op in practice.
+void EncoderBlock<DataType>::ReleaseDeviceBuffers() {
+  if (mha_q_w) sycl::free(mha_q_w, sycl_queue_);
+  if (mha_q_b) sycl::free(mha_q_b, sycl_queue_);
+  if (mha_k_w) sycl::free(mha_k_w, sycl_queue_);
+  if (mha_k_b) sycl::free(mha_k_b, sycl_queue_);
+  if (mha_v_w) sycl::free(mha_v_w, sycl_queue_);
+  if (mha_v_b) sycl::free(mha_v_b, sycl_queue_);
+  if (mha_qkv_w) sycl::free(mha_qkv_w, sycl_queue_);
+  if (mha_qkv_b) sycl::free(mha_qkv_b, sycl_queue_);
+  if (mha_dense_w) sycl::free(mha_dense_w, sycl_queue_);
+  if (mha_dense_b) sycl::free(mha_dense_b, sycl_queue_);
+  if (ln1_gammas) sycl::free(ln1_gammas, sycl_queue_);
+  if (ln1_betas) sycl::free(ln1_betas, sycl_queue_);
+  if (ffn_dense1_w) sycl::free(ffn_dense1_w, sycl_queue_);
+  if (ffn_dense1_b) sycl::free(ffn_dense1_b, sycl_queue_);
+  if (ffn_dense2_w) sycl::free(ffn_dense2_w, sycl_queue_);
+  if (ffn_dense2_b) sycl::free(ffn_dense2_b, sycl_queue_);
+  if (ln2_gammas) sycl::free(ln2_gammas, sycl_queue_);
+  if (ln2_betas) sycl::free(ln2_betas, sycl_queue_);
+  // Pure-MHA layers leave every kda_* member null.
   if (kda_q_w) sycl::free(kda_q_w, sycl_queue_);
   if (kda_q_b) sycl::free(kda_q_b, sycl_queue_);
   if (kda_k_w) sycl::free(kda_k_w, sycl_queue_);
@@ -3751,17 +3876,20 @@ EncoderBlock<DataType>::~EncoderBlock() {
   if (kda_decay_gate_a_w) sycl::free(kda_decay_gate_a_w, sycl_queue_);
   if (kda_decay_gate_a_b) sycl::free(kda_decay_gate_a_b, sycl_queue_);
   if (has_smolgen_) {
-    sycl::free(smol_compress, sycl_queue_);
-    sycl::free(smol_dense1_w, sycl_queue_);
-    sycl::free(smol_dense1_b, sycl_queue_);
-    sycl::free(smol_dense2_w, sycl_queue_);
-    sycl::free(smol_dense2_b, sycl_queue_);
-    sycl::free(smol_ln1_gammas, sycl_queue_);
-    sycl::free(smol_ln1_betas, sycl_queue_);
-    sycl::free(smol_ln2_gammas, sycl_queue_);
-    sycl::free(smol_ln2_betas, sycl_queue_);
+    if (smol_compress) sycl::free(smol_compress, sycl_queue_);
+    if (smol_dense1_w) sycl::free(smol_dense1_w, sycl_queue_);
+    if (smol_dense1_b) sycl::free(smol_dense1_b, sycl_queue_);
+    if (smol_dense2_w) sycl::free(smol_dense2_w, sycl_queue_);
+    if (smol_dense2_b) sycl::free(smol_dense2_b, sycl_queue_);
+    if (smol_ln1_gammas) sycl::free(smol_ln1_gammas, sycl_queue_);
+    if (smol_ln1_betas) sycl::free(smol_ln1_betas, sycl_queue_);
+    if (smol_ln2_gammas) sycl::free(smol_ln2_gammas, sycl_queue_);
+    if (smol_ln2_betas) sycl::free(smol_ln2_betas, sycl_queue_);
   }
 }
+
+template <typename DataType>
+EncoderBlock<DataType>::~EncoderBlock() { ReleaseDeviceBuffers(); }
 
 template <typename DataType>
 EmbeddingLayer<DataType>::EmbeddingLayer(BaseLayer<DataType>* ip,
@@ -3817,6 +3945,17 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
                   weights.ip_add_gate.size() > 0),
       has_smolgen_(weights.has_smolgen),
       is_pe_dense_embedding_(is_pe_dense_embedding) {
+  // Constructor-unwind guard (S4): releases the outer uploads if anything
+  // below throws; already-constructed encoders are destroyed as members.
+  // Disarmed once construction completes.
+  struct UnwindGuard {
+    AttentionBody* self;
+    bool armed = true;
+    ~UnwindGuard() {
+      if (armed) self->ReleaseDeviceBuffers();
+    }
+  } unwind_guard{this};
+
   allocAndUpload<DataType>(&ip_emb_w_, weights.ip_emb_w, scratch, sycl_queue_);
   allocAndUpload<DataType>(&ip_emb_b_, weights.ip_emb_b, scratch, sycl_queue_);
 
@@ -3855,7 +3994,7 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
     size_t dest_byte_count = element_count * sizeof(DataType);
     size_t float_byte_count = element_count * sizeof(float);
     pos_encoding_ =
-        (DataType*)sycl::malloc_device(dest_byte_count, sycl_queue_);
+        checkedMallocDevice<DataType>(element_count, sycl_queue_);
     sycl_queue_.memcpy(scratch, kPosEncoding, float_byte_count);
     copyTypeConverted(pos_encoding_, (float*)scratch,
                       static_cast<int>(element_count), sycl_queue_);
@@ -3885,36 +4024,40 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
 
     encoder_weights_.emplace_back(std::unique_ptr<EncoderBlock<DataType>>(pW));
   }
+  unwind_guard.armed = false;
 }
 
 template <typename DataType>
-AttentionBody<DataType>::~AttentionBody() {
-  sycl::free(ip_emb_w_, sycl_queue_);
-  sycl::free(ip_emb_b_, sycl_queue_);
+void AttentionBody<DataType>::ReleaseDeviceBuffers() {
+  if (ip_emb_w_) sycl::free(ip_emb_w_, sycl_queue_);
+  if (ip_emb_b_) sycl::free(ip_emb_b_, sycl_queue_);
   if (is_pe_dense_embedding_) {
-    sycl::free(ip_emb_pre_w_, sycl_queue_);
-    sycl::free(ip_emb_pre_b_, sycl_queue_);
-    sycl::free(ip_emb_ln_g_, sycl_queue_);
-    sycl::free(ip_emb_ln_b_, sycl_queue_);
-    sycl::free(ip_emb_ffn_d1_w_, sycl_queue_);
-    sycl::free(ip_emb_ffn_d1_b_, sycl_queue_);
-    sycl::free(ip_emb_ffn_d2_w_, sycl_queue_);
-    sycl::free(ip_emb_ffn_d2_b_, sycl_queue_);
-    sycl::free(ip_emb_ffn_ln_g_, sycl_queue_);
-    sycl::free(ip_emb_ffn_ln_b_, sycl_queue_);
+    if (ip_emb_pre_w_) sycl::free(ip_emb_pre_w_, sycl_queue_);
+    if (ip_emb_pre_b_) sycl::free(ip_emb_pre_b_, sycl_queue_);
+    if (ip_emb_ln_g_) sycl::free(ip_emb_ln_g_, sycl_queue_);
+    if (ip_emb_ln_b_) sycl::free(ip_emb_ln_b_, sycl_queue_);
+    if (ip_emb_ffn_d1_w_) sycl::free(ip_emb_ffn_d1_w_, sycl_queue_);
+    if (ip_emb_ffn_d1_b_) sycl::free(ip_emb_ffn_d1_b_, sycl_queue_);
+    if (ip_emb_ffn_d2_w_) sycl::free(ip_emb_ffn_d2_w_, sycl_queue_);
+    if (ip_emb_ffn_d2_b_) sycl::free(ip_emb_ffn_d2_b_, sycl_queue_);
+    if (ip_emb_ffn_ln_g_) sycl::free(ip_emb_ffn_ln_g_, sycl_queue_);
+    if (ip_emb_ffn_ln_b_) sycl::free(ip_emb_ffn_ln_b_, sycl_queue_);
   } else {
-    sycl::free(pos_encoding_, sycl_queue_);
+    if (pos_encoding_) sycl::free(pos_encoding_, sycl_queue_);
   }
 
   if (has_gating_) {
-    sycl::free(ip_mult_gate_, sycl_queue_);
-    sycl::free(ip_add_gate_, sycl_queue_);
+    if (ip_mult_gate_) sycl::free(ip_mult_gate_, sycl_queue_);
+    if (ip_add_gate_) sycl::free(ip_add_gate_, sycl_queue_);
   }
   if (has_smolgen_) {
-    sycl::free(smolgen_global_, sycl_queue_);
+    if (smolgen_global_) sycl::free(smolgen_global_, sycl_queue_);
   }
   // encoder_weights_ is managed by std::unique_ptr
 }
+
+template <typename DataType>
+AttentionBody<DataType>::~AttentionBody() { ReleaseDeviceBuffers(); }
 
 template <typename DataType>
 void AttentionBody<DataType>::Eval(int N, DataType* output,

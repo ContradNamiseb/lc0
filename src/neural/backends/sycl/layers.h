@@ -321,6 +321,10 @@ class EncoderBlock {
                DataType* buffer1, DataType* buffer2,
                sycl::queue& sycl_queue);
 
+  // Frees every device buffer owned by this block; null-tolerant so the
+  // constructor's unwind guard can call it on a partial construction (S4).
+  void ReleaseDeviceBuffers();
+
   // GPU side device memory pointers
   DataType *mha_q_w = nullptr, *mha_q_b = nullptr;
   DataType *mha_k_w = nullptr, *mha_k_b = nullptr;
@@ -488,6 +492,10 @@ class AttentionBody : public BaseLayer<DataType> {
             sycl::queue &sycl_queue, DataType*** = nullptr) override;
 
  private:
+  // Frees every device buffer owned by this body; null-tolerant so the
+  // constructor's unwind guard can call it on a partial construction (S4).
+  void ReleaseDeviceBuffers();
+
   DataType *ip_emb_pre_w_ = nullptr, *ip_emb_pre_b_ = nullptr;
   DataType *ip_emb_w_ = nullptr, *ip_emb_b_ = nullptr;
   DataType *ip_emb_ln_g_ = nullptr, *ip_emb_ln_b_ = nullptr;

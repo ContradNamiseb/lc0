@@ -42,9 +42,13 @@ struct InputsOutputs {
                 bool cublasDisableTensorCores = false): q_ct1(m_ct1) {
   #ifdef USE_CUBLAS
     cublasHandle_t h= cuBlasContextManager::getcuBlasHandle_t();
-  #endif                
-    input_masks_mem_shared_ = malloc_host<uint64_t>(maxBatchSize * kInputPlanes, q_ct1);
-    input_val_mem_shared_ = malloc_host<float>(maxBatchSize * kInputPlanes, q_ct1);
+  #endif
+    // Every allocation below is checked (S5) and every one already made is
+    // released if a later one throws (S4): a throwing constructor must not
+    // leak the earlier buffers.
+    try {
+    input_masks_mem_shared_ = checkedMallocHost<uint64_t>(maxBatchSize * kInputPlanes, q_ct1);
+    input_val_mem_shared_ = checkedMallocHost<float>(maxBatchSize * kInputPlanes, q_ct1);
     // Separate device memory copy for policy output.
     // It's faster to write to device memory and then copy to host memory
     // than having the kernel write directly to it (for discrete GPUs).
@@ -53,36 +57,44 @@ struct InputsOutputs {
     // always-copy path below is what every build has actually run. Reintroduce
     // properly, keyed on a real backend option, if the iGPU trade-off is ever
     // re-measured.)
-    op_policy_mem_ = malloc_host<float>(maxBatchSize * kNumOutputPolicy, q_ct1);
-    op_policy_mem_gpu_ = malloc_device<float>(maxBatchSize * kNumOutputPolicy, q_ct1);
-    op_value_mem_shared_ = malloc_host<float>(maxBatchSize * (wdl ? 3 : 1), q_ct1);
+    op_policy_mem_ = checkedMallocHost<float>(maxBatchSize * kNumOutputPolicy, q_ct1);
+    op_policy_mem_gpu_ = checkedMallocDevice<float>(maxBatchSize * kNumOutputPolicy, q_ct1);
+    op_value_mem_shared_ = checkedMallocHost<float>(maxBatchSize * (wdl ? 3 : 1), q_ct1);
 
     if (moves_left) {
-      op_moves_left_mem_shared_ = malloc_host<float>(maxBatchSize, q_ct1);
+      op_moves_left_mem_shared_ = checkedMallocHost<float>(maxBatchSize, q_ct1);
     }
 
     // memory for network execution managed inside this structure
     if (tensor_mem_size) {
       multi_stream_ = true;
-      scratch_mem_ = (void*)sycl::malloc_device( scratch_size, q_ct1);
+      scratch_mem_ = (void*)checkedMallocDevice<char>(scratch_size, q_ct1);
       for (auto& mem : tensor_mem_) {
-        mem = (void*)sycl::malloc_device(tensor_mem_size, q_ct1);
+        mem = (void*)checkedMallocDevice<char>(tensor_mem_size, q_ct1);
         q_ct1.memset(mem, 0, tensor_mem_size);
       }
     } else {
       multi_stream_ = false;
     }
+    } catch (...) {
+      ReleaseAll();
+      throw;
+    }
   }
 
 
-  ~InputsOutputs() {
-    sycl::free(input_masks_mem_shared_, q_ct1);
-    sycl::free(input_val_mem_shared_, q_ct1);
-    sycl::free(op_value_mem_shared_, q_ct1);
+  ~InputsOutputs() { ReleaseAll(); }
+
+  // Frees every buffer allocated so far; null-tolerant, so it can run from
+  // the constructor's failure path too.
+  void ReleaseAll() {
+    if (input_masks_mem_shared_) sycl::free(input_masks_mem_shared_, q_ct1);
+    if (input_val_mem_shared_) sycl::free(input_val_mem_shared_, q_ct1);
+    if (op_value_mem_shared_) sycl::free(op_value_mem_shared_, q_ct1);
     if (op_moves_left_mem_shared_ != nullptr)
       sycl::free(op_moves_left_mem_shared_, q_ct1);
-    sycl::free(op_policy_mem_gpu_, q_ct1);
-    sycl::free(op_policy_mem_, q_ct1);
+    if (op_policy_mem_gpu_) sycl::free(op_policy_mem_gpu_, q_ct1);
+    if (op_policy_mem_) sycl::free(op_policy_mem_, q_ct1);
 
     if (multi_stream_) {
       for (auto mem : tensor_mem_) {
@@ -97,19 +109,29 @@ struct InputsOutputs {
         sycl::free(head_offset_pointers_, q_ct1);
       } 
     }
+    input_masks_mem_shared_ = nullptr;
+    input_val_mem_shared_ = nullptr;
+    op_value_mem_shared_ = nullptr;
+    op_moves_left_mem_shared_ = nullptr;
+    op_policy_mem_gpu_ = nullptr;
+    op_policy_mem_ = nullptr;
+    tensor_mem_[0] = tensor_mem_[1] = tensor_mem_[2] = nullptr;
+    scratch_mem_ = nullptr;
+    offset_pointers_ = nullptr;
+    head_offset_pointers_ = nullptr;
   }
-  uint64_t* input_masks_mem_shared_;
-  float* input_val_mem_shared_;
-  float* op_value_mem_shared_;
+  uint64_t* input_masks_mem_shared_ = nullptr;
+  float* input_val_mem_shared_ = nullptr;
+  float* op_value_mem_shared_ = nullptr;
   float* op_moves_left_mem_shared_ = nullptr;
 
   // This is a seperate copy.
-  float* op_policy_mem_gpu_;
-  float* op_policy_mem_;
+  float* op_policy_mem_gpu_ = nullptr;
+  float* op_policy_mem_ = nullptr;
 
   // memory needed to run the network owned by InputsOutputs when multi_stream
   // is enabled
-  bool multi_stream_;
+  bool multi_stream_ = false;
   void* tensor_mem_[3] = {nullptr, nullptr, nullptr};
   void* scratch_mem_ = nullptr;
   void** offset_pointers_ = nullptr;

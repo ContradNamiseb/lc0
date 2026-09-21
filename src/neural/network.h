@@ -121,6 +121,10 @@ class Network {
   virtual void InitThread(int /*id*/) {}
   virtual bool IsCpu() const { return false; }
   virtual int GetMiniBatchSize() const { return 256; }
+  // Maximum number of inputs a single computation may accept. Backends that
+  // allocate per-batch staging memory must report and enforce their real
+  // capacity; the backend wrapper advertises this to the search.
+  virtual int GetMaxBatchSize() const { return 1024; }
   virtual int GetPreferredBatchStep() const { return 1; }
   virtual ~Network() = default;
 };

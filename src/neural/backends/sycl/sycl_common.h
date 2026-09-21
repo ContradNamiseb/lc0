@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include <cstdlib>
 #include <string>
 #include <sycl/sycl.hpp>
 
@@ -95,6 +96,54 @@ struct SyclDeviceCache {
   bool is_gpu = false;
   std::string device_name;
 };
+
+// Test-only allocation-failure injection (review S4/S5): when
+// LC0_TEST_SYCL_ALLOC_FAIL_AT is set to N, the Nth checked allocation after
+// the value was last changed throws instead of allocating. Deterministic and
+// inert when unset; intended for single-threaded test use.
+inline void MaybeInjectUsmAllocationFailure() {
+  const char* env = std::getenv("LC0_TEST_SYCL_ALLOC_FAIL_AT");
+  static std::string last_value;
+  static int counter = 0;
+  const std::string value = env ? env : "";
+  if (value != last_value) {
+    last_value = value;
+    counter = 0;
+  }
+  if (value.empty() || value == "0") return;
+  if (++counter == std::atoi(value.c_str())) {
+    throw Exception("injected USM allocation failure at allocation #" + value +
+                    " (test).");
+  }
+}
+
+// Checked USM allocation helpers (review S5): a nullptr from a nonzero
+// allocation request is an out-of-memory failure, not a valid empty tensor.
+// Callers that want an intentionally empty tensor pass size 0 (which may
+// legitimately return nullptr).
+inline void CheckUsmAllocation(const void* ptr, size_t bytes,
+                               const char* kind) {
+  if (ptr == nullptr && bytes != 0) {
+    throw Exception(std::string("SYCL ") + kind + " USM allocation of " +
+                    std::to_string(bytes) + " bytes failed (out of memory).");
+  }
+}
+
+template <typename T>
+T* checkedMallocDevice(size_t count, sycl::queue& queue) {
+  MaybeInjectUsmAllocationFailure();
+  T* ptr = sycl::malloc_device<T>(count, queue);
+  CheckUsmAllocation(ptr, count * sizeof(T), "device");
+  return ptr;
+}
+
+template <typename T>
+T* checkedMallocHost(size_t count, sycl::queue& queue) {
+  MaybeInjectUsmAllocationFailure();
+  T* ptr = sycl::malloc_host<T>(count, queue);
+  CheckUsmAllocation(ptr, count * sizeof(T), "host");
+  return ptr;
+}
 
 }  // namespace sycldnn_backend
 }  // namespace lczero

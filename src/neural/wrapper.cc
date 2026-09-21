@@ -61,7 +61,7 @@ class NetworkAsBackend : public Backend {
     attrs_.runs_on_cpu = network_->IsCpu();
     attrs_.suggested_num_search_threads = network_->GetThreads();
     attrs_.recommended_batch_size = network_->GetMiniBatchSize();
-    attrs_.maximum_batch_size = 1024;
+    attrs_.maximum_batch_size = network_->GetMaxBatchSize();
     input_format_ = caps.input_format;
   }
 
@@ -108,6 +108,14 @@ class NetworkAsBackendComputation : public BackendComputation {
 
   AddInputResult AddInput(const EvalPosition& pos,
                           EvalResultPtr result) override {
+    // The advertised maximum is a hard capacity: the backend's staging
+    // buffers are sized for it (S3).
+    if (entries_.size() >=
+        static_cast<size_t>(backend_->attrs_.maximum_batch_size)) {
+      throw Exception(
+          "AddInput would exceed the network's maximum batch size (" +
+          std::to_string(backend_->attrs_.maximum_batch_size) + ").");
+    }
     int transform;
     const size_t idx = entries_.emplace_back(Entry{
         .input = EncodePositionForNN(backend_->input_format_, pos.pos, 8,
