@@ -571,5 +571,16 @@ TEST(OpenVinoParity, ConcurrentInstancesIsolated) {
 
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
-  return RUN_ALL_TESTS();
+  const int rc = RUN_ALL_TESTS();
+  if (rc == 0) {
+    auto* unit = ::testing::UnitTest::GetInstance();
+    if (unit->test_to_run_count() > 0 &&
+        unit->skipped_test_count() == unit->test_to_run_count()) {
+      // CI must be able to tell "all skipped" from "passed" (review item 5).
+      std::cerr << "ALL TESTS SKIPPED - no usable OpenVINO backend/device; "
+                   "distinct exit code 3" << std::endl;
+      return 3;
+    }
+  }
+  return rc;
 }

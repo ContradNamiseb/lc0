@@ -1067,6 +1067,14 @@ if get_option('gtest')
     include_directories: includes, dependencies: [deps, gtest]
   ), args: '--gtest_output=xml:kda_parity.xml', timeout: 600)
 
+  # SYCL helper tests (allow-fusing decision, group limits, shape contract).
+  # The file had never been referenced by meson.build, so these tests were
+  # not part of any configured suite (review S7).
+  test('SyclHelpers',
+    executable('sycl_test', 'src/neural/backends/sycl/sycl_test.cc',
+    include_directories: includes, link_with: lc0_lib, dependencies: gtest),
+    args: '--gtest_output=xml:sycl_test.xml', timeout: 90)
+
   # OpenVINO parity: converter-valid synthetic nets (PE_MAP embedding, which
   # the ONNX converter accepts) through the blas reference and the openvino
   # backend. The old KDA test above is SYCL-hardcoded and its NONE-embedding

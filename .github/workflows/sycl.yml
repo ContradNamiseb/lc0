@@ -60,7 +60,7 @@ jobs:
           
           meson setup --buildtype release build \
             -Dsycl=l0 \
-            -Dgtest=false \
+            -Dgtest=true \
             -Dnative_arch=false \
             -Db_lto=true \
             -Dcpp_link_args="-fuse-ld=lld" \
@@ -79,6 +79,27 @@ jobs:
           cd build
           curl -L https://training.lczero.org/get_network?sha=195b450999e874d07aea2c09fd0db5eff9d4441ec1ad5a60a140fe8ea94c4f3a -o T79.pb.gz
           touch -t 201801010000.00 T79.pb.gz
+      - name: Run SYCL parity tests
+        if: success()
+        run: |
+          cd build
+          # Exit code 3 is "all tests skipped" (no usable SYCL device): make
+          # that visible as a GitHub warning instead of a silent pass, while
+          # a real failure (any other nonzero code) still fails the job.
+          set +e
+          LC0_TEST_REAL_NET=T79.pb.gz ./kda_parity_test --gtest_output=xml:parity.xml
+          rc=$?
+          set -e
+          if [ $rc -eq 3 ]; then
+            echo "::warning::SYCL parity tests all skipped - no usable SYCL device on this runner"
+            exit 0
+          fi
+          exit $rc
+      - name: Run SYCL helper tests
+        if: success()
+        run: |
+          cd build
+          ./sycl_test --gtest_output=xml:sycl_helpers.xml
       - name: Upload a Build Artifact
         if: success()
         uses: actions/upload-artifact@v4.4.3
