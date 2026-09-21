@@ -44,6 +44,15 @@
 #include "utils/trace.h"
 
 namespace lczero {
+
+#ifndef NDEBUG
+// Debug-only memo exactness audit (see the hit path for the rationale).
+std::atomic<uint64_t> g_memo_hits{0};
+std::atomic<uint64_t> g_memo_mismatch{0};
+std::atomic<uint64_t> g_memo_slot_type_flip{0};
+std::atomic<uint64_t> g_memo_q_value_drift{0};
+std::atomic<uint64_t> g_memo_visorpol_drift{0};
+#endif  // !NDEBUG
 namespace classic {
 
 namespace {
@@ -1075,6 +1084,14 @@ void Search::CancelSharedCollisions() REQUIRES(nodes_mutex_) {
 }
 
 Search::~Search() {
+#ifndef NDEBUG
+  CERR << "MEMO AUDIT: hits " << g_memo_hits.load(std::memory_order_relaxed)
+       << ", mismatches " << g_memo_mismatch.load(std::memory_order_relaxed)
+       << " [slot-type-flip " << g_memo_slot_type_flip.load(std::memory_order_relaxed)
+       << ", q-value-drift " << g_memo_q_value_drift.load(std::memory_order_relaxed)
+       << ", visited-pol-drift " << g_memo_visorpol_drift.load(std::memory_order_relaxed)
+       << "].";
+#endif
   Abort();
   Wait();
   {
@@ -1491,9 +1508,11 @@ void SearchWorker::ProcessPickedTask(int start_idx, int end_idx,
 // task of slots and serializing the round on the widest subtree. Tunable.
 static constexpr int kMaxSplitsPerTask = 100;  // matches the round-wide MAX_TASKS cap
 
-// Bound on the per-worker level-entry memo (policy/utility reuse across
-// level entries). ~1.8KB per entry worst case, so 16384 entries is roughly
-// 28MB per search worker; cleared wholesale (not evicted) when exceeded.
+// Bound on the per-worker level-entry memo (utility/visited_pol reuse
+// across level entries). Fixed ~1KB per entry (std::array<float,256>), so
+// 16384 entries is roughly 16MB per search worker worst case; cleared
+// wholesale (not evicted) when exceeded -- with flat entries the clear is
+// one table deallocation, no per-entry frees (review #924 item 2).
 constexpr int kMaxPickMemoEntries = 16384;
 
 void SearchWorker::ResetTasks() {
@@ -1710,14 +1729,67 @@ void SearchWorker::PickNodesToExtendTask(
       float visited_pol = 0.0f;
       auto& memo = workspace->pick_memo;
       auto memo_it = memo.find(node);
-      const uint32_t memo_stamp = node->GetN();
+      const uint32_t memo_stamp =
+          NodeMutationSeq().load(std::memory_order_relaxed);
       if (memo_it != memo.end() &&
-          memo_it->second.stamp_n == memo_stamp &&
-          memo_it->second.policy.size() >=
-              static_cast<size_t>(cache.max_policy_entries_needed)) {
+          memo_it->second.stamp_epoch == memo_stamp &&
+          memo_it->second.num_edges >= cache.max_policy_entries_needed) {
         const auto& e = memo_it->second;
+#ifndef NDEBUG
+        // Debug-only exactness audit: recompute what the miss path would
+        // produce and verify the memo serves identical values. The global
+        // mutation sequence makes this a tautology (no mutation since save
+        // => identical recompute), so it is compiled out in release and
+        // kept here as the executable statement of that invariant.
+        g_memo_hits.fetch_add(1, std::memory_order_relaxed);
+        {
+          const float audit_draw_score =
+              ((current_path.size() + base_depth) % 2 == 0) ? odd_draw_score
+                                                            : even_draw_score;
+          m_evaluator.SetParent(node);
+          float audit_visited_pol = 0.0f;
+          std::array<float, 256> audit_util;
+          std::fill_n(audit_util.begin(), cache.max_policy_entries_needed,
+                      std::numeric_limits<float>::lowest());
+          for (Node* child : node->VisitedNodes()) {
+            const int idx = child->Index();
+            audit_visited_pol += node->GetEdgeP(idx);
+            if (idx >= cache.max_policy_entries_needed) continue;
+            const float q = child->GetQ(audit_draw_score);
+            audit_util[idx] = q + m_evaluator.GetMUtility(child, q);
+          }
+          const float audit_fpu =
+              GetFpu(params_, node, is_root_node, audit_draw_score,
+                     audit_visited_pol);
+          for (int i = 0; i < cache.max_policy_entries_needed; i++) {
+            if (audit_util[i] == std::numeric_limits<float>::lowest()) {
+              audit_util[i] = audit_fpu + m_evaluator.GetDefaultMUtility();
+            }
+            if (audit_util[i] != e.utility[i]) {
+              g_memo_mismatch.fetch_add(1, std::memory_order_relaxed);
+              // Distinguish: was the memo's value the FPU default while the
+              // recompute found a real visited-child utility (or vice versa)?
+              const bool memo_is_fpu =
+                  (e.utility[i] ==
+                   (audit_fpu + m_evaluator.GetDefaultMUtility()));
+              const bool audit_is_fpu =
+                  (audit_util[i] ==
+                   (audit_fpu + m_evaluator.GetDefaultMUtility()));
+              if (memo_is_fpu != audit_is_fpu) {
+                g_memo_slot_type_flip.fetch_add(1, std::memory_order_relaxed);
+              } else {
+                g_memo_q_value_drift.fetch_add(1, std::memory_order_relaxed);
+              }
+            }
+          }
+          if (audit_visited_pol != e.visited_pol) {
+            g_memo_mismatch.fetch_add(1, std::memory_order_relaxed);
+            g_memo_visorpol_drift.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+#endif
         for (int i = 0; i < cache.max_policy_entries_needed; i++) {
-          cache.children[i].policy = e.policy[i];
+          cache.children[i].policy = node->GetEdgeP(i);
           cache.children[i].utility = e.utility[i];
         }
         visited_pol = e.visited_pol;
@@ -1760,24 +1832,30 @@ void SearchWorker::PickNodesToExtendTask(
                 fpu + m_evaluator.GetDefaultMUtility();
           }
         }
-        // Save for future entries. Full-edge arrays so a later entry with
-        // the same N but a larger max_policy_entries_needed still hits;
-        // slots beyond this entry's cap carry the FPU fill value they
-        // would have received anyway.
+        // Save for future entries (review #924 items 1-4): fill every edge
+        // slot with the FPU default, then restore the TRUE evaluated Q for
+        // every visited child across ALL edges -- not just those within
+        // this entry's cap. The old code read cache.children[i].utility for
+        // i < cap and assumed beyond-cap slots were unvisited; that
+        // assumption held in measurement (9M observations, 0 hits) but was
+        // a latent corruption hole this fill closes by construction. No
+        // allocation: the entry is fixed-size.
         if (memo.size() > static_cast<size_t>(kMaxPickMemoEntries)) {
           memo.clear();
         }
         auto& e = memo[node];
-        e.stamp_n = memo_stamp;
+        e.stamp_epoch = memo_stamp;
         e.visited_pol = visited_pol;
-        const int num_edges = node->GetNumEdges();
-        e.policy.resize(num_edges);
-        e.utility.resize(num_edges);
-        for (int i = 0; i < num_edges; i++) {
-          e.policy[i] = node->GetEdgeP(i);
-          e.utility[i] = (i < cache.max_policy_entries_needed)
-                             ? cache.children[i].utility
-                             : fpu + m_evaluator.GetDefaultMUtility();
+        const int num_edges =
+            std::min<int>(node->GetNumEdges(), e.utility.size());
+        e.num_edges = static_cast<uint8_t>(num_edges);
+        const float default_utility = fpu + m_evaluator.GetDefaultMUtility();
+        std::fill_n(e.utility.begin(), num_edges, default_utility);
+        for (Node* child : node->VisitedNodes()) {
+          const int idx = child->Index();
+          if (idx >= num_edges) continue;
+          const float q = child->GetQ(draw_score);
+          e.utility[idx] = q + m_evaluator.GetMUtility(child, q);
         }
       }
 

@@ -124,6 +124,17 @@ class Edge_Iterator;
 template <bool is_const>
 class VisitedNode_Iterator;
 
+
+// Global node-mutation sequence: bumped by EVERY state change on ANY node.
+// A memo entry derived from child state is only valid while no node has
+// mutated (a child can gain visits via ANOTHER parent -- classic reuses
+// nodes across paths -- without touching this node's own counters, which
+// is the measured failure mode of the per-node N/epoch stamps).
+inline std::atomic<uint32_t>& NodeMutationSeq() {
+  static std::atomic<uint32_t> seq{0};
+  return seq;
+}
+
 class Node {
  public:
   using Iterator = Edge_Iterator<false>;
@@ -161,6 +172,7 @@ class Node {
   // Returns sum of policy priors which have had at least one playout.
   float GetVisitedPolicy() const;
   uint32_t GetN() const { return n_; }
+
   uint32_t GetNInFlight() const { return n_in_flight_; }
   uint32_t GetChildrenVisits() const { return n_ > 0 ? n_ - 1 : 0; }
   // Returns n = n_if_flight.

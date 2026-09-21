@@ -442,11 +442,21 @@ class SearchWorker {
   // immutable per node within a search, and utility/visited_pol only
   // change when a backup moves through the node (its N changes); the N
   // stamp makes the whole entry reusable across level entries.
+  //
+  // Shape per review #924 (items 2-4): NO dynamic members, so insertion
+  // performs zero heap allocations (the old two-vector version malloc'd
+  // twice per memo miss inside the hottest pick loop, and the wholesale
+  // clear freed ~33k allocations at once). Policy is NOT stored: GetEdgeP
+  // reads the node's own contiguous, immutable edge array in a couple of
+  // instructions, so duplicating it here was pure overhead. The utility
+  // array covers ALL num_edges slots (fixed 1KB per entry, matching
+  // CachedNodeData::children's bound) so a later entry with a larger
+  // max_policy_entries_needed still hits.
   struct PickMemoEntry {
-    uint32_t stamp_n = 0;
+    uint32_t stamp_epoch = 0;  // Node::GetEpoch() -- see node.h
     float visited_pol = 0.0f;
-    std::vector<float> policy;   // num_edges entries
-    std::vector<float> utility;  // num_edges entries (fpu-filled tail)
+    uint8_t num_edges = 0;
+    std::array<float, 256> utility;
   };
 
   // Holds per task worker scratch data

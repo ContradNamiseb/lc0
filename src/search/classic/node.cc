@@ -298,6 +298,7 @@ void Node::SortEdges() {
 }
 
 void Node::MakeTerminal(GameResult result, float plies_left, Terminal type) {
+  NodeMutationSeq().fetch_add(1, std::memory_order_relaxed);
   if (type != Terminal::TwoFold) SetBounds(result, result);
   terminal_type_ = type;
   m_ = plies_left;
@@ -317,6 +318,7 @@ void Node::MakeTerminal(GameResult result, float plies_left, Terminal type) {
 }
 
 void Node::MakeNotTerminal() {
+  NodeMutationSeq().fetch_add(1, std::memory_order_relaxed);
   terminal_type_ = Terminal::NonTerminal;
   n_ = 0;
 
@@ -341,6 +343,7 @@ void Node::MakeNotTerminal() {
 }
 
 void Node::SetBounds(GameResult lower, GameResult upper) {
+  NodeMutationSeq().fetch_add(1, std::memory_order_relaxed);
   lower_bound_ = lower;
   upper_bound_ = upper;
 }
@@ -354,6 +357,7 @@ bool Node::TryStartScoreUpdate() {
 void Node::CancelScoreUpdate(int multivisit) { n_in_flight_ -= multivisit; }
 
 void Node::FinalizeScoreUpdate(float v, float d, float m, int multivisit) {
+  NodeMutationSeq().fetch_add(1, std::memory_order_relaxed);
   // Recompute Q.
   wl_ += multivisit * (v - wl_) / (n_ + multivisit);
   d_ += multivisit * (d - d_) / (n_ + multivisit);
@@ -366,6 +370,7 @@ void Node::FinalizeScoreUpdate(float v, float d, float m, int multivisit) {
 }
 
 void Node::AdjustForTerminal(float v, float d, float m, int multivisit) {
+  NodeMutationSeq().fetch_add(1, std::memory_order_relaxed);
   // Recompute Q.
   wl_ += multivisit * v / n_;
   d_ += multivisit * d / n_;
@@ -373,6 +378,7 @@ void Node::AdjustForTerminal(float v, float d, float m, int multivisit) {
 }
 
 void Node::RevertTerminalVisits(float v, float d, float m, int multivisit) {
+  NodeMutationSeq().fetch_add(1, std::memory_order_relaxed);
   // Compute new n_ first, as reducing a node to 0 visits is a special case.
   const int n_new = n_ - multivisit;
   if (n_new <= 0) {
