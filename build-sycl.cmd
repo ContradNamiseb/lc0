@@ -1,7 +1,17 @@
 @echo off
 setlocal
 
+rem vcvars64 MUST run before oneAPI setvars: without it setvars cannot locate
+rem Visual Studio, leaves the MSVC/SDK and Intel compiler lib dirs out of LIB,
+rem and icx then fails meson's sanity check with
+rem   LNK1104: cannot open file 'libircmt.lib'
+rem The LIB prepend is required as well -- libircmt.lib is an Intel compiler
+rem library, so vcvars64 alone does not supply it. Same order as
+rem rebuild-sycl-openvino.cmd, which already documented this.
+call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat" >nul
+if errorlevel 1 (echo vcvars64 failed & exit /b 1)
 call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat"
+set "LIB=C:\Program Files (x86)\Intel\oneAPI\compiler\2026.1\lib;%LIB%"
 
 rem 1. Set the following for the options you want to build.
 rem SYCL can be off, l0, amd or nvidia.
