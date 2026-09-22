@@ -836,10 +836,6 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
     manager.run_passes(model);
   }
 
-  // Default fp16 to true on GPU for maximum throughput (2.3x-2.4x speedup)
-  const bool want_fp16 = options.GetOrDefault<bool>("fp16", is_gpu_device);
-  profile_ = options.GetOrDefault<bool>("profile", false);
-
   // Does this net actually have KDA layers? (ReplaceKdaScan above has
   // already turned any KDA TensorIterator into KdaScanOp nodes, so this is
   // a direct check, not a guess from the net's metadata.) Used below to
@@ -853,6 +849,20 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
       break;
     }
   }
+
+  // Default fp16 to true on GPU for maximum throughput, except for KDA
+  // nets, which default to f32. Measured on Iris Xe with kda-native-935532
+  // (2026-09-21): f16 anywhere in the encoder trunk breaks accuracy
+  // (policy_abs 11.8 raw vs 0.003 at f32; SYCL-fp16 shows the same failure,
+  // so it is net-inherent, not backend-specific). The kda_safe marking
+  // cannot help: mark_as_precision_sensitive disables f16 conversion of the
+  // whole producer chain before a marked input, so the trunk stays f32
+  // anyway, while the unmarked tail still runs f16 and loses accuracy --
+  // strictly slower AND less accurate than plain f32 (959 vs 992 nps at
+  // batch 8; policy_abs 0.29 vs 0.003).
+  const bool want_fp16 =
+      options.GetOrDefault<bool>("fp16", is_gpu_device && !has_kda);
+  profile_ = options.GetOrDefault<bool>("profile", false);
 
   // A graph that still carries a KdaScanOp needs either the GPU custom-layer
   // config (generated only for converter-path models, on one concrete GPU
@@ -883,13 +893,14 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
     }
   }
 
-  // kda_safe: mixed precision. Keeps the KDA recurrence's tensors and the
-  // value head in fp32 inside an otherwise-fp16 graph, since those are where
-  // half rounding costs the most (measured ~1.6e-2 absolute value error at
-  // plain fp16), while the bulk of the FC/FFN work keeps fp16 speed. Comes on
-  // automatically for any net with KDA layers -- a KDA net should not need a
-  // manual flag to avoid its own worst fp16 error -- but can be forced off
-  // (raw fp16 throughput, ~6x faster, at the larger error) or on.
+  // kda_safe: mixed precision for users who explicitly force fp16 on a KDA
+  // net (fp16 now defaults off for them; see above). Keeps the KDA
+  // recurrence's tensors and the value head in fp32 inside an otherwise-fp16
+  // graph, since those are where half rounding costs the most (measured
+  // ~1.6e-2 absolute value error at plain fp16). Note the marks flood f32
+  // backward over the whole producer chain, so on Iris Xe this mode measured
+  // slower than plain f32 while still less accurate -- it exists for
+  // hardware where fp16 genuinely wins, not as a recommendation here.
   const bool kda_safe = options.GetOrDefault<bool>("kda_safe", has_kda) &&
                         want_fp16 && is_gpu_device;
   if (kda_safe) {
