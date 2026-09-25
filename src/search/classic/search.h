@@ -438,22 +438,18 @@ class SearchWorker {
     CachedNodeData() = default;
   };
 
-  // One level-entry memo record (see TaskWorkspace::pick_memo). Policy is
-  // immutable per node within a search, and utility/visited_pol only
-  // change when a backup moves through the node (its N changes); the N
-  // stamp makes the whole entry reusable across level entries.
-  //
-  // Shape per review #924 (items 2-4): NO dynamic members, so insertion
-  // performs zero heap allocations (the old two-vector version malloc'd
-  // twice per memo miss inside the hottest pick loop, and the wholesale
-  // clear freed ~33k allocations at once). Policy is NOT stored: GetEdgeP
-  // reads the node's own contiguous, immutable edge array in a couple of
-  // instructions, so duplicating it here was pure overhead. The utility
-  // array covers ALL num_edges slots (fixed 1KB per entry, matching
-  // CachedNodeData::children's bound) so a later entry with a larger
-  // max_policy_entries_needed still hits.
+  // One level-entry memo record (see TaskWorkspace::pick_memo). Validity is
+  // stamped with NodeMutationSeq() (node.h): an entry is served only while
+  // NO node has mutated anywhere since it was saved, because the terminal
+  // machinery can change served child state without changing the parent's N
+  // (see node.h). Policy is NOT stored: GetEdgeP reads the node's own
+  // contiguous, immutable edge array in a couple of instructions, so
+  // duplicating it here was pure overhead. The utility array covers ALL
+  // num_edges slots (fixed 1KB per entry, matching CachedNodeData::children's
+  // bound) so a later entry with a larger max_policy_entries_needed still
+  // hits. Fixed-size: insertion performs zero heap allocations.
   struct PickMemoEntry {
-    uint32_t stamp_epoch = 0;  // Node::GetEpoch() -- see node.h
+    uint32_t stamp_epoch = 0;  // NodeMutationSeq() snapshot -- see node.h
     float visited_pol = 0.0f;
     uint8_t num_edges = 0;
     std::array<float, 256> utility;
@@ -490,8 +486,11 @@ class SearchWorker {
 
     // Level-entry memo (PickMemoEntry, defined beside CachedNodeData):
     // per-worker, so it dies with the workspace every search and keys
-    // (node pointers) stay valid for its lifetime. Cleared wholesale
-    // when the entry bound is hit.
+    // (node pointers) stay valid for its lifetime. Cleared wholesale when
+    // the entry bound is reached; clear() keeps the backing store
+    // (intentional -- avoids re-grow churn across gather rounds; ~16MB per
+    // worker held for the search's lifetime), and with fixed-size entries
+    // there are no per-entry frees.
     absl::flat_hash_map<Node*, PickMemoEntry> pick_memo;
 
     TaskWorkspace() {

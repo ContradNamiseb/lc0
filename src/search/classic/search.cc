@@ -1511,8 +1511,9 @@ static constexpr int kMaxSplitsPerTask = 100;  // matches the round-wide MAX_TAS
 // Bound on the per-worker level-entry memo (utility/visited_pol reuse
 // across level entries). Fixed ~1KB per entry (std::array<float,256>), so
 // 16384 entries is roughly 16MB per search worker worst case; cleared
-// wholesale (not evicted) when exceeded -- with flat entries the clear is
-// one table deallocation, no per-entry frees (review #924 item 2).
+// wholesale (not evicted) when reached -- with flat entries there are no
+// per-entry frees, and clear() deliberately keeps the backing store to
+// avoid re-grow churn across gather rounds.
 constexpr int kMaxPickMemoEntries = 16384;
 
 void SearchWorker::ResetTasks() {
@@ -1721,11 +1722,12 @@ void SearchWorker::PickNodesToExtendTask(
                      node->GetNStarted() + cur_limit + 2);
       }
 
-      // Level-entry memo (more node reuse): if this node was entered
-      // before and no backup has moved through it since (N unchanged),
-      // restore the cached policy/utility/visited_pol instead of
-      // recomputing them. Values restored here are bit-identical to what
-      // the recompute below would produce for the same N.
+      // Level-entry memo (more node reuse): if this node was entered before
+      // and no node has mutated anywhere since (NodeMutationSeq unchanged),
+      // restore the cached utility/visited_pol instead of recomputing them;
+      // policy is read live from the node's immutable edge array. Served
+      // values are identical to the recompute below by construction -- the
+      // seq is bumped by every Node mutator (see node.h).
       float visited_pol = 0.0f;
       auto& memo = workspace->pick_memo;
       auto memo_it = memo.find(node);
@@ -1840,7 +1842,7 @@ void SearchWorker::PickNodesToExtendTask(
         // assumption held in measurement (9M observations, 0 hits) but was
         // a latent corruption hole this fill closes by construction. No
         // allocation: the entry is fixed-size.
-        if (memo.size() > static_cast<size_t>(kMaxPickMemoEntries)) {
+        if (memo.size() >= static_cast<size_t>(kMaxPickMemoEntries)) {
           memo.clear();
         }
         auto& e = memo[node];

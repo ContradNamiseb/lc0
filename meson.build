@@ -1195,7 +1195,7 @@ if get_option('gtest')
 
   test('DepthStackAndCache',
     executable('inline_depth_stack_test', 'src/search/classic/inline_depth_stack_test.cc', pb_files,
-    include_directories: includes, link_with: lc0_lib, dependencies: gtest,
+    include_directories: includes, link_with: lc0_lib, dependencies: [gtest] + deps,
     # The test probes SearchWorker's private picking-cache structures and
     # documents that it builds with access control disabled.
     cpp_args: '-fno-access-control'),

@@ -26,6 +26,7 @@
 */
 
 #include "chess/gamestate.h"
+#include <mutex>
 #include "search/classic/stoppers/factory.h"
 #include "search/dag_classic/search.h"
 #include "search/register.h"
@@ -82,6 +83,10 @@ class DagClassicSearch : public SearchBase {
   // Strong references to LowNodes kept across moves (pruned by the Search
   // constructor: >= kMinVisitsToRetain visits, capped count).
   std::vector<std::shared_ptr<LowNode>> tt_retention_;
+  // Guards tt_retention_ for BOTH worker pushes (ExtendNode) and the Search
+  // constructor's prune; must live here, not in Search, so a new Search's
+  // ctor and a dying Search's stragglers share one lock.
+  std::mutex tt_retention_mutex_;
   std::optional<std::chrono::steady_clock::time_point> move_start_time_;
 };
 
@@ -106,9 +111,12 @@ MoveList StringsToMovelist(const std::vector<std::string>& moves,
 void DagClassicSearch::NewGame() {
   LCTRACE_FUNCTION_SCOPE;
   LOGFILE << "New game.";
-  search_.reset();
+  search_.reset();  // Joins workers first; only then is clearing safe.
   tt_.clear();
-  tt_retention_.clear();
+  {
+    std::lock_guard<std::mutex> retention_lock(tt_retention_mutex_);
+    tt_retention_.clear();
+  }
   tree_.reset();
   time_manager_ = classic::MakeTimeManager(*options_);
 }
@@ -164,7 +172,7 @@ void DagClassicSearch::StartSearch(const GoParams& params) {
       *tree_, backend_, std::move(forwarder),
       StringsToMovelist(params.searchmoves, tree_->HeadPosition().GetBoard()),
       *move_start_time_, std::move(stopper), params.infinite, params.ponder,
-      *options_, &tt_, &tt_retention_, syzygy_tb_);
+      *options_, &tt_, &tt_retention_, &tt_retention_mutex_, syzygy_tb_);
 
   LOGFILE << "Timer started at "
           << FormatTime(SteadyClockToSystemClock(*move_start_time_));

@@ -61,6 +61,7 @@ class Search {
          std::unique_ptr<classic::SearchStopper> stopper, bool infinite,
          bool ponder, const OptionsDict& options, TranspositionTable* tt,
          std::vector<std::shared_ptr<LowNode>>* tt_retention,
+         std::mutex* tt_retention_mutex,
          SyzygyTablebase* syzygy_tb);
 
   ~Search();
@@ -175,10 +176,12 @@ class Search {
   // pruning (see the Search constructor), owned by the wrapper so they
   // outlive the per-move Search and the between-moves tree trim.
   std::vector<std::shared_ptr<LowNode>>* tt_retention_ = nullptr;
-  // Guards tt_retention_ pushes: ExtendNode runs concurrently on pool
-  // threads, and an unguarded vector push there corrupts the heap (found
-  // as a crash 800ms into the first fastchess game, threads>1).
-  std::mutex tt_retention_mutex_;
+  // Guards tt_retention_ against concurrent ExtendNode pushes AND the next
+  // Search constructor's prune. Owned by the WRAPPER (next to the vector),
+  // not per-Search: a per-Search mutex cannot serialize the new ctor's
+  // prune against a dying search's straggler pushes (the new Search is
+  // constructed before the assignment destroys the old one).
+  std::mutex* tt_retention_mutex_ = nullptr;
 
   // ---- retention diagnostics (one TTPERSIST-only line per move) ----
   // Every Search gets a generation id; LowNodes record their creator's.
@@ -187,6 +190,12 @@ class Search {
   // include (they ride along on a retained ancestor's child chain).
   const uint64_t gen_;
   std::atomic<uint64_t> tt_hits_from_retention_{0};
+  // Cross-move TT hits REFUSED by the ExtendNode clean filter (terminal or
+  // non-clean bounds on an older-generation payload). The prune log's
+  // "unclean dropped" counts only flat-vector entries and cannot see
+  // unclean descendants riding a retained ancestor's child chain -- this
+  // counter is the only signal that covers those.
+  std::atomic<uint64_t> tt_crossmove_refused_{0};
   // Non-expired TT entries from older generations at construction time.
   uint64_t diag_crossmove_entries_ = 0;
   SyzygyTablebase* syzygy_tb_;

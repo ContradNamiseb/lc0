@@ -354,7 +354,16 @@ bool Node::TryStartScoreUpdate() {
   return true;
 }
 
-void Node::CancelScoreUpdate(int multivisit) { n_in_flight_ -= multivisit; }
+void Node::CancelScoreUpdate(int multivisit) {
+  // Bumped here as well: VisitedNode_Iterator's early exit depends on
+  // n_in_flight_, so a cancel can change what a pick-memo recompute would
+  // see with no backup running at all. TryStartScoreUpdate and
+  // IncrementNInFlight only INCREASE n_in_flight_, which cannot change the
+  // served values (skipped unvisited children contribute nothing), so they
+  // stay uninstrumented to preserve the memo hit rate.
+  NodeMutationSeq().fetch_add(1, std::memory_order_relaxed);
+  n_in_flight_ -= multivisit;
+}
 
 void Node::FinalizeScoreUpdate(float v, float d, float m, int multivisit) {
   NodeMutationSeq().fetch_add(1, std::memory_order_relaxed);

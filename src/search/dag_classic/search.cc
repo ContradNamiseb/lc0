@@ -223,6 +223,7 @@ Search::Search(const NodeTree& tree, Backend* backend,
                bool ponder, const OptionsDict& options,
                TranspositionTable* tt,
                std::vector<std::shared_ptr<LowNode>>* tt_retention,
+               std::mutex* tt_retention_mutex,
                SyzygyTablebase* syzygy_tb)
     : ok_to_respond_bestmove_(!infinite && !ponder),
       gen_(NextSearchGen()),
@@ -230,6 +231,7 @@ Search::Search(const NodeTree& tree, Backend* backend,
       root_node_(tree.GetCurrentHead()),
       tt_(tt),
       tt_retention_(tt_retention),
+      tt_retention_mutex_(tt_retention_mutex),
       syzygy_tb_(syzygy_tb),
       played_history_(tree.GetPositionHistory()),
       backend_(backend),
@@ -248,6 +250,12 @@ Search::Search(const NodeTree& tree, Backend* backend,
   // the tree trim, so this search re-attaches to previously-searched
   // transpositions through the normal is_tt_hit path.
   if (tt_retention_ != nullptr && !tt_retention_->empty()) {
+    // Locked against a DYING search's straggler ExtendNode pushes: the new
+    // Search is constructed before the old one is destroyed (wrapper
+    // StartSearch), and Engine::Go does not by itself guarantee the
+    // previous search stopped. The mutex is wrapper-owned so both sides
+    // share one lock (a per-Search mutex could not serialize this pair).
+    std::lock_guard<std::mutex> retention_lock(*tt_retention_mutex_);
     auto& keep = *tt_retention_;
     const size_t before = keep.size();
     // Retention filter. A survivor must be CLEAN: its value may only be
@@ -261,6 +269,9 @@ Search::Search(const NodeTree& tree, Backend* backend,
     // Both were suspected of poisoning the first persistence match
     // (dag-orig beat TTPERSIST 4-0-8 with no outcome correlation to hit
     // rate). Retain only non-terminal nodes still at the full window.
+    // NOTE: this filter sees only the flat vector; unclean descendants
+    // riding a retained ancestor's child chain are refused at the adoption
+    // site instead (ExtendNode), and tt_crossmove_refused_ counts those.
     size_t dropped_unclean = 0;
     keep.erase(std::remove_if(keep.begin(), keep.end(),
                               [&dropped_unclean](
@@ -274,8 +285,6 @@ Search::Search(const NodeTree& tree, Backend* backend,
                                 return false;
                               }),
                keep.end());
-    size_t kept_visits = 0;
-    for (const auto& n : keep) kept_visits += n->GetN();
     if (keep.size() > kMaxRetainedLowNodes) {
       std::nth_element(
           keep.begin(), keep.begin() + kMaxRetainedLowNodes, keep.end(),
@@ -285,6 +294,9 @@ Search::Search(const NodeTree& tree, Backend* backend,
           });
       keep.resize(kMaxRetainedLowNodes);
     }
+    // Counted AFTER the cap so the log reports what is actually retained.
+    size_t kept_visits = 0;
+    for (const auto& n : keep) kept_visits += n->GetN();
     CERR << "TT persistence: retained " << keep.size() << " node(s) / "
          << kept_visits << " visit(s) (from " << before << " tracked; "
          << dropped_unclean << " unclean dropped).";
@@ -316,7 +328,13 @@ Search::Search(const NodeTree& tree, Backend* backend,
   // known to the time manager and stoppers from t=0 (the backup-site import
   // alone left a window where a stopper could read a stale 0) and playout 1
   // picks a child instead of visiting the root as a fresh leaf. Same
-  // cleanliness gates as the ExtendNode adoption site.
+  // cleanliness gates as the ExtendNode adoption site, except the visit
+  // gate is GetN() > 0 rather than kMinVisitsToRetain: a sub-threshold root
+  // payload can legitimately survive via a retained ancestor's child chain,
+  // and importing even a small payload is no worse than a fresh eval.
+  // Note the adopted payload keeps the PREVIOUS search's Dirichlet-noised
+  // root priors -- the same behavior as upstream's between-moves tree
+  // reuse, but a real difference vs a non-persistent search.
   if (root_node_->GetN() == 0 && !root_node_->GetLowNode()) {
     const uint64_t root_hash =
         played_history_.HashLast(params_.GetCacheHistoryLength() + 1);
@@ -329,6 +347,10 @@ Search::Search(const NodeTree& tree, Backend* backend,
         root_node_->SetLowNode(cand);
         root_node_->InitFromLowNode();
         initial_visits_ = root_node_->GetN();
+        // Counted as a cross-move hit so the per-move TT summary reflects
+        // ctor adoptions too (they bypass ExtendNode's counters).
+        tt_hits_.fetch_add(1, std::memory_order_relaxed);
+        tt_hits_from_retention_.fetch_add(1, std::memory_order_relaxed);
         CERR << "TT root adopted in ctor: N=" << initial_visits_;
       }
     }
@@ -1270,6 +1292,8 @@ Search::~Search() {
   CERR << "TT summary: hits " << tt_hits_.load(std::memory_order_relaxed)
        << " (from retention "
        << tt_hits_from_retention_.load(std::memory_order_relaxed)
+       << ", cross-move refused "
+       << tt_crossmove_refused_.load(std::memory_order_relaxed)
        << "), playouts " << total_playouts_ << ", evals "
        << network_evaluations_ << ".";
   Abort();
@@ -2253,6 +2277,10 @@ void SearchWorker::ExtendNode(NodeToProcess& picked_node) {
       (picked_node.tt_low_node->IsTerminal() ||
        picked_node.tt_low_node->GetBounds() != kCleanRetentionBounds)) {
     picked_node.tt_low_node.reset();
+    // Counted: this is the only cleanliness signal covering unclean
+    // descendants that ride a retained ancestor's child chain -- the ctor
+    // prune's "unclean dropped" sees the flat vector only.
+    search_->tt_crossmove_refused_.fetch_add(1, std::memory_order_relaxed);
   }
   if (picked_node.tt_low_node) {
     assert(!tt_iter->second.expired());
@@ -2271,7 +2299,7 @@ void SearchWorker::ExtendNode(NodeToProcess& picked_node) {
     // must hold the retention mutex or the vector corrupts.
     if (search_->tt_retention_ != nullptr) {
       std::lock_guard<std::mutex> retention_lock(
-          search_->tt_retention_mutex_);
+          *search_->tt_retention_mutex_);
       search_->tt_retention_->push_back(picked_node.tt_low_node);
     }
     picked_node.nn_queried = true;
@@ -2461,12 +2489,12 @@ void SearchWorker::DoBackupUpdateSingleNode(
     if (adopted->GetN() == 0 && ln && ln->GetN() > 0 && ln->GetGen() != 0 &&
         ln->GetGen() != search_->gen_) {
       adopted->InitFromLowNode();
-      if (adopted == search_->root_node_) {
-        // The constructor captured initial_visits_ from a fresh root (N=0).
-        // Now that the root carries the inherited visits, count them toward
-        // the node budget and node reporting, as classic's tree reuse does.
-        search_->initial_visits_ = adopted->GetN();
-      }
+      // No initial_visits_ update here: the root never reaches this block
+      // (the constructor either adopted a clean retained root and set
+      // initial_visits_ itself, or no adoptable payload existed, and tree
+      // reuse gives the root GetN() > 0). Keeping initial_visits_
+      // constructor-only also removes the old unlocked-write vs
+      // SendUciInfo read race.
     }
   }
 

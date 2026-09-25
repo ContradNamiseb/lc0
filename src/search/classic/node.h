@@ -126,10 +126,16 @@ class VisitedNode_Iterator;
 
 
 // Global node-mutation sequence: bumped by EVERY state change on ANY node.
-// A memo entry derived from child state is only valid while no node has
-// mutated (a child can gain visits via ANOTHER parent -- classic reuses
-// nodes across paths -- without touching this node's own counters, which
-// is the measured failure mode of the per-node N/epoch stamps).
+// A pick-memo entry derived from child state is valid only while no node
+// has mutated anywhere. Stamping on the parent's N is NOT sound: the
+// terminal machinery mutates served state without touching the parent's N --
+// AdjustForTerminal rewrites wl_/d_/m_ in place, MakeTerminal overwrites
+// them (and zeroes the parent's edge P for a lost child), and
+// EnsureNodeTwoFoldCorrectForDepth's RevertTerminalVisits + MakeNotTerminal
+// can return a parent's N to a previously stamped value with different
+// child utilities (N-ABA). The monotone seq also defuses memo-key address
+// reuse (MakeSolid/GC recycle Node memory): reaching n_ > 0 requires an
+// instrumented mutator, which moves the seq past any stale stamp.
 inline std::atomic<uint32_t>& NodeMutationSeq() {
   static std::atomic<uint32_t> seq{0};
   return seq;

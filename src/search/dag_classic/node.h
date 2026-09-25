@@ -658,9 +658,11 @@ class LowNode : private LowNodeCounted {
 
   // 8 byte fields.
   // Average value (from value head of neural network) of all visited nodes in
-  // subtree. For terminal nodes, eval is stored. This is from the perspective
-  // of the player who "just" moved to reach this position, rather than from the
-  // perspective of the player-to-move for the position.
+  // subtree. For terminal nodes, eval is stored. NOTE: unlike Node::wl_, this
+  // is stored from the perspective of the player TO MOVE at this position
+  // (SetNNEval stores the raw NN q, and backups flip the sign each ply), so a
+  // Node holding this LowNode carries the OPPOSITE sign -- see
+  // Node::InitFromLowNode.
   // WL stands for "W minus L". Is equal to Q if draw score is 0.
   double wl_ = 0.0f;
   // Averaged draw probability. Works similarly to WL, except that D is not
