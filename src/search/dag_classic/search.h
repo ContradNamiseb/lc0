@@ -61,7 +61,7 @@ class Search {
          std::unique_ptr<classic::SearchStopper> stopper, bool infinite,
          bool ponder, const OptionsDict& options, TranspositionTable* tt,
          std::vector<std::shared_ptr<LowNode>>* tt_retention,
-         std::mutex* tt_retention_mutex,
+         std::mutex* tt_retention_mutex, bool tt_persist,
          SyzygyTablebase* syzygy_tb);
 
   ~Search();
@@ -182,6 +182,10 @@ class Search {
   // prune against a dying search's straggler pushes (the new Search is
   // constructed before the assignment destroys the old one).
   std::mutex* tt_retention_mutex_ = nullptr;
+  // Cross-move persistence gate (TTPersist option). False = within-move
+  // TT only: nothing is pushed for retention and any retained anchors
+  // are released at construction.
+  bool tt_persist_ = true;
 
   // ---- retention diagnostics (one TTPERSIST-only line per move) ----
   // Every Search gets a generation id; LowNodes record their creator's.

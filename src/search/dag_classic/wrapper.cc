@@ -32,6 +32,7 @@
 #include "search/register.h"
 #include "search/search.h"
 #include "neural/shared_params.h"
+#include "utils/optionsparser.h"
 #include "utils/trace.h"
 
 namespace lczero {
@@ -50,6 +51,15 @@ const OptionId kClearTree{
      .uci_option = "ClearTree",
      .help_text = "Clear the tree before the next search.",
      .visibility = OptionId::kProOnly}};
+
+// H5: the persistence gate. Whole-tree retention is the branch's deliberate
+// policy (see the policy note at kMaxRetainedLowNodes); this option exists
+// so it can be switched off for A/B runs and for the eventual PR review
+// without a rebuild. Default matches the branch's tested behavior (on).
+const OptionId kTTPersistId{
+    "tt-persist", "TTPersist",
+    "Keep transposition table entries alive across moves so later moves "
+    "and games reuse previously searched subtrees."};
 
 class DagClassicSearch : public SearchBase {
  public:
@@ -172,7 +182,8 @@ void DagClassicSearch::StartSearch(const GoParams& params) {
       *tree_, backend_, std::move(forwarder),
       StringsToMovelist(params.searchmoves, tree_->HeadPosition().GetBoard()),
       *move_start_time_, std::move(stopper), params.infinite, params.ponder,
-      *options_, &tt_, &tt_retention_, &tt_retention_mutex_, syzygy_tb_);
+      *options_, &tt_, &tt_retention_, &tt_retention_mutex_,
+      options_->Get<bool>(kTTPersistId), syzygy_tb_);
 
   LOGFILE << "Timer started at "
           << FormatTime(SteadyClockToSystemClock(*move_start_time_));
@@ -190,6 +201,7 @@ class DagClassicSearchFactory : public SearchFactory {
   void PopulateParams(OptionsParser* parser) const override {
     parser->Add<IntOption>(kThreadsOptionId, 0, 128) = 0;
     SearchParams::Populate(parser);
+    parser->Add<BoolOption>(kTTPersistId) = true;
     classic::PopulateTimeManagementOptions(classic::RunType::kUci, parser);
 
     parser->Add<ButtonOption>(kClearTree);

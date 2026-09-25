@@ -200,6 +200,14 @@ namespace {
 // raised to 10000 so only deep, high-confidence nodes anchor retention.
 constexpr uint32_t kMinVisitsToRetain = 10000;
 // Hard cap on retained LowNodes (memory bound; pruned least-visited-first).
+// H5 POLICY: whole-tree retention is DELIBERATE, not an accident. Retaining
+// one anchor keeps its entire child_ subtree alive, and that subtree IS the
+// reuse (tt_ holds weak_ptrs; the anchor's chain is the only thing keeping
+// descendant LowNodes alive -- see the F1 revert on board #43). The policy
+// bounds are: (1) anchors must clear kMinVisitsToRetain; (2) at most
+// kMaxRetainedLowNodes anchors; (3) the live payload is measured for real
+// (LiveLowNodeCount) and feeds RamLimitMb via the wrapper's memory estimate.
+// The whole gate is user-controllable via the TTPersist option (default on).
 constexpr size_t kMaxRetainedLowNodes = 500'000;
 // A "clean" retained node carries only position-determined data: not
 // terminal, still at the full bounds window. Terminal marks and proven
@@ -223,7 +231,7 @@ Search::Search(const NodeTree& tree, Backend* backend,
                bool ponder, const OptionsDict& options,
                TranspositionTable* tt,
                std::vector<std::shared_ptr<LowNode>>* tt_retention,
-               std::mutex* tt_retention_mutex,
+               std::mutex* tt_retention_mutex, bool tt_persist,
                SyzygyTablebase* syzygy_tb)
     : ok_to_respond_bestmove_(!infinite && !ponder),
       gen_(NextSearchGen()),
@@ -232,6 +240,7 @@ Search::Search(const NodeTree& tree, Backend* backend,
       tt_(tt),
       tt_retention_(tt_retention),
       tt_retention_mutex_(tt_retention_mutex),
+      tt_persist_(tt_persist),
       syzygy_tb_(syzygy_tb),
       played_history_(tree.GetPositionHistory()),
       backend_(backend),
@@ -249,7 +258,13 @@ Search::Search(const NodeTree& tree, Backend* backend,
   // keeping the most-visited). Survivors keep their TT entries alive past
   // the tree trim, so this search re-attaches to previously-searched
   // transpositions through the normal is_tt_hit path.
-  if (tt_retention_ != nullptr && !tt_retention_->empty()) {
+  if (!tt_persist_ && tt_retention_ != nullptr && !tt_retention_->empty()) {
+    // TTPersist off: release any anchors a previous (persisting) search
+    // left behind so retention fully drains to the within-move TT.
+    std::lock_guard<std::mutex> retention_lock(*tt_retention_mutex_);
+    tt_retention_->clear();
+  }
+  if (tt_persist_ && tt_retention_ != nullptr && !tt_retention_->empty()) {
     // Locked against a DYING search's straggler ExtendNode pushes: the new
     // Search is constructed before the old one is destroyed (wrapper
     // StartSearch), and Engine::Go does not by itself guarantee the
@@ -2297,7 +2312,7 @@ void SearchWorker::ExtendNode(NodeToProcess& picked_node) {
     // Search constructor can decide which ones survive the tree trim.
     // ExtendNode runs on multiple pool threads concurrently -- the push
     // must hold the retention mutex or the vector corrupts.
-    if (search_->tt_retention_ != nullptr) {
+    if (search_->tt_persist_ && search_->tt_retention_ != nullptr) {
       std::lock_guard<std::mutex> retention_lock(
           *search_->tt_retention_mutex_);
       search_->tt_retention_->push_back(picked_node.tt_low_node);
