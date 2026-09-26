@@ -167,5 +167,43 @@ void genOffsetPointers(T** offsets, int heads, int max_batch, int depth,
 void fusedMHA(void* output, void* mha_q, void* mha_k, void* mha_v, void* skip,
               int batch_size, int num_heads, int depth, cudaStream_t stream);
 
+// KDA (Kimi Delta Attention) encoder-layer kernels. The recurrence is a
+// 64-step sequential scan per (batch, head); the traversal order comes from
+// the shared kKdaDirectionOrder table in neural/kda_directions.h, uploaded to
+// device memory by the caller (dir_order points at 16*64 ints).
+
+// Per-head traversal directions for the kernel, passed by value (16 ints).
+struct KdaDirectionList {
+  int d[16];
+};
+
+// One thread block of value_dim threads per (batch, head); the recurrent
+// state and staging are float regardless of T (precision compounds over the
+// 64-step scan; T matters only at the global-memory boundary).
+template <typename T>
+void kdaRecurrenceValueParallel(int N, int heads, int key_dim, int value_dim,
+                                int direction_count, KdaDirectionList directions,
+                                const int* dir_order, float log_decay_floor,
+                                const T* qkv, int qkv_stride, const T* q,
+                                const T* k, const T* v, const T* raw_decay,
+                                const T* dt_bias, const T* a_log,
+                                const T* beta, T* mixed, cudaStream_t stream);
+
+// 3x3 same-padded depthwise convolution over the 8x8 board, added back to the
+// input (residual). scratch must hold N*64*emb_size elements.
+template <typename T>
+void applyKdaLocalDepthwiseConv(int N, int emb_size, const T* input,
+                                const T* conv_w, const T* conv_b, T* scratch,
+                                T* output, cudaStream_t stream);
+
+// Sigmoid output gate, applied after the (optional) RMS norm.
+template <typename T>
+void applyKdaOutputGate(int n, T* mixed, const T* gate, cudaStream_t stream);
+
+// RMS norm across the value depth of each token, scaled by gammas.
+template <typename T>
+void applyKdaOutputRmsNorm(int tokens, int value_depth, T* mixed,
+                           const T* gammas, float eps, cudaStream_t stream);
+
 }  // namespace cudnn_backend
 }  // namespace lczero

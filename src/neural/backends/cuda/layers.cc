@@ -32,6 +32,7 @@
 
 #include "cuda_common.h"
 #include "kernels.h"
+#include "neural/kda_directions.h"
 #include "neural/network.h"
 #include "neural/tables/attention_policy_map.h"
 #include "utils/fp16_utils.h"
@@ -1476,7 +1477,8 @@ AttentionPolicyHead<DataType>::AttentionPolicyHead(
         max_batch_size, ACTIVATION_SWISH, act_,
         1e-6,          // attentionbody nets don't have policy encoders, so
         use_gemm_ex,   // using old epsilon for backward compatibility with T78.
-        false);
+        false,
+        {});  // policy encoders are always MHA -- no KDA directions.
     encoder_weights_.emplace_back(pW);
   }
 }
@@ -1487,58 +1489,374 @@ EncoderBlock<DataType>::EncoderBlock(
     int size, float alpha, DataType* smolgen_global_scratch,
     int smolgen_global_size, int max_batch_size, ActivationFunction smolgen_act,
     ActivationFunction ffn_act, float default_eps, bool use_gemm_ex,
-    bool fused_mha)
+    bool fused_mha, const std::vector<int>& kda_directions)
     : embedding_op_size_(size),
       encoder_heads_(heads),
       alpha_(alpha),
       default_eps_(default_eps),
-      has_smolgen_(cpu_weights.mha.has_smolgen),
+      has_smolgen_(!cpu_weights.is_kda && cpu_weights.mha.has_smolgen),
       smolgen_activation_(smolgen_act),
       ffn_activation_(ffn_act),
       max_batch_size_(max_batch_size),
       use_fused_mha_(fused_mha),
-      use_gemm_ex_(use_gemm_ex) {
-  mha_q_size_ = cpu_weights.mha.q_b.size();
-  mha_k_size_ = cpu_weights.mha.k_b.size();
-  mha_v_size_ = cpu_weights.mha.v_b.size();
-  mha_dense_size_ = cpu_weights.mha.dense_b.size();
-  ffn_dense1_size_ = cpu_weights.ffn.dense1_b.size();
-  ffn_dense2_size_ = cpu_weights.ffn.dense2_b.size();
+      use_gemm_ex_(use_gemm_ex),
+      is_kda_(cpu_weights.is_kda) {
+  if (is_kda_) {
+    // KDA mixer layer: validate and upload the KDA weights instead of the
+    // MHA ones. Mirrors the SYCL backend's EncoderBlock KDA branch.
+    mha_q_size_ = 0;
+    mha_k_size_ = 0;
+    mha_v_size_ = 0;
+    mha_dense_size_ = 0;
+    kda_key_dim_ = cpu_weights.kda.key_dim;
+    kda_value_dim_ = cpu_weights.kda.value_dim;
+    kda_gate_rank_ = cpu_weights.kda.gate_rank;
+    kda_rms_norm_epsilon_ = cpu_weights.kda.rms_norm_epsilon;
+    kda_output_gate_ = cpu_weights.kda.output_gate;
+    kda_output_rms_norm_ = cpu_weights.kda.output_rms_norm;
+    kda_local_conv_ = cpu_weights.kda.local_conv;
+    kda_qkv_silu_ = cpu_weights.kda.qkv_silu;
+    kda_direction_count_ = static_cast<int>(kda_directions.size());
 
-  allocAndUpload<DataType>(&mha_q_w, cpu_weights.mha.q_w, scratch);
-  allocAndUpload<DataType>(&mha_q_b, cpu_weights.mha.q_b, scratch);
+    if (kda_key_dim_ <= 0 || kda_value_dim_ <= 0 || kda_gate_rank_ <= 0) {
+      throw Exception("Invalid KDA dimensions.");
+    }
+    if (kda_key_dim_ > 32) {
+      // kda_recurrence_kernel keeps the recurrence state in a per-thread
+      // register array of 32 floats.
+      throw Exception("KDA key_dim > 32 is not supported by the CUDA "
+                      "backend.");
+    }
+    if (kda_value_dim_ > 1024) {
+      // The recurrence launches one thread block of kda_value_dim_ threads
+      // per (batch, head).
+      throw Exception("KDA value_dim (" + std::to_string(kda_value_dim_) +
+                      ") exceeds the CUDA block size limit (1024).");
+    }
+    if (kda_direction_count_ <= 0 || kda_direction_count_ > 16 ||
+        encoder_heads_ % kda_direction_count_ != 0) {
+      throw Exception("KDA directions must evenly divide the encoder heads.");
+    }
+    // EvalKda() feeds these KDA-derived widths to addBiasBatched (vectorized
+    // over groups of 4 channels) and LayerNorm (over 16), which throw at
+    // *eval* time on non-divisible widths -- i.e. after a full
+    // successful-looking load. Reject them here, where the message can name
+    // the offending dimension.
+    {
+      const int key_depth_ld = encoder_heads_ * kda_key_dim_;
+      const int value_depth_ld = encoder_heads_ * kda_value_dim_;
+      auto require_divisible = [](const char* what, int value, int divisor) {
+        if (value % divisor != 0) {
+          throw Exception(
+              std::string("KDA ") + what + " (" + std::to_string(value) +
+              ") must be a multiple of " + std::to_string(divisor) +
+              " for the CUDA backend's vectorized kernels.");
+        }
+      };
+      require_divisible("key_depth (heads * key_dim)", key_depth_ld, 4);
+      require_divisible("value_depth (heads * value_dim)", value_depth_ld, 4);
+      // gate_rank % 4 covers both the fused decay/gate bias width
+      // (2*gate_rank) and the unfused per-projection width (gate_rank).
+      require_divisible("gate_rank", kda_gate_rank_, 4);
+      require_divisible("encoder head count", encoder_heads_, 4);
+      require_divisible("embedding size", embedding_op_size_, 16);
+    }
+    for (int i = 0; i < kda_direction_count_; ++i) {
+      if (kda_directions[i] < 1 || kda_directions[i] > 16) {
+        throw Exception("Unsupported KDA traversal direction.");
+      }
+      kda_directions_[i] = kda_directions[i];
+    }
+    if (kda_output_rms_norm_ && cpu_weights.kda.out_norm_gammas.empty()) {
+      throw Exception("KDA output RMS norm requested but out_norm_gammas is "
+                      "missing from the network.");
+    }
+    if (kda_local_conv_ &&
+        encoder_heads_ * kda_key_dim_ < embedding_op_size_) {
+      // EvalKda() reuses buffer2 -- sized max_tokens * (key_depth +
+      // value_depth) for the later decay/gate computation -- as scratch for
+      // the local-conv output, which needs max_tokens * embedding_op_size_.
+      // Without this check a net with too few key dims would silently write
+      // past the buffer.
+      throw Exception(
+          "KDA local_conv requires encoder_heads * kda_key_dim >= "
+          "embedding_op_size.");
+    }
 
-  allocAndUpload<DataType>(&mha_k_w, cpu_weights.mha.k_w, scratch);
-  allocAndUpload<DataType>(&mha_k_b, cpu_weights.mha.k_b, scratch);
+    // KDA's proto makes most biases optional (unlike MHA), so a malformed
+    // net silently becomes an out-of-bounds gemm/kernel read instead of a
+    // load-time error unless every weight is shape-checked here.
+    const int key_depth = encoder_heads_ * kda_key_dim_;
+    const int value_depth = encoder_heads_ * kda_value_dim_;
+    auto require_exact = [](const char* name, const std::vector<float>& v,
+                            size_t expected) {
+      if (v.size() != expected) {
+        throw Exception(
+            "KDA weight '" + std::string(name) + "' has size " +
+            std::to_string(v.size()) + ", expected " +
+            std::to_string(expected) + ".");
+      }
+    };
+    auto check_if_present = [](const char* name, const std::vector<float>& v,
+                               size_t expected) {
+      if (!v.empty() && v.size() != expected) {
+        throw Exception(
+            "KDA weight '" + std::string(name) + "' has size " +
+            std::to_string(v.size()) + ", expected " +
+            std::to_string(expected) + ".");
+      }
+    };
+    require_exact("q_w", cpu_weights.kda.q_w,
+                  static_cast<size_t>(embedding_op_size_) * key_depth);
+    require_exact("k_w", cpu_weights.kda.k_w,
+                  static_cast<size_t>(embedding_op_size_) * key_depth);
+    require_exact("v_w", cpu_weights.kda.v_w,
+                  static_cast<size_t>(embedding_op_size_) * value_depth);
+    require_exact("decay_a_w", cpu_weights.kda.decay_a_w,
+                  static_cast<size_t>(embedding_op_size_) * kda_gate_rank_);
+    require_exact("decay_b_w", cpu_weights.kda.decay_b_w,
+                  static_cast<size_t>(kda_gate_rank_) * key_depth);
+    require_exact("beta_w", cpu_weights.kda.beta_w,
+                  static_cast<size_t>(embedding_op_size_) * encoder_heads_);
+    require_exact("dt_bias", cpu_weights.kda.dt_bias,
+                  static_cast<size_t>(key_depth));
+    require_exact("a_log", cpu_weights.kda.a_log,
+                  static_cast<size_t>(encoder_heads_));
+    require_exact("dense_w", cpu_weights.kda.dense_w,
+                  static_cast<size_t>(value_depth) * embedding_op_size_);
+    // dense_b is required, not optional: EvalKda's LN1 dereferences it
+    // unconditionally (unlike q_b/k_b/v_b/etc., which are only applied if
+    // present).
+    require_exact("dense_b", cpu_weights.kda.dense_b,
+                  static_cast<size_t>(embedding_op_size_));
+    check_if_present("q_b", cpu_weights.kda.q_b,
+                     static_cast<size_t>(key_depth));
+    check_if_present("k_b", cpu_weights.kda.k_b,
+                     static_cast<size_t>(key_depth));
+    check_if_present("v_b", cpu_weights.kda.v_b,
+                     static_cast<size_t>(value_depth));
+    check_if_present("decay_a_b", cpu_weights.kda.decay_a_b,
+                     static_cast<size_t>(kda_gate_rank_));
+    check_if_present("decay_b_b", cpu_weights.kda.decay_b_b,
+                     static_cast<size_t>(key_depth));
+    check_if_present("beta_b", cpu_weights.kda.beta_b,
+                     static_cast<size_t>(encoder_heads_));
+    if (kda_output_rms_norm_) {
+      require_exact("out_norm_gammas", cpu_weights.kda.out_norm_gammas,
+                    static_cast<size_t>(value_depth));
+    }
+    if (kda_output_gate_) {
+      // Required, not optional: EvalKda's non-fused branch gemms with
+      // kda_gate_a_w/kda_gate_b_w unconditionally once output_gate is set.
+      require_exact("gate_a_w", cpu_weights.kda.gate_a_w,
+                    static_cast<size_t>(embedding_op_size_) * kda_gate_rank_);
+      require_exact("gate_b_w", cpu_weights.kda.gate_b_w,
+                    static_cast<size_t>(kda_gate_rank_) * value_depth);
+      check_if_present("gate_a_b", cpu_weights.kda.gate_a_b,
+                       static_cast<size_t>(kda_gate_rank_));
+      check_if_present("gate_b_b", cpu_weights.kda.gate_b_b,
+                       static_cast<size_t>(value_depth));
+    }
+    if (kda_local_conv_) {
+      require_exact("local_conv_w", cpu_weights.kda.local_conv_w,
+                    static_cast<size_t>(embedding_op_size_) * 9);
+      check_if_present("local_conv_b", cpu_weights.kda.local_conv_b,
+                       static_cast<size_t>(embedding_op_size_));
+    }
 
-  allocAndUpload<DataType>(&mha_v_w, cpu_weights.mha.v_w, scratch);
-  allocAndUpload<DataType>(&mha_v_b, cpu_weights.mha.v_b, scratch);
+    // addBiasBatched() launches C/4 threads per row, so a fused bias wider
+    // than 2048 channels overflows the 512-thread block; a load-time
+    // diagnostic beats an eval-time failure after a successful-looking load.
+    if ((!cpu_weights.kda.q_b.empty() || !cpu_weights.kda.k_b.empty() ||
+         !cpu_weights.kda.v_b.empty()) &&
+        2 * key_depth + value_depth > 2048) {
+      throw Exception(
+          "KDA fused QKV bias width (" +
+          std::to_string(2 * key_depth + value_depth) +
+          ") exceeds the addBiasBatched kernel limit (2048).");
+    }
 
-  // big allocation to hold qkv weights one after the other
-  {
-    size_t elements = cpu_weights.mha.q_w.size();
-    size_t size = elements * sizeof(DataType) * 3;
-    ReportCUDAErrors(cudaMalloc(&mha_qkv_w, size));
+    allocAndUpload<DataType>(&kda_q_w, cpu_weights.kda.q_w, scratch);
+    allocAndUpload<DataType>(&kda_q_b, cpu_weights.kda.q_b, scratch);
+    allocAndUpload<DataType>(&kda_k_w, cpu_weights.kda.k_w, scratch);
+    allocAndUpload<DataType>(&kda_k_b, cpu_weights.kda.k_b, scratch);
+    allocAndUpload<DataType>(&kda_v_w, cpu_weights.kda.v_w, scratch);
+    allocAndUpload<DataType>(&kda_v_b, cpu_weights.kda.v_b, scratch);
+    allocAndUpload<DataType>(&kda_decay_a_w, cpu_weights.kda.decay_a_w,
+                             scratch);
+    allocAndUpload<DataType>(&kda_decay_a_b, cpu_weights.kda.decay_a_b,
+                             scratch);
+    allocAndUpload<DataType>(&kda_decay_b_w, cpu_weights.kda.decay_b_w,
+                             scratch);
+    allocAndUpload<DataType>(&kda_decay_b_b, cpu_weights.kda.decay_b_b,
+                             scratch);
+    allocAndUpload<DataType>(&kda_beta_w, cpu_weights.kda.beta_w, scratch);
+    allocAndUpload<DataType>(&kda_beta_b, cpu_weights.kda.beta_b, scratch);
+    allocAndUpload<DataType>(&kda_a_log, cpu_weights.kda.a_log, scratch);
+    allocAndUpload<DataType>(&kda_dt_bias, cpu_weights.kda.dt_bias, scratch);
+    allocAndUpload<DataType>(&kda_gate_a_w, cpu_weights.kda.gate_a_w, scratch);
+    allocAndUpload<DataType>(&kda_gate_a_b, cpu_weights.kda.gate_a_b, scratch);
+    allocAndUpload<DataType>(&kda_gate_b_w, cpu_weights.kda.gate_b_w, scratch);
+    allocAndUpload<DataType>(&kda_gate_b_b, cpu_weights.kda.gate_b_b, scratch);
+    allocAndUpload<DataType>(&kda_out_norm_gammas,
+                             cpu_weights.kda.out_norm_gammas, scratch);
+    allocAndUpload<DataType>(&kda_dense_w, cpu_weights.kda.dense_w, scratch);
+    allocAndUpload<DataType>(&kda_dense_b, cpu_weights.kda.dense_b, scratch);
+
+    if (kda_local_conv_) {
+      allocAndUpload<DataType>(&kda_local_conv_w, cpu_weights.kda.local_conv_w,
+                               scratch);
+      if (!cpu_weights.kda.local_conv_b.empty()) {
+        allocAndUpload<DataType>(&kda_local_conv_b,
+                                 cpu_weights.kda.local_conv_b, scratch);
+      }
+    }
+
+    // Fused QKV projection weights (one gemm instead of three).
+    const int qkv_depth = 2 * key_depth + value_depth;
+    {
+      const size_t qkv_w_bytes =
+          static_cast<size_t>(qkv_depth) * embedding_op_size_ *
+          sizeof(DataType);
+      ReportCUDAErrors(cudaMalloc(&kda_qkv_w, qkv_w_bytes));
+      const size_t q_bytes = cpu_weights.kda.q_w.size() * sizeof(DataType);
+      const size_t k_bytes = cpu_weights.kda.k_w.size() * sizeof(DataType);
+      const size_t v_bytes = cpu_weights.kda.v_w.size() * sizeof(DataType);
+      ReportCUDAErrors(
+          cudaMemcpy(kda_qkv_w, kda_q_w, q_bytes, cudaMemcpyDeviceToDevice));
+      ReportCUDAErrors(cudaMemcpy(reinterpret_cast<char*>(kda_qkv_w) + q_bytes,
+                                  kda_k_w, k_bytes, cudaMemcpyDeviceToDevice));
+      ReportCUDAErrors(cudaMemcpy(
+          reinterpret_cast<char*>(kda_qkv_w) + q_bytes + k_bytes, kda_v_w,
+          v_bytes, cudaMemcpyDeviceToDevice));
+    }
+
+    if (kda_q_b && kda_k_b && kda_v_b) {
+      ReportCUDAErrors(
+          cudaMalloc(&kda_qkv_b, qkv_depth * sizeof(DataType)));
+      const size_t b_q = static_cast<size_t>(key_depth) * sizeof(DataType);
+      const size_t b_v = static_cast<size_t>(value_depth) * sizeof(DataType);
+      ReportCUDAErrors(
+          cudaMemcpy(kda_qkv_b, kda_q_b, b_q, cudaMemcpyDeviceToDevice));
+      ReportCUDAErrors(cudaMemcpy(reinterpret_cast<char*>(kda_qkv_b) + b_q,
+                                  kda_k_b, b_q, cudaMemcpyDeviceToDevice));
+      ReportCUDAErrors(cudaMemcpy(
+          reinterpret_cast<char*>(kda_qkv_b) + 2 * b_q, kda_v_b, b_v,
+          cudaMemcpyDeviceToDevice));
+    } else if (kda_q_b || kda_k_b || kda_v_b) {
+      // Partially present bias set: the fused path is taken whenever the
+      // fused weights exist, so building the fused bias only when ALL three
+      // exist would silently drop every present slice. Absent slices are
+      // zero-filled, which makes addBiasBatched's add-then-activate
+      // elementwise identical to applying each projection's bias -- or no
+      // bias, plus activation -- independently.
+      ReportCUDAErrors(
+          cudaMalloc(&kda_qkv_b, qkv_depth * sizeof(DataType)));
+      ReportCUDAErrors(
+          cudaMemset(kda_qkv_b, 0, qkv_depth * sizeof(DataType)));
+      const size_t b_q = static_cast<size_t>(key_depth) * sizeof(DataType);
+      const size_t b_v = static_cast<size_t>(value_depth) * sizeof(DataType);
+      if (kda_q_b) {
+        ReportCUDAErrors(
+            cudaMemcpy(kda_qkv_b, kda_q_b, b_q, cudaMemcpyDeviceToDevice));
+      }
+      if (kda_k_b) {
+        ReportCUDAErrors(cudaMemcpy(reinterpret_cast<char*>(kda_qkv_b) + b_q,
+                                    kda_k_b, b_q, cudaMemcpyDeviceToDevice));
+      }
+      if (kda_v_b) {
+        ReportCUDAErrors(cudaMemcpy(
+            reinterpret_cast<char*>(kda_qkv_b) + 2 * b_q, kda_v_b, b_v,
+            cudaMemcpyDeviceToDevice));
+      }
+    }
+
+    if (kda_output_gate_ && kda_gate_a_w) {
+      // Fused [decay_a | gate_a] projection (one gemm instead of two).
+      const size_t decay_a_bytes =
+          cpu_weights.kda.decay_a_w.size() * sizeof(DataType);
+      const size_t gate_a_bytes =
+          cpu_weights.kda.gate_a_w.size() * sizeof(DataType);
+      ReportCUDAErrors(
+          cudaMalloc(&kda_decay_gate_a_w, decay_a_bytes + gate_a_bytes));
+      ReportCUDAErrors(cudaMemcpy(kda_decay_gate_a_w, kda_decay_a_w,
+                                  decay_a_bytes, cudaMemcpyDeviceToDevice));
+      ReportCUDAErrors(cudaMemcpy(
+          reinterpret_cast<char*>(kda_decay_gate_a_w) + decay_a_bytes,
+          kda_gate_a_w, gate_a_bytes, cudaMemcpyDeviceToDevice));
+
+      if (kda_decay_a_b || kda_gate_a_b) {
+        // Same partial-presence fix as the fused QKV bias above: an absent
+        // half must be zero-filled rather than dropping the present half.
+        ReportCUDAErrors(cudaMalloc(&kda_decay_gate_a_b,
+                                    2 * kda_gate_rank_ * sizeof(DataType)));
+        ReportCUDAErrors(cudaMemset(kda_decay_gate_a_b, 0,
+                                    2 * kda_gate_rank_ * sizeof(DataType)));
+        const size_t b_r =
+            static_cast<size_t>(kda_gate_rank_) * sizeof(DataType);
+        if (kda_decay_a_b) {
+          ReportCUDAErrors(cudaMemcpy(kda_decay_gate_a_b, kda_decay_a_b, b_r,
+                                      cudaMemcpyDeviceToDevice));
+        }
+        if (kda_gate_a_b) {
+          ReportCUDAErrors(cudaMemcpy(
+              reinterpret_cast<char*>(kda_decay_gate_a_b) + b_r, kda_gate_a_b,
+              b_r, cudaMemcpyDeviceToDevice));
+        }
+      }
+    }
+
+    // Upload the shared traversal table (single source of truth:
+    // neural/kda_directions.h). 16*64 ints, used by the recurrence kernel.
     ReportCUDAErrors(
-        cudaMemcpy(mha_qkv_w, mha_q_w, size / 3, cudaMemcpyDeviceToDevice));
-    ReportCUDAErrors(cudaMemcpy(mha_qkv_w + elements, mha_k_w, size / 3,
-                                cudaMemcpyDeviceToDevice));
-    ReportCUDAErrors(cudaMemcpy(mha_qkv_w + elements * 2, mha_v_w, size / 3,
-                                cudaMemcpyDeviceToDevice));
+        cudaMalloc(&kda_dir_order_, 16 * 64 * sizeof(int)));
+    ReportCUDAErrors(cudaMemcpy(kda_dir_order_, kKdaDirectionOrder,
+                                16 * 64 * sizeof(int),
+                                cudaMemcpyHostToDevice));
+  } else {
+    mha_q_size_ = cpu_weights.mha.q_b.size();
+    mha_k_size_ = cpu_weights.mha.k_b.size();
+    mha_v_size_ = cpu_weights.mha.v_b.size();
+    mha_dense_size_ = cpu_weights.mha.dense_b.size();
 
-    elements = cpu_weights.mha.q_b.size();
-    size = elements * sizeof(DataType) * 3;
-    ReportCUDAErrors(cudaMalloc(&mha_qkv_b, size));
-    ReportCUDAErrors(
-        cudaMemcpy(mha_qkv_b, mha_q_b, size / 3, cudaMemcpyDeviceToDevice));
-    ReportCUDAErrors(cudaMemcpy(mha_qkv_b + elements, mha_k_b, size / 3,
-                                cudaMemcpyDeviceToDevice));
-    ReportCUDAErrors(cudaMemcpy(mha_qkv_b + elements * 2, mha_v_b, size / 3,
-                                cudaMemcpyDeviceToDevice));
+    allocAndUpload<DataType>(&mha_q_w, cpu_weights.mha.q_w, scratch);
+    allocAndUpload<DataType>(&mha_q_b, cpu_weights.mha.q_b, scratch);
+
+    allocAndUpload<DataType>(&mha_k_w, cpu_weights.mha.k_w, scratch);
+    allocAndUpload<DataType>(&mha_k_b, cpu_weights.mha.k_b, scratch);
+
+    allocAndUpload<DataType>(&mha_v_w, cpu_weights.mha.v_w, scratch);
+    allocAndUpload<DataType>(&mha_v_b, cpu_weights.mha.v_b, scratch);
+
+    // big allocation to hold qkv weights one after the other
+    {
+      size_t elements = cpu_weights.mha.q_w.size();
+      size_t size = elements * sizeof(DataType) * 3;
+      ReportCUDAErrors(cudaMalloc(&mha_qkv_w, size));
+      ReportCUDAErrors(
+          cudaMemcpy(mha_qkv_w, mha_q_w, size / 3, cudaMemcpyDeviceToDevice));
+      ReportCUDAErrors(cudaMemcpy(mha_qkv_w + elements, mha_k_w, size / 3,
+                                  cudaMemcpyDeviceToDevice));
+      ReportCUDAErrors(cudaMemcpy(mha_qkv_w + elements * 2, mha_v_w, size / 3,
+                                  cudaMemcpyDeviceToDevice));
+
+      elements = cpu_weights.mha.q_b.size();
+      size = elements * sizeof(DataType) * 3;
+      ReportCUDAErrors(cudaMalloc(&mha_qkv_b, size));
+      ReportCUDAErrors(
+          cudaMemcpy(mha_qkv_b, mha_q_b, size / 3, cudaMemcpyDeviceToDevice));
+      ReportCUDAErrors(cudaMemcpy(mha_qkv_b + elements, mha_k_b, size / 3,
+                                  cudaMemcpyDeviceToDevice));
+      ReportCUDAErrors(cudaMemcpy(mha_qkv_b + elements * 2, mha_v_b, size / 3,
+                                  cudaMemcpyDeviceToDevice));
+    }
+
+    allocAndUpload<DataType>(&mha_dense_w, cpu_weights.mha.dense_w, scratch);
+    allocAndUpload<DataType>(&mha_dense_b, cpu_weights.mha.dense_b, scratch);
   }
 
-  allocAndUpload<DataType>(&mha_dense_w, cpu_weights.mha.dense_w, scratch);
-  allocAndUpload<DataType>(&mha_dense_b, cpu_weights.mha.dense_b, scratch);
+  ffn_dense1_size_ = cpu_weights.ffn.dense1_b.size();
+  ffn_dense2_size_ = cpu_weights.ffn.dense2_b.size();
 
   allocAndUpload<DataType>(&ln1_gammas, cpu_weights.ln1_gammas, scratch);
   allocAndUpload<DataType>(&ln1_betas, cpu_weights.ln1_betas, scratch);
@@ -1661,6 +1979,11 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
                                   DataType* buffer2, cublasHandle_t cublas,
                                   cudaStream_t stream,
                                   DataType*** offset_pointers) const {
+  if (is_kda_) {
+    EvalKda(N, in_out_tensor, scratch, buffer1, buffer2, cublas, stream);
+    return;
+  }
+
   const int d_model = mha_q_size_;
   const int depth = d_model / encoder_heads_;
 
@@ -1993,6 +2316,239 @@ AttentionPolicyHead<DataType>::~AttentionPolicyHead() {
 }
 
 template <typename DataType>
+void EncoderBlock<DataType>::EvalKda(int N, DataType* in_out_tensor,
+                                     DataType* scratch, DataType* buffer1,
+                                     DataType* buffer2, cublasHandle_t cublas,
+                                     cudaStream_t stream) const {
+  // Mirrors KDA_LOG_DECAY_FLOOR in the trainer, which clamps the per-token log
+  // decay so its chunkwise-parallel recurrence stays in the float32 range.
+  constexpr float kKdaLogDecayFloor = -10.0f;
+  const int tokens = N * 64;
+  const int max_tokens = max_batch_size_ * 64;
+  const int key_depth = encoder_heads_ * kda_key_dim_;
+  const int value_depth = encoder_heads_ * kda_value_dim_;
+
+  // Apply the optional 3x3 depthwise board convolution before projections.
+  // The convolved tensor feeds the projections only -- it must NOT overwrite
+  // in_out_tensor, because the encoder residual added at LN1 below is the
+  // pre-mixer layer input x, not x + conv(x). The BLAS reference writes a
+  // separate conv_input for the same reason.
+  DataType* proj_input = in_out_tensor;
+  if (kda_local_conv_) {
+    // Persistent region past q/k/v and the non-fused gate_hidden; it has to
+    // stay live until the last projection (beta) reads it. buffer2 is still
+    // free here, so it serves as the conv kernel's transient intermediate.
+    proj_input =
+        scratch + max_tokens * (2 * key_depth + value_depth + kda_gate_rank_);
+    applyKdaLocalDepthwiseConv<DataType>(N, embedding_op_size_, in_out_tensor,
+                                         kda_local_conv_w, kda_local_conv_b,
+                                         buffer2, proj_input, stream);
+  }
+
+  DataType* q = scratch;
+  DataType* k = q + max_tokens * key_depth;
+  DataType* v = k + max_tokens * key_depth;
+
+  // The trainer's qkv_silu applies SiLU (= Swish) to the q/k/v projections.
+  const ActivationFunction qkv_act =
+      kda_qkv_silu_ ? ACTIVATION_SWISH : ACTIVATION_NONE;
+
+  if (kda_qkv_w) {
+    const int qkv_depth = 2 * key_depth + value_depth;
+    cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, qkv_depth, tokens,
+                          embedding_op_size_, 1.0f, kda_qkv_w,
+                          embedding_op_size_, proj_input, embedding_op_size_,
+                          0.0f, q, qkv_depth);
+    if (kda_qkv_b) {
+      addBiasBatched(q, q, kda_qkv_b, 1, tokens, qkv_depth, qkv_act, stream);
+    } else if (qkv_act != ACTIVATION_NONE) {
+      // qkv_silu with no fused bias: the activation must still run -- the
+      // BLAS reference applies it regardless of bias presence. addVectors
+      // with a null second operand is exactly elementwise-activate here.
+      addVectors(q, q, static_cast<DataType*>(nullptr), tokens * qkv_depth,
+                 tokens * qkv_depth, 0, qkv_act, stream);
+    }
+  } else {
+    cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, key_depth, tokens,
+                          embedding_op_size_, 1.0f, kda_q_w,
+                          embedding_op_size_, proj_input, embedding_op_size_,
+                          0.0f, q, key_depth);
+    cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, key_depth, tokens,
+                          embedding_op_size_, 1.0f, kda_k_w,
+                          embedding_op_size_, proj_input, embedding_op_size_,
+                          0.0f, k, key_depth);
+    cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, value_depth,
+                          tokens, embedding_op_size_, 1.0f, kda_v_w,
+                          embedding_op_size_, proj_input, embedding_op_size_,
+                          0.0f, v, value_depth);
+    if (kda_q_b) {
+      addBiasBatched(q, q, kda_q_b, 1, tokens, key_depth, qkv_act, stream);
+    }
+    if (kda_k_b) {
+      addBiasBatched(k, k, kda_k_b, 1, tokens, key_depth, qkv_act, stream);
+    }
+    if (kda_v_b) {
+      addBiasBatched(v, v, kda_v_b, 1, tokens, value_depth, qkv_act, stream);
+    }
+    if (qkv_act != ACTIVATION_NONE) {
+      // See the fused-branch comment: apply the activation even where the
+      // matching bias is missing.
+      if (!kda_q_b) {
+        addVectors(q, q, static_cast<DataType*>(nullptr), tokens * key_depth,
+                   tokens * key_depth, 0, qkv_act, stream);
+      }
+      if (!kda_k_b) {
+        addVectors(k, k, static_cast<DataType*>(nullptr), tokens * key_depth,
+                   tokens * key_depth, 0, qkv_act, stream);
+      }
+      if (!kda_v_b) {
+        addVectors(v, v, static_cast<DataType*>(nullptr),
+                   tokens * value_depth, tokens * value_depth, 0, qkv_act,
+                   stream);
+      }
+    }
+  }
+
+  DataType* decay_hidden = buffer1;
+  DataType* gate_hidden =
+      kda_output_gate_ && !kda_decay_gate_a_w
+          ? (scratch + max_tokens * (2 * key_depth + value_depth))
+          : nullptr;
+  // Distance between consecutive tokens in decay_hidden / gate_hidden. The
+  // fused gemm below writes ONE interleaved row per token ([decay_a |
+  // gate_a], width 2*gate_rank, because ldc = 2*gate_rank in column-major),
+  // so its consumers have to stride by the full fused width and find the gate
+  // half gate_rank into each row. The non-fused path instead writes two
+  // separately packed buffers of width gate_rank each. Getting this wrong
+  // silently feeds decay_b the previous token's gate_a.
+  int decay_hidden_ld = kda_gate_rank_;
+  int gate_hidden_ld = kda_gate_rank_;
+
+  if (kda_output_gate_ && kda_decay_gate_a_w) {
+    cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, 2 * kda_gate_rank_,
+                          tokens, embedding_op_size_, 1.0f,
+                          kda_decay_gate_a_w, embedding_op_size_, proj_input,
+                          embedding_op_size_, 0.0f, decay_hidden,
+                          2 * kda_gate_rank_);
+    if (kda_decay_gate_a_b) {
+      addBiasBatched(decay_hidden, decay_hidden, kda_decay_gate_a_b, 1, tokens,
+                     2 * kda_gate_rank_, ACTIVATION_NONE, stream);
+    }
+    decay_hidden_ld = 2 * kda_gate_rank_;
+    gate_hidden_ld = 2 * kda_gate_rank_;
+    gate_hidden = decay_hidden + kda_gate_rank_;
+  } else {
+    cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, kda_gate_rank_,
+                          tokens, embedding_op_size_, 1.0f, kda_decay_a_w,
+                          embedding_op_size_, proj_input, embedding_op_size_,
+                          0.0f, decay_hidden, kda_gate_rank_);
+    if (kda_decay_a_b) {
+      addBiasBatched(decay_hidden, decay_hidden, kda_decay_a_b, 1, tokens,
+                     kda_gate_rank_, ACTIVATION_NONE, stream);
+    }
+    if (kda_output_gate_) {
+      cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, kda_gate_rank_,
+                            tokens, embedding_op_size_, 1.0f, kda_gate_a_w,
+                            embedding_op_size_, proj_input,
+                            embedding_op_size_, 0.0f, gate_hidden,
+                            kda_gate_rank_);
+      if (kda_gate_a_b) {
+        addBiasBatched(gate_hidden, gate_hidden, kda_gate_a_b, 1, tokens,
+                       kda_gate_rank_, ACTIVATION_NONE, stream);
+      }
+    }
+  }
+
+  DataType* raw_decay = buffer2;
+  cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, key_depth, tokens,
+                        kda_gate_rank_, 1.0f, kda_decay_b_w, kda_gate_rank_,
+                        decay_hidden, decay_hidden_ld, 0.0f, raw_decay,
+                        key_depth);
+  if (kda_decay_b_b) {
+    addBiasBatched(raw_decay, raw_decay, kda_decay_b_b, 1, tokens, key_depth,
+                   ACTIVATION_NONE, stream);
+  }
+
+  // The gate gemm must run BEFORE the beta gemm. In the fused path
+  // gate_hidden points into buffer1 (decay_hidden + gate_rank, spanning up to
+  // tokens * 2*gate_rank), while beta is written at
+  // buffer1 + max_tokens * value_depth. Those regions are disjoint only while
+  // 2*gate_rank <= value_depth; consuming gate_hidden first makes the
+  // ordering safe for any dims instead of relying on that inequality.
+  DataType* gate = nullptr;
+  if (kda_output_gate_) {
+    gate = buffer2 + max_tokens * key_depth;
+    cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, value_depth, tokens,
+                          kda_gate_rank_, 1.0f, kda_gate_b_w, kda_gate_rank_,
+                          gate_hidden, gate_hidden_ld, 0.0f, gate, value_depth);
+    if (kda_gate_b_b) {
+      addBiasBatched(gate, gate, kda_gate_b_b, 1, tokens, value_depth,
+                     ACTIVATION_NONE, stream);
+    }
+  }
+
+  DataType* beta = buffer1 + max_tokens * value_depth;
+  cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, encoder_heads_,
+                        tokens, embedding_op_size_, 1.0f, kda_beta_w,
+                        embedding_op_size_, proj_input, embedding_op_size_,
+                        0.0f, beta, encoder_heads_);
+  if (kda_beta_b) {
+    addBiasBatched(beta, beta, kda_beta_b, 1, tokens, encoder_heads_,
+                   ACTIVATION_NONE, stream);
+  }
+
+  DataType* mixed = buffer1;
+  const DataType* qkv = kda_qkv_w ? scratch : nullptr;
+  const int qkv_stride = 2 * key_depth + value_depth;
+  KdaDirectionList directions;
+  for (int i = 0; i < 16; ++i) directions.d[i] = kda_directions_[i];
+  // q/k/v describe the non-fused layout and are meaningless once qkv (fused)
+  // is set -- the kernel takes the qkv branch exclusively in that case and
+  // never dereferences them, so pass nullptr rather than pointers a future
+  // reader might mistake for the fused layout.
+  kdaRecurrenceValueParallel<DataType>(
+      N, encoder_heads_, kda_key_dim_, kda_value_dim_, kda_direction_count_,
+      directions, kda_dir_order_, kKdaLogDecayFloor, qkv, qkv_stride,
+      qkv ? nullptr : q, qkv ? nullptr : k, qkv ? nullptr : v, raw_decay,
+      kda_dt_bias, kda_a_log, beta, mixed, stream);
+
+  if (kda_output_rms_norm_) {
+    applyKdaOutputRmsNorm(tokens, value_depth, mixed, kda_out_norm_gammas,
+                          kda_rms_norm_epsilon_, stream);
+  }
+
+  // The gate must apply after the (optional) RMS norm, not before: they do
+  // not commute, since the gate rescales each element before the norm would
+  // divide by the resulting RMS. The trainer and BLAS reference both
+  // normalize first and gate second.
+  if (kda_output_gate_) {
+    applyKdaOutputGate(tokens * value_depth, mixed, gate, stream);
+  }
+
+  cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, embedding_op_size_,
+                        tokens, value_depth, 1.0f, kda_dense_w, value_depth,
+                        mixed, value_depth, 0.0f, buffer2, embedding_op_size_);
+  LayerNorm<DataType>(tokens, embedding_op_size_, scratch, buffer2,
+                      kda_dense_b, in_out_tensor, ln1_gammas, ln1_betas,
+                      default_eps_, alpha_, ACTIVATION_NONE, stream);
+
+  cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, ffn_dense1_size_,
+                        tokens, embedding_op_size_, 1.0f, ffn_dense1_w,
+                        embedding_op_size_, scratch, embedding_op_size_, 0.0f,
+                        in_out_tensor, ffn_dense1_size_);
+  addBiasBatched(in_out_tensor, in_out_tensor, ffn_dense1_b, 1, tokens,
+                 ffn_dense1_size_, ffn_activation_, stream);
+
+  cublasXgemm<DataType>(cublas, CUBLAS_OP_T, CUBLAS_OP_N, embedding_op_size_,
+                        tokens, ffn_dense1_size_, 1.0f, ffn_dense2_w,
+                        ffn_dense1_size_, in_out_tensor, ffn_dense1_size_,
+                        0.0f, buffer1, embedding_op_size_);
+  LayerNorm<DataType>(tokens, embedding_op_size_, in_out_tensor, buffer1,
+                      ffn_dense2_b, scratch, ln2_gammas, ln2_betas,
+                      default_eps_, alpha_, ACTIVATION_NONE, stream);
+}
+
+template <typename DataType>
 EncoderBlock<DataType>::~EncoderBlock() {
   ReportCUDAErrors(cudaFree(mha_q_w));
   ReportCUDAErrors(cudaFree(mha_q_b));
@@ -2022,6 +2578,36 @@ EncoderBlock<DataType>::~EncoderBlock() {
     ReportCUDAErrors(cudaFree(smol_ln1_betas));
     ReportCUDAErrors(cudaFree(smol_ln2_gammas));
     ReportCUDAErrors(cudaFree(smol_ln2_betas));
+  }
+  if (is_kda_) {
+    ReportCUDAErrors(cudaFree(kda_q_w));
+    ReportCUDAErrors(cudaFree(kda_q_b));
+    ReportCUDAErrors(cudaFree(kda_k_w));
+    ReportCUDAErrors(cudaFree(kda_k_b));
+    ReportCUDAErrors(cudaFree(kda_v_w));
+    ReportCUDAErrors(cudaFree(kda_v_b));
+    ReportCUDAErrors(cudaFree(kda_qkv_w));
+    ReportCUDAErrors(cudaFree(kda_qkv_b));
+    ReportCUDAErrors(cudaFree(kda_decay_a_w));
+    ReportCUDAErrors(cudaFree(kda_decay_a_b));
+    ReportCUDAErrors(cudaFree(kda_decay_b_w));
+    ReportCUDAErrors(cudaFree(kda_decay_b_b));
+    ReportCUDAErrors(cudaFree(kda_beta_w));
+    ReportCUDAErrors(cudaFree(kda_beta_b));
+    ReportCUDAErrors(cudaFree(kda_a_log));
+    ReportCUDAErrors(cudaFree(kda_dt_bias));
+    ReportCUDAErrors(cudaFree(kda_gate_a_w));
+    ReportCUDAErrors(cudaFree(kda_gate_a_b));
+    ReportCUDAErrors(cudaFree(kda_gate_b_w));
+    ReportCUDAErrors(cudaFree(kda_gate_b_b));
+    ReportCUDAErrors(cudaFree(kda_decay_gate_a_w));
+    ReportCUDAErrors(cudaFree(kda_decay_gate_a_b));
+    ReportCUDAErrors(cudaFree(kda_out_norm_gammas));
+    ReportCUDAErrors(cudaFree(kda_dense_w));
+    ReportCUDAErrors(cudaFree(kda_dense_b));
+    ReportCUDAErrors(cudaFree(kda_local_conv_w));
+    ReportCUDAErrors(cudaFree(kda_local_conv_b));
+    ReportCUDAErrors(cudaFree(kda_dir_order_));
   }
 }
 
@@ -2061,7 +2647,8 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
                                        int num_res_blocks, int input_c,
                                        int max_batch_size,
                                        bool is_pe_dense_embedding,
-                                       bool use_gemm_ex, bool fused_mha)
+                                       bool use_gemm_ex, bool fused_mha,
+                                       const std::vector<int>& kda_directions)
     : BaseLayer<DataType>(weights.ip_emb_b.size(), 8, 8, nullptr, false,
                           use_gemm_ex),
       embedding_op_size_(weights.ip_emb_b.size()),
@@ -2128,7 +2715,8 @@ AttentionBody<DataType>::AttentionBody(const MultiHeadWeights& weights,
         enc, scratch, encoder_head_count_, embedding_op_size_, alpha,
         smolgen_global_, smolgen_global_size_, max_batch_size,
         activations_.smolgen_activation, activations_.ffn_activation,
-        is_pe_dense_embedding_ ? 1e-3 : 1e-6, use_gemm_ex, use_fused_mha_);
+        is_pe_dense_embedding_ ? 1e-3 : 1e-6, use_gemm_ex, use_fused_mha_,
+        kda_directions);
     encoder_weights_.emplace_back(pW);
   }
 }

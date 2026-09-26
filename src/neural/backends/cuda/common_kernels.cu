@@ -29,6 +29,7 @@
 #include <cassert>
 
 #include "cuda_common.h"
+#include "kernels.h"
 #include "neural/tables/activation_function.h"
 #include "neural/tables/attention_policy_map.h"
 #include "utils/exception.h"
@@ -1654,5 +1655,289 @@ template void genOffsetPointers<half>(half** offsets, int heads, int max_batch,
                                       int depth, int d_model, half* k, half* q,
                                       half* b1, half* v, half* b2,
                                       cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// KDA (Kimi Delta Attention) encoder-layer kernels.
+// CUDA port of the SYCL implementation in sycl/common_kernels.dp.cpp;
+// semantics mirror the BLAS reference (blas/network_blas.cc ForwardKdaMixer).
+// ---------------------------------------------------------------------------
+namespace {
+
+// 64-step sequential gated delta-rule scan: one thread block of value_dim
+// threads per (batch, head), each thread owning one value channel. Staging
+// (p_q/p_k/p_decay) and the recurrent state stay float regardless of T: this
+// is a sequential scan with no barrier that ever re-normalizes, so precision
+// loss compounds across the whole board. T matters only at the global-memory
+// boundary (loads of q/k/v/decay/beta and the final store), which is where a
+// narrower type pays off for a kernel that is bandwidth-bound at 64
+// sequential small reads per head. key_dim must be <= 32 (checked at load);
+// the state lives in a per-thread register array.
+template <typename T>
+__global__ void kda_recurrence_kernel(
+    int heads, int key_dim, int value_dim, int direction_count,
+    KdaDirectionList directions, const int* dir_order, float log_decay_floor,
+    const T* qkv, int qkv_stride, const T* q, const T* k, const T* v,
+    const T* raw_decay, const T* dt_bias, const T* a_log, const T* beta,
+    T* mixed) {
+  extern __shared__ float kda_shared[];  // p_q, p_k, p_decay: key_dim each
+  float* p_q = kda_shared;
+  float* p_k = p_q + key_dim;
+  float* p_decay = p_k + key_dim;
+
+  const int local_id = threadIdx.x;  // the value channel this thread owns
+  const int batch = blockIdx.x / heads;
+  const int head = blockIdx.x % heads;
+
+  const int direction_index = head / (heads / direction_count);
+  const int direction = directions.d[direction_index];
+
+  const float scale = 1.0f / sqrtf(static_cast<float>(key_dim));
+  const float decay_scale = expf(static_cast<float>(a_log[head]));
+  const int key_depth = heads * key_dim;
+  const int value_depth = heads * value_dim;
+
+  float state[32];
+  for (int i = 0; i < key_dim && i < 32; ++i) {
+    state[i] = 0.0f;
+  }
+
+  for (int token = 0; token < 64; ++token) {
+    // One branchless table read for all 16 directions (orthogonal, diagonal
+    // and serpentine). dir_order is the device copy of the shared
+    // kKdaDirectionOrder table from neural/kda_directions.h.
+    const int square = dir_order[(direction - 1) * 64 + token];
+
+    const int token_idx = batch * 64 + square;
+    const T* q_ptr;
+    const T* k_ptr;
+    const T* v_ptr;
+
+    if (qkv != nullptr) {
+      q_ptr = qkv + token_idx * qkv_stride + head * key_dim;
+      k_ptr = qkv + token_idx * qkv_stride + key_depth + head * key_dim;
+      v_ptr = qkv + token_idx * qkv_stride + 2 * key_depth + head * value_dim;
+    } else {
+      q_ptr = q + token_idx * key_depth + head * key_dim;
+      k_ptr = k + token_idx * key_depth + head * key_dim;
+      v_ptr = v + token_idx * value_depth + head * value_dim;
+    }
+
+    const int raw_decay_offset = token_idx * key_depth + head * key_dim;
+    const int value_offset = token_idx * value_depth + head * value_dim;
+
+    // Strided staging into shared memory. The single load here is the only
+    // place T's storage width matters; everything downstream works in float.
+    for (int i = local_id; i < key_dim; i += blockDim.x) {
+      p_q[i] = static_cast<float>(q_ptr[i]);
+      p_k[i] = static_cast<float>(k_ptr[i]);
+
+      const float decay_input = static_cast<float>(raw_decay[raw_decay_offset + i]) +
+                                static_cast<float>(dt_bias[head * key_dim + i]);
+      const float softplus = (decay_input > 0.0f ? decay_input : 0.0f) +
+                             log1pf(expf(-fabsf(decay_input)));
+      const float log_decay = fmaxf(-decay_scale * softplus, log_decay_floor);
+      p_decay[i] = expf(log_decay);
+    }
+
+    __syncthreads();
+
+    float q_norm_sq = 0.0f;
+    float k_norm_sq = 0.0f;
+    for (int key = 0; key < key_dim; ++key) {
+      q_norm_sq += p_q[key] * p_q[key];
+      k_norm_sq += p_k[key] * p_k[key];
+    }
+    const float q_norm =
+        1.0f / sqrtf(q_norm_sq > 1.0e-12f ? q_norm_sq : 1.0e-12f);
+    const float k_norm =
+        1.0f / sqrtf(k_norm_sq > 1.0e-12f ? k_norm_sq : 1.0e-12f);
+
+    for (int key = 0; key < key_dim; ++key) {
+      state[key] *= p_decay[key];
+    }
+
+    const float beta_value = static_cast<float>(beta[token_idx * heads + head]);
+    const float update_rate = 1.0f / (1.0f + expf(-beta_value));
+
+    float prediction = 0.0f;
+    for (int key = 0; key < key_dim; ++key) {
+      prediction += p_k[key] * k_norm * state[key];
+    }
+
+    const float delta =
+        update_rate * (static_cast<float>(v_ptr[local_id]) - prediction);
+
+    float output = 0.0f;
+    for (int key = 0; key < key_dim; ++key) {
+      state[key] += p_k[key] * k_norm * delta;
+      output += p_q[key] * q_norm * scale * state[key];
+    }
+
+    mixed[value_offset + local_id] = static_cast<T>(output);
+
+    // p_q/p_k/p_decay are read by every thread above but rewritten by the
+    // first key_dim threads at the top of the next iteration; without this
+    // barrier a writer can loop back and overwrite them before a slower
+    // reader has finished this token.
+    __syncthreads();
+  }
+}
+
+// 3x3 same-padded depthwise convolution over the 8x8 board (one thread per
+// token x channel), matching the trainer's DepthwiseConv2D(kernel_size=3,
+// padding="same"). The residual add is a separate kernel below.
+template <typename T>
+__global__ void kda_local_conv_kernel(int emb_size, const T* input,
+                                      const T* conv_w, const T* conv_b,
+                                      T* scratch) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int token = idx / emb_size;
+  const int c = idx % emb_size;
+
+  // token spans all N*64 tokens; board coordinates are intra-batch.
+  const int batch_base = (token / 64) * 64;
+  const int square = token - batch_base;
+  const int rank = square / 8;
+  const int file = square % 8;
+
+  // Accumulate in float even for T=half: only 9 taps, one cast at the end.
+  float sum = (conv_b != nullptr) ? static_cast<float>(conv_b[c]) : 0.0f;
+  for (int kr = 0; kr < 3; ++kr) {
+    const int nr = rank + kr - 1;
+    if (nr < 0 || nr > 7) continue;
+    for (int kf = 0; kf < 3; ++kf) {
+      const int nf = file + kf - 1;
+      if (nf < 0 || nf > 7) continue;
+      const int neighbour_token = batch_base + nr * 8 + nf;
+      sum += static_cast<float>(conv_w[c * 9 + kr * 3 + kf]) *
+             static_cast<float>(input[neighbour_token * emb_size + c]);
+    }
+  }
+  scratch[token * emb_size + c] = static_cast<T>(sum);
+}
+
+template <typename T>
+__global__ void kda_residual_add_kernel(int n, const T* input, const T* scratch,
+                                        T* output) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  output[i] = static_cast<T>(static_cast<float>(input[i]) +
+                             static_cast<float>(scratch[i]));
+}
+
+// Sigmoid output gate. Must run after the (optional) RMS norm, not before:
+// they do not commute since the gate rescales each element before the norm
+// would divide by the resulting RMS.
+template <typename T>
+__global__ void kda_output_gate_kernel(int n, T* mixed, const T* gate) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const float gate_value = static_cast<float>(gate[i]);
+  const float sigmoid = 1.0f / (1.0f + expf(-gate_value));
+  mixed[i] = static_cast<T>(static_cast<float>(mixed[i]) * sigmoid);
+}
+
+// RMS norm across the value depth of each token, scaled by gammas.
+template <typename T>
+__global__ void kda_rms_norm_kernel(int tokens, int value_depth, T* mixed,
+                                    const T* gammas, float eps) {
+  const int token = blockIdx.x * blockDim.x + threadIdx.x;
+  if (token >= tokens) return;
+  const int offset = token * value_depth;
+  float sum_squares = 0.0f;
+  for (int channel = 0; channel < value_depth; ++channel) {
+    const float val = static_cast<float>(mixed[offset + channel]);
+    sum_squares += val * val;
+  }
+  const float factor = 1.0f / sqrtf(sum_squares / value_depth + eps);
+  for (int channel = 0; channel < value_depth; ++channel) {
+    mixed[offset + channel] =
+        static_cast<T>(static_cast<float>(mixed[offset + channel]) * factor *
+                       static_cast<float>(gammas[channel]));
+  }
+}
+
+}  // namespace
+
+template <typename T>
+void kdaRecurrenceValueParallel(int N, int heads, int key_dim, int value_dim,
+                                int direction_count, KdaDirectionList directions,
+                                const int* dir_order, float log_decay_floor,
+                                const T* qkv, int qkv_stride, const T* q,
+                                const T* k, const T* v, const T* raw_decay,
+                                const T* dt_bias, const T* a_log,
+                                const T* beta, T* mixed, cudaStream_t stream) {
+  const int shared_bytes = 3 * key_dim * sizeof(float);
+  kda_recurrence_kernel<T>
+      <<<N * heads, value_dim, shared_bytes, stream>>>(
+          heads, key_dim, value_dim, direction_count, directions, dir_order,
+          log_decay_floor, qkv, qkv_stride, q, k, v, raw_decay, dt_bias, a_log,
+          beta, mixed);
+}
+
+template <typename T>
+void applyKdaLocalDepthwiseConv(int N, int emb_size, const T* input,
+                                const T* conv_w, const T* conv_b, T* scratch,
+                                T* output, cudaStream_t stream) {
+  const int total = N * 64 * emb_size;
+  const int blocks = (total + 255) / 256;
+  kda_local_conv_kernel<T>
+      <<<blocks, 256, 0, stream>>>(emb_size, input, conv_w, conv_b, scratch);
+  kda_residual_add_kernel<T><<<blocks, 256, 0, stream>>>(total, input, scratch,
+                                                         output);
+}
+
+template <typename T>
+void applyKdaOutputGate(int n, T* mixed, const T* gate, cudaStream_t stream) {
+  kda_output_gate_kernel<T><<<(n + 255) / 256, 256, 0, stream>>>(n, mixed,
+                                                                 gate);
+}
+
+template <typename T>
+void applyKdaOutputRmsNorm(int tokens, int value_depth, T* mixed,
+                           const T* gammas, float eps, cudaStream_t stream) {
+  kda_rms_norm_kernel<T>
+      <<<(tokens + 255) / 256, 256, 0, stream>>>(tokens, value_depth, mixed,
+                                                 gammas, eps);
+}
+
+template void kdaRecurrenceValueParallel<float>(
+    int N, int heads, int key_dim, int value_dim, int direction_count,
+    KdaDirectionList directions, const int* dir_order, float log_decay_floor,
+    const float* qkv, int qkv_stride, const float* q, const float* k,
+    const float* v, const float* raw_decay, const float* dt_bias,
+    const float* a_log, const float* beta, float* mixed, cudaStream_t stream);
+template void kdaRecurrenceValueParallel<half>(
+    int N, int heads, int key_dim, int value_dim, int direction_count,
+    KdaDirectionList directions, const int* dir_order, float log_decay_floor,
+    const half* qkv, int qkv_stride, const half* q, const half* k,
+    const half* v, const half* raw_decay, const half* dt_bias,
+    const half* a_log, const half* beta, half* mixed, cudaStream_t stream);
+
+template void applyKdaLocalDepthwiseConv<float>(int N, int emb_size,
+                                                const float* input,
+                                                const float* conv_w,
+                                                const float* conv_b,
+                                                float* scratch, float* output,
+                                                cudaStream_t stream);
+template void applyKdaLocalDepthwiseConv<half>(int N, int emb_size,
+                                               const half* input,
+                                               const half* conv_w,
+                                               const half* conv_b,
+                                               half* scratch, half* output,
+                                               cudaStream_t stream);
+
+template void applyKdaOutputGate<float>(int n, float* mixed, const float* gate,
+                                        cudaStream_t stream);
+template void applyKdaOutputGate<half>(int n, half* mixed, const half* gate,
+                                       cudaStream_t stream);
+
+template void applyKdaOutputRmsNorm<float>(int tokens, int value_depth,
+                                           float* mixed, const float* gammas,
+                                           float eps, cudaStream_t stream);
+template void applyKdaOutputRmsNorm<half>(int tokens, int value_depth,
+                                          half* mixed, const half* gammas,
+                                          float eps, cudaStream_t stream);
+
 }  // namespace cudnn_backend
 }  // namespace lczero

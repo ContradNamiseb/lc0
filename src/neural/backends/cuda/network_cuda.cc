@@ -126,6 +126,37 @@ static size_t getMaxAttentionBodySize(const MultiHeadWeights& weights, int N) {
   return size;
 }
 
+// Max scratch needed by the KDA mixer path of any encoder layer, in bytes.
+// Mirrors the SYCL backend's getMaxKdaBodySize: the scratch region holds
+// q/k/v plus the non-fused gate hidden state plus (with local_conv) the
+// convolved projection input; each of buffer1/buffer2 (halves of the same
+// allocation) must independently fit the largest aux layout EvalKda uses.
+template <typename DataType>
+static size_t getMaxKdaBodySize(const MultiHeadWeights& weights, int N) {
+  size_t size = 0;
+  for (const auto& encoder : weights.encoder) {
+    if (!encoder.is_kda) continue;
+    const size_t heads = weights.encoder_head_count;
+    const size_t key_depth = heads * encoder.kda.key_dim;
+    const size_t value_depth = heads * encoder.kda.value_dim;
+    const size_t gate_rank = encoder.kda.gate_rank;
+    const size_t tokens = static_cast<size_t>(N) * 64;
+    // With local_conv, EvalKda keeps the convolved projection input in a
+    // persistent region past q/k/v and the non-fused gate_hidden, so that
+    // in_out_tensor survives untouched as the LN1 residual skip.
+    const size_t conv_input_width =
+        encoder.kda.local_conv ? weights.ip_emb_b.size() : 0;
+    const size_t qkv_size =
+        tokens * (2 * key_depth + value_depth + gate_rank + conv_input_width) *
+        sizeof(DataType);
+    const size_t aux_buffer_size =
+        tokens * std::max(2 * gate_rank, key_depth + value_depth + heads) *
+        sizeof(DataType);
+    size = std::max(size, std::max(qkv_size, 2 * aux_buffer_size));
+  }
+  return size;
+}
+
 template <typename DataType>
 class CudaNetworkComputation : public NetworkComputation {
  public:
@@ -215,7 +246,8 @@ class CudaNetwork : public Network {
     conv_policy_ = nf.policy() == NF::POLICY_CONVOLUTION;
     attn_policy_ = nf.policy() == NF::POLICY_ATTENTION;
     attn_body_ = nf.network() == NF::NETWORK_ATTENTIONBODY_WITH_HEADFORMAT ||
-                 nf.network() == NF::NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT;
+                 nf.network() == NF::NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT ||
+                 nf.network() == NF::NETWORK_KDA_HYBRID_WITH_MULTIHEADFORMAT;
 
     max_batch_size_ = options.GetOrDefault<int>("max_batch", 1024);
     // min_batch_size_ is chosen as 4 as it is common that for sizes less than
@@ -401,8 +433,12 @@ class CudaNetwork : public Network {
 
     const size_t attentionBodySize =
         getMaxAttentionBodySize(weights, max_batch_size_) * sizeof(DataType);
-    scratch_size_ = std::max(scratch_size_,
-                             std::max(attentionPolicySize, attentionBodySize));
+    const size_t kdaBodySize =
+        getMaxKdaBodySize<DataType>(weights, max_batch_size_);
+    scratch_size_ =
+        std::max(scratch_size_,
+                 std::max(attentionPolicySize,
+                          std::max(attentionBodySize, kdaBodySize)));
 
     ReportCUDAErrors(cudaMalloc(&scratch_mem_, scratch_size_));
 
@@ -497,7 +533,9 @@ class CudaNetwork : public Network {
           static_cast<InputEmbedding>(
               file.format().network_format().input_embedding()) ==
               InputEmbedding::INPUT_EMBEDDING_PE_DENSE,
-          use_gemm_ex, use_fused_mha);
+          use_gemm_ex, use_fused_mha,
+          std::vector<int>(nf.kda_directions().begin(),
+                           nf.kda_directions().end()));
       network_.emplace_back(std::move(attention_body));
 
       encoder_last_ = getLastLayer();
@@ -1277,6 +1315,7 @@ std::unique_ptr<Network> MakeCudaNetwork(const std::optional<WeightsFile>& w,
     case NF::NETWORK_SE_WITH_HEADFORMAT:
     case NF::NETWORK_ATTENTIONBODY_WITH_HEADFORMAT:
     case NF::NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT:
+    case NF::NETWORK_KDA_HYBRID_WITH_MULTIHEADFORMAT:
       break;
     default:
       throw Exception("Network format " +

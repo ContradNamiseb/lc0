@@ -28,8 +28,10 @@
 
 #include <cublas_v2.h>
 
+#include <array>
 #include <cstddef>
 #include <memory>
+#include <vector>
 
 #include "cuda_common.h"
 #include "neural/network_legacy.h"
@@ -342,33 +344,37 @@ class EncoderBlock {
                DataType* smolgen_global_scratch, int smolgen_global_size,
                int max_batch_size, ActivationFunction smolgen_act,
                ActivationFunction ffn_act, float default_eps, bool use_gemm_ex,
-               bool fused_mha);
+               bool fused_mha, const std::vector<int>& kda_directions);
   ~EncoderBlock();
 
   void Eval(int N, DataType* inpop, DataType* scratch0, DataType* scratch1,
             DataType* scratch2, cublasHandle_t cublas, cudaStream_t stream,
             DataType*** offset_pointers) const;
 
+  void EvalKda(int N, DataType* in_out_tensor, DataType* scratch,
+               DataType* buffer1, DataType* buffer2, cublasHandle_t cublas,
+               cudaStream_t stream) const;
+
   // all GPU side pointers
-  DataType *mha_q_w, *mha_q_b;
-  DataType *mha_k_w, *mha_k_b;
-  DataType *mha_v_w, *mha_v_b;
-  DataType *mha_qkv_w, *mha_qkv_b;
-  DataType *mha_dense_w, *mha_dense_b;
+  DataType *mha_q_w = nullptr, *mha_q_b = nullptr;
+  DataType *mha_k_w = nullptr, *mha_k_b = nullptr;
+  DataType *mha_v_w = nullptr, *mha_v_b = nullptr;
+  DataType *mha_qkv_w = nullptr, *mha_qkv_b = nullptr;
+  DataType *mha_dense_w = nullptr, *mha_dense_b = nullptr;
 
-  DataType *ln1_gammas, *ln1_betas;
+  DataType *ln1_gammas = nullptr, *ln1_betas = nullptr;
 
-  DataType *ffn_dense1_w, *ffn_dense1_b;
-  DataType *ffn_dense2_w, *ffn_dense2_b;
+  DataType *ffn_dense1_w = nullptr, *ffn_dense1_b = nullptr;
+  DataType *ffn_dense2_w = nullptr, *ffn_dense2_b = nullptr;
 
-  DataType *ln2_gammas, *ln2_betas;
+  DataType *ln2_gammas = nullptr, *ln2_betas = nullptr;
 
-  DataType *smol_compress;
-  DataType *smol_dense1_w, *smol_dense1_b;
-  DataType *smol_dense2_w, *smol_dense2_b;
-  DataType *smol_ln1_gammas, *smol_ln1_betas;
-  DataType *smol_ln2_gammas, *smol_ln2_betas;
-  DataType *smol_global;
+  DataType *smol_compress = nullptr;
+  DataType *smol_dense1_w = nullptr, *smol_dense1_b = nullptr;
+  DataType *smol_dense2_w = nullptr, *smol_dense2_b = nullptr;
+  DataType *smol_ln1_gammas = nullptr, *smol_ln1_betas = nullptr;
+  DataType *smol_ln2_gammas = nullptr, *smol_ln2_betas = nullptr;
+  DataType *smol_global = nullptr;
 
   int mha_q_size_;
   int mha_k_size_;
@@ -397,6 +403,38 @@ class EncoderBlock {
   const int max_batch_size_;
   const bool use_fused_mha_;
   const bool use_gemm_ex_;
+
+  // KDA (Kimi Delta Attention) mixer state -- used instead of the MHA
+  // weights above when is_kda_ is set. Mirrors the SYCL backend's
+  // EncoderBlock KDA members.
+  DataType *kda_q_w = nullptr, *kda_q_b = nullptr;
+  DataType *kda_k_w = nullptr, *kda_k_b = nullptr;
+  DataType *kda_v_w = nullptr, *kda_v_b = nullptr;
+  DataType *kda_qkv_w = nullptr, *kda_qkv_b = nullptr;
+  DataType *kda_decay_a_w = nullptr, *kda_decay_a_b = nullptr;
+  DataType *kda_decay_b_w = nullptr, *kda_decay_b_b = nullptr;
+  DataType *kda_beta_w = nullptr, *kda_beta_b = nullptr;
+  DataType *kda_a_log = nullptr, *kda_dt_bias = nullptr;
+  DataType *kda_gate_a_w = nullptr, *kda_gate_a_b = nullptr;
+  DataType *kda_gate_b_w = nullptr, *kda_gate_b_b = nullptr;
+  DataType *kda_decay_gate_a_w = nullptr, *kda_decay_gate_a_b = nullptr;
+  DataType *kda_out_norm_gammas = nullptr;
+  DataType *kda_dense_w = nullptr, *kda_dense_b = nullptr;
+  DataType *kda_local_conv_w = nullptr, *kda_local_conv_b = nullptr;
+  // Device copy of kKdaDirectionOrder (neural/kda_directions.h): 16*64 ints.
+  int* kda_dir_order_ = nullptr;
+
+  bool is_kda_;
+  int kda_key_dim_ = 0;
+  int kda_value_dim_ = 0;
+  int kda_gate_rank_ = 0;
+  float kda_rms_norm_epsilon_ = 0.0f;
+  bool kda_output_gate_ = false;
+  bool kda_output_rms_norm_ = false;
+  bool kda_local_conv_ = false;
+  bool kda_qkv_silu_ = false;
+  int kda_direction_count_ = 0;
+  std::array<int, 16> kda_directions_{};
 };
 
 // The Attention policy head implementation
@@ -483,7 +521,8 @@ class AttentionBody : public BaseLayer<DataType> {
   AttentionBody(const MultiHeadWeights& weights, void* scratch,
                 Activations activations, int num_res_blocks, int input_c,
                 int max_batch_size, bool is_pe_dense_embedding,
-                bool use_gemm_ex, bool fused_mha);
+                bool use_gemm_ex, bool fused_mha,
+                const std::vector<int>& kda_directions);
   ~AttentionBody();
   void Eval(int N, DataType* output, const DataType* input,
             const DataType* input2, void* scratch, size_t scratch_size,
