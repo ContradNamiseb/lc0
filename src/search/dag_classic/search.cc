@@ -2423,9 +2423,16 @@ bool SearchWorker::MaybeAdjustForTerminalOrTransposition(
     // may retroactively re-value them (doing both corrupts ancestor Q and
     // trips the LowNode::AdjustForTerminal multivisit<=n_ assert).
     n_to_fix = n->GetN() - n->GetImportedN();
-    v_delta = v - n->GetWL();
-    d_delta = d - n->GetD();
-    m_delta = m - n->GetM();
+    // The deltas are measured against the POST-IMPORT visits' recorded mean,
+    // not the blended n->GetWL(): ancestors only ever recorded the
+    // post-import visits, so a blend-measured delta mis-weights the
+    // correction and can push an ancestor's WL outside the WDL simplex
+    // (the WLDMInvariantsHold assert).
+    float rec_wl, rec_d, rec_m;
+    n->GetPostImportWLDM(&rec_wl, &rec_d, &rec_m);
+    v_delta = v - rec_wl;
+    d_delta = d - rec_d;
+    m_delta = m - rec_m;
     // Update bounds.
     if (params_.GetStickyEndgames()) {
       auto tt = nl->GetTerminalType();
@@ -2558,7 +2565,11 @@ void SearchWorker::DoBackupUpdateSingleNode(
        /* ++it in the body */) {
     n->FinalizeScoreUpdate(v, d, m, node_to_process.multivisit);
     if (n_to_fix > 0 && !n->IsTerminal()) {
-      n->AdjustForTerminal(v_delta, d_delta, m_delta, n_to_fix);
+      // Same cap as the LowNode application below: the fixup count comes from
+      // a deeper transposition/bounds source and can exceed this intermediate
+      // node's own recorded visits.
+      const uint32_t fix = std::min(n_to_fix, n->GetN());
+      if (fix > 0) n->AdjustForTerminal(v_delta, d_delta, m_delta, fix);
     }
 
     // Stop delta update on repetition "terminal" and propagate a draw above
@@ -2589,8 +2600,29 @@ void SearchWorker::DoBackupUpdateSingleNode(
       n_to_fix = 0;
     }
     pl->FinalizeScoreUpdate(v, d, m, node_to_process.multivisit);
+#ifndef NDEBUG
+    if (n_to_fix > 0 && n_to_fix > pl->GetN()) {
+      std::cerr << "FIXUPCOUNT-DBG n_to_fix=" << n_to_fix
+                << " pl_n=" << pl->GetN() << " p_n=" << p->GetN()
+                << " p_imported=" << p->GetImportedN()
+                << " pl_transposition=" << pl->IsTransposition()
+                << " pl_gen=" << pl->GetGen()
+                << " search_gen=" << static_cast<int>(search_->gen_)
+                << " vd=" << v_delta << " dd=" << d_delta << " md=" << m_delta
+                << " mv=" << node_to_process.multivisit << std::endl;
+    }
+#endif
     if (n_to_fix > 0) {
-      pl->AdjustForTerminal(v_delta, d_delta, m_delta, n_to_fix);
+      // Never retroactively re-value more visits than this ancestor actually
+      // recorded. The fixup count originates at a deeper transposition or
+      // bounds collapse and counts that node's visits; a LowNode on the path
+      // only ever recorded the share that passed through it (DAG sharing and
+      // cross-generation retention make the counts genuinely different).
+      // Correcting visits it never had both trips multivisit<=n_ and
+      // corrupts the running average (WLDMInvariantsHold). Capping under-
+      // corrects, which keeps the ancestor a valid weighted average.
+      const uint32_t fix = std::min(n_to_fix, pl->GetN());
+      if (fix > 0) pl->AdjustForTerminal(v_delta, d_delta, m_delta, fix);
     }
 
     bool old_update_parent_bounds = update_parent_bounds;
@@ -2695,9 +2727,12 @@ bool SearchWorker::MaybeSetBounds(Node* p, float m, uint32_t* n_to_fix,
         upper, (upper == GameResult::BLACK_WON ? std::max(losing_m, m) : m),
         prefer_tb ? Terminal::Tablebase : Terminal::EndOfGame);
     // v, d and m will be set in MaybeAdjustForTerminalOrTransposition.
-    *v_delta = pl->GetWL() + p->GetWL();
-    *d_delta = pl->GetD() - p->GetD();
-    *m_delta = pl->GetM() + 1 - p->GetM();
+    // Deltas against the post-import recorded mean, as above.
+    float rec_wl, rec_d, rec_m;
+    p->GetPostImportWLDM(&rec_wl, &rec_d, &rec_m);
+    *v_delta = pl->GetWL() + rec_wl;
+    *d_delta = pl->GetD() - rec_d;
+    *m_delta = pl->GetM() + 1 - rec_m;
     p->MakeTerminal(
         -upper,
         (upper == GameResult::BLACK_WON ? std::max(losing_m, m) : m) + 1.0f,

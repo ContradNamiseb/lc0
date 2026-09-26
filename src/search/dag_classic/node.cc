@@ -357,6 +357,22 @@ void LowNode::FinalizeScoreUpdate(float v, float d, float m,
   n_ += multivisit;
 }
 
+namespace {
+// Project (wl, d, m) back into the valid region. The terminal/transposition
+// fixup re-values a deep node's visits in every ancestor on the backup path,
+// but with DAG sharing and cross-generation retention the fixup's count and
+// delta are computed from the source's books, not the recipient's; repeated
+// small corrections can otherwise accumulate a node out of the WDL simplex
+// (|wl| + d <= 1). Clamping keeps every value valid regardless of bookkeeping
+// drift; the asserts in the callers verify the postcondition.
+void ClampWldmToValidRegion(double* wl, double* d, float* m) {
+  *wl = std::clamp(*wl, -1.0, 1.0);
+  *d = std::clamp(*d, 0.0, 1.0);
+  if (std::abs(*wl) + *d > 1.0) *d = 1.0 - std::abs(*wl);
+  if (*m < 0.0f) *m = 0.0f;
+}
+}  // namespace
+
 void LowNode::AdjustForTerminal(float v, float d, float m,
                                 uint32_t multivisit) {
   assert(static_cast<uint32_t>(multivisit) <= n_);
@@ -365,6 +381,8 @@ void LowNode::AdjustForTerminal(float v, float d, float m,
   wl_ += multivisit * v / n_;
   d_ += multivisit * d / n_;
   m_ += multivisit * m / n_;
+
+  ClampWldmToValidRegion(&wl_, &d_, &m_);
 
   assert(WLDMInvariantsHold());
 }
@@ -391,6 +409,9 @@ void Node::AdjustForTerminal(float v, float d, float m, uint32_t multivisit) {
   wl_ += multivisit * v / n_;
   d_ += multivisit * d / n_;
   m_ += multivisit * m / n_;
+
+  // See LowNode::AdjustForTerminal.
+  ClampWldmToValidRegion(&wl_, &d_, &m_);
 
   assert(WLDMInvariantsHold());
 }
@@ -444,9 +465,37 @@ void Node::InitFromLowNode() {
   // (low node of a transposition is the parent's view), so WL flips.
   n_ = low_node_->GetN();
   imported_n_ = n_;
-  wl_ = -low_node_->GetWL();
-  d_ = low_node_->GetD();
-  m_ = low_node_->GetM() + 1;
+  imported_wl_ = -low_node_->GetWL();
+  imported_d_ = low_node_->GetD();
+  imported_m_ = low_node_->GetM() + 1;
+  wl_ = imported_wl_;
+  d_ = imported_d_;
+  m_ = imported_m_;
+}
+
+void Node::GetPostImportWLDM(float* wl, float* d, float* m) const {
+  const uint32_t new_n = n_ - imported_n_;
+  if (new_n == 0) {
+    // No post-import visits; the fixup count is zero too, so these values
+    // are never applied. Return the blended state to stay defined.
+    *wl = wl_;
+    *d = d_;
+    *m = m_;
+    return;
+  }
+  // Double intermediates: when the imported block dwarfs the new visits the
+  // subtraction cancels hard, and the 1e-6 assert tolerance downstream
+  // cannot absorb float-level noise.
+  const double inv = 1.0 / new_n;
+  *wl = static_cast<float>((n_ * static_cast<double>(wl_) -
+                            imported_n_ * static_cast<double>(imported_wl_)) *
+                           inv);
+  *d = static_cast<float>((n_ * static_cast<double>(d_) -
+                           imported_n_ * static_cast<double>(imported_d_)) *
+                          inv);
+  *m = static_cast<float>((n_ * static_cast<double>(m_) -
+                           imported_n_ * static_cast<double>(imported_m_)) *
+                          inv);
 }
 void Node::UnsetLowNode() {
   if (low_node_) low_node_->RemoveParent();

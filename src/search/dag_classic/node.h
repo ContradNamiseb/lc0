@@ -302,6 +302,16 @@ class Node {
   // them: an ancestor LowNode cannot retroactively re-value visits it
   // never recorded. See MaybeAdjustForTerminalOrTransposition.
   uint32_t GetImportedN() const { return imported_n_; }
+  // Mean WLDM of the visits made AFTER a cross-generation import, as this
+  // node's current ancestors recorded them. Exact by running-average algebra:
+  // n_ * wl_ == imported_n_ * imported_wl_ + (sum of post-import values),
+  // and both FinalizeScoreUpdate and AdjustForTerminal preserve the identity
+  // (a fixup adds the same count * delta to this node's and the ancestors'
+  // records). Terminal-fixup deltas must be measured against THIS mean, not
+  // the blended GetWL(): ancestors never recorded the imported visits, so a
+  // blend-measured delta over/under-corrects them and can push an ancestor's
+  // WL outside the WDL simplex (WLDMInvariantsHold).
+  void GetPostImportWLDM(float* wl, float* d, float* m) const;
   uint32_t GetNInFlight() const;
   uint32_t GetChildrenVisits() const;
   uint32_t GetTotalVisits() const;
@@ -444,6 +454,12 @@ class Node {
   // To minimize the number of padding bytes and to avoid having unnecessary
   // padding when new fields are added, we arrange the fields by size, largest
   // to smallest.
+  //
+  // Exception for the cross-generation import bookkeeping: it sits past the
+  // picking-hot prefix instead of in size order. The first cache line holds
+  // everything selection touches per candidate (low_node_, wl_/d_, sibling_,
+  // edge_, m_, n_, n_in_flight_, index_, bounds/flags); the imported_* fields
+  // are only read by the terminal/transposition fixup and the import itself.
 
   // 16 byte fields on 64-bit platforms, 8 byte on 32-bit.
   // Shared pointer to the low node.
@@ -464,22 +480,18 @@ class Node {
   // Pointer to a next sibling. nullptr if there are no further siblings.
   atomic_unique_ptr<Node> sibling_;
 
+  // Move and policy for this edge.
+  Edge edge_;
+
   // 4 byte fields.
   // Estimated remaining plies.
   float m_ = 0.0f;
   // How many completed visits this node had.
   uint32_t n_ = 0;
-  // How many of n_ came from a cross-generation import (0 for nodes that
-  // were never imported). Only InitFromLowNode writes it, once, under
-  // nodes_mutex_.
-  uint32_t imported_n_ = 0;
   // (AKA virtual loss.) How many threads currently process this node (started
   // but not finished). This value is added to n during selection which node
   // to pick in MCTS, and also when selecting the best move.
   std::atomic<uint32_t> n_in_flight_ = 0;
-
-  // Move and policy for this edge.
-  Edge edge_;
 
   // 2 byte fields.
   // Index of this node is parent's edge list.
@@ -495,10 +507,23 @@ class Node {
   GameResult upper_bound_ : 2;
   // Edge was handled as a repetition at some point.
   bool repetition_ : 1;
+
+  // Cold: cross-generation import bookkeeping (second cache line).
+  // How many of n_ came from a cross-generation import (0 for nodes that
+  // were never imported). Only InitFromLowNode writes it, once, under
+  // nodes_mutex_.
+  uint32_t imported_n_ = 0;
+  // The imported block's WLDM at import time (same frame as wl_/d_/m_).
+  // Together with imported_n_ they make the post-import visit mean
+  // recoverable: see GetPostImportWLDM.
+  float imported_wl_ = 0.0f;
+  float imported_d_ = 0.0f;
+  float imported_m_ = 0.0f;
 };
 
-// Check that Node still fits into an expected cache line size.
-static_assert(sizeof(Node) <= 64, "Node is too large");
+// Node is two cache lines: the picking-hot prefix (through the bounds/flags
+// bitfields) fits in the first; the import bookkeeping spills into the second.
+static_assert(sizeof(Node) <= 80, "Node is too large");
 
 // Total live LowNodes across all searches and any retention holding them.
 // Inline accessor with a function-local static: one counter, all TUs.
