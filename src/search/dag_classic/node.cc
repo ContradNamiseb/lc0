@@ -443,6 +443,7 @@ void Node::InitFromLowNode() {
   // Values are stored from the OPPONENT's perspective on the LowNode
   // (low node of a transposition is the parent's view), so WL flips.
   n_ = low_node_->GetN();
+  imported_n_ = n_;
   wl_ = -low_node_->GetWL();
   d_ = low_node_->GetD();
   m_ = low_node_->GetM() + 1;

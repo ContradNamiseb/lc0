@@ -2417,8 +2417,12 @@ bool SearchWorker::MaybeAdjustForTerminalOrTransposition(
     d = nl->GetD();
     m = nl->GetM() + 1;
     // When starting at or going through a transposition/terminal, make sure to
-    // use the information it has already acquired.
-    n_to_fix = n->GetN();
+    // use the information it has already acquired. Imported visits (cross-
+    // generation adoption) are EXCLUDED: they were recorded in the LowNode
+    // by a previous search, never in this path's ancestors, so no ancestor
+    // may retroactively re-value them (doing both corrupts ancestor Q and
+    // trips the LowNode::AdjustForTerminal multivisit<=n_ assert).
+    n_to_fix = n->GetN() - n->GetImportedN();
     v_delta = v - n->GetWL();
     d_delta = d - n->GetD();
     m_delta = m - n->GetM();
@@ -2682,8 +2686,11 @@ bool SearchWorker::MaybeSetBounds(Node* p, float m, uint32_t* n_to_fix,
   } else if (lower == upper) {
     // Search can stop at the parent if the bounds can't change anymore, so make
     // it terminal preferring shorter wins and longer losses.
-    *n_to_fix = p->GetN();
-    assert(*n_to_fix > 0);
+    // Imported visits excluded -- see MaybeAdjustForTerminalOrTransposition;
+    // an imported node whose bounds collapse before any post-import visit
+    // legitimately fixes up 0 visits upstream.
+    *n_to_fix = p->GetN() - p->GetImportedN();
+    assert(p->GetN() > 0);
     pl->MakeTerminal(
         upper, (upper == GameResult::BLACK_WON ? std::max(losing_m, m) : m),
         prefer_tb ? Terminal::Tablebase : Terminal::EndOfGame);

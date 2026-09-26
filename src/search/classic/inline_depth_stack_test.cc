@@ -156,7 +156,10 @@ TEST(CachedNodeData, WorkspaceReuseDoesNotLeakBetweenCalls) {
   narrow.CreateEdges(MoveList(5));
   {
     int idx = 0;
-    for (auto& edge : narrow.Edges()) edge.edge()->SetP(9.0f + idx++);
+    // Priors must stay in [0,1]: SetP asserts the range on assert-enabled
+    // builds. Descending values keep the same relative order the test
+    // expects; the old 9.0f+idx literals were invalid policy.
+    for (auto& edge : narrow.Edges()) edge.edge()->SetP(0.9f - 0.01f * idx++);
   }
 
   // Round 1: a wide "level" fills 200 entries, same as PickNodesToExtendTask

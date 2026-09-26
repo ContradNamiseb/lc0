@@ -295,6 +295,13 @@ class Node {
   // Returns sum of policy priors which have had at least one playout.
   float GetVisitedPolicy() const;
   uint32_t GetN() const { return n_; }
+  // Visits this node started with from a cross-generation LowNode import
+  // (InitFromLowNode). Those visits were recorded in the LowNode by a
+  // PREVIOUS search -- they never flowed through this node's current
+  // ancestor chain -- so terminal-fixup counts (n_to_fix) must exclude
+  // them: an ancestor LowNode cannot retroactively re-value visits it
+  // never recorded. See MaybeAdjustForTerminalOrTransposition.
+  uint32_t GetImportedN() const { return imported_n_; }
   uint32_t GetNInFlight() const;
   uint32_t GetChildrenVisits() const;
   uint32_t GetTotalVisits() const;
@@ -462,6 +469,10 @@ class Node {
   float m_ = 0.0f;
   // How many completed visits this node had.
   uint32_t n_ = 0;
+  // How many of n_ came from a cross-generation import (0 for nodes that
+  // were never imported). Only InitFromLowNode writes it, once, under
+  // nodes_mutex_.
+  uint32_t imported_n_ = 0;
   // (AKA virtual loss.) How many threads currently process this node (started
   // but not finished). This value is added to n during selection which node
   // to pick in MCTS, and also when selecting the best move.
@@ -567,6 +578,13 @@ class LowNode : private LowNodeCounted {
   bool HasChildren() const { return num_edges_ > 0; }
 
   uint32_t GetN() const { return n_; }
+  // Visits this node started with from a cross-generation LowNode import
+  // (InitFromLowNode). Those visits were recorded in the LowNode by a
+  // PREVIOUS search -- they never flowed through this node's current
+  // ancestor chain -- so terminal-fixup counts (n_to_fix) must exclude
+  // them: an ancestor LowNode cannot retroactively re-value visits it
+  // never recorded. See MaybeAdjustForTerminalOrTransposition.
+  uint32_t GetImportedN() const { return imported_n_; }
   uint32_t GetChildrenVisits() const { return n_ - 1; }
 
   // Returns node eval, i.e. average subtree V for non-terminal node and -1/0/1
@@ -680,6 +698,10 @@ class LowNode : private LowNodeCounted {
   float m_ = 0.0f;
   // How many completed visits this node had.
   uint32_t n_ = 0;
+  // How many of n_ came from a cross-generation import (0 for nodes that
+  // were never imported). Only InitFromLowNode writes it, once, under
+  // nodes_mutex_.
+  uint32_t imported_n_ = 0;
 
   // 2 byte fields.
   // Number of parents.
