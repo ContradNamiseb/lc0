@@ -884,6 +884,14 @@ if get_option('build_backends')
 
       if get_option('sycl') == 'l0'
         message('Building SYCL for the L0 backend')
+        sycl_targets = get_option('sycl_targets')
+        if sycl_targets != ''
+          if 'spir64' not in sycl_targets.split(',')
+            warning('Without spir64 in -Dsycl_targets, lc0 runs only on the GPUs listed there')
+          endif
+          add_project_arguments('-fsycl-targets=' + sycl_targets, language : 'cpp')
+          add_project_link_arguments('-fsycl-targets=' + sycl_targets, language : 'cpp')
+        endif
         add_project_arguments('-DMKL_ILP64', language : 'cpp')
         deps += cc.find_library('mkl_sycl', required: true)
         deps += cc.find_library('mkl_intel_ilp64', required: true)

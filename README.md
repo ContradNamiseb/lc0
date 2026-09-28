@@ -145,6 +145,8 @@ The compiler for C code is icx and for C++ code is icx on Windows but icpx on Li
 
 To build Lc0 with SYCL you need to set the `sycl` build option using `-Dsycl=l0` (that is el zero) for an Intel GPU or `-Dsycl=amd` for (you guessed it) an AMD GPU.
 
+With `-Dsycl=l0` the GPU driver compiles the kernels the first time Lc0 runs, which can take a while, and caches them for later runs. To compile them ahead of time instead, list the GPUs in the `sycl_targets` option, using the names of the icx `-fsycl-targets` option, together with `spir64`, which keeps compiling at run time for any other GPU. For example, `-Dsycl_targets=intel_gpu_bmg_g21,spir64` for a Battlemage card.
+
 You may also have to set the `dpct_include` option to point to the DPC++ Compatibility Tool includes, the `onemkl_include` similarly for the oneMKL includes, or `hip_libdirs` and `hip_include` to the AMD HIP libraries and includes respectively.
 
 On Linux, a typical session would go like this:

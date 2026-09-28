@@ -229,6 +229,11 @@ option('sycl',
        value: 'off',
        description: 'Enable SYCL backend')
 
+option('sycl_targets',
+       type: 'string',
+       value: '',
+       description: 'For -Dsycl=l0, GPUs to compile the kernels for ahead of time, as -fsycl-targets, e.g. -Dsycl_targets=intel_gpu_bmg_g21,spir64 (spir64 keeps compiling at run time for other GPUs)')
+
 option('hip_libdirs',
        type: 'array',
        value: ['/opt/rocm/lib'],
