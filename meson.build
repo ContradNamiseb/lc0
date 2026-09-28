@@ -884,6 +884,9 @@ if get_option('build_backends')
 
       if get_option('sycl') == 'l0'
         message('Building SYCL for the L0 backend')
+        # One device image per kernel: the GPU driver compiles an image the
+        # first time one of its kernels runs, so it compiles only those used.
+        add_project_link_arguments('-fsycl-device-code-split=per_kernel', language : 'cpp')
         add_project_arguments('-DMKL_ILP64', language : 'cpp')
         deps += cc.find_library('mkl_sycl', required: true)
         deps += cc.find_library('mkl_intel_ilp64', required: true)
