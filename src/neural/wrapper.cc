@@ -62,6 +62,7 @@ class NetworkAsBackend : public Backend {
     attrs_.suggested_num_search_threads = network_->GetThreads();
     attrs_.recommended_batch_size = network_->GetMiniBatchSize();
     attrs_.maximum_batch_size = 1024;
+    attrs_.preferred_batch_step = network_->GetPreferredBatchStep();
     input_format_ = caps.input_format;
   }
 

@@ -47,6 +47,8 @@ struct BackendAttributes {
   int suggested_num_search_threads;
   int recommended_batch_size;
   int maximum_batch_size;
+  // Batch sizes that are a multiple of this run best.
+  int preferred_batch_step;
 };
 
 struct EvalResultPtr {

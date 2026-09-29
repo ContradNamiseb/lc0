@@ -50,7 +50,7 @@ namespace lczero {
 namespace backend_process {
 
 constexpr uint32_t kMagic = 0x6c63304e;
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2;
 constexpr uint32_t kMaxLegalMoves = 256;
 
 enum class ProcessState : uint32_t { kStarting, kReady, kFailed };
