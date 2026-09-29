@@ -46,8 +46,10 @@
 #include <thread>
 #include <vector>
 
+#include "neural/backends/backend_process/gpu_dispatch.h"
 #include "neural/backends/backend_process/interprocess.h"
 #include "neural/backends/backend_process/protocol.h"
+#include "neural/register.h"
 #include "neural/shared_params.h"
 #include "utils/exception.h"
 #include "utils/logging.h"
@@ -141,39 +143,40 @@ OptionsEntry ParseEntry(std::string_view text) {
   return entry;
 }
 
-struct DemuxGroup {
+// The backend that shares batches out over one backend process per GPU.
+constexpr std::string_view kGpuDispatchName = "gpu-dispatch";
+
+struct ProcessGroup {
   std::string backend;
   std::string backend_options;
 };
 
-// The backend and options of each network that a demux backend configured
-// with `backend_options` creates, as DemuxingNetwork works them out: a group
-// reads the top-level options that it does not set itself, and runs the
-// backend named by its "backend" option or else by its name. Empty for a
-// configuration that leaves demux a single network or a group no backend.
-std::vector<DemuxGroup> DemuxGroups(std::string_view backend_options) {
+// The backend and options of each GPU that gpu-dispatch configured with
+// `backend_options` runs, read the way DemuxingNetwork reads its groups: a
+// group reads the top-level options that it does not set itself, and runs the
+// backend named by its "backend" option or else by its name. Options with no
+// groups make one group. Empty if a group names no backend.
+std::vector<ProcessGroup> ProcessGroups(std::string_view backend_options) {
   std::vector<OptionsEntry> top_level;
   std::vector<OptionsEntry> groups;
   for (std::string_view text : SplitOptions(backend_options)) {
     const OptionsEntry entry = ParseEntry(text);
     (entry.is_group ? groups : top_level).push_back(entry);
   }
-  std::vector<DemuxGroup> result;
+  if (groups.empty()) groups.push_back({"()", "", "", true});
+  std::vector<ProcessGroup> result;
   for (const OptionsEntry& group : groups) {
     std::vector<OptionsEntry> own;
     for (std::string_view text : SplitOptions(group.value)) {
       own.push_back(ParseEntry(text));
     }
-    DemuxGroup& part = result.emplace_back();
+    ProcessGroup& part = result.emplace_back();
     part.backend = group.key;
     auto add = [&part](const OptionsEntry& entry) {
       if (!entry.is_group && entry.key == "backend") {
         part.backend = entry.value;
         return;
       }
-      // The number of demux's own threads for the group; the backend
-      // process has its own, one per slot.
-      if (!entry.is_group && entry.key == "threads") return;
       if (!part.backend_options.empty()) part.backend_options += ',';
       part.backend_options += entry.text;
     };
@@ -185,16 +188,13 @@ std::vector<DemuxGroup> DemuxGroups(std::string_view backend_options) {
       }
     }
     for (const OptionsEntry& entry : own) add(entry);
-    // demux fails on it, so let it.
-    if (part.backend.empty()) return {};
+    if (part.backend.empty() || part.backend == kGpuDispatchName) return {};
   }
-  if (result.size() < 2) return {};
   return result;
 }
 
 // The command line of each backend process that `options` ask for: one per
-// group of a demux backend, so that each GPU has a process of its own, and
-// one for any other backend.
+// GPU of gpu-dispatch, and one for any other backend.
 std::vector<std::vector<std::string>> ProcessFlags(const OptionsDict& options) {
   std::vector<std::string> shared_flags;
   for (const OptionId* id :
@@ -211,12 +211,20 @@ std::vector<std::vector<std::string>> ProcessFlags(const OptionsDict& options) {
       options.Get<std::string>(SharedBackendParams::kBackendId);
   const std::string backend_options =
       options.Get<std::string>(SharedBackendParams::kBackendOptionsId);
-  std::vector<DemuxGroup> groups;
-  if (backend == "demux") groups = DemuxGroups(backend_options);
-  if (groups.empty()) groups.push_back({backend, backend_options});
+  std::vector<ProcessGroup> groups;
+  if (backend == kGpuDispatchName) {
+    groups = ProcessGroups(backend_options);
+    if (groups.empty()) {
+      throw Exception(
+          "The gpu-dispatch backend needs a backend for every GPU, as in "
+          "backend=cuda-fp16,(gpu=0),(gpu=1)");
+    }
+  } else {
+    groups.push_back({backend, backend_options});
+  }
 
   std::vector<std::vector<std::string>> flags;
-  for (const DemuxGroup& group : groups) {
+  for (const ProcessGroup& group : groups) {
     std::vector<std::string>& process = flags.emplace_back(shared_flags);
     process.push_back(Flag(SharedBackendParams::kBackendId, group.backend));
     process.push_back(
@@ -229,6 +237,53 @@ std::vector<std::vector<std::string>> ProcessFlags(const OptionsDict& options) {
 std::string NewName() {
   static std::atomic<uint32_t> counter{0};
   return std::to_string(CurrentProcessId()) + "-" + std::to_string(counter++);
+}
+
+// Puts `pos` into `record`.
+void WriteRecord(const EvalPosition& pos, bool want_policy,
+                 PositionRecord& record) {
+  if (pos.legal_moves.size() > kMaxLegalMoves) {
+    throw Exception("Too many legal moves for the backend process");
+  }
+  // The encoder reads at most kMoveHistory positions.
+  const auto history =
+      pos.pos.last(std::min<size_t>(pos.pos.size(), kMoveHistory));
+  record.history_size = history.size();
+  record.num_moves = pos.legal_moves.size();
+  record.want_policy = want_policy;
+  std::memcpy(record.history, history.data(),
+              history.size() * sizeof(Position));
+  std::memcpy(record.moves, pos.legal_moves.data(),
+              pos.legal_moves.size() * sizeof(Move));
+}
+
+// Copies the part of `from` that is in use.
+void CopyRecord(const PositionRecord& from, PositionRecord& to) {
+  to.history_size = from.history_size;
+  to.num_moves = from.num_moves;
+  to.want_policy = from.want_policy;
+  std::memcpy(to.history, from.history, from.history_size * sizeof(Position));
+  std::memcpy(to.moves, from.moves, from.num_moves * sizeof(Move));
+}
+
+// Hands the first `batch_size` results out to where the search wants them.
+void HandOutResults(const ResultRecord* source,
+                    const EvalResultPtr* destination, size_t batch_size) {
+  for (size_t i = 0; i < batch_size; ++i) {
+    if (destination[i].q) *destination[i].q = source[i].q;
+    if (destination[i].d) *destination[i].d = source[i].d;
+    if (destination[i].m) *destination[i].m = source[i].m;
+    std::copy_n(source[i].p,
+                std::min<size_t>(destination[i].p.size(), kMaxLegalMoves),
+                destination[i].p.begin());
+  }
+}
+
+// Seconds of std::chrono::steady_clock, as SlotHeader::finished_at counts.
+double Now() {
+  return std::chrono::duration<double>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
 }
 
 class ChildProcessBackend : public Backend {
@@ -362,6 +417,10 @@ class ChildProcessBackend : public Backend {
     }
   }
 
+  // How many times the backend process has started. A batch sent after
+  // start n and answered with the count still n ran in one process.
+  uint32_t NumStarts() const { return starts_.load(std::memory_order_relaxed); }
+
   SlotView Slot(uint32_t index) const {
     return GetSlot(shared_memory_.data(), index);
   }
@@ -455,24 +514,11 @@ class ChildProcessComputation : public BackendComputation {
   // Puts the position at `index` of the batch; safe to call concurrently for
   // different indices.
   void Write(size_t index, const EvalPosition& pos, EvalResultPtr result) {
-    if (pos.legal_moves.size() > kMaxLegalMoves) {
-      throw Exception("Too many legal moves for the backend process");
-    }
     if (index >= kMaxBatch) {
       throw Exception("Batch is larger than the backend process allows");
     }
     AcquireSlot();
-    // The encoder reads at most kMoveHistory positions.
-    const auto history =
-        pos.pos.last(std::min<size_t>(pos.pos.size(), kMoveHistory));
-    PositionRecord& record = backend_->Slot(slot_).positions[index];
-    record.history_size = history.size();
-    record.num_moves = pos.legal_moves.size();
-    record.want_policy = !result.p.empty();
-    std::memcpy(record.history, history.data(),
-                history.size() * sizeof(Position));
-    std::memcpy(record.moves, pos.legal_moves.data(),
-                pos.legal_moves.size() * sizeof(Move));
+    WriteRecord(pos, !result.p.empty(), backend_->Slot(slot_).positions[index]);
     results_[index] = result;
   }
 
@@ -495,18 +541,8 @@ class ChildProcessComputation : public BackendComputation {
   // Waits for the batch that Send() posted and hands out its results.
   void Receive() {
     if (batch_size_ == 0) return;
-    const SlotView slot = backend_->Slot(slot_);
     backend_->Receive(slot_, request_);
-    for (size_t i = 0; i < batch_size_; ++i) {
-      const ResultRecord& source = slot.results[i];
-      const EvalResultPtr& destination = results_[i];
-      if (destination.q) *destination.q = source.q;
-      if (destination.d) *destination.d = source.d;
-      if (destination.m) *destination.m = source.m;
-      std::copy_n(source.p,
-                  std::min<size_t>(destination.p.size(), kMaxLegalMoves),
-                  destination.p.begin());
-    }
+    HandOutResults(backend_->Slot(slot_).results, results_, batch_size_);
   }
 
  private:
@@ -523,20 +559,44 @@ std::unique_ptr<BackendComputation> ChildProcessBackend::CreateComputation() {
   return std::make_unique<ChildProcessComputation>(this);
 }
 
-// Splits every batch across one backend process per demux group, much as
-// DemuxingNetwork splits it across its networks, so that a crash on one GPU
-// restarts only that GPU's process.
-class DemuxingBackend : public Backend {
+// Before a GPU has run any batch: a guess, the same for every GPU, that the
+// first batches correct.
+constexpr double kPriorOverhead = 1e-3;
+constexpr double kPriorPerPosition = 1e-4;
+
+// Shares every batch out over one backend process per GPU, each part going
+// to the GPU that would finish it first; see gpu_dispatch.h. A crash on one
+// GPU restarts only that GPU's process, and until it is back its late work
+// makes it look busy, so the other GPUs take the batches.
+class GpuDispatchBackend : public Backend {
  public:
-  explicit DemuxingBackend(std::vector<std::vector<std::string>> flags)
-      : flags_(std::move(flags)), parts_(flags_.size()) {
+  // The positions of a batch until it is planned, and what its parts need.
+  // Kept for later batches, so that a batch allocates nothing once warmed
+  // up.
+  struct Batch {
+    struct Part {
+      size_t first = 0;
+      int slot = -1;
+      ChildProcessBackend::Request request{};
+      double sent_at = 0;
+    };
+    std::vector<PositionRecord> records;
+    std::vector<EvalResultPtr> results;
+    // Per GPU.
+    std::vector<size_t> sizes;
+    std::vector<double> predicted;
+    std::vector<Part> parts;
+  };
+
+  explicit GpuDispatchBackend(std::vector<std::vector<std::string>> flags)
+      : flags_(std::move(flags)), gpus_(flags_.size()) {
     // The processes load their networks at the same time.
-    std::vector<std::exception_ptr> errors(parts_.size());
+    std::vector<std::exception_ptr> errors(gpus_.size());
     std::vector<std::thread> threads;
-    for (size_t i = 0; i < parts_.size(); ++i) {
+    for (size_t i = 0; i < gpus_.size(); ++i) {
       threads.emplace_back([this, &errors, i] {
         try {
-          parts_[i] = std::make_unique<ChildProcessBackend>(flags_[i]);
+          gpus_[i] = std::make_unique<ChildProcessBackend>(flags_[i]);
         } catch (...) {
           errors[i] = std::current_exception();
         }
@@ -547,27 +607,24 @@ class DemuxingBackend : public Backend {
       if (error) std::rethrow_exception(error);
     }
 
-    attributes_ = parts_[0]->GetAttributes();
-    int maximum_batch_size = attributes_.maximum_batch_size;
-    for (const auto& part : parts_) {
-      const BackendAttributes attributes = part->GetAttributes();
+    attributes_ = gpus_[0]->GetAttributes();
+    attributes_.recommended_batch_size = 0;
+    attributes_.maximum_batch_size = 0;
+    for (const auto& gpu : gpus_) {
+      const BackendAttributes attributes = gpu->GetAttributes();
       attributes_.runs_on_cpu &= attributes.runs_on_cpu;
-      attributes_.recommended_batch_size =
-          std::min(attributes_.recommended_batch_size,
-                   attributes.recommended_batch_size);
-      maximum_batch_size =
-          std::min(maximum_batch_size, attributes.maximum_batch_size);
+      attributes_.suggested_num_search_threads =
+          std::max(attributes_.suggested_num_search_threads,
+                   attributes.suggested_num_search_threads);
+      attributes_.recommended_batch_size += attributes.recommended_batch_size;
+      attributes_.maximum_batch_size += attributes.maximum_batch_size;
       attributes_.preferred_batch_step = std::max(
           attributes_.preferred_batch_step, attributes.preferred_batch_step);
+      queues_.emplace_back(CostModel(kPriorOverhead, kPriorPerPosition));
     }
-    const int step = attributes_.preferred_batch_step =
+    attributes_.preferred_batch_step =
         std::max(attributes_.preferred_batch_step, 1);
-    attributes_.recommended_batch_size *= parts_.size();
-    // DemuxingNetwork leaves Network::GetThreads() at its default.
-    attributes_.suggested_num_search_threads = 1;
-    // No part gets more whole steps than a batch this large gives it.
-    attributes_.maximum_batch_size =
-        parts_.size() * std::max(maximum_batch_size / step, 1) * step;
+    loads_.resize(gpus_.size());
   }
 
   BackendAttributes GetAttributes() const override { return attributes_; }
@@ -580,99 +637,185 @@ class DemuxingBackend : public Backend {
     return ProcessFlags(options) == flags_ ? UPDATE_OK : NEED_RESTART;
   }
 
-  ChildProcessBackend* Part(size_t index) const { return parts_[index].get(); }
-  size_t NumParts() const { return parts_.size(); }
-  // Which part gets a batch's first chunk; it moves on with every batch, so
-  // that the extra chunks of uneven batches spread over the parts.
-  size_t NextStart() { return start_.fetch_add(1) % parts_.size(); }
+  ChildProcessBackend* Gpu(size_t index) const { return gpus_[index].get(); }
+
+  // Shares a batch of `batch_size` positions out over the GPUs and counts
+  // the parts as sent: sets batch.sizes and batch.predicted.
+  void Plan(size_t batch_size, Batch& batch) {
+    std::lock_guard lock(queues_mutex_);
+    const double now = Now();
+    for (size_t i = 0; i < gpus_.size(); ++i) {
+      loads_[i] = {
+          queues_[i].FreeAt(now),
+          static_cast<size_t>(gpus_[i]->GetAttributes().maximum_batch_size),
+          &queues_[i].Model()};
+    }
+    if (!PlanBatch(batch_size, attributes_.preferred_batch_step, now, loads_,
+                   batch.sizes)) {
+      throw Exception("Batch is larger than the backend processes allow");
+    }
+    for (size_t i = 0; i < gpus_.size(); ++i) {
+      batch.predicted[i] =
+          batch.sizes[i] ? queues_[i].Dispatch(batch.sizes[i], now) : 0;
+    }
+  }
+
+  // Records that GPU `index` finished a part of `batch_size` positions at
+  // `finished_at`.
+  void Complete(size_t index, size_t batch_size, double predicted,
+                double sent_at, double finished_at, bool learn) {
+    std::lock_guard lock(queues_mutex_);
+    queues_[index].Complete(batch_size, predicted, sent_at, finished_at, learn);
+  }
+
+  std::unique_ptr<Batch> TakeBatch() {
+    {
+      std::lock_guard lock(batches_mutex_);
+      if (!free_batches_.empty()) {
+        std::unique_ptr<Batch> batch = std::move(free_batches_.back());
+        free_batches_.pop_back();
+        return batch;
+      }
+    }
+    auto batch = std::make_unique<Batch>();
+    batch->records.resize(attributes_.maximum_batch_size);
+    batch->results.resize(attributes_.maximum_batch_size);
+    batch->sizes.resize(gpus_.size());
+    batch->predicted.resize(gpus_.size());
+    batch->parts.resize(gpus_.size());
+    return batch;
+  }
+
+  void ReturnBatch(std::unique_ptr<Batch> batch) {
+    std::lock_guard lock(batches_mutex_);
+    free_batches_.push_back(std::move(batch));
+  }
 
  private:
   const std::vector<std::vector<std::string>> flags_;
-  std::vector<std::unique_ptr<ChildProcessBackend>> parts_;
+  std::vector<std::unique_ptr<ChildProcessBackend>> gpus_;
   BackendAttributes attributes_;
-  std::atomic<size_t> start_ = 0;
+
+  std::mutex queues_mutex_;
+  std::vector<GpuQueue> queues_;
+  // Only for Plan(), kept to spare it an allocation.
+  std::vector<GpuLoad> loads_;
+
+  std::mutex batches_mutex_;
+  std::vector<std::unique_ptr<Batch>> free_batches_;
 };
 
-// Deals the batch out in chunks of the preferred batch step, chunk c going to
-// part (start + c) % parts. Positions go straight into the parts' slots as
-// they arrive, so no part needs the batch size to place them.
-class DemuxingComputation : public BackendComputation {
+class GpuDispatchComputation : public BackendComputation {
  public:
-  explicit DemuxingComputation(DemuxingBackend* backend)
-      : step_(backend->GetAttributes().preferred_batch_step),
-        maximum_batch_size_(backend->GetAttributes().maximum_batch_size),
-        start_(backend->NextStart()) {
-    parts_.reserve(backend->NumParts());
-    for (size_t i = 0; i < backend->NumParts(); ++i) {
-      parts_.push_back(
-          std::make_unique<ChildProcessComputation>(backend->Part(i)));
+  explicit GpuDispatchComputation(GpuDispatchBackend* backend)
+      : backend_(backend), batch_(backend->TakeBatch()) {}
+
+  // Also after ComputeBlocking() threw: every part it sent is answered or
+  // its process is dead.
+  ~GpuDispatchComputation() override {
+    for (size_t i = 0; i < batch_->parts.size(); ++i) {
+      int& slot = batch_->parts[i].slot;
+      if (slot >= 0) backend_->Gpu(i)->ReleaseSlot(slot);
+      slot = -1;
     }
+    backend_->ReturnBatch(std::move(batch_));
   }
 
   size_t UsedBatchSize() const override {
-    return std::min(size_.load(), maximum_batch_size_);
+    return std::min(size_.load(), batch_->records.size());
   }
 
+  // The search's task workers call this concurrently.
   AddInputResult AddInput(const EvalPosition& pos,
                           EvalResultPtr result) override {
     const size_t index = size_.fetch_add(1);
-    if (index >= maximum_batch_size_) {
+    if (index >= batch_->records.size()) {
       throw Exception("Batch is larger than the backend processes allow");
     }
-    // In part order, so that computations waiting for slots never wait on
-    // each other in a cycle.
-    std::call_once(slots_acquired_, [&] {
-      for (const auto& part : parts_) part->AcquireSlot();
-    });
-    const size_t chunk = index / step_;
-    parts_[(start_ + chunk) % parts_.size()]->Write(
-        chunk / parts_.size() * step_ + index % step_, pos, result);
+    WriteRecord(pos, !result.p.empty(), batch_->records[index]);
+    batch_->results[index] = result;
     return ENQUEUED_FOR_EVAL;
   }
 
   void ComputeBlocking() override {
     const size_t batch_size = UsedBatchSize();
-    const size_t chunks = (batch_size + step_ - 1) / step_;
-    for (size_t i = 0; i < parts_.size(); ++i) {
-      // The part's chunks are offset, offset + parts, ... below chunks; the
-      // batch's last chunk may be short.
-      const size_t offset = (i + parts_.size() - start_) % parts_.size();
-      size_t size = 0;
-      if (offset < chunks) {
-        const size_t part_chunks =
-            (chunks - offset + parts_.size() - 1) / parts_.size();
-        size = part_chunks * step_;
-        if (offset + (part_chunks - 1) * parts_.size() == chunks - 1) {
-          size -= chunks * step_ - batch_size;
-        }
+    if (batch_size == 0) return;
+    GpuDispatchBackend::Batch& batch = *batch_;
+    backend_->Plan(batch_size, batch);
+    // Slots are taken in GPU order, so that computations waiting for slots
+    // never wait on each other in a cycle. Each part is sent as soon as it
+    // is copied, so the first GPUs start while the others are filled.
+    size_t first = 0;
+    for (size_t i = 0; i < batch.parts.size(); ++i) {
+      GpuDispatchBackend::Batch::Part& part = batch.parts[i];
+      const size_t size = batch.sizes[i];
+      part.first = first;
+      first += size;
+      if (size == 0) continue;
+      ChildProcessBackend* gpu = backend_->Gpu(i);
+      part.slot = gpu->AcquireSlot();
+      const SlotView slot = gpu->Slot(part.slot);
+      for (size_t j = 0; j < size; ++j) {
+        CopyRecord(batch.records[part.first + j], slot.positions[j]);
       }
-      parts_[i]->Send(size);
+      slot.header->batch_size = size;
+      part.sent_at = Now();
+      part.request = gpu->Send(part.slot);
     }
     // Every part is waited for even after one fails, as a slot is released
     // only once its process has answered or died.
     std::exception_ptr error;
-    for (const auto& part : parts_) {
+    for (size_t i = 0; i < batch.parts.size(); ++i) {
+      GpuDispatchBackend::Batch::Part& part = batch.parts[i];
+      const size_t size = batch.sizes[i];
+      if (size == 0) continue;
+      ChildProcessBackend* gpu = backend_->Gpu(i);
+      const SlotView slot = gpu->Slot(part.slot);
+      bool answered = false;
       try {
-        part->Receive();
+        gpu->Receive(part.slot, part.request);
+        answered = true;
       } catch (...) {
         if (!error) error = std::current_exception();
       }
+      // A part that waited for a restart says nothing of the GPU's speed.
+      const bool learn =
+          answered && gpu->NumStarts() == part.request.first_start;
+      backend_->Complete(i, size, batch.predicted[i], part.sent_at,
+                         learn ? slot.header->finished_at * 1e-9 : Now(),
+                         learn);
+      if (answered) {
+        HandOutResults(slot.results, &batch.results[part.first], size);
+      }
+      gpu->ReleaseSlot(part.slot);
+      part.slot = -1;
     }
     if (error) std::rethrow_exception(error);
   }
 
  private:
-  const size_t step_;
-  const size_t maximum_batch_size_;
-  const size_t start_;
-  std::vector<std::unique_ptr<ChildProcessComputation>> parts_;
-  std::once_flag slots_acquired_;
+  GpuDispatchBackend* const backend_;
+  std::unique_ptr<GpuDispatchBackend::Batch> batch_;
   std::atomic<size_t> size_ = 0;
 };
 
-std::unique_ptr<BackendComputation> DemuxingBackend::CreateComputation() {
-  return std::make_unique<DemuxingComputation>(this);
+std::unique_ptr<BackendComputation> GpuDispatchBackend::CreateComputation() {
+  return std::make_unique<GpuDispatchComputation>(this);
 }
+
+// Lists gpu-dispatch among the backends, so that the Backend option takes
+// it. Only lc0 itself runs it, never a backend process.
+class GpuDispatchFactory : public BackendFactory {
+ public:
+  int GetPriority() const override { return -1100; }
+  std::string_view GetName() const override { return kGpuDispatchName; }
+  std::unique_ptr<Backend> Create(const OptionsDict&) override {
+    throw Exception("The gpu-dispatch backend runs only in lc0 itself");
+  }
+};
+
+BackendManager::Register register_gpu_dispatch(
+    std::make_unique<GpuDispatchFactory>());
 
 }  // namespace
 
@@ -682,7 +825,7 @@ std::unique_ptr<Backend> CreateChildProcessBackend(const OptionsDict& options) {
   if (flags.size() == 1) {
     backend = std::make_unique<ChildProcessBackend>(std::move(flags[0]));
   } else {
-    backend = std::make_unique<DemuxingBackend>(std::move(flags));
+    backend = std::make_unique<GpuDispatchBackend>(std::move(flags));
   }
   // Records the configuration, for IsSameConfiguration().
   backend->UpdateConfiguration(options);
