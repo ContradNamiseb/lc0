@@ -50,7 +50,7 @@ namespace lczero {
 namespace backend_process {
 
 constexpr uint32_t kMagic = 0x6c63304e;
-constexpr uint32_t kVersion = 2;
+constexpr uint32_t kVersion = 3;
 constexpr uint32_t kMaxLegalMoves = 256;
 
 enum class ProcessState : uint32_t { kStarting, kReady, kFailed };
@@ -87,6 +87,10 @@ struct SlotHeader {
   // process picks up the batch its predecessor died on.
   std::atomic<uint64_t> request_sequence;
   std::atomic<uint64_t> response_sequence;
+  // When the backend process finished the batch, in nanoseconds of
+  // std::chrono::steady_clock, which counts from the same moment in every
+  // process: the time a GPU took is known even if lc0 reads the answer late.
+  int64_t finished_at;
 };
 
 struct PositionRecord {

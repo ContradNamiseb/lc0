@@ -27,6 +27,7 @@
 
 #include "neural/backends/backend_process/backend_process.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -96,6 +97,10 @@ void RunSlot(Backend* backend, void* base, uint32_t index,
       continue;
     }
     slot.header->failed = !Evaluate(backend, slot, header->max_batch);
+    slot.header->finished_at =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
     slot.header->response_sequence.store(sequence, std::memory_order_release);
     response->Post();
   }
