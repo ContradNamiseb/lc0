@@ -140,6 +140,7 @@ common_files += [
   'src/neural/backends/backend_process/backend_process.cc',
   'src/neural/backends/backend_process/interprocess.cc',
   'src/neural/backends/backend_process/child_process_backend.cc',
+  'src/neural/backends/backend_process/gpu_dispatch.cc',
   'src/neural/register.cc',
   'src/neural/shared_params.cc',
   'src/neural/wrapper.cc',
@@ -1146,6 +1147,11 @@ if get_option('gtest')
     executable('fp16_test', 'src/utils/fp16_utils_test.cc',
     include_directories: includes, link_with: lc0_lib, dependencies: gtest
   ), args: '--gtest_output=xml:fp16.xml', timeout: 90)
+
+  test('GpuDispatch',
+    executable('gpu_dispatch_test', 'src/neural/backends/backend_process/gpu_dispatch_test.cc',
+    include_directories: includes, link_with: lc0_lib, dependencies: gtest
+  ), args: '--gtest_output=xml:gpu_dispatch.xml', timeout: 90)
 
   test('HashCat',
     executable('hashcat_test', 'src/utils/hashcat_test.cc',
