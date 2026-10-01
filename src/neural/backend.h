@@ -49,6 +49,7 @@ struct BackendAttributes {
   int maximum_batch_size;
   // Batch sizes that are a multiple of this run best.
   int preferred_batch_step;
+  pblczero::NetworkFormat::InputFormat input_format;
 };
 
 struct EvalResultPtr {
