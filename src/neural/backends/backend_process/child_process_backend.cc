@@ -33,6 +33,7 @@
 #include "neural/backends/backend_process/child_process_backend.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -240,19 +241,22 @@ std::string NewName() {
 }
 
 // Puts `pos` into `record`.
-void WriteRecord(const EvalPosition& pos, bool want_policy,
+void WriteRecord(pblczero::NetworkFormat::InputFormat input_format,
+                 const EvalPosition& pos, bool want_policy,
                  PositionRecord& record) {
   if (pos.legal_moves.size() > kMaxLegalMoves) {
     throw Exception("Too many legal moves for the backend process");
   }
-  // The encoder reads at most kMoveHistory positions.
-  const auto history =
-      pos.pos.last(std::min<size_t>(pos.pos.size(), kMoveHistory));
-  record.history_size = history.size();
+  // Only the positions the encoder reads cross to the backend process.
+  std::array<int, kCompactHistory> history;
+  const int history_size = CompactHistoryForNN(input_format, pos.pos, history);
+  record.history_size = history_size;
   record.num_moves = pos.legal_moves.size();
   record.want_policy = want_policy;
-  std::memcpy(record.history, history.data(),
-              history.size() * sizeof(Position));
+  for (int i = 0; i < history_size; ++i) {
+    std::memcpy(record.history + i * sizeof(Position), &pos.pos[history[i]],
+                sizeof(Position));
+  }
   std::memcpy(record.moves, pos.legal_moves.data(),
               pos.legal_moves.size() * sizeof(Move));
 }
@@ -518,7 +522,8 @@ class ChildProcessComputation : public BackendComputation {
       throw Exception("Batch is larger than the backend process allows");
     }
     AcquireSlot();
-    WriteRecord(pos, !result.p.empty(), backend_->Slot(slot_).positions[index]);
+    WriteRecord(backend_->GetAttributes().input_format, pos, !result.p.empty(),
+                backend_->Slot(slot_).positions[index]);
     results_[index] = result;
   }
 
@@ -732,7 +737,8 @@ class GpuDispatchComputation : public BackendComputation {
     if (index >= batch_->records.size()) {
       throw Exception("Batch is larger than the backend processes allow");
     }
-    WriteRecord(pos, !result.p.empty(), batch_->records[index]);
+    WriteRecord(backend_->GetAttributes().input_format, pos, !result.p.empty(),
+                batch_->records[index]);
     batch_->results[index] = result;
     return ENQUEUED_FOR_EVAL;
   }
