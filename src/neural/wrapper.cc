@@ -64,6 +64,7 @@ class NetworkAsBackend : public Backend {
     attrs_.maximum_batch_size = 1024;
     attrs_.preferred_batch_step = network_->GetPreferredBatchStep();
     input_format_ = caps.input_format;
+    attrs_.input_format = input_format_;
   }
 
   BackendAttributes GetAttributes() const override { return attrs_; }
