@@ -25,21 +25,31 @@
 #include <algorithm>
 #include <cassert>
 #include <functional>
+#include <limits>
 #include <list>
 #include <memory>
 #include <mutex>
+#include <span>
+#include <string>
+#include <string_view>
 
 #include "sycl_common.h"
 #include "inputs_outputs.h"
 #include "kernels.h"
 #include "layers.h"
+#include "neural/backend.h"
 #include "neural/backends/shared/activation.h"
+#include "neural/encoder.h"
 #include "neural/factory.h"
 #include "neural/network_legacy.h"
+#include "neural/register.h"
+#include "neural/shared_params.h"
 #include "neural/tables/attention_policy_map.h"
 #include "neural/tables/policy_map.h"
+#include "utils/atomic_vector.h"
 #include "utils/bititer.h"
 #include "utils/exception.h"
+#include "utils/fastmath.h"
 #include <cmath>
 
 namespace lczero {
@@ -926,6 +936,11 @@ class SyclNetwork : public Network {
                                                               moves_left_);
   }
 
+  // What SyclBackendComputation needs to size a batch and read its outputs.
+  bool HasWdl() const { return wdl_; }
+  bool HasMovesLeft() const { return moves_left_; }
+  int GetMaxBatchSize() const { return max_batch_size_; }
+
   std::unique_ptr<InputsOutputs> GetInputsOutputs() {
     std::lock_guard<std::mutex> lock(inputs_outputs_lock_);
     if (free_inputs_outputs_.empty()) {
@@ -1065,8 +1080,8 @@ void SyclNetworkComputation<DataType>::ComputeBlocking() {
 }
 
 template <typename DataType>
-std::unique_ptr<Network> MakeSyclNetwork(const std::optional<WeightsFile>& w,
-                                         const OptionsDict& options) {
+std::unique_ptr<SyclNetwork<DataType>> MakeSyclNetwork(
+    const std::optional<WeightsFile>& w, const OptionsDict& options) {
   if (!w) {
     throw Exception(
         "The sycl" +
@@ -1135,27 +1150,269 @@ std::unique_ptr<Network> MakeSyclNetwork(const std::optional<WeightsFile>& w,
   return std::make_unique<SyclNetwork<DataType>>(weights, options);
 }
 
-std::unique_ptr<Network> MakeSyclNetworkAuto(
-    const std::optional<WeightsFile>& weights, const OptionsDict& options) {
+// Whether sycl-auto runs the selected device in half precision.
+static bool UseHalfPrecision(const OptionsDict& options) {
   int gpu_id = options.GetOrDefault<int>("gpu", 0);
 
   auto devices = sycl::device::get_devices();
   if (gpu_id >= devices.size()) {
-      throw Exception("Invalid GPU ID");
-   }
+    throw Exception("Invalid GPU ID");
+  }
   CERR << "Trying to switch to [sycl-fp16]...";
   if (devices[gpu_id].has(sycl::aspect::fp16)) {
-    CERR << "Switched to [sycl-fp16]..."; 
-    return MakeSyclNetwork<sycl::half>(weights, options);     
-  } else {
-    CERR << "Device does not support sycl-fp16";
+    CERR << "Switched to [sycl-fp16]...";
+    return true;
   }
+  CERR << "Device does not support sycl-fp16";
   CERR << "Switched to [sycl]...";
+  return false;
+}
+
+std::unique_ptr<Network> MakeSyclNetworkAuto(
+    const std::optional<WeightsFile>& weights, const OptionsDict& options) {
+  if (UseHalfPrecision(options)) {
+    return MakeSyclNetwork<sycl::half>(weights, options);
+  }
   return MakeSyclNetwork<float>(weights, options);
 }
 
-REGISTER_NETWORK("sycl-auto", MakeSyclNetworkAuto, 132)
-REGISTER_NETWORK("sycl", MakeSyclNetwork<float>, 131)
-REGISTER_NETWORK("sycl-fp16", MakeSyclNetwork<sycl::half>, 130)
+static FillEmptyHistory EncodeHistoryFill(std::string_view history_fill) {
+  if (history_fill == "fen_only") return FillEmptyHistory::FEN_ONLY;
+  if (history_fill == "always") return FillEmptyHistory::ALWAYS;
+  assert(history_fill == "no");
+  return FillEmptyHistory::NO;
+}
+
+template <typename DataType>
+class SyclBackendComputation;
+
+// The Backend API (neural/backend.h) on top of SyclNetwork, without going
+// through NetworkAsBackend.
+template <typename DataType>
+class SyclBackend : public Backend {
+ public:
+  SyclBackend(std::unique_ptr<SyclNetwork<DataType>> network,
+              const OptionsDict& options)
+      : network_(std::move(network)),
+        backend_options_(
+            options.Get<std::string>(SharedBackendParams::kBackendOptionsId)),
+        weights_path_(
+            options.Get<std::string>(SharedBackendParams::kWeightsId)) {
+    UpdateConfiguration(options);
+    const NetworkCapabilities& capabilities = network_->GetCapabilities();
+    attributes_.has_mlh = capabilities.has_mlh();
+    attributes_.has_wdl = capabilities.has_wdl();
+    attributes_.runs_on_cpu = network_->IsCpu();
+    attributes_.suggested_num_search_threads = network_->GetThreads();
+    attributes_.recommended_batch_size = network_->GetMiniBatchSize();
+    // The input and output buffers hold this many positions.
+    attributes_.maximum_batch_size = network_->GetMaxBatchSize();
+    attributes_.input_format = capabilities.input_format;
+  }
+
+  BackendAttributes GetAttributes() const override { return attributes_; }
+
+  std::unique_ptr<BackendComputation> CreateComputation() override {
+    return std::make_unique<SyclBackendComputation<DataType>>(this);
+  }
+
+  UpdateConfigurationResult UpdateConfiguration(
+      const OptionsDict& options) override {
+    Backend::UpdateConfiguration(options);
+    if (backend_options_ !=
+        options.Get<std::string>(SharedBackendParams::kBackendOptionsId)) {
+      return NEED_RESTART;
+    }
+    if (weights_path_ !=
+        options.Get<std::string>(SharedBackendParams::kWeightsId)) {
+      return NEED_RESTART;
+    }
+    softmax_policy_temperature_ =
+        1.0f / options.Get<float>(SharedBackendParams::kPolicySoftmaxTemp);
+    fill_empty_history_ = EncodeHistoryFill(
+        options.Get<std::string>(SharedBackendParams::kHistoryFill));
+    return UPDATE_OK;
+  }
+
+ private:
+  friend class SyclBackendComputation<DataType>;
+
+  std::unique_ptr<SyclNetwork<DataType>> network_;
+  BackendAttributes attributes_;
+  float softmax_policy_temperature_;
+  FillEmptyHistory fill_empty_history_;
+  const std::string backend_options_;
+  const std::string weights_path_;
+};
+
+template <typename DataType>
+class SyclBackendComputation : public BackendComputation {
+ public:
+  explicit SyclBackendComputation(SyclBackend<DataType>* backend)
+      : backend_(backend),
+        network_(backend->network_.get()),
+        inputs_outputs_(network_->GetInputsOutputs()),
+        entries_(backend->attributes_.maximum_batch_size) {}
+
+  ~SyclBackendComputation() override {
+    network_->ReleaseInputsOutputs(std::move(inputs_outputs_));
+  }
+
+  size_t UsedBatchSize() const override { return entries_.size(); }
+
+  AddInputResult AddInput(const EvalPosition& position,
+                          EvalResultPtr result) override {
+    int transform;
+    const InputPlanes planes =
+        EncodePositionForNN(backend_->attributes_.input_format, position.pos, 8,
+                            backend_->fill_empty_history_, &transform);
+    const size_t index = entries_.emplace_back(Entry{
+        .legal_moves =
+            MoveList(position.legal_moves.begin(), position.legal_moves.end()),
+        .result = result,
+        .transform = transform});
+    // The index reserves this input's planes in the shared buffers, so
+    // concurrent callers write to different ones.
+    uint64_t* masks =
+        &inputs_outputs_->input_masks_mem_shared_[index * kInputPlanes];
+    float* values =
+        &inputs_outputs_->input_val_mem_shared_[index * kInputPlanes];
+    for (size_t i = 0; i < planes.size(); ++i) {
+      masks[i] = planes[i].mask;
+      values[i] = planes[i].value;
+    }
+    return ENQUEUED_FOR_EVAL;
+  }
+
+  void ComputeBlocking() override {
+    const int batch_size = static_cast<int>(entries_.size());
+    if (batch_size == 0) return;
+    network_->forwardEval(inputs_outputs_.get(), batch_size);
+
+    const bool wdl = network_->HasWdl();
+    const bool moves_left = network_->HasMovesLeft();
+    const float* value = inputs_outputs_->op_value_mem_shared_;
+    for (int i = 0; i < batch_size; ++i) {
+      const Entry& entry = entries_[i];
+      const EvalResultPtr& result = entry.result;
+      if (result.q) {
+        *result.q = wdl ? value[3 * i] - value[3 * i + 2] : value[i];
+      }
+      if (result.d) *result.d = wdl ? value[3 * i + 1] : 0.0f;
+      if (result.m) {
+        *result.m =
+            moves_left ? inputs_outputs_->op_moves_left_mem_shared_[i] : 0.0f;
+      }
+      if (!result.p.empty()) {
+        SoftmaxPolicy(entry,
+                      &inputs_outputs_->op_policy_mem_[i * kNumOutputPolicy]);
+      }
+    }
+  }
+
+ private:
+  struct Entry {
+    MoveList legal_moves;
+    EvalResultPtr result;
+    int transform;
+  };
+
+  // Softmax over the legal moves of one position, as NetworkAsBackend does it.
+  void SoftmaxPolicy(const Entry& entry, const float* policy) const {
+    const std::span<float> destination = entry.result.p;
+    float max_logit = -std::numeric_limits<float>::infinity();
+    size_t count = 0;
+    for (const Move move : entry.legal_moves) {
+      const float logit = policy[MoveToNNIndex(move, entry.transform)];
+      destination[count++] = logit;
+      max_logit = std::max(max_logit, logit);
+    }
+    const float temperature = backend_->softmax_policy_temperature_;
+    float total = 0.0f;
+    for (float& probability : destination) {
+      probability = FastExp((probability - max_logit) * temperature);
+      total += probability;
+    }
+    const float scale = total > 0.0f ? 1.0f / total : 1.0f;
+    for (float& probability : destination) probability *= scale;
+  }
+
+  SyclBackend<DataType>* backend_;
+  SyclNetwork<DataType>* network_;
+  std::unique_ptr<InputsOutputs> inputs_outputs_;
+  // AddInput is called from several search threads at once.
+  AtomicVector<Entry> entries_;
+};
+
+template <typename DataType>
+std::unique_ptr<Backend> MakeSyclBackend(
+    const std::optional<WeightsFile>& weights,
+    const OptionsDict& network_options, const OptionsDict& options) {
+  return std::make_unique<SyclBackend<DataType>>(
+      MakeSyclNetwork<DataType>(weights, network_options), options);
+}
+
+std::unique_ptr<Backend> MakeSyclBackendAuto(
+    const std::optional<WeightsFile>& weights,
+    const OptionsDict& network_options, const OptionsDict& options) {
+  if (UseHalfPrecision(network_options)) {
+    return MakeSyclBackend<sycl::half>(weights, network_options, options);
+  }
+  return MakeSyclBackend<float>(weights, network_options, options);
+}
+
+class SyclBackendFactory : public BackendFactory {
+ public:
+  // Takes the weights, the options of --backend-opts and the top-level
+  // options.
+  using CreateFunction =
+      std::unique_ptr<Backend> (*)(const std::optional<WeightsFile>&,
+                                   const OptionsDict&, const OptionsDict&);
+
+  SyclBackendFactory(std::string name, int priority, CreateFunction create)
+      : name_(std::move(name)), priority_(priority), create_(create) {}
+
+  int GetPriority() const override { return priority_; }
+  std::string_view GetName() const override { return name_; }
+
+  std::unique_ptr<Backend> Create(const OptionsDict& options) override {
+    OptionsDict network_options;
+    network_options.AddSubdictFromString(
+        options.Get<std::string>(SharedBackendParams::kBackendOptionsId));
+    const std::optional<WeightsFile> weights =
+        LoadWeights(options.Get<std::string>(SharedBackendParams::kWeightsId));
+    std::unique_ptr<Backend> backend =
+        create_(weights, network_options, options);
+    network_options.CheckAllOptionsRead(name_);
+    return backend;
+  }
+
+ private:
+  const std::string name_;
+  const int priority_;
+  const CreateFunction create_;
+};
+
+namespace {
+
+// The composite backends (demux, multiplexing, roundrobin, check) create their
+// children through NetworkFactory, so the networks stay registered there.
+[[maybe_unused]] NetworkFactory::Register register_network_auto(
+    "sycl-auto", MakeSyclNetworkAuto, 132);
+[[maybe_unused]] NetworkFactory::Register register_network(
+    "sycl", MakeSyclNetwork<float>, 131);
+[[maybe_unused]] NetworkFactory::Register register_network_half(
+    "sycl-fp16", MakeSyclNetwork<sycl::half>, 130);
+
+[[maybe_unused]] BackendManager::Register register_backend_auto(
+    std::make_unique<SyclBackendFactory>("sycl-auto", 132,
+                                         MakeSyclBackendAuto));
+[[maybe_unused]] BackendManager::Register register_backend(
+    std::make_unique<SyclBackendFactory>("sycl", 131, MakeSyclBackend<float>));
+[[maybe_unused]] BackendManager::Register register_backend_half(
+    std::make_unique<SyclBackendFactory>("sycl-fp16", 130,
+                                         MakeSyclBackend<sycl::half>));
+
+}  // namespace
 
 }  // namespace lczero
