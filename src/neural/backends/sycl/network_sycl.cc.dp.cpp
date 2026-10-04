@@ -40,7 +40,7 @@
 #include "neural/backend.h"
 #include "neural/backends/shared/activation.h"
 #include "neural/encoder.h"
-#include "neural/factory.h"
+#include "neural/network.h"
 #include "neural/network_legacy.h"
 #include "neural/register.h"
 #include "neural/shared_params.h"
@@ -54,9 +54,6 @@
 
 namespace lczero {
 using namespace sycldnn_backend;
-
-template <typename DataType>
-class SyclNetwork;
 
 static size_t getMaxAttentionHeadSize(
     const MultiHeadWeights::PolicyHead& weights, int N) {
@@ -128,72 +125,7 @@ static size_t getMaxAttentionBodySize(const MultiHeadWeights& weights, int N) {
 }
 
 template <typename DataType>
-class SyclNetworkComputation : public NetworkComputation {
- public:
-  SyclNetworkComputation(SyclNetwork<DataType>* network, bool wdl,
-                         bool moves_left);
-  ~SyclNetworkComputation();
-
-  void AddInput(InputPlanes&& input) override {
-    const auto iter_mask =
-        &inputs_outputs_->input_masks_mem_shared_[batch_size_ * kInputPlanes];
-    const auto iter_val =
-        &inputs_outputs_->input_val_mem_shared_[batch_size_ * kInputPlanes];
-
-    int i = 0;
-    for (const auto& plane : input) {
-      iter_mask[i] = plane.mask;
-      iter_val[i] = plane.value;
-      i++;
-    }
-
-    batch_size_++;
-  }
-
-  void ComputeBlocking() override;
-
-  int GetBatchSize() const override { return batch_size_; }
-
-  float GetQVal(int sample) const override {
-    if (wdl_) {
-      auto w = inputs_outputs_->op_value_mem_shared_[3 * sample + 0];
-      auto l = inputs_outputs_->op_value_mem_shared_[3 * sample + 2];
-      return w - l;
-    }
-    return inputs_outputs_->op_value_mem_shared_[sample];
-  }
-
-  float GetDVal(int sample) const override {
-    if (wdl_) {
-      auto d = inputs_outputs_->op_value_mem_shared_[3 * sample + 1];
-      return d;
-    }
-    return 0.0f;
-  }
-
-  float GetPVal(int sample, int move_id) const override {
-    return inputs_outputs_->op_policy_mem_[sample * kNumOutputPolicy + move_id];
-  }
-
-  float GetMVal(int sample) const override {
-    if (moves_left_) {
-      return inputs_outputs_->op_moves_left_mem_shared_[sample];
-    }
-    return 0.0f;
-  }
-
- private:
-  // Memory holding inputs, outputs.
-  std::unique_ptr<InputsOutputs> inputs_outputs_;
-  int batch_size_;
-  bool wdl_;
-  bool moves_left_;
-
-  SyclNetwork<DataType>* network_;
-};
-
-template <typename DataType>
-class SyclNetwork : public Network {
+class SyclNetwork {
  public:
   SyclNetwork(const WeightsFile& file, const OptionsDict& options)
       : capabilities_{file.format().network_format().input(),
@@ -916,24 +848,17 @@ class SyclNetwork : public Network {
     }
   }
 
-  const NetworkCapabilities& GetCapabilities() const override {
-    return capabilities_;
-  }
+  const NetworkCapabilities& GetCapabilities() const { return capabilities_; }
 
   // Check if device is the cpu for thread handling.
-  bool IsCpu() const override { return is_cpu_; }
+  bool IsCpu() const { return is_cpu_; }
 
-  int GetThreads() const override { return 1 + multi_stream_; }
+  int GetThreads() const { return 1 + multi_stream_; }
 
-  int GetMiniBatchSize() const override {
-     if (is_cpu_) return 47;
-       // Simple heuristic that seems to work for a wide range of GPUs.
-       return 2 * compute_units_;
-    }
-  
-  std::unique_ptr<NetworkComputation> NewComputation() override {
-    return std::make_unique<SyclNetworkComputation<DataType>>(this, wdl_,
-                                                              moves_left_);
+  int GetMiniBatchSize() const {
+    if (is_cpu_) return 47;
+    // Simple heuristic that seems to work for a wide range of GPUs.
+    return 2 * compute_units_;
   }
 
   // What SyclBackendComputation needs to size a batch and read its outputs.
@@ -1062,24 +987,6 @@ class SyclNetwork : public Network {
 };
 
 template <typename DataType>
-SyclNetworkComputation<DataType>::SyclNetworkComputation(
-    SyclNetwork<DataType>* network, bool wdl, bool moves_left)
-    : wdl_(wdl), moves_left_(moves_left), network_(network) {
-  batch_size_ = 0;
-  inputs_outputs_ = network_->GetInputsOutputs();
-}
-
-template <typename DataType>
-SyclNetworkComputation<DataType>::~SyclNetworkComputation() {
-  network_->ReleaseInputsOutputs(std::move(inputs_outputs_));
-}
-
-template <typename DataType>
-void SyclNetworkComputation<DataType>::ComputeBlocking() {
-  network_->forwardEval(inputs_outputs_.get(), GetBatchSize());
-}
-
-template <typename DataType>
 std::unique_ptr<SyclNetwork<DataType>> MakeSyclNetwork(
     const std::optional<WeightsFile>& w, const OptionsDict& options) {
   if (!w) {
@@ -1166,14 +1073,6 @@ static bool UseHalfPrecision(const OptionsDict& options) {
   CERR << "Device does not support sycl-fp16";
   CERR << "Switched to [sycl]...";
   return false;
-}
-
-std::unique_ptr<Network> MakeSyclNetworkAuto(
-    const std::optional<WeightsFile>& weights, const OptionsDict& options) {
-  if (UseHalfPrecision(options)) {
-    return MakeSyclNetwork<sycl::half>(weights, options);
-  }
-  return MakeSyclNetwork<float>(weights, options);
 }
 
 static FillEmptyHistory EncodeHistoryFill(std::string_view history_fill) {
@@ -1394,15 +1293,6 @@ class SyclBackendFactory : public BackendFactory {
 };
 
 namespace {
-
-// The composite backends (demux, multiplexing, roundrobin, check) create their
-// children through NetworkFactory, so the networks stay registered there.
-[[maybe_unused]] NetworkFactory::Register register_network_auto(
-    "sycl-auto", MakeSyclNetworkAuto, 132);
-[[maybe_unused]] NetworkFactory::Register register_network(
-    "sycl", MakeSyclNetwork<float>, 131);
-[[maybe_unused]] NetworkFactory::Register register_network_half(
-    "sycl-fp16", MakeSyclNetwork<sycl::half>, 130);
 
 [[maybe_unused]] BackendManager::Register register_backend_auto(
     std::make_unique<SyclBackendFactory>("sycl-auto", 132,
