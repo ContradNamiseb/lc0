@@ -302,7 +302,7 @@ DirectMlOnnxNetwork::DirectMlOnnxNetwork(const WeightsFile& file,
   BuildProgram(max_batch_);
 
   const uint64_t input_bytes =
-      uint64_t{max_batch_} * kNumInputPlanes * 64 * sizeof(float);
+      static_cast<uint64_t>(max_batch_) * kNumInputPlanes * 64 * sizeof(float);
   weight_arena_.Create(ctx_.device(), weight_bytes_, "directml-onnx weights");
   input_arena_.Create(ctx_.device(), input_bytes, "directml-onnx input");
   output_arena_.Create(ctx_.device(), output_bytes_, "directml-onnx output");
