@@ -727,10 +727,12 @@ constexpr float kScaleTol = 5e-5f;
 // (eps ~= 1.19e-7); IEEE 754 half has eps ~= 9.77e-4, so holding a genuinely
 // fp16 backend to 5e-5 (< 0.05 ULP of its own representation) is not an
 // achievable bar regardless of correctness. 5e-3 (0.5%) is the floor for
-// directml-fp16 specifically -- every other backend (directml, eigen, blas)
-// keeps the original 5e-5 bar unchanged; callers opt in explicitly via the
-// fp16 parameter, default false, so a call site that forgets to pass it
-// silently keeps the tighter FP32 bar rather than silently loosening.
+// the half-precision backends only (directml-fp16, and onnx-dml unless it
+// runs with fp16=false, see TestBackendIsHalfPrecision) -- every other
+// backend (directml, eigen, blas) keeps the original 5e-5 bar unchanged;
+// callers opt in explicitly via the fp16 parameter, default false, so a call
+// site that forgets to pass it silently keeps the tighter FP32 bar rather
+// than silently loosening.
 constexpr float kAbsTolFp16 = 5e-3f;
 constexpr float kScaleTolFp16 = 3e-2f;
 
@@ -794,15 +796,43 @@ inline void AssertFiniteOutputs(const Outputs& o, const char* who) {
 // passing for the wrong reason.
 void ValidateTestBackendChoice(const std::string& test_backend) {
   static const std::set<std::string> kAllowed = {"directml", "directml-fp16",
-                                                 "eigen"};
+                                                 "eigen", "onnx-dml"};
   if (kAllowed.find(test_backend) == kAllowed.end()) {
     FAIL() << "LC0_TEST_BACKEND=" << test_backend
-           << " is not on the allowed list (directml, directml-fp16, "
-              "eigen) -- comparing the blas reference against itself (or "
+           << " is not on the allowed list (directml, directml-fp16, eigen, "
+              "onnx-dml) -- comparing the blas reference against itself (or "
               "any other unrecognized backend) would make every parity "
               "assertion in this suite trivially pass without testing "
               "anything.";
   }
+}
+
+// The net as the backend under test receives it. The ONNX converter has no
+// INPUT_EMBEDDING_NONE case for an attention body, while the blas reference
+// computes that label exactly as PE_MAP (network_blas.cc only branches on
+// PE_DENSE), so it is relabeled for onnx-dml; the synthetic nets here nearly
+// all say NONE and would otherwise never reach the converter.
+pblczero::Net NetForTestBackend(const std::string& test_backend,
+                                const pblczero::Net& net) {
+  using NF = pblczero::NetworkFormat;
+  pblczero::Net out = net;
+  auto* nf = out.mutable_format()->mutable_network_format();
+  if (test_backend == "onnx-dml" &&
+      nf->input_embedding() == NF::INPUT_EMBEDDING_NONE) {
+    nf->set_input_embedding(NF::INPUT_EMBEDDING_PE_MAP);
+  }
+  return out;
+}
+
+// Whether the backend under test computes in half precision, which selects
+// the wider tolerance. onnx-dml is fp16 unless LC0_TEST_BACKEND_OPTS says
+// fp16=false.
+bool TestBackendIsHalfPrecision(const std::string& test_backend) {
+  if (test_backend == "directml-fp16") return true;
+  if (test_backend != "onnx-dml") return false;
+  OptionsDict options;
+  ApplyTestBackendOpts(&options);
+  return options.GetOrDefault<bool>("fp16", true);
 }
 
 void CompareBackendsBatch(const pblczero::Net& net, int batch) {
@@ -827,9 +857,9 @@ void CompareBackendsBatch(const pblczero::Net& net, int batch) {
     GTEST_SKIP() << "no usable directml device: "
                  << DirectMlAvailability().reason;
   }
-  const std::vector<Outputs> dml =
-      RunNetworkBatch(test_backend, net, planes);
-  const bool fp16_bound = test_backend == "directml-fp16";
+  const std::vector<Outputs> dml = RunNetworkBatch(
+      test_backend, NetForTestBackend(test_backend, net), planes);
+  const bool fp16_bound = TestBackendIsHalfPrecision(test_backend);
 
   for (int n = 0; n < batch; ++n) {
     // F5: assert before searching, not after -- see AssertFiniteOutputs.
@@ -902,8 +932,9 @@ void CompareBackends(const pblczero::Net& net) {
     GTEST_SKIP() << "no usable directml device: "
                  << DirectMlAvailability().reason;
   }
-  const Outputs dml = RunNetwork(test_backend, net, planes);
-  const bool fp16_bound = test_backend == "directml-fp16";
+  const Outputs dml =
+      RunNetwork(test_backend, NetForTestBackend(test_backend, net), planes);
+  const bool fp16_bound = TestBackendIsHalfPrecision(test_backend);
 
   // F5: assert before searching, not after -- see AssertFiniteOutputs.
   AssertFiniteOutputs(dml, "directml");
