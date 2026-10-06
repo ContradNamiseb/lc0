@@ -320,6 +320,9 @@ class Converter {
   void AddStdInitializers(OnnxBuilder* builder);
 
   pblczero::TensorProto::DataType GetDataType() const;
+  // The data type GetWeghtsConverter and GetScalarConverter emit: the network
+  // data type, or float32 while float_constants_ is set.
+  WeightsToOnnxConverterOptions::DataType GetConstantDataType() const;
   std::unique_ptr<OnnxConst> GetWeghtsConverter(
       const std::vector<float>&, std::initializer_list<int> dims,
       std::initializer_list<int> order = {});
@@ -337,6 +340,9 @@ class Converter {
   const ActivationFunction default_activation_;
   const float default_eps_;
   bool se_reshape_init_ = false;
+  // Set while emitting a part of the graph that computes in FLOAT whatever
+  // the network data type is.
+  bool float_constants_ = false;
 };
 
 pblczero::TensorProto::DataType Converter::GetDataType() const {
@@ -352,10 +358,15 @@ pblczero::TensorProto::DataType Converter::GetDataType() const {
   }
 }
 
+WeightsToOnnxConverterOptions::DataType Converter::GetConstantDataType() const {
+  return float_constants_ ? WeightsToOnnxConverterOptions::DataType::kFloat32
+                          : options_.data_type;
+}
+
 std::unique_ptr<OnnxConst> Converter::GetWeghtsConverter(
     const std::vector<float>& weights, std::initializer_list<int> dims,
     std::initializer_list<int> order) {
-  switch (options_.data_type) {
+  switch (GetConstantDataType()) {
     case WeightsToOnnxConverterOptions::DataType::kFloat32:
       return std::make_unique<FloatOnnxWeightsAdapter>(weights, dims, order);
     case WeightsToOnnxConverterOptions::DataType::kFloat16:
@@ -369,7 +380,7 @@ std::unique_ptr<OnnxConst> Converter::GetWeghtsConverter(
 }
 
 std::unique_ptr<OnnxConst> Converter::GetScalarConverter(float in) {
-  switch (options_.data_type) {
+  switch (GetConstantDataType()) {
     case WeightsToOnnxConverterOptions::DataType::kFloat32:
       return std::make_unique<FloatOnnxConst>(FloatOnnxConst({in}, {1}));
     case WeightsToOnnxConverterOptions::DataType::kFloat16:
@@ -908,9 +919,18 @@ std::string Converter::MakeKdaMixer(OnnxBuilder* builder,
     beta_parts.push_back(reorder(beta4, 1, gname + "/beta"));
   }
 
+  // The recurrence runs in FLOAT whatever the network data type is. Its
+  // 1e-12 norm clamp is zero in half precision, which turns the norm
+  // reciprocal into infinity, and OnnxBuilder::Scan declares the body's
+  // values as FLOAT.
+  const bool cast_recurrence = GetDataType() != pblczero::TensorProto::FLOAT;
   auto join = [&](const std::vector<std::string>& parts,
                   const std::string& jname) {
-    return parts.size() == 1 ? parts[0] : builder->Concat(jname, parts, 2);
+    auto joined =
+        parts.size() == 1 ? parts[0] : builder->Concat(jname, parts, 2);
+    return cast_recurrence ? builder->Cast(jname + "/to_float", joined,
+                                           pblczero::TensorProto::FLOAT)
+                           : joined;
   };
   auto q_scan = join(q_parts, name + "/scan/q");
   auto k_scan = join(k_parts, name + "/scan/k");
@@ -924,6 +944,7 @@ std::string Converter::MakeKdaMixer(OnnxBuilder* builder,
   for (int head = 0; head < heads; ++head) {
     neg_decay_scale_all[head] = -std::exp(kda.a_log[head]);
   }
+  float_constants_ = true;
   auto dt_bias_const = builder->AddInitializer(
       name + "/dt_bias",
       *GetWeghtsConverter(dt_bias_all, {1, heads, key_dim}));
@@ -1024,8 +1045,12 @@ std::string Converter::MakeKdaMixer(OnnxBuilder* builder,
         return std::make_pair(std::vector<std::string>{new_state},
                               std::vector<std::string>{out_t});
       });
+  float_constants_ = false;
   // scan_out[0] is the final state, which is not needed.
-  const std::string& token_major = scan_out[1];
+  const std::string token_major =
+      cast_recurrence ? builder->Cast(name + "/scan/out/to_data_type",
+                                      scan_out[1], GetDataType())
+                      : scan_out[1];
 
   // Undo each group's traversal order to get back to square-major layout.
   // inv_order[square] = token, the same argsort the trainer applies.
