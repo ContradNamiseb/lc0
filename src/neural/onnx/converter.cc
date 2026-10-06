@@ -1623,19 +1623,21 @@ void Converter::MakeValueHead(pblczero::OnnxModel* onnx, OnnxBuilder* builder,
       "/value/reshape", flow,
       builder->AddInitializer("/const/value_shape",
                               Int64OnnxConst({-1, val_channels * 8 * 8}, {2})));
+  const int val_fc1_outputs = head.ip1_val_b.size();
   flow = builder->MatMul(
       "/value/dense1/matmul", flow,
-      *GetWeghtsConverter(head.ip1_val_w, {val_channels * 8 * 8, 128}, {1, 0}));
+      *GetWeghtsConverter(head.ip1_val_w,
+                          {val_channels * 8 * 8, val_fc1_outputs}, {1, 0}));
   flow = builder->Add("/value/dense1/add", flow,
-                      *GetWeghtsConverter(head.ip1_val_b, {128}));
+                      *GetWeghtsConverter(head.ip1_val_b, {val_fc1_outputs}));
   flow = MakeActivation(builder, flow, "/value/dense1", default_activation_);
 
   const bool wdl = src_.format().network_format().value() ==
                    pblczero::NetworkFormat::VALUE_WDL;
   if (wdl) {
-    flow =
-        builder->MatMul("/value/dense2/matmul", flow,
-                        *GetWeghtsConverter(head.ip2_val_w, {128, 3}, {1, 0}));
+    flow = builder->MatMul(
+        "/value/dense2/matmul", flow,
+        *GetWeghtsConverter(head.ip2_val_w, {val_fc1_outputs, 3}, {1, 0}));
     flow = builder->Add("/value/dense2/add", flow,
                         *GetWeghtsConverter(head.ip2_val_b, {3}));
     if (!options_.no_wdl_softmax) {
@@ -1644,9 +1646,9 @@ void Converter::MakeValueHead(pblczero::OnnxModel* onnx, OnnxBuilder* builder,
     builder->AddOutput(flow, {options_.batch_size, 3}, GetDataType());
     onnx->set_output_wdl(flow);
   } else {
-    flow =
-        builder->MatMul("/value/dense2/matmul", flow,
-                        *GetWeghtsConverter(head.ip2_val_w, {128, 1}, {1, 0}));
+    flow = builder->MatMul(
+        "/value/dense2/matmul", flow,
+        *GetWeghtsConverter(head.ip2_val_w, {val_fc1_outputs, 1}, {1, 0}));
     flow = builder->Add("/value/dense2/add", flow,
                         *GetWeghtsConverter(head.ip2_val_b, {1}));
     auto output = builder->Tanh(options_.output_value, flow);
