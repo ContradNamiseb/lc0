@@ -727,10 +727,11 @@ std::string Converter::MakeKdaLocalConv(OnnxBuilder* builder,
                  name + "/zero_row_shape/tail",
                  Int64OnnxConst({1, embedding_size}, {2}))},
       0);
+  const std::vector<float> zero = {0.0f};
   auto zero_row = builder->Expand(
       name + "/zero_row",
       builder->AddInitializer(name + "/zero_scalar",
-                              FloatOnnxConst({0.0f}, {1, 1, 1})),
+                              *GetWeghtsConverter(zero, {1, 1, 1})),
       zero_row_shape);
   auto padded = builder->Concat(name + "/padded", {shaped, zero_row}, 1);
 
