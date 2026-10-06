@@ -145,17 +145,17 @@ ComPtr<ID3D12Resource> CreateCpuBuffer(ID3D12Device* device,
                                        uint64_t bytes) {
   D3D12_HEAP_PROPERTIES heap = {};
   heap.Type = heap_type;
-  D3D12_RESOURCE_DESC desc = {};
-  desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-  desc.Width = bytes;
-  desc.Height = 1;
-  desc.DepthOrArraySize = 1;
-  desc.MipLevels = 1;
-  desc.SampleDesc.Count = 1;
-  desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  D3D12_RESOURCE_DESC description = {};
+  description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  description.Width = bytes;
+  description.Height = 1;
+  description.DepthOrArraySize = 1;
+  description.MipLevels = 1;
+  description.SampleDesc.Count = 1;
+  description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
   ComPtr<ID3D12Resource> buffer;
   ReportD3DErrors(
-      device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+      device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &description,
                                       heap_type == D3D12_HEAP_TYPE_UPLOAD
                                           ? D3D12_RESOURCE_STATE_GENERIC_READ
                                           : D3D12_RESOURCE_STATE_COPY_DEST,
@@ -357,9 +357,9 @@ uint64_t DirectMlOnnxNetwork::AddWeight(const OnnxValue& value, int value_index,
       std::vector<float> from(rows * columns);
       std::memcpy(from.data(), raw.data(), from.size() * sizeof(float));
       std::vector<float> to(from.size());
-      for (size_t k = 0; k < rows; ++k) {
-        for (size_t m = 0; m < columns; ++m) {
-          to[m * rows + k] = from[k * columns + m];
+      for (size_t row = 0; row < rows; ++row) {
+        for (size_t column = 0; column < columns; ++column) {
+          to[column * rows + row] = from[row * columns + column];
         }
       }
       std::memcpy(weight.bytes.data(), to.data(), weight.bytes.size());
