@@ -38,6 +38,7 @@
 #include "neural/onnx/converter.h"
 #include "utils/bititer.h"
 #include "utils/exception.h"
+#include "utils/logging.h"
 
 // After <span> and <version>, as in layers.cc: DirectMLX.h only uses
 // std::span when __cpp_lib_span is already visible.
@@ -144,6 +145,45 @@ ComPtr<ID3D12Resource> CreateCpuBuffer(ID3D12Device* device,
   return buffer;
 }
 
+// Lists every distinct node pattern of the graph: the operator, the input
+// shapes (w marks an initializer), the output shape and the integer
+// attributes. This is what a translation has to cover, so it is the first
+// thing to look at when a network stops at "not translated yet".
+void PrintPatterns(const OnnxGraph& graph, const std::string& prefix) {
+  std::map<std::string, int> patterns;
+  auto shape = [](const OnnxValue& value) {
+    std::string out = value.initializer ? "w[" : "[";
+    for (size_t i = 0; i < value.dims.size(); ++i) {
+      out += (i ? "," : "") + std::to_string(value.dims[i]);
+    }
+    return out + "]";
+  };
+  for (const OnnxNode& node : graph.nodes()) {
+    std::string key = node.op_type;
+    for (const int input : node.inputs) {
+      key +=
+          " " + (input < 0 ? std::string("-") : shape(graph.values()[input]));
+    }
+    key += " -> " + shape(graph.values()[node.outputs[0]]);
+    if (node.outputs.size() > 1) {
+      key += " x" + std::to_string(node.outputs.size());
+    }
+    for (const auto& attribute : node.proto->attribute()) {
+      if (attribute.name() == "body") continue;
+      key += " " + std::string(attribute.name()) + "=";
+      if (attribute.ints().empty()) key += std::to_string(attribute.i());
+      for (const int64_t value : attribute.ints()) {
+        key += std::to_string(value) + ",";
+      }
+    }
+    ++patterns[key];
+    if (node.body) PrintPatterns(*node.body, prefix + node.op_type + " body: ");
+  }
+  for (const auto& [key, count] : patterns) {
+    CERR << "pattern " << prefix << count << "x " << key;
+  }
+}
+
 struct Outputs {
   std::vector<float> policy;
   std::vector<float> value;
@@ -220,6 +260,10 @@ DirectMlOnnxNetwork::DirectMlOnnxNetwork(const WeightsFile& file,
   is_wdl_ = onnx.has_output_wdl();
   value_name_ = std::string(is_wdl_ ? onnx.output_wdl() : onnx.output_value());
   if (onnx.has_output_mlh()) moves_left_name_ = std::string(onnx.output_mlh());
+
+  if (options.GetOrDefault<bool>("print_patterns", false)) {
+    PrintPatterns(OnnxGraph(model_, 16), "");
+  }
 
   // Every DirectML object has to exist before the first dispatch on this
   // driver, so one graph per batch size is compiled now, and a batch runs on
