@@ -674,6 +674,7 @@ if get_option('build_backends')
       files += [
         'src/neural/backends/directml/network_directml.cc',
         'src/neural/backends/directml/layers.cc',
+        'src/neural/backends/directml/onnx_graph.cc',
       ]
       has_backends = true
       directml_ready = true

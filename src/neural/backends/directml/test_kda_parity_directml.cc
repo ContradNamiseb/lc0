@@ -61,6 +61,8 @@
 #include "utils/optionsdict.h"
 #include "neural/backends/directml/dml_common.h"
 #include "neural/backends/directml/layers.h"
+#include "neural/backends/directml/onnx_graph.h"
+#include "neural/onnx/converter.h"
 #include <thread>
 
 namespace lczero {
@@ -3963,6 +3965,139 @@ TEST(DirectMlKdaParity, DISABLED_DumpSingleRealNetEval) {
   }
 }
 
+}  // namespace lczero
+
+// ---------------------------------------------------------------------------
+// OnnxGraph: the converter's output as the DirectML translator loads it. The
+// loader refuses any operator outside its vocabulary, so these tests are also
+// the contract between the converter and the translator: a converter change
+// that emits a new operator fails here until the translator knows it.
+namespace lczero {
+namespace {
+
+pblczero::ModelProto ConvertForTranslator(
+    const pblczero::Net& net, WeightsToOnnxConverterOptions::DataType type) {
+  WeightsToOnnxConverterOptions options;
+  options.data_type = type;
+  const pblczero::Net converted =
+      ConvertWeightsToOnnx(NetForTestBackend("onnx-dml", net), options);
+  pblczero::ModelProto model;
+  model.ParseFromString(converted.onnx_model().model());
+  return model;
+}
+
+// Every value a node produces must have a type and a positive static shape,
+// and the model must end in a policy of 1858 moves per position.
+void ExpectFullyInferred(const directml_backend::OnnxGraph& graph, int batch,
+                         bool is_main_graph) {
+  for (const auto& node : graph.nodes()) {
+    for (const int output : node.outputs) {
+      const auto& value = graph.values()[output];
+      // LayerNormalization's optional outputs are never used.
+      if (value.dims.empty() && node.op_type == "LayerNormalization") continue;
+      EXPECT_NE(value.data_type, pblczero::TensorProto::UNDEFINED)
+          << node.op_type << " " << node.name;
+      for (const int64_t dim : value.dims) {
+        EXPECT_GT(dim, 0) << node.op_type << " " << node.name;
+      }
+    }
+    if (node.body) ExpectFullyInferred(*node.body, batch, false);
+  }
+  if (!is_main_graph) return;
+  bool has_policy = false;
+  for (const int output : graph.outputs()) {
+    const auto& dims = graph.values()[output].dims;
+    ASSERT_FALSE(dims.empty());
+    EXPECT_EQ(dims[0], batch);
+    has_policy = has_policy || dims == std::vector<int64_t>{batch, 1858};
+  }
+  EXPECT_TRUE(has_policy);
+}
+
+TEST(DirectMlOnnxGraph, LoadsWhatTheConverterEmits) {
+  const std::vector<pblczero::Net> nets = {
+      MakeKdaHybridNet(),
+      MakeKdaMhaNet(),
+      MakeThreeKdaThenMhaNet(),
+      MakeKdaMlhNet(),
+      MakeLocalConvNet(7),
+      MakeFullRealisticNet(true, true, true),
+      MakeFullRealisticNet(false, false, false),
+      MakeKdaSerpentineNet(),
+      MakeMhaMlhNet(),
+      MakeSmolgenMhaNet(),
+      MakePeDenseWithEncodersNet(),
+      MakePeDenseGatedNet(11)};
+  using DataType = WeightsToOnnxConverterOptions::DataType;
+  for (size_t i = 0; i < nets.size(); ++i) {
+    for (const DataType type : {DataType::kFloat32, DataType::kFloat16}) {
+      const pblczero::ModelProto model = ConvertForTranslator(nets[i], type);
+      for (const int batch : {1, 8}) {
+        SCOPED_TRACE("net " + std::to_string(i) + ", batch " +
+                     std::to_string(batch));
+        const directml_backend::OnnxGraph graph(model, batch);
+        ExpectFullyInferred(graph, batch, true);
+      }
+    }
+  }
+}
+
+TEST(DirectMlOnnxGraph, InfersTheRecurrenceShapes) {
+  const NetDims d;
+  const int batch = 4;
+  const pblczero::ModelProto model = ConvertForTranslator(
+      MakeKdaMlhNet(), WeightsToOnnxConverterOptions::DataType::kFloat32);
+  const directml_backend::OnnxGraph graph(model, batch);
+  int scans = 0;
+  for (const auto& node : graph.nodes()) {
+    if (node.op_type != "Scan") continue;
+    ++scans;
+    ASSERT_TRUE(node.body);
+    // One state and five scanned inputs; the body sees the inputs without
+    // the axis of the 64 squares.
+    ASSERT_EQ(node.inputs.size(), 6u);
+    ASSERT_EQ(node.body->inputs().size(), 6u);
+    const auto& query = graph.values()[node.inputs[1]].dims;
+    const auto& body_query = node.body->values()[node.body->inputs()[1]].dims;
+    ASSERT_EQ(query.size(), 4u);
+    EXPECT_EQ(query[0], batch);
+    EXPECT_EQ(query[1], 64);
+    EXPECT_EQ(query[2], d.heads);
+    EXPECT_EQ(body_query, (std::vector<int64_t>{query[0], query[2], query[3]}));
+    // The stacked output puts the squares back on axis 1.
+    ASSERT_EQ(node.outputs.size(), 2u);
+    const auto& stacked = graph.values()[node.outputs[1]].dims;
+    ASSERT_EQ(stacked.size(), 4u);
+    EXPECT_EQ(stacked[0], batch);
+    EXPECT_EQ(stacked[1], 64);
+    EXPECT_EQ(stacked[2], d.heads);
+  }
+  EXPECT_GT(scans, 0);
+}
+
+TEST(DirectMlOnnxGraph, RefusesAnOperatorOutsideTheVocabulary) {
+  pblczero::ModelProto model = ConvertForTranslator(
+      MakeKdaMlhNet(), WeightsToOnnxConverterOptions::DataType::kFloat32);
+  ASSERT_FALSE(model.graph().node().empty());
+  model.mutable_graph()->mutable_node()->back().set_op_type("Erf");
+  EXPECT_THROW(directml_backend::OnnxGraph(model, 1), Exception);
+}
+
+// The same on a real net, which exercises real dimensions and the embedding
+// and head variants no synthetic net here has.
+TEST(DirectMlOnnxGraph, LoadsARealNet) {
+  const char* path = getenv("LC0_TEST_REAL_NET");
+  if (!path) GTEST_SKIP() << "set LC0_TEST_REAL_NET to a .pb.gz to run";
+  const pblczero::Net net = LoadWeightsFromFile(path);
+  using DataType = WeightsToOnnxConverterOptions::DataType;
+  for (const DataType type : {DataType::kFloat32, DataType::kFloat16}) {
+    const pblczero::ModelProto model = ConvertForTranslator(net, type);
+    const directml_backend::OnnxGraph graph(model, 16);
+    ExpectFullyInferred(graph, 16, true);
+  }
+}
+
+}  // namespace
 }  // namespace lczero
 
 int main(int argc, char** argv) {
