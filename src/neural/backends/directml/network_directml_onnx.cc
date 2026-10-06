@@ -95,6 +95,29 @@ uint32_t CanonicalAxis(size_t rank, int64_t axis) {
   return static_cast<uint32_t>(rank == 3 || rank == 1 ? axis + 1 : axis);
 }
 
+// The DirectML type of an ONNX tensor. A comparison is BOOL in ONNX and
+// UINT8 in DirectML.
+DML_TENSOR_DATA_TYPE TensorType(pblczero::TensorProto::DataType data_type,
+                                const std::string& where) {
+  switch (data_type) {
+    case pblczero::TensorProto::FLOAT:
+      return DML_TENSOR_DATA_TYPE_FLOAT32;
+    case pblczero::TensorProto::FLOAT16:
+      return DML_TENSOR_DATA_TYPE_FLOAT16;
+    case pblczero::TensorProto::BOOL:
+      return DML_TENSOR_DATA_TYPE_UINT8;
+    default:
+      throw Exception("directml-onnx: " + where +
+                      " has a data type that is not translated yet.");
+  }
+}
+
+// @input in @type, converted only when it is in another one.
+dml::Expression CastTo(dml::Expression input, DML_TENSOR_DATA_TYPE type) {
+  if (input.Impl()->GetOutputDesc().dataType == type) return input;
+  return dml::Cast(input, type);
+}
+
 Sizes SizesOf(const dml::Expression& expression) {
   const auto sizes = expression.Impl()->GetOutputDesc().sizes;
   return Sizes(sizes.begin(), sizes.end());
@@ -288,6 +311,10 @@ DirectMlOnnxNetwork::DirectMlOnnxNetwork(const WeightsFile& file,
   converter_options.alt_layernorm =
       options.GetOrDefault<bool>("alt_layernorm", false);
   converter_options.alt_selu = options.GetOrDefault<bool>("alt_selu", false);
+  if (options.GetOrDefault<bool>("fp16", false)) {
+    converter_options.data_type =
+        WeightsToOnnxConverterOptions::DataType::kFloat16;
+  }
   const WeightsFile converted = ConvertWeightsToOnnx(file, converter_options);
   const auto& onnx = converted.onnx_model();
   model_.ParseFromString(onnx.model());
@@ -373,9 +400,10 @@ uint64_t DirectMlOnnxNetwork::AddWeight(const OnnxValue& value,
     weight.bytes.resize(indices.size() * sizeof(uint32_t));
     std::memcpy(weight.bytes.data(), indices.data(), weight.bytes.size());
   } else {
-    if (value.data_type != pblczero::TensorProto::FLOAT) {
+    if (value.data_type != pblczero::TensorProto::FLOAT &&
+        value.data_type != pblczero::TensorProto::FLOAT16) {
       throw Exception("directml-onnx: weights " + value.name +
-                      " are not float32.");
+                      " are neither float32 nor float16.");
     }
     weight.bytes.assign(raw.begin(), raw.end());
   }
@@ -447,27 +475,31 @@ void DirectMlOnnxNetwork::BuildProgram(int batch) {
     DmlBindingRef binding;
     binding.kind = DmlBindingRef::Kind::kWeight;
     binding.weight.offset = AddWeight(value, layout);
-    const dml::Expression expression = add_input(
-        layout == WeightLayout::kIndices ? DML_TENSOR_DATA_TYPE_UINT32
-                                         : DML_TENSOR_DATA_TYPE_FLOAT32,
-        sizes, binding);
+    const dml::Expression expression =
+        add_input(layout == WeightLayout::kIndices
+                      ? DML_TENSOR_DATA_TYPE_UINT32
+                      : TensorType(value.data_type, value.name),
+                  sizes, binding);
     weight_inputs.emplace(key, expression);
     return expression;
   };
 
   {
-    const int planes = model_graph.inputs().at(0);
+    // The planes arrive as float32 whatever the network computes in.
+    const OnnxValue& planes = model_graph.values()[model_graph.inputs().at(0)];
     DmlBindingRef binding;
     binding.kind = DmlBindingRef::Kind::kInput;
     model_expressions.emplace(
-        planes,
-        add_input(DML_TENSOR_DATA_TYPE_FLOAT32,
-                  Canonical(model_graph.values()[planes].dims, "the input"),
-                  binding));
+        model_graph.inputs().at(0),
+        CastTo(add_input(DML_TENSOR_DATA_TYPE_FLOAT32,
+                         Canonical(planes.dims, "the input"), binding),
+               TensorType(planes.data_type, "the input")));
   }
 
   const uint32_t ones[] = {1, 1};
   const dml::Span<const uint32_t> unit(ones, 2);
+  // The node being translated, to name it when DirectML refuses an operator.
+  std::string current;
   // Translates every node of @graph, reading and extending @expressions. A
   // Scan node calls it again for its body.
   std::function<void(const OnnxGraph&, Expressions*)> translate =
@@ -475,6 +507,7 @@ void DirectMlOnnxNetwork::BuildProgram(int batch) {
         for (const OnnxNode& node : graph.nodes()) {
           const std::string& op = node.op_type;
           const std::string where = op + " node " + node.name;
+          current = where;
           const OnnxValue& output_value = graph.values()[node.outputs.at(0)];
           // Shape arithmetic on integers was folded when the graph was loaded.
           if (output_value.is_constant) continue;
@@ -592,6 +625,9 @@ void DirectMlOnnxNetwork::BuildProgram(int batch) {
             results.push_back(dml::Sqrt(computed(0)));
           } else if (op == "Reciprocal") {
             results.push_back(dml::Recip(computed(0)));
+          } else if (op == "Cast") {
+            results.push_back(
+                CastTo(computed(0), TensorType(output_value.data_type, where)));
           } else if (op == "Identity") {
             results.push_back(computed(0));
           } else if (op == "Selu") {
@@ -680,8 +716,9 @@ void DirectMlOnnxNetwork::BuildProgram(int batch) {
             for (size_t i = 0; i < input_rank; ++i) {
               strides[CanonicalAxis(input_rank, i)] = dense[permutation[i]];
             }
+            const dml::Expression operand = computed(0);
             results.push_back(dml::Identity(dml::Reinterpret(
-                computed(0), DML_TENSOR_DATA_TYPE_FLOAT32,
+                operand, operand.Impl()->GetOutputDesc().dataType,
                 dml::TensorDimensions(output_sizes.begin(), output_sizes.end()),
                 dml::TensorStrides(strides.begin(), strides.end()))));
           } else if (op == "Slice") {
@@ -856,7 +893,14 @@ void DirectMlOnnxNetwork::BuildProgram(int batch) {
           }
         }
       };
-  translate(model_graph, &model_expressions);
+  try {
+    translate(model_graph, &model_expressions);
+  } catch (const Exception&) {
+    throw;
+  } catch (const std::exception& error) {
+    throw Exception("directml-onnx: DirectML refused " + current + ": " +
+                    error.what());
+  }
 
   std::vector<dml::Expression> outputs;
   std::vector<uint64_t> output_bytes;
@@ -868,7 +912,9 @@ void DirectMlOnnxNetwork::BuildProgram(int batch) {
     if (value_index < 0 || !model_expressions.count(value_index)) {
       throw Exception("directml-onnx: output " + *name + " was not built.");
     }
-    outputs.push_back(model_expressions.at(value_index));
+    // And the outputs leave as float32.
+    outputs.push_back(CastTo(model_expressions.at(value_index),
+                             DML_TENSOR_DATA_TYPE_FLOAT32));
     output_bytes.push_back(
         outputs.back().Impl()->GetOutputDesc().totalTensorSizeInBytes);
     program.output_offsets.push_back(offset);
