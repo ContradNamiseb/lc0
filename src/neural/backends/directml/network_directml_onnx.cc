@@ -24,9 +24,11 @@
 
 #include <algorithm>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <span>
+#include <tuple>
 #include <unordered_map>
 #include <version>
 
@@ -48,7 +50,12 @@ namespace lczero {
 namespace directml_backend {
 namespace {
 
+// Descriptors kept beyond what the compiled graphs need.
+constexpr uint64_t kSpareDescriptors = 16384;
+
 using Sizes = std::vector<uint32_t>;
+// The computed tensors of one graph, by value index, in canonical sizes.
+using Expressions = std::unordered_map<int, dml::Expression>;
 
 // How an initializer is laid out for the DirectML operator that reads it.
 enum class WeightLayout {
@@ -114,7 +121,7 @@ dml::Expression BroadcastTo(dml::Expression input, const Sizes& target,
     strides[i] = from[i] == target[i] ? stride : 0;
     stride *= from[i];
   }
-  return dml::Reinterpret(input, DML_TENSOR_DATA_TYPE_FLOAT32,
+  return dml::Reinterpret(input, input.Impl()->GetOutputDesc().dataType,
                           dml::TensorDimensions(target.begin(), target.end()),
                           dml::TensorStrides(strides.begin(), strides.end()));
 }
@@ -122,7 +129,7 @@ dml::Expression BroadcastTo(dml::Expression input, const Sizes& target,
 // The same elements under new sizes. @input has to be dense.
 dml::Expression Reshaped(dml::Expression input, const Sizes& sizes) {
   if (SizesOf(input) == sizes) return input;
-  return dml::Reinterpret(input, DML_TENSOR_DATA_TYPE_FLOAT32,
+  return dml::Reinterpret(input, input.Impl()->GetOutputDesc().dataType,
                           dml::TensorDimensions(sizes.begin(), sizes.end()),
                           dml::NullOpt);
 }
@@ -239,8 +246,7 @@ class DirectMlOnnxNetwork : public Network {
   };
 
   void BuildProgram(int batch);
-  uint64_t AddWeight(const OnnxValue& value, int value_index,
-                     WeightLayout layout);
+  uint64_t AddWeight(const OnnxValue& value, WeightLayout layout);
   void UploadWeights();
   void Execute(ID3D12CommandList* list);
 
@@ -254,7 +260,7 @@ class DirectMlOnnxNetwork : public Network {
   int max_batch_ = 0;
 
   std::vector<Program> programs_;
-  std::map<std::pair<int, WeightLayout>, Weight> weights_;
+  std::map<std::pair<std::string, WeightLayout>, Weight> weights_;
   uint64_t weight_bytes_ = 0;
   uint64_t output_bytes_ = 0;
   uint64_t transient_bytes_ = 0;
@@ -300,6 +306,18 @@ DirectMlOnnxNetwork::DirectMlOnnxNetwork(const WeightsFile& file,
   max_batch_ = options.GetOrDefault<int>("max_batch", 64);
   for (int batch = 1; batch < max_batch_; batch *= 2) BuildProgram(batch);
   BuildProgram(max_batch_);
+  // An unrolled recurrence needs some twenty thousand descriptors a graph, so
+  // the pool is sized from what the compiled graphs ask for. The spare slots
+  // are for the operator initializer.
+  uint64_t descriptors = kSpareDescriptors;
+  for (const Program& program : programs_) {
+    descriptors +=
+        program.op.op->GetBindingProperties().RequiredDescriptorCount;
+  }
+  ctx_.ReserveDescriptors(descriptors);
+  for (const Program& program : programs_) {
+    ctx_.GetOrCreateBindingTable(program.op.op.Get());
+  }
 
   const uint64_t input_bytes =
       static_cast<uint64_t>(max_batch_) * kNumInputPlanes * 64 * sizeof(float);
@@ -338,9 +356,9 @@ void DirectMlOnnxNetwork::Execute(ID3D12CommandList* list) {
   ctx_.WaitForFence(ctx_.fence(), fence_value);
 }
 
-uint64_t DirectMlOnnxNetwork::AddWeight(const OnnxValue& value, int value_index,
+uint64_t DirectMlOnnxNetwork::AddWeight(const OnnxValue& value,
                                         WeightLayout layout) {
-  const auto key = std::make_pair(value_index, layout);
+  const auto key = std::make_pair(value.name, layout);
   const auto found = weights_.find(key);
   if (found != weights_.end()) return found->second.offset;
 
@@ -397,12 +415,11 @@ void DirectMlOnnxNetwork::UploadWeights() {
 }
 
 void DirectMlOnnxNetwork::BuildProgram(int batch) {
-  const OnnxGraph graph(model_, batch);
+  const OnnxGraph model_graph(model_, batch);
   dml::Graph dml_graph(ctx_.dml_device());
   Program program;
   program.batch = batch;
-  // Every computed tensor, in its canonical sizes.
-  std::unordered_map<int, dml::Expression> expressions;
+  Expressions model_expressions;
 
   auto add_input = [&](DML_TENSOR_DATA_TYPE type, const Sizes& sizes,
                        DmlBindingRef binding) {
@@ -414,297 +431,432 @@ void DirectMlOnnxNetwork::BuildProgram(int batch) {
         dml_graph, static_cast<uint32_t>(program.op.bindings.size() - 1),
         description);
   };
-  auto weight_input = [&](int value_index, WeightLayout layout,
+  // One graph input for an initializer in one layout and size, however many
+  // nodes read it.
+  std::map<std::tuple<std::string, WeightLayout, Sizes>, dml::Expression>
+      weight_inputs;
+  auto weight_input = [&](const OnnxValue& value, WeightLayout layout,
                           const Sizes& sizes) {
-    const OnnxValue& value = graph.values()[value_index];
     if (!value.initializer) {
       throw Exception("directml-onnx: " + value.name +
                       " has to be an initializer.");
     }
+    const auto key = std::make_tuple(value.name, layout, sizes);
+    const auto found = weight_inputs.find(key);
+    if (found != weight_inputs.end()) return found->second;
     DmlBindingRef binding;
     binding.kind = DmlBindingRef::Kind::kWeight;
-    binding.weight.offset = AddWeight(value, value_index, layout);
-    return add_input(layout == WeightLayout::kIndices
-                         ? DML_TENSOR_DATA_TYPE_UINT32
-                         : DML_TENSOR_DATA_TYPE_FLOAT32,
-                     sizes, binding);
+    binding.weight.offset = AddWeight(value, layout);
+    const dml::Expression expression = add_input(
+        layout == WeightLayout::kIndices ? DML_TENSOR_DATA_TYPE_UINT32
+                                         : DML_TENSOR_DATA_TYPE_FLOAT32,
+        sizes, binding);
+    weight_inputs.emplace(key, expression);
+    return expression;
   };
 
   {
-    const int planes = graph.inputs().at(0);
+    const int planes = model_graph.inputs().at(0);
     DmlBindingRef binding;
     binding.kind = DmlBindingRef::Kind::kInput;
-    expressions.emplace(
-        planes, add_input(DML_TENSOR_DATA_TYPE_FLOAT32,
-                          Canonical(graph.values()[planes].dims, "the input"),
-                          binding));
+    model_expressions.emplace(
+        planes,
+        add_input(DML_TENSOR_DATA_TYPE_FLOAT32,
+                  Canonical(model_graph.values()[planes].dims, "the input"),
+                  binding));
   }
 
   const uint32_t ones[] = {1, 1};
   const dml::Span<const uint32_t> unit(ones, 2);
-  for (const OnnxNode& node : graph.nodes()) {
-    const std::string& op = node.op_type;
-    const std::string where = op + " node " + node.name;
-    const OnnxValue& output_value = graph.values()[node.outputs.at(0)];
-    // Shape arithmetic on integers was folded when the graph was loaded.
-    if (output_value.is_constant) continue;
-    const Sizes output_sizes = Canonical(output_value.dims, where);
-    const std::vector<int64_t>& input_dimensions =
-        graph.values()[node.inputs.at(0)].dims;
-    const size_t input_rank = input_dimensions.size();
-    auto computed = [&](size_t i) {
-      const auto found = expressions.find(node.inputs[i]);
-      if (found == expressions.end()) {
-        throw Exception("directml-onnx: " + where +
-                        " reads an initializer where only a computed tensor "
-                        "is translated yet.");
-      }
-      return found->second;
-    };
-    // An operand of an elementwise operator: aligned to the output's rank the
-    // way ONNX broadcasts, then repeated along the axes where it has size 1.
-    auto broadcast = [&](size_t i) {
-      const int value_index = node.inputs[i];
-      const OnnxValue& value = graph.values()[value_index];
-      std::vector<int64_t> aligned(output_value.dims.size() - value.dims.size(),
-                                   1);
-      aligned.insert(aligned.end(), value.dims.begin(), value.dims.end());
-      const Sizes sizes = Canonical(aligned, where);
-      const auto found = expressions.find(value_index);
-      return BroadcastTo(
-          found == expressions.end()
-              ? weight_input(value_index, WeightLayout::kPlain, sizes)
-              : Reshaped(found->second, sizes),
-          output_sizes, where);
-    };
+  // Translates every node of @graph, reading and extending @expressions. A
+  // Scan node calls it again for its body.
+  std::function<void(const OnnxGraph&, Expressions*)> translate =
+      [&](const OnnxGraph& graph, Expressions* expressions) {
+        for (const OnnxNode& node : graph.nodes()) {
+          const std::string& op = node.op_type;
+          const std::string where = op + " node " + node.name;
+          const OnnxValue& output_value = graph.values()[node.outputs.at(0)];
+          // Shape arithmetic on integers was folded when the graph was loaded.
+          if (output_value.is_constant) continue;
+          const Sizes output_sizes = Canonical(output_value.dims, where);
+          const std::vector<int64_t>& input_dimensions =
+              graph.values()[node.inputs.at(0)].dims;
+          const size_t input_rank = input_dimensions.size();
+          auto computed = [&](size_t i) {
+            const auto found = expressions->find(node.inputs[i]);
+            if (found == expressions->end()) {
+              throw Exception(
+                  "directml-onnx: " + where +
+                  " reads an initializer where only a computed tensor "
+                  "is translated yet.");
+            }
+            return found->second;
+          };
+          // An operand of an elementwise operator: aligned to the output's rank
+          // the way ONNX broadcasts, then repeated along the axes where it has
+          // size 1.
+          auto broadcast = [&](size_t i) {
+            const int value_index = node.inputs[i];
+            const OnnxValue& value = graph.values()[value_index];
+            std::vector<int64_t> aligned(
+                output_value.dims.size() - value.dims.size(), 1);
+            aligned.insert(aligned.end(), value.dims.begin(), value.dims.end());
+            const Sizes sizes = Canonical(aligned, where);
+            const auto found = expressions->find(value_index);
+            return BroadcastTo(
+                found == expressions->end()
+                    ? weight_input(value, WeightLayout::kPlain, sizes)
+                    : Reshaped(found->second, sizes),
+                output_sizes, where);
+          };
 
-    std::vector<dml::Expression> results;
-    if (op == "Conv") {
-      const OnnxValue& filter = graph.values()[node.inputs[1]];
-      const auto pads = node.IntsAttribute("pads");
-      const uint32_t start[] = {static_cast<uint32_t>(pads.at(0)),
-                                static_cast<uint32_t>(pads.at(1))};
-      const uint32_t end[] = {static_cast<uint32_t>(pads.at(2)),
-                              static_cast<uint32_t>(pads.at(3))};
-      dml::Optional<dml::Expression> bias;
-      if (node.inputs.size() > 2 && node.inputs[2] >= 0) {
-        bias = weight_input(node.inputs[2], WeightLayout::kChannelBias,
-                            {1, output_sizes[1], 1, 1});
-      }
-      results.push_back(
-          dml::Convolution(computed(0),
-                           weight_input(node.inputs[1], WeightLayout::kFilter,
-                                        Canonical(filter.dims, where)),
-                           bias, DML_CONVOLUTION_MODE_CROSS_CORRELATION,
-                           DML_CONVOLUTION_DIRECTION_FORWARD, unit, unit,
-                           dml::Span<const uint32_t>(start, 2),
-                           dml::Span<const uint32_t>(end, 2)));
-    } else if (op == "MatMul") {
-      const OnnxValue& right = graph.values()[node.inputs[1]];
-      if (right.initializer && right.dims.size() == 2) {
-        // A dense layer over the last axis: every row of [rows, K] times
-        // the weights [K, M], as one matrix multiply.
-        const uint32_t input_width = static_cast<uint32_t>(right.dims[0]);
-        const uint32_t output_width = static_cast<uint32_t>(right.dims[1]);
-        const dml::Expression operand = computed(0);
-        const uint32_t rows =
-            static_cast<uint32_t>(ElementCount(SizesOf(operand)) / input_width);
-        results.push_back(
-            dml::Gemm(Reshaped(operand, {1, 1, rows, input_width}),
-                      weight_input(node.inputs[1], WeightLayout::kPlain,
-                                   {1, 1, input_width, output_width})));
-      } else if ((input_rank == 3 || input_rank == 4) &&
-                 right.dims.size() == input_rank) {
-        // [..., A, K] by [..., K, B], the leading axes being the batch.
-        results.push_back(dml::Gemm(computed(0), computed(1)));
-      } else {
-        throw Exception("directml-onnx: " + where +
-                        " has operand ranks that are not translated yet.");
-      }
-    } else if (op == "Add") {
-      results.push_back(broadcast(0) + broadcast(1));
-    } else if (op == "Mul") {
-      results.push_back(broadcast(0) * broadcast(1));
-    } else if (op == "Sub") {
-      results.push_back(broadcast(0) - broadcast(1));
-    } else if (op == "Div") {
-      results.push_back(broadcast(0) / broadcast(1));
-    } else if (op == "Relu") {
-      results.push_back(dml::ActivationRelu(computed(0)));
-    } else if (op == "Sigmoid") {
-      results.push_back(dml::ActivationSigmoid(computed(0)));
-    } else if (op == "Softplus") {
-      results.push_back(dml::ActivationSoftplus(computed(0)));
-    } else if (op == "Tanh") {
-      results.push_back(dml::ActivationTanh(computed(0)));
-    } else if (op == "Mish") {
-      const dml::Expression operand = computed(0);
-      results.push_back(operand *
-                        dml::ActivationTanh(dml::ActivationSoftplus(operand)));
-    } else if (op == "Elu") {
-      results.push_back(
-          dml::ActivationElu(computed(0), node.FloatAttribute("alpha", 1.0f)));
-    } else if (op == "Exp") {
-      results.push_back(dml::Exp(computed(0)));
-    } else if (op == "Sqrt") {
-      results.push_back(dml::Sqrt(computed(0)));
-    } else if (op == "Reciprocal") {
-      results.push_back(dml::Recip(computed(0)));
-    } else if (op == "Identity") {
-      results.push_back(computed(0));
-    } else if (op == "Selu") {
-      // DirectML's scaled ELU defaults are the SELU constants.
-      results.push_back(dml::ActivationScaledElu(computed(0)));
-    } else if (op == "Softmax") {
-      const uint32_t axes[] = {
-          CanonicalAxis(input_rank, node.IntAttribute("axis", -1))};
-      results.push_back(dml::ActivationSoftmax(
-          computed(0), dml::Span<const uint32_t>(axes, 1)));
-    } else if (op == "ReduceMean") {
-      // The axes are an attribute up to opset 17 and an input from 18 on.
-      std::vector<int64_t> axes = node.IntsAttribute("axes");
-      if (axes.empty() && node.inputs.size() > 1 && node.inputs[1] >= 0) {
-        axes = graph.values()[node.inputs[1]].constant;
-      }
-      std::vector<uint32_t> reduced;
-      for (const int64_t axis : axes) {
-        reduced.push_back(CanonicalAxis(input_rank, axis));
-      }
-      results.push_back(dml::Reduce(
-          computed(0), DML_REDUCE_FUNCTION_AVERAGE,
-          dml::Span<const uint32_t>(reduced.data(), reduced.size())));
-    } else if (op == "GlobalAveragePool") {
-      const uint32_t board[] = {2, 3};
-      results.push_back(dml::Reduce(computed(0), DML_REDUCE_FUNCTION_AVERAGE,
-                                    dml::Span<const uint32_t>(board, 2)));
-    } else if (op == "LayerNormalization") {
-      // From reductions and elementwise operators, the way the native backend
-      // builds it.
-      int64_t first = node.IntAttribute("axis", -1);
-      if (first < 0) first += static_cast<int64_t>(input_rank);
-      std::vector<uint32_t> normalized;
-      for (size_t axis = first; axis < input_rank; ++axis) {
-        normalized.push_back(CanonicalAxis(input_rank, axis));
-      }
-      const dml::Span<const uint32_t> axes(normalized.data(),
-                                           normalized.size());
-      const dml::Expression operand = computed(0);
-      const dml::Expression centered =
-          operand -
-          BroadcastTo(dml::Reduce(operand, DML_REDUCE_FUNCTION_AVERAGE, axes),
-                      output_sizes, where);
-      const dml::Expression variance =
-          dml::Reduce(centered * centered, DML_REDUCE_FUNCTION_AVERAGE, axes);
-      dml::Expression result =
-          centered *
-          BroadcastTo(dml::Recip(dml::Sqrt(
-                          variance + node.FloatAttribute("epsilon", 1e-5f))),
-                      output_sizes, where);
-      if (node.inputs.size() > 1 && node.inputs[1] >= 0) {
-        result = result * broadcast(1);
-      }
-      if (node.inputs.size() > 2 && node.inputs[2] >= 0) {
-        result = result + broadcast(2);
-      }
-      results.push_back(result);
-    } else if (op == "Expand") {
-      // A copy, so that what reads it gets a dense tensor.
-      results.push_back(dml::Identity(broadcast(0)));
-    } else if (op == "Reshape" || op == "Squeeze") {
-      results.push_back(Reshaped(computed(0), output_sizes));
-    } else if (op == "Transpose") {
-      // A copy through a view that walks the input in the output's order.
-      const auto permutation = node.IntsAttribute("perm");
-      if (permutation.size() != input_rank) {
-        throw Exception("directml-onnx: " + where + " has no full perm.");
-      }
-      std::vector<uint32_t> dense(input_rank);
-      uint32_t stride = 1;
-      for (size_t i = input_rank; i-- > 0;) {
-        dense[i] = stride;
-        stride *= static_cast<uint32_t>(input_dimensions[i]);
-      }
-      // The axes Canonical() adds have size 1 and keep their dense stride.
-      Sizes strides(4);
-      stride = 1;
-      for (size_t i = 4; i-- > 0;) {
-        strides[i] = stride;
-        stride *= output_sizes[i];
-      }
-      for (size_t i = 0; i < input_rank; ++i) {
-        strides[CanonicalAxis(input_rank, i)] = dense[permutation[i]];
-      }
-      results.push_back(dml::Identity(dml::Reinterpret(
-          computed(0), DML_TENSOR_DATA_TYPE_FLOAT32,
-          dml::TensorDimensions(output_sizes.begin(), output_sizes.end()),
-          dml::TensorStrides(strides.begin(), strides.end()))));
-    } else if (op == "Slice") {
-      if (node.inputs.size() != 3) {
-        throw Exception("directml-onnx: " + where +
-                        " has axes or steps, which are not translated yet.");
-      }
-      // Without an axes input the bounds cover the leading axes.
-      const auto& starts = graph.values()[node.inputs[1]].constant;
-      const auto& ends = graph.values()[node.inputs[2]].constant;
-      if (starts.size() != ends.size() || starts.size() > input_rank) {
-        throw Exception("directml-onnx: " + where + " has malformed bounds.");
-      }
-      Sizes offsets(4, 0);
-      Sizes window = SizesOf(computed(0));
-      for (size_t i = 0; i < starts.size(); ++i) {
-        const int64_t size = input_dimensions[i];
-        const int64_t first = std::clamp<int64_t>(
-            starts[i] < 0 ? starts[i] + size : starts[i], 0, size);
-        const int64_t last = std::clamp<int64_t>(
-            ends[i] < 0 ? ends[i] + size : ends[i], 0, size);
-        offsets[CanonicalAxis(input_rank, i)] = static_cast<uint32_t>(first);
-        window[CanonicalAxis(input_rank, i)] =
-            static_cast<uint32_t>(last - first);
-      }
-      const int32_t steps[] = {1, 1, 1, 1};
-      results.push_back(dml::Slice(computed(0),
-                                   dml::Span<const uint32_t>(offsets.data(), 4),
-                                   dml::Span<const uint32_t>(window.data(), 4),
-                                   dml::Span<const int32_t>(steps, 4)));
-    } else if (op == "Concat") {
-      std::vector<dml::Expression> parts;
-      for (size_t i = 0; i < node.inputs.size(); ++i) {
-        parts.push_back(computed(i));
-      }
-      results.push_back(dml::Join(
-          dml::Span<const dml::Expression>(parts.data(), parts.size()),
-          CanonicalAxis(input_rank, node.IntAttribute("axis", 0))));
-    } else if (op == "Split") {
-      int64_t axis = node.IntAttribute("axis", 0);
-      if (axis < 0) axis += static_cast<int64_t>(input_rank);
-      std::vector<uint32_t> parts;
-      for (const int output : node.outputs) {
-        parts.push_back(
-            static_cast<uint32_t>(graph.values()[output].dims[axis]));
-      }
-      results =
-          dml::Split(computed(0), CanonicalAxis(input_rank, axis),
-                     dml::Span<const uint32_t>(parts.data(), parts.size()));
-    } else if (op == "Gather") {
-      const OnnxValue& indices = graph.values()[node.inputs[1]];
-      results.push_back(dml::Gather(
-          computed(0),
-          weight_input(node.inputs[1], WeightLayout::kIndices,
-                       {1, 1, 1, static_cast<uint32_t>(indices.dims.at(0))}),
-          CanonicalAxis(input_rank, node.IntAttribute("axis", 0)), 1));
-    } else {
-      throw Exception("directml-onnx: " + where + " is not translated yet.");
-    }
-    for (size_t i = 0; i < results.size(); ++i) {
-      const OnnxValue& value = graph.values()[node.outputs[i]];
-      const Sizes expected = Canonical(value.dims, where);
-      if (ElementCount(SizesOf(results[i])) != ElementCount(expected)) {
-        throw Exception("directml-onnx: " + where +
-                        " was translated to the wrong size.");
-      }
-      expressions.emplace(node.outputs[i], Reshaped(results[i], expected));
-    }
-  }
+          std::vector<dml::Expression> results;
+          if (op == "Conv") {
+            const OnnxValue& filter = graph.values()[node.inputs[1]];
+            const auto pads = node.IntsAttribute("pads");
+            const uint32_t start[] = {static_cast<uint32_t>(pads.at(0)),
+                                      static_cast<uint32_t>(pads.at(1))};
+            const uint32_t end[] = {static_cast<uint32_t>(pads.at(2)),
+                                    static_cast<uint32_t>(pads.at(3))};
+            dml::Optional<dml::Expression> bias;
+            if (node.inputs.size() > 2 && node.inputs[2] >= 0) {
+              bias = weight_input(graph.values()[node.inputs[2]],
+                                  WeightLayout::kChannelBias,
+                                  {1, output_sizes[1], 1, 1});
+            }
+            results.push_back(
+                dml::Convolution(computed(0),
+                                 weight_input(graph.values()[node.inputs[1]],
+                                              WeightLayout::kFilter,
+                                              Canonical(filter.dims, where)),
+                                 bias, DML_CONVOLUTION_MODE_CROSS_CORRELATION,
+                                 DML_CONVOLUTION_DIRECTION_FORWARD, unit, unit,
+                                 dml::Span<const uint32_t>(start, 2),
+                                 dml::Span<const uint32_t>(end, 2)));
+          } else if (op == "MatMul") {
+            const OnnxValue& right = graph.values()[node.inputs[1]];
+            if (right.initializer && right.dims.size() == 2) {
+              // A dense layer over the last axis: every row of [rows, K] times
+              // the weights [K, M], as one matrix multiply.
+              const uint32_t input_width = static_cast<uint32_t>(right.dims[0]);
+              const uint32_t output_width =
+                  static_cast<uint32_t>(right.dims[1]);
+              const dml::Expression operand = computed(0);
+              const uint32_t rows = static_cast<uint32_t>(
+                  ElementCount(SizesOf(operand)) / input_width);
+              results.push_back(
+                  dml::Gemm(Reshaped(operand, {1, 1, rows, input_width}),
+                            weight_input(graph.values()[node.inputs[1]],
+                                         WeightLayout::kPlain,
+                                         {1, 1, input_width, output_width})));
+            } else if ((input_rank == 3 || input_rank == 4) &&
+                       right.dims.size() == input_rank) {
+              // [..., A, K] by [..., K, B], the leading axes being the batch.
+              results.push_back(dml::Gemm(computed(0), computed(1)));
+            } else {
+              throw Exception(
+                  "directml-onnx: " + where +
+                  " has operand ranks that are not translated yet.");
+            }
+          } else if (op == "Add") {
+            results.push_back(broadcast(0) + broadcast(1));
+          } else if (op == "Mul") {
+            results.push_back(broadcast(0) * broadcast(1));
+          } else if (op == "Sub") {
+            results.push_back(broadcast(0) - broadcast(1));
+          } else if (op == "Div") {
+            results.push_back(broadcast(0) / broadcast(1));
+          } else if (op == "Greater") {
+            results.push_back(dml::GreaterThan(broadcast(0), broadcast(1)));
+          } else if (op == "Where") {
+            results.push_back(
+                dml::If(broadcast(0), broadcast(1), broadcast(2)));
+          } else if (op == "Relu") {
+            results.push_back(dml::ActivationRelu(computed(0)));
+          } else if (op == "Sigmoid") {
+            results.push_back(dml::ActivationSigmoid(computed(0)));
+          } else if (op == "Softplus") {
+            results.push_back(dml::ActivationSoftplus(computed(0)));
+          } else if (op == "Tanh") {
+            results.push_back(dml::ActivationTanh(computed(0)));
+          } else if (op == "Mish") {
+            const dml::Expression operand = computed(0);
+            results.push_back(operand * dml::ActivationTanh(
+                                            dml::ActivationSoftplus(operand)));
+          } else if (op == "Elu") {
+            results.push_back(dml::ActivationElu(
+                computed(0), node.FloatAttribute("alpha", 1.0f)));
+          } else if (op == "Exp") {
+            results.push_back(dml::Exp(computed(0)));
+          } else if (op == "Sqrt") {
+            results.push_back(dml::Sqrt(computed(0)));
+          } else if (op == "Reciprocal") {
+            results.push_back(dml::Recip(computed(0)));
+          } else if (op == "Identity") {
+            results.push_back(computed(0));
+          } else if (op == "Selu") {
+            // DirectML's scaled ELU defaults are the SELU constants.
+            results.push_back(dml::ActivationScaledElu(computed(0)));
+          } else if (op == "Softmax") {
+            const uint32_t axes[] = {
+                CanonicalAxis(input_rank, node.IntAttribute("axis", -1))};
+            results.push_back(dml::ActivationSoftmax(
+                computed(0), dml::Span<const uint32_t>(axes, 1)));
+          } else if (op == "ReduceMean") {
+            // The axes are an attribute up to opset 17 and an input from 18 on.
+            std::vector<int64_t> axes = node.IntsAttribute("axes");
+            if (axes.empty() && node.inputs.size() > 1 && node.inputs[1] >= 0) {
+              axes = graph.values()[node.inputs[1]].constant;
+            }
+            std::vector<uint32_t> reduced;
+            for (const int64_t axis : axes) {
+              reduced.push_back(CanonicalAxis(input_rank, axis));
+            }
+            results.push_back(dml::Reduce(
+                computed(0), DML_REDUCE_FUNCTION_AVERAGE,
+                dml::Span<const uint32_t>(reduced.data(), reduced.size())));
+          } else if (op == "GlobalAveragePool") {
+            const uint32_t board[] = {2, 3};
+            results.push_back(dml::Reduce(computed(0),
+                                          DML_REDUCE_FUNCTION_AVERAGE,
+                                          dml::Span<const uint32_t>(board, 2)));
+          } else if (op == "LayerNormalization") {
+            // From reductions and elementwise operators, the way the native
+            // backend builds it.
+            int64_t first = node.IntAttribute("axis", -1);
+            if (first < 0) first += static_cast<int64_t>(input_rank);
+            std::vector<uint32_t> normalized;
+            for (size_t axis = first; axis < input_rank; ++axis) {
+              normalized.push_back(CanonicalAxis(input_rank, axis));
+            }
+            const dml::Span<const uint32_t> axes(normalized.data(),
+                                                 normalized.size());
+            const dml::Expression operand = computed(0);
+            const dml::Expression centered =
+                operand -
+                BroadcastTo(
+                    dml::Reduce(operand, DML_REDUCE_FUNCTION_AVERAGE, axes),
+                    output_sizes, where);
+            const dml::Expression variance = dml::Reduce(
+                centered * centered, DML_REDUCE_FUNCTION_AVERAGE, axes);
+            dml::Expression result =
+                centered *
+                BroadcastTo(
+                    dml::Recip(dml::Sqrt(
+                        variance + node.FloatAttribute("epsilon", 1e-5f))),
+                    output_sizes, where);
+            if (node.inputs.size() > 1 && node.inputs[1] >= 0) {
+              result = result * broadcast(1);
+            }
+            if (node.inputs.size() > 2 && node.inputs[2] >= 0) {
+              result = result + broadcast(2);
+            }
+            results.push_back(result);
+          } else if (op == "Expand") {
+            // A copy, so that what reads it gets a dense tensor.
+            results.push_back(dml::Identity(broadcast(0)));
+          } else if (op == "Reshape" || op == "Squeeze") {
+            results.push_back(Reshaped(computed(0), output_sizes));
+          } else if (op == "Transpose") {
+            // A copy through a view that walks the input in the output's order.
+            const auto permutation = node.IntsAttribute("perm");
+            if (permutation.size() != input_rank) {
+              throw Exception("directml-onnx: " + where + " has no full perm.");
+            }
+            std::vector<uint32_t> dense(input_rank);
+            uint32_t stride = 1;
+            for (size_t i = input_rank; i-- > 0;) {
+              dense[i] = stride;
+              stride *= static_cast<uint32_t>(input_dimensions[i]);
+            }
+            // The axes Canonical() adds have size 1 and keep their dense
+            // stride.
+            Sizes strides(4);
+            stride = 1;
+            for (size_t i = 4; i-- > 0;) {
+              strides[i] = stride;
+              stride *= output_sizes[i];
+            }
+            for (size_t i = 0; i < input_rank; ++i) {
+              strides[CanonicalAxis(input_rank, i)] = dense[permutation[i]];
+            }
+            results.push_back(dml::Identity(dml::Reinterpret(
+                computed(0), DML_TENSOR_DATA_TYPE_FLOAT32,
+                dml::TensorDimensions(output_sizes.begin(), output_sizes.end()),
+                dml::TensorStrides(strides.begin(), strides.end()))));
+          } else if (op == "Slice") {
+            if (node.inputs.size() != 3) {
+              throw Exception(
+                  "directml-onnx: " + where +
+                  " has axes or steps, which are not translated yet.");
+            }
+            // Without an axes input the bounds cover the leading axes.
+            const auto& starts = graph.values()[node.inputs[1]].constant;
+            const auto& ends = graph.values()[node.inputs[2]].constant;
+            if (starts.size() != ends.size() || starts.size() > input_rank) {
+              throw Exception("directml-onnx: " + where +
+                              " has malformed bounds.");
+            }
+            Sizes offsets(4, 0);
+            Sizes window = SizesOf(computed(0));
+            for (size_t i = 0; i < starts.size(); ++i) {
+              const int64_t size = input_dimensions[i];
+              const int64_t first = std::clamp<int64_t>(
+                  starts[i] < 0 ? starts[i] + size : starts[i], 0, size);
+              const int64_t last = std::clamp<int64_t>(
+                  ends[i] < 0 ? ends[i] + size : ends[i], 0, size);
+              offsets[CanonicalAxis(input_rank, i)] =
+                  static_cast<uint32_t>(first);
+              window[CanonicalAxis(input_rank, i)] =
+                  static_cast<uint32_t>(last - first);
+            }
+            const int32_t steps[] = {1, 1, 1, 1};
+            results.push_back(dml::Slice(
+                computed(0), dml::Span<const uint32_t>(offsets.data(), 4),
+                dml::Span<const uint32_t>(window.data(), 4),
+                dml::Span<const int32_t>(steps, 4)));
+          } else if (op == "Concat") {
+            std::vector<dml::Expression> parts;
+            for (size_t i = 0; i < node.inputs.size(); ++i) {
+              parts.push_back(computed(i));
+            }
+            results.push_back(dml::Join(
+                dml::Span<const dml::Expression>(parts.data(), parts.size()),
+                CanonicalAxis(input_rank, node.IntAttribute("axis", 0))));
+          } else if (op == "Split") {
+            int64_t axis = node.IntAttribute("axis", 0);
+            if (axis < 0) axis += static_cast<int64_t>(input_rank);
+            std::vector<uint32_t> parts;
+            for (const int output : node.outputs) {
+              parts.push_back(
+                  static_cast<uint32_t>(graph.values()[output].dims[axis]));
+            }
+            results = dml::Split(
+                computed(0), CanonicalAxis(input_rank, axis),
+                dml::Span<const uint32_t>(parts.data(), parts.size()));
+          } else if (op == "Gather") {
+            const OnnxValue& indices = graph.values()[node.inputs[1]];
+            results.push_back(dml::Gather(
+                computed(0),
+                weight_input(
+                    graph.values()[node.inputs[1]], WeightLayout::kIndices,
+                    {1, 1, 1, static_cast<uint32_t>(indices.dims.at(0))}),
+                CanonicalAxis(input_rank, node.IntAttribute("axis", 0)), 1));
+          } else if (op == "Scan") {
+            // Unrolled: the body is translated once for every step of the scan.
+            const OnnxGraph& body = *node.body;
+            const size_t state_count =
+                node.inputs.size() -
+                static_cast<size_t>(node.IntAttribute("num_scan_inputs", 0));
+            for (const char* directions :
+                 {"scan_input_directions", "scan_output_directions"}) {
+              for (const int64_t reversed : node.IntsAttribute(directions)) {
+                if (reversed) {
+                  throw Exception(
+                      "directml-onnx: " + where +
+                      " scans in reverse, which is not translated yet.");
+                }
+              }
+            }
+            auto scan_axis = [](const std::vector<int64_t>& axes, size_t i,
+                                size_t rank) {
+              const int64_t axis = i < axes.size() ? axes[i] : 0;
+              return static_cast<size_t>(
+                  axis < 0 ? axis + static_cast<int64_t>(rank) : axis);
+            };
+
+            // Every scanned input, cut into its steps.
+            const auto input_axes = node.IntsAttribute("scan_input_axes");
+            std::vector<std::vector<dml::Expression>> steps;
+            size_t length = 0;
+            for (size_t i = state_count; i < node.inputs.size(); ++i) {
+              const std::vector<int64_t>& scanned =
+                  graph.values()[node.inputs[i]].dims;
+              const size_t axis =
+                  scan_axis(input_axes, i - state_count, scanned.size());
+              length = static_cast<size_t>(scanned[axis]);
+              const std::vector<uint32_t> parts(length, 1);
+              steps.push_back(dml::Split(
+                  computed(i), CanonicalAxis(scanned.size(), axis),
+                  dml::Span<const uint32_t>(parts.data(), parts.size())));
+            }
+
+            // What the body reads from this graph by name, other than
+            // initializers.
+            std::vector<bool> is_local(body.values().size(), false);
+            for (const int input : body.inputs()) is_local[input] = true;
+            for (const OnnxNode& inner : body.nodes()) {
+              for (const int output : inner.outputs) is_local[output] = true;
+            }
+            Expressions outer;
+            for (size_t index = 0; index < body.values().size(); ++index) {
+              if (is_local[index]) continue;
+              const auto found =
+                  expressions->find(graph.FindValue(body.values()[index].name));
+              if (found != expressions->end()) {
+                outer.emplace(static_cast<int>(index), found->second);
+              }
+            }
+
+            std::vector<dml::Expression> states;
+            for (size_t i = 0; i < state_count; ++i)
+              states.push_back(computed(i));
+            std::vector<std::vector<dml::Expression>> stacked(
+                node.outputs.size() - state_count);
+            for (size_t step = 0; step < length; ++step) {
+              Expressions inner = outer;
+              for (size_t i = 0; i < node.inputs.size(); ++i) {
+                const int input = body.inputs()[i];
+                inner.emplace(
+                    input,
+                    Reshaped(i < state_count ? states[i]
+                                             : steps[i - state_count][step],
+                             Canonical(body.values()[input].dims, where)));
+              }
+              translate(body, &inner);
+              for (size_t i = 0; i < node.outputs.size(); ++i) {
+                const dml::Expression produced = inner.at(body.outputs()[i]);
+                if (i < state_count) {
+                  states[i] = produced;
+                } else {
+                  stacked[i - state_count].push_back(produced);
+                }
+              }
+            }
+
+            results = states;
+            const auto output_axes = node.IntsAttribute("scan_output_axes");
+            for (size_t i = 0; i < stacked.size(); ++i) {
+              // Each step is one slice of the output along its scan axis.
+              std::vector<int64_t> slice =
+                  graph.values()[node.outputs[state_count + i]].dims;
+              const size_t axis = scan_axis(output_axes, i, slice.size());
+              slice[axis] = 1;
+              const Sizes sizes = Canonical(slice, where);
+              for (dml::Expression& part : stacked[i])
+                part = Reshaped(part, sizes);
+              results.push_back(
+                  dml::Join(dml::Span<const dml::Expression>(stacked[i].data(),
+                                                             stacked[i].size()),
+                            CanonicalAxis(slice.size(), axis)));
+            }
+          } else {
+            throw Exception("directml-onnx: " + where +
+                            " is not translated yet.");
+          }
+          for (size_t i = 0; i < results.size(); ++i) {
+            const OnnxValue& value = graph.values()[node.outputs[i]];
+            const Sizes expected = Canonical(value.dims, where);
+            if (ElementCount(SizesOf(results[i])) != ElementCount(expected)) {
+              throw Exception("directml-onnx: " + where +
+                              " was translated to the wrong size.");
+            }
+            expressions->emplace(node.outputs[i],
+                                 Reshaped(results[i], expected));
+          }
+        }
+      };
+  translate(model_graph, &model_expressions);
 
   std::vector<dml::Expression> outputs;
   std::vector<uint64_t> output_bytes;
@@ -712,11 +864,11 @@ void DirectMlOnnxNetwork::BuildProgram(int batch) {
   for (const std::string* name :
        {&policy_name_, &value_name_, &moves_left_name_}) {
     if (name->empty()) continue;
-    const int value_index = graph.FindValue(*name);
-    if (value_index < 0 || !expressions.count(value_index)) {
+    const int value_index = model_graph.FindValue(*name);
+    if (value_index < 0 || !model_expressions.count(value_index)) {
       throw Exception("directml-onnx: output " + *name + " was not built.");
     }
-    outputs.push_back(expressions.at(value_index));
+    outputs.push_back(model_expressions.at(value_index));
     output_bytes.push_back(
         outputs.back().Impl()->GetOutputDesc().totalTensorSizeInBytes);
     program.output_offsets.push_back(offset);
@@ -732,7 +884,6 @@ void DirectMlOnnxNetwork::BuildProgram(int batch) {
   program.op.transient_bytes =
       program.op.op->GetBindingProperties().TemporaryResourceSize;
   transient_bytes_ = std::max(transient_bytes_, program.op.transient_bytes);
-  ctx_.GetOrCreateBindingTable(program.op.op.Get());
   programs_.push_back(std::move(program));
 }
 
