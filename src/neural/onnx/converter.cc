@@ -1709,6 +1709,13 @@ void Converter::MakeMovesLeftHead(pblczero::OnnxModel* onnx,
 
 void Converter::GenerateOnnx(pblczero::OnnxModel* onnx) {
   MultiHeadWeights weights(src_.weights());
+  // The dense positional-encoding embedding reads its normalisation weights
+  // unconditionally, so a net without them is refused here, as the blas
+  // backend refuses it, instead of being read past the end.
+  ValidateEmbeddingNormWeights(
+      weights, NumEncBlocks() > 0 &&
+                   src_.format().network_format().input_embedding() ==
+                       pblczero::NetworkFormat::INPUT_EMBEDDING_PE_DENSE);
   OnnxBuilder builder(options_.opset, options_.ir);
 
   if (GetDataType() == pblczero::TensorProto::FLOAT16) {
