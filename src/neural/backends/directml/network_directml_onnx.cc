@@ -26,7 +26,9 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <span>
 #include <unordered_map>
+#include <version>
 
 #include "neural/backends/directml/dml_common.h"
 #include "neural/backends/directml/layers.h"
@@ -37,12 +39,9 @@
 #include "utils/bititer.h"
 #include "utils/exception.h"
 
-// <span> and <version> first, as in layers.cc: DirectMLX.h only uses
+// After <span> and <version>, as in layers.cc: DirectMLX.h only uses
 // std::span when __cpp_lib_span is already visible.
 #include <DirectMLX.h>
-
-#include <span>
-#include <version>
 
 namespace lczero {
 namespace directml_backend {
