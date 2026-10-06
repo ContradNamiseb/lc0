@@ -55,14 +55,12 @@ enum class WeightLayout {
   kPlain,        // The ONNX shape, as four dimensions.
   kFilter,       // A convolution filter, already [M, C, H, W].
   kChannelBias,  // [M] as [1, M, 1, 1].
-  kDenseFilter,  // MatMul weights [K, M] as a 1x1 filter [M, K, 1, 1].
   kIndices,      // Gather indices as UINT32 [1, 1, 1, count].
 };
 
 // Every tensor is stored dense, in ONNX element order, as four dimensions:
 // [N, C, H, W] as it is, [A, B, C] as [1, A, B, C], [A, B] as [A, B, 1, 1]
-// (which makes a dense layer a 1x1 convolution over B) and [K] as
-// [1, K, 1, 1]. A reshape is then only a new set of sizes.
+// and [K] as [1, K, 1, 1]. A reshape is then only a new set of sizes.
 Sizes Canonical(const std::vector<int64_t>& dimensions,
                 const std::string& where) {
   auto at = [&](size_t i) { return static_cast<uint32_t>(dimensions[i]); };
@@ -190,7 +188,11 @@ void PrintPatterns(const OnnxGraph& graph, const std::string& prefix) {
     for (const auto& attribute : node.proto->attribute()) {
       if (attribute.name() == "body") continue;
       key += " " + std::string(attribute.name()) + "=";
-      if (attribute.ints().empty()) key += std::to_string(attribute.i());
+      if (attribute.has_f()) {
+        key += std::to_string(attribute.f());
+      } else if (attribute.ints().empty()) {
+        key += std::to_string(attribute.i());
+      }
       for (const int64_t value : attribute.ints()) {
         key += std::to_string(value) + ",";
       }
@@ -350,20 +352,6 @@ uint64_t DirectMlOnnxNetwork::AddWeight(const OnnxValue& value, int value_index,
                       " are not float32.");
     }
     weight.bytes.assign(raw.begin(), raw.end());
-    if (layout == WeightLayout::kDenseFilter) {
-      // [K, M] row-major to [M, K].
-      const size_t rows = value.dims[0];
-      const size_t columns = value.dims[1];
-      std::vector<float> from(rows * columns);
-      std::memcpy(from.data(), raw.data(), from.size() * sizeof(float));
-      std::vector<float> to(from.size());
-      for (size_t row = 0; row < rows; ++row) {
-        for (size_t column = 0; column < columns; ++column) {
-          to[column * rows + row] = from[row * columns + column];
-        }
-      }
-      std::memcpy(weight.bytes.data(), to.data(), weight.bytes.size());
-    }
   }
   weight.offset = weight_bytes_;
   weight_bytes_ += AlignUp(weight.bytes.size());
@@ -450,6 +438,8 @@ void DirectMlOnnxNetwork::BuildProgram(int batch) {
     const std::string& op = node.op_type;
     const std::string where = op + " node " + node.name;
     const OnnxValue& output_value = graph.values()[node.outputs.at(0)];
+    // Shape arithmetic on integers was folded when the graph was loaded.
+    if (output_value.is_constant) continue;
     const Sizes output_sizes = Canonical(output_value.dims, where);
     const std::vector<int64_t>& input_dimensions =
         graph.values()[node.inputs.at(0)].dims;
@@ -504,19 +494,20 @@ void DirectMlOnnxNetwork::BuildProgram(int batch) {
     } else if (op == "MatMul") {
       const OnnxValue& right = graph.values()[node.inputs[1]];
       if (right.initializer && right.dims.size() == 2) {
-        // A dense layer over the last axis is a 1x1 convolution over
-        // [rows, K, 1, 1].
+        // A dense layer over the last axis: every row of [rows, K] times
+        // the weights [K, M], as one matrix multiply.
         const uint32_t input_width = static_cast<uint32_t>(right.dims[0]);
         const uint32_t output_width = static_cast<uint32_t>(right.dims[1]);
-        const dml::Expression x = computed(0);
+        const dml::Expression operand = computed(0);
         const uint32_t rows =
-            static_cast<uint32_t>(ElementCount(SizesOf(x)) / input_width);
-        results.push_back(dml::Convolution(
-            Reshaped(x, {rows, input_width, 1, 1}),
-            weight_input(node.inputs[1], WeightLayout::kDenseFilter,
-                         {output_width, input_width, 1, 1})));
-      } else if (input_rank == 3 && right.dims.size() == 3) {
-        // [1, N, A, K] by [1, N, K, B].
+            static_cast<uint32_t>(ElementCount(SizesOf(operand)) / input_width);
+        results.push_back(
+            dml::Gemm(Reshaped(operand, {1, 1, rows, input_width}),
+                      weight_input(node.inputs[1], WeightLayout::kPlain,
+                                   {1, 1, input_width, output_width})));
+      } else if ((input_rank == 3 || input_rank == 4) &&
+                 right.dims.size() == input_rank) {
+        // [..., A, K] by [..., K, B], the leading axes being the batch.
         results.push_back(dml::Gemm(computed(0), computed(1)));
       } else {
         throw Exception("directml-onnx: " + where +
@@ -538,6 +529,21 @@ void DirectMlOnnxNetwork::BuildProgram(int batch) {
       results.push_back(dml::ActivationSoftplus(computed(0)));
     } else if (op == "Tanh") {
       results.push_back(dml::ActivationTanh(computed(0)));
+    } else if (op == "Mish") {
+      const dml::Expression operand = computed(0);
+      results.push_back(operand *
+                        dml::ActivationTanh(dml::ActivationSoftplus(operand)));
+    } else if (op == "Elu") {
+      results.push_back(
+          dml::ActivationElu(computed(0), node.FloatAttribute("alpha", 1.0f)));
+    } else if (op == "Exp") {
+      results.push_back(dml::Exp(computed(0)));
+    } else if (op == "Sqrt") {
+      results.push_back(dml::Sqrt(computed(0)));
+    } else if (op == "Reciprocal") {
+      results.push_back(dml::Recip(computed(0)));
+    } else if (op == "Identity") {
+      results.push_back(computed(0));
     } else if (op == "Selu") {
       // DirectML's scaled ELU defaults are the SELU constants.
       results.push_back(dml::ActivationScaledElu(computed(0)));
@@ -554,7 +560,44 @@ void DirectMlOnnxNetwork::BuildProgram(int batch) {
       results.push_back(dml::Reduce(
           computed(0), DML_REDUCE_FUNCTION_AVERAGE,
           dml::Span<const uint32_t>(reduced.data(), reduced.size())));
-    } else if (op == "Reshape") {
+    } else if (op == "GlobalAveragePool") {
+      const uint32_t board[] = {2, 3};
+      results.push_back(dml::Reduce(computed(0), DML_REDUCE_FUNCTION_AVERAGE,
+                                    dml::Span<const uint32_t>(board, 2)));
+    } else if (op == "LayerNormalization") {
+      // From reductions and elementwise operators, the way the native backend
+      // builds it.
+      int64_t first = node.IntAttribute("axis", -1);
+      if (first < 0) first += static_cast<int64_t>(input_rank);
+      std::vector<uint32_t> normalized;
+      for (size_t axis = first; axis < input_rank; ++axis) {
+        normalized.push_back(CanonicalAxis(input_rank, axis));
+      }
+      const dml::Span<const uint32_t> axes(normalized.data(),
+                                           normalized.size());
+      const dml::Expression operand = computed(0);
+      const dml::Expression centered =
+          operand -
+          BroadcastTo(dml::Reduce(operand, DML_REDUCE_FUNCTION_AVERAGE, axes),
+                      output_sizes, where);
+      const dml::Expression variance =
+          dml::Reduce(centered * centered, DML_REDUCE_FUNCTION_AVERAGE, axes);
+      dml::Expression result =
+          centered *
+          BroadcastTo(dml::Recip(dml::Sqrt(
+                          variance + node.FloatAttribute("epsilon", 1e-5f))),
+                      output_sizes, where);
+      if (node.inputs.size() > 1 && node.inputs[1] >= 0) {
+        result = result * broadcast(1);
+      }
+      if (node.inputs.size() > 2 && node.inputs[2] >= 0) {
+        result = result + broadcast(2);
+      }
+      results.push_back(result);
+    } else if (op == "Expand") {
+      // A copy, so that what reads it gets a dense tensor.
+      results.push_back(dml::Identity(broadcast(0)));
+    } else if (op == "Reshape" || op == "Squeeze") {
       results.push_back(Reshaped(computed(0), output_sizes));
     } else if (op == "Transpose") {
       // A copy through a view that walks the input in the output's order.

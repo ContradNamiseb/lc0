@@ -115,6 +115,14 @@ std::vector<int64_t> OnnxNode::IntsAttribute(
   return {};
 }
 
+float OnnxNode::FloatAttribute(std::string_view attribute_name,
+                               float default_value) const {
+  for (const auto& attribute : proto->attribute()) {
+    if (attribute.name() == attribute_name) return attribute.f();
+  }
+  return default_value;
+}
+
 const std::vector<std::string>& OnnxGraph::SupportedOperators() {
   static const std::vector<std::string> kOperators = {"Add",
                                                       "Cast",

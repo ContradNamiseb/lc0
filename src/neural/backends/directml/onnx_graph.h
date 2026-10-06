@@ -63,6 +63,8 @@ struct OnnxNode {
   int64_t IntAttribute(std::string_view attribute_name,
                        int64_t default_value) const;
   std::vector<int64_t> IntsAttribute(std::string_view attribute_name) const;
+  float FloatAttribute(std::string_view attribute_name,
+                       float default_value) const;
 };
 
 class OnnxGraph {
