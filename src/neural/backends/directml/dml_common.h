@@ -247,6 +247,7 @@ class DmlDescriptorPool {
     stride_ = device->GetDescriptorHandleIncrementSize(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     capacity_ = capacity;
+    cursor_ = 0;
   }
 
   // Reserves count consecutive slots. 64 slots per binding table is far more
@@ -283,6 +284,8 @@ class DmlDescriptorPool {
   // permanently reserved.
 
   ID3D12DescriptorHeap* heap() const { return heap_.Get(); }
+  uint32_t capacity() const { return capacity_; }
+  uint32_t taken() const { return cursor_; }
 
  private:
   ComPtr<ID3D12DescriptorHeap> heap_;
@@ -349,6 +352,11 @@ class DmlDeviceContext {
   // rewritten (CPU-side, immediate) only after the previous batch's GPU
   // work has completed.
   IDMLBindingTable* GetOrCreateBindingTable(IDMLCompiledOperator* op);
+  // Replaces the descriptor pool by one of @capacity slots when that is more
+  // than it has. A graph translated from ONNX can need tens of thousands of
+  // descriptors, which is only known once it is compiled. The tables keep
+  // their slots for good, so this has to come before the first of them.
+  void ReserveDescriptors(uint64_t capacity);
   IDMLDevice* dml_device() const { return dml_device_.Get(); }
 
   // DirectML compiles GEMMs and convolutions to vendor meta-commands by

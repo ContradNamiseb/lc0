@@ -1150,6 +1150,20 @@ DmlHalf::operator float() const { return F16BitsToF32(bits); }
 
 // Implemented in network_directml.cc (device bring-up lives there, like the
 // CUDA backend's device discovery in network_cuda.cc).
+void DmlDeviceContext::ReserveDescriptors(uint64_t capacity) {
+  if (capacity <= descriptors_.capacity()) return;
+  if (descriptors_.taken() != 0) {
+    throw Exception(
+        "directml backend: the descriptor pool cannot grow once a binding "
+        "table has taken slots from it");
+  }
+  if (capacity > D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_1) {
+    throw Exception("directml backend: " + std::to_string(capacity) +
+                    " descriptors are more than one Direct3D 12 heap holds");
+  }
+  descriptors_.Create(device_.Get(), static_cast<uint32_t>(capacity));
+}
+
 IDMLBindingTable* DmlDeviceContext::GetOrCreateBindingTable(
     IDMLCompiledOperator* op) {
   auto it = tables_.find(op);
