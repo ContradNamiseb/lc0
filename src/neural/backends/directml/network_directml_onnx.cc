@@ -273,8 +273,16 @@ DirectMlOnnxNetwork::DirectMlOnnxNetwork(const WeightsFile& file,
                     file.format().network_format().output(),
                     file.format().network_format().moves_left()} {
   ctx_.Init(options);
-  const WeightsFile converted =
-      ConvertWeightsToOnnx(file, WeightsToOnnxConverterOptions());
+  // The converter's own switches, under the names the onnx backends give
+  // them, so that every form it can emit can be run through the translation.
+  WeightsToOnnxConverterOptions converter_options;
+  converter_options.opset =
+      options.GetOrDefault<int>("opset", converter_options.opset);
+  converter_options.alt_mish = options.GetOrDefault<bool>("alt_mish", false);
+  converter_options.alt_layernorm =
+      options.GetOrDefault<bool>("alt_layernorm", false);
+  converter_options.alt_selu = options.GetOrDefault<bool>("alt_selu", false);
+  const WeightsFile converted = ConvertWeightsToOnnx(file, converter_options);
   const auto& onnx = converted.onnx_model();
   model_.ParseFromString(onnx.model());
   policy_name_ = std::string(onnx.output_policy());
@@ -553,8 +561,13 @@ void DirectMlOnnxNetwork::BuildProgram(int batch) {
       results.push_back(dml::ActivationSoftmax(
           computed(0), dml::Span<const uint32_t>(axes, 1)));
     } else if (op == "ReduceMean") {
+      // The axes are an attribute up to opset 17 and an input from 18 on.
+      std::vector<int64_t> axes = node.IntsAttribute("axes");
+      if (axes.empty() && node.inputs.size() > 1 && node.inputs[1] >= 0) {
+        axes = graph.values()[node.inputs[1]].constant;
+      }
       std::vector<uint32_t> reduced;
-      for (const int64_t axis : node.IntsAttribute("axes")) {
+      for (const int64_t axis : axes) {
         reduced.push_back(CanonicalAxis(input_rank, axis));
       }
       results.push_back(dml::Reduce(
