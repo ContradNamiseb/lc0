@@ -52,6 +52,16 @@
 namespace lczero {
 namespace {
 
+// The position encoding table as one vector, row after row.
+std::vector<float> PosEncodingValues() {
+  std::vector<float> values;
+  values.reserve(64 * kNumPosEncodingChannels);
+  for (const auto& row : kPosEncoding) {
+    values.insert(values.end(), std::begin(row), std::end(row));
+  }
+  return values;
+}
+
 // Traversal order of the 64 squares for each KdaDirection value. Kept in
 // sync with the identical function of the same name in
 // src/neural/backends/blas/network_blas.cc (itself commented "Must match
@@ -1220,9 +1230,7 @@ std::string Converter::AttentionBodyMapEmbedding(OnnxBuilder* builder,
         "/attn_body/pad/expand", pad,
         builder->AddInitializer(
             "/const/pos_encoding",
-            *GetWeghtsConverter(
-                std::vector<float>(kPosEncoding[0], kPosEncoding[0] + 64 * 64),
-                {1, 64 * 64})));
+            *GetWeghtsConverter(PosEncodingValues(), {1, 64 * 64})));
 
     pad = builder->Reshape(
         "/attn_body/pad/reshape_out", pad,
@@ -1240,9 +1248,7 @@ std::string Converter::AttentionBodyMapEmbedding(OnnxBuilder* builder,
         "/attn_body/expand",
         builder->AddInitializer(
             "/const/pos_encoding",
-            *GetWeghtsConverter(
-                std::vector<float>(kPosEncoding[0], kPosEncoding[0] + 64 * 64),
-                {1, 64, 64})),
+            *GetWeghtsConverter(PosEncodingValues(), {1, 64, 64})),
         pad);
   } else {
     pad = builder->AddInitializer(
@@ -1252,9 +1258,7 @@ std::string Converter::AttentionBodyMapEmbedding(OnnxBuilder* builder,
         "/attn_body/expand",
         builder->AddInitializer(
             "/const/pos_encoding",
-            *GetWeghtsConverter(
-                std::vector<float>(kPosEncoding[0], kPosEncoding[0] + 64 * 64),
-                {1, 64, 64})),
+            *GetWeghtsConverter(PosEncodingValues(), {1, 64, 64})),
         pad);
   }
   flow = builder->Concat("/attn_body/padded_input", {flow, pad}, 2);
