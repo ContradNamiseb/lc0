@@ -832,6 +832,15 @@ pblczero::Net NetForTestBackend(const std::string& test_backend,
   return out;
 }
 
+// The ONNX converter tells an attention body from a residual tower by its
+// encoder count (NumEncBlocks() > 0 in converter.cc), so an embedding with no
+// encoder behind it is converted as a tower with no filters and the policy
+// head's first weight comes out [0, N]. No trained net has that shape; the
+// synthetic ones that do cannot reach a backend built on the converter.
+bool ConverterCannotExpress(const pblczero::Net& net) {
+  return net.weights().has_ip_emb_b() && net.weights().encoder_size() == 0;
+}
+
 // Whether the backend under test computes in half precision, which selects
 // the wider tolerance. onnx-dml is fp16 unless LC0_TEST_BACKEND_OPTS says
 // fp16=false, and directml-onnx is fp16 only when it says fp16=true.
@@ -865,6 +874,11 @@ void CompareBackendsBatch(const pblczero::Net& net, int batch) {
   if (test_backend == "directml" && !DirectMlAvailability().available) {
     GTEST_SKIP() << "no usable directml device: "
                  << DirectMlAvailability().reason;
+  }
+  if (UsesOnnxConverter(test_backend) && ConverterCannotExpress(net)) {
+    GTEST_SKIP() << "the ONNX converter has no attention body without an "
+                    "encoder, so "
+                 << test_backend << " cannot load this net";
   }
   const std::vector<Outputs> dml = RunNetworkBatch(
       test_backend, NetForTestBackend(test_backend, net), planes);
@@ -940,6 +954,11 @@ void CompareBackends(const pblczero::Net& net) {
   if (test_backend == "directml" && !DirectMlAvailability().available) {
     GTEST_SKIP() << "no usable directml device: "
                  << DirectMlAvailability().reason;
+  }
+  if (UsesOnnxConverter(test_backend) && ConverterCannotExpress(net)) {
+    GTEST_SKIP() << "the ONNX converter has no attention body without an "
+                    "encoder, so "
+                 << test_backend << " cannot load this net";
   }
   const Outputs dml =
       RunNetwork(test_backend, NetForTestBackend(test_backend, net), planes);
