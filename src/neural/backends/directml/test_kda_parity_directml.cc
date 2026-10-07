@@ -797,12 +797,13 @@ inline void AssertFiniteOutputs(const Outputs& o, const char* who) {
 // allowed; anything else not on this list fails loudly instead of quietly
 // passing for the wrong reason.
 void ValidateTestBackendChoice(const std::string& test_backend) {
-  static const std::set<std::string> kAllowed = {"directml", "directml-fp16",
-                                                 "eigen", "onnx-dml"};
+  static const std::set<std::string> kAllowed = {
+      "directml", "directml-fp16", "directml-onnx", "eigen", "onnx-dml"};
   if (kAllowed.find(test_backend) == kAllowed.end()) {
     FAIL() << "LC0_TEST_BACKEND=" << test_backend
-           << " is not on the allowed list (directml, directml-fp16, eigen, "
-              "onnx-dml) -- comparing the blas reference against itself (or "
+           << " is not on the allowed list (directml, directml-fp16, "
+              "directml-onnx, eigen, onnx-dml) -- comparing the blas "
+              "reference against itself (or "
               "any other unrecognized backend) would make every parity "
               "assertion in this suite trivially pass without testing "
               "anything.";
@@ -812,14 +813,19 @@ void ValidateTestBackendChoice(const std::string& test_backend) {
 // The net as the backend under test receives it. The ONNX converter has no
 // INPUT_EMBEDDING_NONE case for an attention body, while the blas reference
 // computes that label exactly as PE_MAP (network_blas.cc only branches on
-// PE_DENSE), so it is relabeled for onnx-dml; the synthetic nets here nearly
-// all say NONE and would otherwise never reach the converter.
+// PE_DENSE), so it is relabeled for the two backends built on the converter,
+// onnx-dml and directml-onnx; the synthetic nets here nearly all say NONE and
+// would otherwise never reach the converter.
+bool UsesOnnxConverter(const std::string& test_backend) {
+  return test_backend == "onnx-dml" || test_backend == "directml-onnx";
+}
+
 pblczero::Net NetForTestBackend(const std::string& test_backend,
                                 const pblczero::Net& net) {
   using NF = pblczero::NetworkFormat;
   pblczero::Net out = net;
   auto* nf = out.mutable_format()->mutable_network_format();
-  if (test_backend == "onnx-dml" &&
+  if (UsesOnnxConverter(test_backend) &&
       nf->input_embedding() == NF::INPUT_EMBEDDING_NONE) {
     nf->set_input_embedding(NF::INPUT_EMBEDDING_PE_MAP);
   }
@@ -828,13 +834,14 @@ pblczero::Net NetForTestBackend(const std::string& test_backend,
 
 // Whether the backend under test computes in half precision, which selects
 // the wider tolerance. onnx-dml is fp16 unless LC0_TEST_BACKEND_OPTS says
-// fp16=false.
+// fp16=false, and directml-onnx is fp16 only when it says fp16=true.
 bool TestBackendIsHalfPrecision(const std::string& test_backend) {
   if (test_backend == "directml-fp16") return true;
-  if (test_backend != "onnx-dml") return false;
+  const bool is_half_by_default = test_backend == "onnx-dml";
+  if (!is_half_by_default && test_backend != "directml-onnx") return false;
   OptionsDict options;
   ApplyTestBackendOpts(&options);
-  return options.GetOrDefault<bool>("fp16", true);
+  return options.GetOrDefault<bool>("fp16", is_half_by_default);
 }
 
 void CompareBackendsBatch(const pblczero::Net& net, int batch) {
