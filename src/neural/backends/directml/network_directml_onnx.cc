@@ -40,6 +40,7 @@
 #include "neural/onnx/converter.h"
 #include "utils/bititer.h"
 #include "utils/exception.h"
+#include "utils/fp16_utils.h"
 #include "utils/logging.h"
 
 // After <span> and <version>, as in layers.cc: DirectMLX.h only uses
@@ -116,6 +117,43 @@ DML_TENSOR_DATA_TYPE TensorType(pblczero::TensorProto::DataType data_type,
 dml::Expression CastTo(dml::Expression input, DML_TENSOR_DATA_TYPE type) {
   if (input.Impl()->GetOutputDesc().dataType == type) return input;
   return dml::Cast(input, type);
+}
+
+// The nodes of @graph that compute in half precision under kda_safe: all but
+// the scans, the node that produces @value_output, and whatever those read,
+// directly or through other nodes. Nothing that stays in single precision
+// reads a half-precision tensor, so the only conversions are downwards.
+std::vector<bool> HalfPrecisionNodes(const OnnxGraph& graph, int value_output) {
+  const std::vector<OnnxNode>& nodes = graph.nodes();
+  std::vector<int> producer(graph.values().size(), -1);
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    for (const int output : nodes[i].outputs) {
+      producer[output] = static_cast<int>(i);
+    }
+  }
+  std::vector<bool> is_half(nodes.size(), true);
+  // The values still to be traced back to what computes them.
+  std::vector<int> pending;
+  auto keep_single = [&](size_t i) {
+    is_half[i] = false;
+    for (const int input : nodes[i].inputs) pending.push_back(input);
+    if (!nodes[i].body) return;
+    // And what a loop body takes from this graph by name.
+    for (const OnnxValue& inner : nodes[i].body->values()) {
+      pending.push_back(graph.FindValue(inner.name));
+    }
+  };
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    if (nodes[i].op_type == "Scan") keep_single(i);
+  }
+  pending.push_back(value_output);
+  while (!pending.empty()) {
+    const int value = pending.back();
+    pending.pop_back();
+    if (value < 0 || producer[value] < 0 || !is_half[producer[value]]) continue;
+    keep_single(static_cast<size_t>(producer[value]));
+  }
+  return is_half;
 }
 
 Sizes SizesOf(const dml::Expression& expression) {
@@ -269,7 +307,9 @@ class DirectMlOnnxNetwork : public Network {
   };
 
   void BuildProgram(int batch);
-  uint64_t AddWeight(const OnnxValue& value, WeightLayout layout);
+  // @as_half stores float32 weights as float16, for a node that computes in
+  // half precision in a model converted in single.
+  uint64_t AddWeight(const OnnxValue& value, WeightLayout layout, bool as_half);
   void UploadWeights();
   void Execute(ID3D12CommandList* list);
 
@@ -280,10 +320,13 @@ class DirectMlOnnxNetwork : public Network {
   std::string value_name_;
   std::string moves_left_name_;
   bool is_wdl_ = false;
+  // Half precision with the recurrence, the value head and what feeds them
+  // left in single, the openvino backend's kda_safe.
+  bool kda_safe_ = false;
   int max_batch_ = 0;
 
   std::vector<Program> programs_;
-  std::map<std::pair<std::string, WeightLayout>, Weight> weights_;
+  std::map<std::tuple<std::string, WeightLayout, bool>, Weight> weights_;
   uint64_t weight_bytes_ = 0;
   uint64_t output_bytes_ = 0;
   uint64_t transient_bytes_ = 0;
@@ -311,11 +354,34 @@ DirectMlOnnxNetwork::DirectMlOnnxNetwork(const WeightsFile& file,
   converter_options.alt_layernorm =
       options.GetOrDefault<bool>("alt_layernorm", false);
   converter_options.alt_selu = options.GetOrDefault<bool>("alt_selu", false);
-  if (options.GetOrDefault<bool>("fp16", false)) {
+  const bool fp16 = options.GetOrDefault<bool>("fp16", false);
+  // Read whether or not it applies, so that it is never an unknown option.
+  const bool kda_safe_given = options.Exists<bool>("kda_safe");
+  const bool kda_safe_wanted = options.GetOrDefault<bool>("kda_safe", true);
+  const WeightsFile converted = [&] {
+    WeightsFile single = ConvertWeightsToOnnx(file, converter_options);
+    if (!fp16) return single;
+    // Half precision anywhere in the trunk of a network with a KDA recurrence
+    // evaluates some positions wrongly: kda-native-935532 returned a draw for
+    // a won position, here and through ONNX Runtime alike. So such a network
+    // takes kda_safe unless told otherwise, as it does in the openvino
+    // backend, and keeps the single-precision model to compute its trunk from.
+    pblczero::ModelProto model;
+    model.ParseFromString(single.onnx_model().model());
+    const auto& nodes = model.graph().node();
+    const bool has_recurrence =
+        std::any_of(nodes.begin(), nodes.end(),
+                    [](const auto& node) { return node.op_type() == "Scan"; });
+    kda_safe_ = kda_safe_given ? kda_safe_wanted : has_recurrence;
+    if (kda_safe_) return single;
+    if (has_recurrence) {
+      CERR << "directml-onnx: fp16 without kda_safe on a network with a KDA "
+              "recurrence evaluates some positions wrongly.";
+    }
     converter_options.data_type =
         WeightsToOnnxConverterOptions::DataType::kFloat16;
-  }
-  const WeightsFile converted = ConvertWeightsToOnnx(file, converter_options);
+    return ConvertWeightsToOnnx(file, converter_options);
+  }();
   const auto& onnx = converted.onnx_model();
   model_.ParseFromString(onnx.model());
   policy_name_ = std::string(onnx.output_policy());
@@ -384,8 +450,8 @@ void DirectMlOnnxNetwork::Execute(ID3D12CommandList* list) {
 }
 
 uint64_t DirectMlOnnxNetwork::AddWeight(const OnnxValue& value,
-                                        WeightLayout layout) {
-  const auto key = std::make_pair(value.name, layout);
+                                        WeightLayout layout, bool as_half) {
+  const auto key = std::make_tuple(value.name, layout, as_half);
   const auto found = weights_.find(key);
   if (found != weights_.end()) return found->second.offset;
 
@@ -405,7 +471,18 @@ uint64_t DirectMlOnnxNetwork::AddWeight(const OnnxValue& value,
       throw Exception("directml-onnx: weights " + value.name +
                       " are neither float32 nor float16.");
     }
-    weight.bytes.assign(raw.begin(), raw.end());
+    if (as_half && value.data_type == pblczero::TensorProto::FLOAT) {
+      weight.bytes.resize(raw.size() / sizeof(float) * sizeof(uint16_t));
+      for (size_t i = 0; i < raw.size() / sizeof(float); ++i) {
+        float single;
+        std::memcpy(&single, raw.data() + i * sizeof(float), sizeof(float));
+        const uint16_t half = FP32toFP16(single);
+        std::memcpy(weight.bytes.data() + i * sizeof(uint16_t), &half,
+                    sizeof(uint16_t));
+      }
+    } else {
+      weight.bytes.assign(raw.begin(), raw.end());
+    }
   }
   weight.offset = weight_bytes_;
   weight_bytes_ += AlignUp(weight.bytes.size());
@@ -459,9 +536,24 @@ void DirectMlOnnxNetwork::BuildProgram(int batch) {
         dml_graph, static_cast<uint32_t>(program.op.bindings.size() - 1),
         description);
   };
-  // One graph input for an initializer in one layout and size, however many
-  // nodes read it.
-  std::map<std::tuple<std::string, WeightLayout, Sizes>, dml::Expression>
+  // Under kda_safe, the nodes that compute in half precision and whether the
+  // node being translated is one. A Scan never is, nor is anything in its body.
+  std::vector<bool> half_nodes;
+  if (kda_safe_) {
+    half_nodes =
+        HalfPrecisionNodes(model_graph, model_graph.FindValue(value_name_));
+    if (programs_.empty()) {
+      CERR << "directml-onnx: kda_safe keeps "
+           << std::count(half_nodes.begin(), half_nodes.end(), false) << " of "
+           << half_nodes.size()
+           << " nodes in fp32 (the recurrence, the value head and what feeds "
+              "them); the rest computes in fp16.";
+    }
+  }
+  bool is_half_node = false;
+  // One graph input for an initializer in one layout, size and precision,
+  // however many nodes read it.
+  std::map<std::tuple<std::string, WeightLayout, Sizes, bool>, dml::Expression>
       weight_inputs;
   auto weight_input = [&](const OnnxValue& value, WeightLayout layout,
                           const Sizes& sizes) {
@@ -469,19 +561,39 @@ void DirectMlOnnxNetwork::BuildProgram(int batch) {
       throw Exception("directml-onnx: " + value.name +
                       " has to be an initializer.");
     }
-    const auto key = std::make_tuple(value.name, layout, sizes);
+    const bool as_half = is_half_node && layout != WeightLayout::kIndices &&
+                         value.data_type == pblczero::TensorProto::FLOAT;
+    const auto key = std::make_tuple(value.name, layout, sizes, as_half);
     const auto found = weight_inputs.find(key);
     if (found != weight_inputs.end()) return found->second;
     DmlBindingRef binding;
     binding.kind = DmlBindingRef::Kind::kWeight;
-    binding.weight.offset = AddWeight(value, layout);
-    const dml::Expression expression =
-        add_input(layout == WeightLayout::kIndices
-                      ? DML_TENSOR_DATA_TYPE_UINT32
-                      : TensorType(value.data_type, value.name),
-                  sizes, binding);
+    binding.weight.offset = AddWeight(value, layout, as_half);
+    DML_TENSOR_DATA_TYPE type = DML_TENSOR_DATA_TYPE_UINT32;
+    if (as_half) {
+      type = DML_TENSOR_DATA_TYPE_FLOAT16;
+    } else if (layout != WeightLayout::kIndices) {
+      type = TensorType(value.data_type, value.name);
+    }
+    const dml::Expression expression = add_input(type, sizes, binding);
     weight_inputs.emplace(key, expression);
     return expression;
+  };
+  // A tensor as the node being translated reads it: a half-precision node
+  // reads one computed in single precision through a conversion, made once
+  // however many such nodes read it.
+  Expressions halved;
+  auto in_precision = [&](int value_index, const dml::Expression& expression) {
+    if (!is_half_node || expression.Impl()->GetOutputDesc().dataType !=
+                             DML_TENSOR_DATA_TYPE_FLOAT32) {
+      return expression;
+    }
+    const auto found = halved.find(value_index);
+    if (found != halved.end()) return found->second;
+    return halved
+        .emplace(value_index,
+                 dml::Cast(expression, DML_TENSOR_DATA_TYPE_FLOAT16))
+        .first->second;
   };
 
   {
@@ -501,10 +613,15 @@ void DirectMlOnnxNetwork::BuildProgram(int batch) {
   // The node being translated, to name it when DirectML refuses an operator.
   std::string current;
   // Translates every node of @graph, reading and extending @expressions. A
-  // Scan node calls it again for its body.
-  std::function<void(const OnnxGraph&, Expressions*)> translate =
-      [&](const OnnxGraph& graph, Expressions* expressions) {
-        for (const OnnxNode& node : graph.nodes()) {
+  // Scan node calls it again for its body. @half says which nodes compute in
+  // half precision, none when it is null.
+  std::function<void(const OnnxGraph&, Expressions*, const std::vector<bool>*)>
+      translate = [&](const OnnxGraph& graph, Expressions* expressions,
+                      const std::vector<bool>* half) {
+        for (size_t node_index = 0; node_index < graph.nodes().size();
+             ++node_index) {
+          const OnnxNode& node = graph.nodes()[node_index];
+          is_half_node = half && (*half)[node_index];
           const std::string& op = node.op_type;
           const std::string where = op + " node " + node.name;
           current = where;
@@ -523,7 +640,7 @@ void DirectMlOnnxNetwork::BuildProgram(int batch) {
                   " reads an initializer where only a computed tensor "
                   "is translated yet.");
             }
-            return found->second;
+            return in_precision(node.inputs[i], found->second);
           };
           // An operand of an elementwise operator: aligned to the output's rank
           // the way ONNX broadcasts, then repeated along the axes where it has
@@ -539,7 +656,7 @@ void DirectMlOnnxNetwork::BuildProgram(int batch) {
             return BroadcastTo(
                 found == expressions->end()
                     ? weight_input(value, WeightLayout::kPlain, sizes)
-                    : Reshaped(found->second, sizes),
+                    : Reshaped(in_precision(value_index, found->second), sizes),
                 output_sizes, where);
           };
 
@@ -850,7 +967,7 @@ void DirectMlOnnxNetwork::BuildProgram(int batch) {
                                              : steps[i - state_count][step],
                              Canonical(body.values()[input].dims, where)));
               }
-              translate(body, &inner);
+              translate(body, &inner, nullptr);
               for (size_t i = 0; i < node.outputs.size(); ++i) {
                 const dml::Expression produced = inner.at(body.outputs()[i]);
                 if (i < state_count) {
@@ -894,7 +1011,8 @@ void DirectMlOnnxNetwork::BuildProgram(int batch) {
         }
       };
   try {
-    translate(model_graph, &model_expressions);
+    translate(model_graph, &model_expressions,
+              kda_safe_ ? &half_nodes : nullptr);
   } catch (const Exception&) {
     throw;
   } catch (const std::exception& error) {

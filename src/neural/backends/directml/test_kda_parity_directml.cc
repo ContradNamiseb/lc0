@@ -609,9 +609,8 @@ Outputs RunNetwork(const std::string& backend, const WeightsFile& weights,
 // Runs a whole batch and returns EVERY sample, not just the first.
 std::vector<Outputs> RunNetworkBatch(const std::string& backend,
                                      const WeightsFile& weights,
-                                     const std::vector<InputPlanes>& planes) {
-  OptionsDict options;
-  ApplyTestBackendOpts(&options);
+                                     const std::vector<InputPlanes>& planes,
+                                     const OptionsDict& options) {
   auto network = NetworkFactory::Get()->Create(backend, weights, options);
   auto computation = network->NewComputation();
   for (const auto& p : planes) computation->AddInput(InputPlanes(p));
@@ -627,6 +626,15 @@ std::vector<Outputs> RunNetworkBatch(const std::string& backend,
     }
   }
   return out;
+}
+
+// The same with the options LC0_TEST_BACKEND_OPTS gives.
+std::vector<Outputs> RunNetworkBatch(const std::string& backend,
+                                     const WeightsFile& weights,
+                                     const std::vector<InputPlanes>& planes) {
+  OptionsDict options;
+  ApplyTestBackendOpts(&options);
+  return RunNetworkBatch(backend, weights, planes, options);
 }
 
 bool HasBackend(const std::string& name) {
@@ -4133,6 +4141,43 @@ TEST(DirectMlOnnxGraph, LoadsARealNet) {
     const directml_backend::OnnxGraph graph(model, 16);
     ExpectFullyInferred(graph, 16, true);
   }
+}
+
+// kda_safe keeps the value head and everything it reads in single precision,
+// so with fp16 the value comes out exactly as it does without, while the
+// policy and moves-left heads compute in half precision and move by its
+// rounding. A node of the trunk put on the wrong side would show in the value.
+TEST(DirectMlOnnxGraph, KdaSafeKeepsTheValueInSinglePrecision) {
+  if (!HasBackend("directml-onnx")) {
+    GTEST_SKIP() << "directml-onnx backend not compiled in";
+  }
+  if (!DirectMlAvailability().available) {
+    GTEST_SKIP() << "no usable directml device: "
+                 << DirectMlAvailability().reason;
+  }
+  const pblczero::Net net = NetForTestBackend("directml-onnx", MakeKdaMlhNet());
+  const std::vector<InputPlanes> planes = EncodeDistinctPositions(4);
+  OptionsDict single_options;
+  OptionsDict safe_options;
+  safe_options.Set<bool>("fp16", true);
+  const std::vector<Outputs> single =
+      RunNetworkBatch("directml-onnx", net, planes, single_options);
+  const std::vector<Outputs> safe =
+      RunNetworkBatch("directml-onnx", net, planes, safe_options);
+  bool policy_moved = false;
+  for (size_t n = 0; n < planes.size(); ++n) {
+    EXPECT_EQ(safe[n].q, single[n].q) << "sample " << n;
+    EXPECT_EQ(safe[n].d, single[n].d) << "sample " << n;
+    float absmax = 0.0f, worst = 0.0f;
+    for (int i = 0; i < 1858; ++i) {
+      absmax = std::max(absmax, std::fabs(single[n].policy[i]));
+      worst =
+          std::max(worst, std::fabs(safe[n].policy[i] - single[n].policy[i]));
+    }
+    EXPECT_LT(worst, ScaledOutputBound(absmax, true)) << "sample " << n;
+    policy_moved = policy_moved || worst > 0.0f;
+  }
+  EXPECT_TRUE(policy_moved) << "no node computed in half precision";
 }
 
 }  // namespace
