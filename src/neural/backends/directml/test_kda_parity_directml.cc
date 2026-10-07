@@ -752,6 +752,16 @@ inline float ScaledOutputBound(float reference_scale, bool fp16 = false) {
   return std::max(abs_tol, scale_tol * std::fabs(reference_scale));
 }
 
+// How far below its own best move the reference may put the move the backend
+// picked. Nothing in single precision: a different move fails. In half
+// precision two logits the reference separates by less than twice the bound
+// each is held to can trade places with both still inside it, and the nearly
+// flat policies of the synthetic nets do: onnx-dml and directml-onnx both
+// answer 0.02194 for one move where blas has 0.02189 for its best, another.
+inline float AllowedBestMoveGap(float reference_scale, bool fp16 = false) {
+  return fp16 ? 2.0f * ScaledOutputBound(reference_scale, true) : 0.0f;
+}
+
 // F5 (agora thread 19 #560, codex-sol's independent review): the worst-diff
 // and argmax searches below both rely on `>` comparisons (`diff > worst`,
 // `policy[i] > policy[best]`), and a NaN operand makes every such comparison
@@ -921,7 +931,8 @@ void CompareBackendsBatch(const pblczero::Net& net, int batch) {
       if (dml[n].policy[i] > dml[n].policy[dml_best]) dml_best = i;
       if (reference[n].policy[i] > reference[n].policy[ref_best]) ref_best = i;
     }
-    EXPECT_EQ(dml_best, ref_best)
+    EXPECT_LE(reference[n].policy[ref_best] - reference[n].policy[dml_best],
+              AllowedBestMoveGap(ref_absmax, fp16_bound))
         << "sample " << n << ": policy argmax differs, directml picks "
         << dml_best << " (logit " << dml[n].policy[dml_best] << "), blas picks "
         << ref_best << " (logit " << reference[n].policy[ref_best] << ")";
@@ -1036,7 +1047,8 @@ void CompareBackends(const pblczero::Net& net) {
     if (dml.policy[i] > dml.policy[dml_best]) dml_best = i;
     if (reference.policy[i] > reference.policy[ref_best]) ref_best = i;
   }
-  EXPECT_EQ(dml_best, ref_best)
+  EXPECT_LE(reference.policy[ref_best] - reference.policy[dml_best],
+            AllowedBestMoveGap(ref_absmax, fp16_bound))
       << "policy argmax differs: directml picks move index " << dml_best
       << " (logit " << dml.policy[dml_best] << "), blas picks " << ref_best
       << " (logit " << reference.policy[ref_best] << ")";
