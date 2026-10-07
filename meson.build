@@ -1091,13 +1091,25 @@ if get_option('gtest')
     # backends) compiled straight into the executable: backend registration
     # happens in static initializers inside each backend object, so archive
     # linking would drop the unreferenced registration objects.
-    test('KdaParityDirectML',
-      executable('kda_parity_test_directml',
-                 'src/neural/backends/directml/test_kda_parity_directml.cc',
-                 files,
-        include_directories: includes + include_directories('third_party/directml'),
-        dependencies: [deps, gtest]),
+    kda_parity_test_directml = executable('kda_parity_test_directml',
+      'src/neural/backends/directml/test_kda_parity_directml.cc',
+      files,
+      include_directories: includes + include_directories('third_party/directml'),
+      dependencies: [deps, gtest])
+    test('KdaParityDirectML', kda_parity_test_directml,
       args: '--gtest_output=xml:kda_parity_directml.xml', timeout: 600)
+    # The same suite with the backend that translates the converter's ONNX
+    # graph under test, in single and in half precision. One at a time: each
+    # run compiles every net for the GPU, and three at once outlast the timeout.
+    test('KdaParityDirectMLOnnx', kda_parity_test_directml,
+      args: '--gtest_output=xml:kda_parity_directml_onnx.xml',
+      env: ['LC0_TEST_BACKEND=directml-onnx'], is_parallel: false,
+      timeout: 900)
+    test('KdaParityDirectMLOnnxHalf', kda_parity_test_directml,
+      args: '--gtest_output=xml:kda_parity_directml_onnx_half.xml',
+      env: ['LC0_TEST_BACKEND=directml-onnx',
+            'LC0_TEST_BACKEND_OPTS=fp16=true'],
+      is_parallel: false, timeout: 900)
   endif
 endif
 
