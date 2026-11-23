@@ -971,6 +971,28 @@ if get_option('build_backends')
       endif
   endif
 
+  ## ~~~~~~~~~~
+  ## OpenVINO
+  ## ~~~~~~~~~~
+  if get_option('openvino')
+    openvino_lib = cc.find_library('openvino', dirs: get_option('openvino_libdirs'),
+                                   required: false)
+    if openvino_lib.found()
+      deps += openvino_lib
+      includes += include_directories(get_option('openvino_include'), is_system: true)
+      files += 'src/neural/backends/openvino/network_openvino.cc'
+      files += 'src/neural/backends/openvino/kda_scan_op.cc'
+      files += 'src/neural/backends/openvino/kda_scan_pass.cc'
+      files += 'src/neural/backends/openvino/se_residual_op.cc'
+      files += 'src/neural/backends/openvino/se_residual_pass.cc'
+      has_backends = true
+    else
+      error('openvino requested but libopenvino was not found in ' +
+            ','.join(get_option('openvino_libdirs')) +
+            ' -- fix openvino_libdirs/openvino_include or drop -Dopenvino.')
+    endif
+  endif
+
 endif # if get_option('build_backends')
 
 if not has_backends and get_option('lc0') and get_option('build_backends')
