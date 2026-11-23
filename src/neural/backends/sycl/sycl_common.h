@@ -57,29 +57,5 @@ void CublasError(int status, const char* file, const int& line);
 
 inline int DivUp(int a, int b) { return (a + b - 1) / b; }
 
-// Compile-time precision traits for SyclNetwork<Precision>.
-// DataType is the inter-layer activation buffer type (float or sycl::half);
-// kEnableInt8 enables W8A8 DP4A INT8 execution for quantized trunk layers.
-struct SyclFp32 {
-  using DataType = float;
-  static constexpr bool kEnableInt8 = false;
-  static constexpr const char* kBackendSuffix = "";
-};
-
-struct SyclFp16 {
-  using DataType = sycl::half;
-  static constexpr bool kEnableInt8 = false;
-  static constexpr const char* kBackendSuffix = "-fp16";
-};
-
-struct SyclInt8 {
-  using DataType = sycl::half;
-  using WeightType = int8_t;
-  using ActType = uint8_t;
-  using AccType = int32_t;
-  static constexpr bool kEnableInt8 = true;
-  static constexpr const char* kBackendSuffix = "-int8";
-};
-
 }  // namespace sycldnn_backend
 }  // namespace lczero
