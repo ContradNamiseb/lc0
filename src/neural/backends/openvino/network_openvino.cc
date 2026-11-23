@@ -144,12 +144,13 @@ class OpenVinoNetwork : public Network {
   int GetMiniBatchSize() const override {
     // The batch the search gathers before evaluating when the user leaves
     // MinibatchSize at 0 (wrapper.cc surfaces this as recommended_batch_size).
-    // 256 is the Network base-class default; returning kMaxBatchSize (1024)
-    // here padded most default-config inferences up to 1024 rows of real GPU
-    // work and quadrupled max_out_of_order on a backend whose per-inference
-    // latency is already its weak spot. Custom-layer JIT shapes are handled
-    // by BucketBatch()/batch_buckets_, not by a large suggested minibatch.
+    // When static batching (batch=N) is enabled, match that exact batch size so
+    // search batches land on 1x static GPU inference without padding waste.
+    if (fixed_batch_ > 0) return fixed_batch_;
     return 256;
+  }
+  int GetPreferredBatchStep() const override {
+    return fixed_batch_ > 0 ? fixed_batch_ : 1;
   }
   bool IsCpu() const override { return is_cpu_; }
 
@@ -187,6 +188,7 @@ class OpenVinoNetwork : public Network {
     profile_infers_++;
   }
   int min_batch() const { return min_batch_; }
+  int fixed_batch() const { return fixed_batch_; }
   bool is_ir_model() const { return is_ir_model_; }
   // Test seam: this instance's private config directory, as a string.
   const std::string& config_dir() const { return config_dir_string_; }
@@ -220,7 +222,7 @@ class OpenVinoNetwork : public Network {
     std::lock_guard<std::mutex> lock(io_mutex_);
     if (free_inputs_outputs_.empty()) {
       return std::make_unique<InputsOutputs>(
-          kMaxBatchSize, compiled_model_.create_infer_request());
+          io_capacity_, compiled_model_.create_infer_request());
     }
     auto io = std::move(free_inputs_outputs_.front());
     free_inputs_outputs_.pop_front();
@@ -260,6 +262,11 @@ class OpenVinoNetwork : public Network {
   std::filesystem::path config_dir_;
   std::string config_dir_string_;
   int min_batch_ = 4;
+  // Static batch size selected via `batch=N` (0 = dynamic -1 batch). Static
+  // shapes let OpenVINO's Intel GPU plugin select its fastest fused DP4A INT8
+  // and static FP16 kernels instead of dynamic-shape fallback dispatches.
+  int fixed_batch_ = 0;
+  int io_capacity_ = kMaxBatchSize;
   // Ascending batch shapes the search is allowed to use, and which warmup
   // pre-compiles. Empty means "no bucketing" -- see BucketBatch().
   std::vector<int> batch_buckets_;
@@ -320,6 +327,51 @@ void OpenVinoNetworkComputation::AddInput(InputPlanes&& input) {
 void OpenVinoNetworkComputation::ComputeBlocking() {
   if (batch_size_ == 0) return;
 
+  const auto& ports = network_->ports();
+  const size_t val_width = has_wdl_ ? InputsOutputs::kValueWidth : size_t{1};
+
+  if (network_->fixed_batch() > 0) {
+    const int fb = network_->fixed_batch();
+    const size_t nb = static_cast<size_t>(fb);
+    const int padded_total = ((batch_size_ + fb - 1) / fb) * fb;
+    if (padded_total > batch_size_) {
+      std::memset(io_->input_val_mem_ +
+                      static_cast<size_t>(batch_size_) * kInputPlanes * 64,
+                  0,
+                  static_cast<size_t>(padded_total - batch_size_) *
+                      kInputPlanes * 64 * sizeof(float));
+    }
+    for (int offset = 0; offset < batch_size_; offset += fb) {
+      // Contiguous host tensor with exact dense strides (zero memcpy, zero heap
+      // alloc; works identically for ir_path and ONNX-converted models).
+      ov::Tensor chunk_in(
+          ov::element::f32, {nb, kInputPlanes, 8, 8},
+          io_->input_val_mem_ +
+              static_cast<size_t>(offset) * kInputPlanes * 64);
+      io_->infer_request_.set_input_tensor(chunk_in);
+      io_->infer_request_.set_tensor(
+          ports.policy_port,
+          ov::Tensor(ov::element::f32, {nb, InputsOutputs::kPolicyWidth},
+                     io_->policy_.data() +
+                         static_cast<size_t>(offset) *
+                             InputsOutputs::kPolicyWidth));
+      io_->infer_request_.set_tensor(
+          ports.value_port,
+          ov::Tensor(ov::element::f32, {nb, val_width},
+                     io_->value_.data() +
+                         static_cast<size_t>(offset) * val_width));
+      if (has_mlh_) {
+        io_->infer_request_.set_tensor(
+            ports.mlh_port,
+            ov::Tensor(ov::element::f32, {nb, 1},
+                       io_->moves_left_.data() + static_cast<size_t>(offset)));
+      }
+      io_->infer_request_.infer();
+      if (network_->profile()) network_->AccumulateProfile(io_->infer_request_);
+    }
+    return;
+  }
+
   // Evaluate at least min_batch positions. Samples are independent,
   // so the padding rows cannot affect the real ones; they are zeroed
   // rather than left stale so the padding is at least well-defined,
@@ -360,7 +412,6 @@ void OpenVinoNetworkComputation::ComputeBlocking() {
   // from whatever get_tensor() hands us is what crashed: on the GPU plugin
   // that memory is not dependably host-readable, and no amount of bounds
   // checking helps because the pointer itself is the problem.
-  const auto& ports = network_->ports();
   const size_t nb = static_cast<size_t>(infer_batch);
   io_->infer_request_.set_tensor(
       ports.policy_port,
@@ -368,9 +419,7 @@ void OpenVinoNetworkComputation::ComputeBlocking() {
                  io_->policy_.data()));
   io_->infer_request_.set_tensor(
       ports.value_port,
-      ov::Tensor(ov::element::f32,
-                 {nb, has_wdl_ ? InputsOutputs::kValueWidth : size_t{1}},
-                 io_->value_.data()));
+      ov::Tensor(ov::element::f32, {nb, val_width}, io_->value_.data()));
   if (has_mlh_) {
     io_->infer_request_.set_tensor(
         ports.mlh_port,
@@ -666,6 +715,16 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
   // used to hang the constructor -- the bucket ladder below steps batches
   // up by doubling until they reach kMaxBatchSize, which 0 never does.
   min_batch_ = std::clamp(requested_min_batch, 1, kMaxBatchSize);
+  const int requested_batch = options.GetOrDefault<int>("batch", 0);
+  if (requested_batch < 0 || requested_batch > kMaxBatchSize) {
+    CERR << "OpenVINO: clamping batch=" << requested_batch
+         << " to [0, " << kMaxBatchSize << "].";
+  }
+  fixed_batch_ = std::clamp(requested_batch, 0, kMaxBatchSize);
+  io_capacity_ =
+      fixed_batch_ > 0
+          ? ((kMaxBatchSize + fixed_batch_ - 1) / fixed_batch_) * fixed_batch_
+          : kMaxBatchSize;
   is_cpu_ = is_cpu_device;
   // Claim this instance's private config directory up front (unique per
   // instance even within one process -- see MakeInstanceConfigDir), so every
@@ -727,10 +786,13 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
                    const_cast<char*>(model_bytes.data())));
   }
 
-  // Dynamic batch shape: -1 lets OpenVINO recompile internal shape-dependent
-  // constants once here rather than reshaping (and paying that cost) inside
-  // ComputeBlocking() on every call.
-  model->reshape({{-1, kInputPlanes, 8, 8}});
+  // Static batch (batch=N) lets OpenVINO's Intel GPU plugin compile its fastest
+  // static-shape DP4A INT8 and FP16 kernels; batch=0 retains dynamic (-1) batch.
+  if (fixed_batch_ > 0) {
+    model->reshape({{fixed_batch_, kInputPlanes, 8, 8}});
+  } else {
+    model->reshape({{-1, kInputPlanes, 8, 8}});
+  }
 
   for (const auto& output : model->outputs()) {
     const std::string name = output.get_any_name();
@@ -1022,7 +1084,8 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
         // batches cluster near MinibatchSize rather than spreading uniformly,
         // the padding they cost in practice is much less than the worst-case
         // 2x. Overridable for measurement.
-        if (options.GetOrDefault<bool>("bucket_batches", true)) {
+        if (fixed_batch_ == 0 &&
+            options.GetOrDefault<bool>("bucket_batches", true)) {
           for (int b = min_batch_; b < kMaxBatchSize; b *= 2) {
             batch_buckets_.push_back(b);
           }
@@ -1073,7 +1136,10 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
 
   compiled_model_ = core_.compile_model(model, device, device_config);
   CERR << "OpenVINO model compiled successfully on " << device
-       << (want_fp16 && is_gpu_device ? " (FP16)" : " (FP32)") << ".";
+       << (want_fp16 && is_gpu_device ? " (FP16" : " (FP32")
+       << (fixed_batch_ > 0 ? ", static batch=" + std::to_string(fixed_batch_)
+                            : ", dynamic batch")
+       << ").";
 
   // compile_model() does not actually build the device kernels: the GPU
   // plugin JITs them lazily on first execution, through the Intel graphics
@@ -1100,7 +1166,11 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
       // all -- warming only one shape would leave the rest to stall the
       // search exactly as before. Without one, a single shape suffices.
       std::vector<int> warm_shapes = batch_buckets_;
-      if (warm_shapes.empty()) warm_shapes.push_back(min_batch_);
+      if (fixed_batch_ > 0) {
+        warm_shapes = {fixed_batch_};
+      } else if (warm_shapes.empty()) {
+        warm_shapes.push_back(min_batch_);
+      }
       const auto warm_start = std::chrono::steady_clock::now();
 
       for (const int shape : warm_shapes) {
@@ -1110,7 +1180,10 @@ OpenVinoNetwork::OpenVinoNetwork(const WeightsFile& weights,
 
       // Bind exactly what ComputeBlocking binds, so warmup compiles the
       // kernels the search will actually use rather than a variant of them.
-      if (is_ir_model_) {
+      if (fixed_batch_ > 0) {
+        io->infer_request_.set_input_tensor(ov::Tensor(
+            ov::element::f32, {nb, kInputPlanes, 8, 8}, io->input_val_mem_));
+      } else if (is_ir_model_) {
         ov::Tensor exact(io->input_tensor_.get_element_type(),
                          {nb, kInputPlanes, 8, 8});
         std::memcpy(exact.data<float>(), io->input_val_mem_,
