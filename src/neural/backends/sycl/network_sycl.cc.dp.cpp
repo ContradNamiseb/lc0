@@ -45,7 +45,7 @@
 namespace lczero {
 using namespace sycldnn_backend;
 
-template <typename DataType>
+template <typename Precision>
 class SyclNetwork;
 
 static size_t getMaxAttentionHeadSize(
@@ -117,10 +117,10 @@ static size_t getMaxAttentionBodySize(const MultiHeadWeights& weights, int N) {
   return size;
 }
 
-template <typename DataType>
+template <typename Precision>
 class SyclNetworkComputation : public NetworkComputation {
  public:
-  SyclNetworkComputation(SyclNetwork<DataType>* network, bool wdl,
+  SyclNetworkComputation(SyclNetwork<Precision>* network, bool wdl,
                          bool moves_left);
   ~SyclNetworkComputation();
 
@@ -179,11 +179,14 @@ class SyclNetworkComputation : public NetworkComputation {
   bool wdl_;
   bool moves_left_;
 
-  SyclNetwork<DataType>* network_;
+  SyclNetwork<Precision>* network_;
 };
 
-template <typename DataType>
+template <typename Precision>
 class SyclNetwork : public Network {
+  using DataType = typename Precision::DataType;
+  static constexpr bool kEnableInt8 = Precision::kEnableInt8;
+
  public:
   SyclNetwork(const WeightsFile& file, const OptionsDict& options)
       : capabilities_{file.format().network_format().input(),
@@ -252,32 +255,30 @@ class SyclNetwork : public Network {
     // Select GPU to run on (for *the current* thread).
     multi_stream_ = options.GetOrDefault<bool>("multi_stream", false);
 
-    bool has_int8_encoder_weights = false;
-    for (const auto& enc : weights.encoder) {
-      if (enc.mha.has_int8 && enc.ffn.has_int8) {
-        has_int8_encoder_weights = true;
-        break;
+    if constexpr (kEnableInt8) {
+      bool has_int8_encoder_weights = false;
+      for (const auto& enc : weights.encoder) {
+        if (enc.mha.has_int8 && enc.ffn.has_int8) {
+          has_int8_encoder_weights = true;
+          break;
+        }
       }
-    }
-    bool has_int8_residual_weights = !weights.residual.empty();
-    for (const auto& res : weights.residual) {
-      if (!res.conv1.has_int8 || !res.conv2.has_int8) {
-        has_int8_residual_weights = false;
-        break;
+      bool has_int8_residual_weights = !weights.residual.empty();
+      for (const auto& res : weights.residual) {
+        if (!res.conv1.has_int8 || !res.conv2.has_int8) {
+          has_int8_residual_weights = false;
+          break;
+        }
       }
-    }
-    const bool want_int8 = options.GetOrDefault<bool>("int8", true);
-    use_int8_ = want_int8 && has_int8_encoder_weights;
+      const bool want_int8 = options.GetOrDefault<bool>("int8", true);
+      use_int8_ = want_int8 && has_int8_encoder_weights;
 #ifdef USE_SYCL_DNNL
-    use_int8_residual_ =
-        std::is_same<sycl::half, DataType>::value && want_int8 &&
-        has_int8_residual_weights;
-#else
-    use_int8_residual_ = false;
+      use_int8_residual_ = want_int8 && has_int8_residual_weights;
 #endif
-    if ((use_int8_ || use_int8_residual_) && multi_stream_) {
-      CERR << "SYCL INT8: disabling multi_stream for shared INT8 scratch safety.";
-      multi_stream_ = false;
+      if ((use_int8_ || use_int8_residual_) && multi_stream_) {
+        CERR << "SYCL INT8: disabling multi_stream for shared INT8 scratch safety.";
+        multi_stream_ = false;
+      }
     }
 
     // layout used by cuda backend is nchw.
@@ -423,12 +424,15 @@ class SyclNetwork : public Network {
 
       // Residual block(s).
 #ifdef USE_SYCL_DNNL
-      if (use_int8_residual_) {
-        auto tower = std::make_unique<Int8ResidualTower<DataType>>(
-            getLastLayer(), weights.residual, kNumFilters, act, *sycl_queue_);
-        CERR << "Using SYCL W8A8 INT8 residual tower (oneDNN DP4A convs + FP32 SE + FP16 input/heads).";
-        network_.emplace_back(std::move(tower));
-      } else
+      if constexpr (kEnableInt8) {
+        if (use_int8_residual_) {
+          auto tower = std::make_unique<Int8ResidualTower<DataType>>(
+              getLastLayer(), weights.residual, kNumFilters, act, *sycl_queue_);
+          CERR << "Using SYCL W8A8 INT8 residual tower (oneDNN DP4A convs + FP32 SE + FP16 input/heads).";
+          network_.emplace_back(std::move(tower));
+        }
+      }
+      if (!use_int8_residual_)
 #endif
       for (int block = 0; block < numBlocks_; block++) {
         bool has_se = weights.residual[block].has_se;
@@ -756,10 +760,13 @@ class SyclNetwork : public Network {
       
 
       // Residual block(s).
-      if (use_int8_residual_) {
-        network_[l++]->Eval(batchSize, tensor_mem[2], tensor_mem[2], nullptr,
-                            scratch_mem, scratch_size_, io_sycl_queue_, nullptr);
-      } else {
+      if constexpr (kEnableInt8) {
+        if (use_int8_residual_) {
+          network_[l++]->Eval(batchSize, tensor_mem[2], tensor_mem[2], nullptr,
+                              scratch_mem, scratch_size_, io_sycl_queue_, nullptr);
+        }
+      }
+      if (!use_int8_residual_) {
         for (int block = 0; block < numBlocks_; block++) {
           if (use_res_block_winograd_fuse_opt_) {
             network_[l++]->Eval(batchSize, tensor_mem[2], skip_connection,
@@ -964,8 +971,8 @@ class SyclNetwork : public Network {
     }
   
   std::unique_ptr<NetworkComputation> NewComputation() override {
-    return std::make_unique<SyclNetworkComputation<DataType>>(this, wdl_,
-                                                              moves_left_);
+    return std::make_unique<SyclNetworkComputation<Precision>>(this, wdl_,
+                                                               moves_left_);
   }
 
   std::unique_ptr<InputsOutputs> GetInputsOutputs() {
@@ -1090,31 +1097,30 @@ class SyclNetwork : public Network {
     }
 };
 
-template <typename DataType>
-SyclNetworkComputation<DataType>::SyclNetworkComputation(
-    SyclNetwork<DataType>* network, bool wdl, bool moves_left)
+template <typename Precision>
+SyclNetworkComputation<Precision>::SyclNetworkComputation(
+    SyclNetwork<Precision>* network, bool wdl, bool moves_left)
     : wdl_(wdl), moves_left_(moves_left), network_(network) {
   batch_size_ = 0;
   inputs_outputs_ = network_->GetInputsOutputs();
 }
 
-template <typename DataType>
-SyclNetworkComputation<DataType>::~SyclNetworkComputation() {
+template <typename Precision>
+SyclNetworkComputation<Precision>::~SyclNetworkComputation() {
   network_->ReleaseInputsOutputs(std::move(inputs_outputs_));
 }
 
-template <typename DataType>
-void SyclNetworkComputation<DataType>::ComputeBlocking() {
+template <typename Precision>
+void SyclNetworkComputation<Precision>::ComputeBlocking() {
   network_->forwardEval(inputs_outputs_.get(), GetBatchSize());
 }
 
-template <typename DataType>
+template <typename Precision>
 std::unique_ptr<Network> MakeSyclNetwork(const std::optional<WeightsFile>& w,
                                          const OptionsDict& options) {
   if (!w) {
     throw Exception(
-        "The sycl" +
-        std::string(std::is_same<sycl::half, DataType>::value ? "-fp16" : "") +
+        std::string("The sycl") + Precision::kBackendSuffix +
         " backend requires a network file.");
   }
   const WeightsFile& weights = *w;
@@ -1176,7 +1182,7 @@ std::unique_ptr<Network> MakeSyclNetwork(const std::optional<WeightsFile>& w,
                       NF::InputEmbeddingFormat_Name(nf.input_embedding()) +
                       " is not supported by the SYCL backend.");
   }
-  return std::make_unique<SyclNetwork<DataType>>(weights, options);
+  return std::make_unique<SyclNetwork<Precision>>(weights, options);
 }
 
 std::unique_ptr<Network> MakeSyclNetworkAuto(
@@ -1190,17 +1196,17 @@ std::unique_ptr<Network> MakeSyclNetworkAuto(
   CERR << "Trying to switch to [sycl-fp16]...";
   if (devices[gpu_id].has(sycl::aspect::fp16)) {
     CERR << "Switched to [sycl-fp16]..."; 
-    return MakeSyclNetwork<sycl::half>(weights, options);     
+    return MakeSyclNetwork<SyclFp16>(weights, options);     
   } else {
     CERR << "Device does not support sycl-fp16";
   }
   CERR << "Switched to [sycl]...";
-  return MakeSyclNetwork<float>(weights, options);
+  return MakeSyclNetwork<SyclFp32>(weights, options);
 }
 
 REGISTER_NETWORK("sycl-auto", MakeSyclNetworkAuto, 132)
-REGISTER_NETWORK("sycl", MakeSyclNetwork<float>, 131)
-REGISTER_NETWORK("sycl-fp16", MakeSyclNetwork<sycl::half>, 130)
-REGISTER_NETWORK("sycl-int8", MakeSyclNetwork<sycl::half>, 129)
+REGISTER_NETWORK("sycl", MakeSyclNetwork<SyclFp32>, 131)
+REGISTER_NETWORK("sycl-fp16", MakeSyclNetwork<SyclFp16>, 130)
+REGISTER_NETWORK("sycl-int8", MakeSyclNetwork<SyclInt8>, 129)
 
 }  // namespace lczero

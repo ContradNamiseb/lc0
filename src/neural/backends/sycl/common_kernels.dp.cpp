@@ -2076,6 +2076,39 @@ inline float activateScalarInt8Epilogue(float val, ActivationFunction act) {
   }
 }
 
+inline sycl::float4 activateFloat4(sycl::float4 val, ActivationFunction act) {
+  switch (act) {
+    case ACTIVATION_RELU_2: {
+      const sycl::float4 r = sycl::fmax(val, sycl::float4(0.0f));
+      return r * r;
+    }
+    case ACTIVATION_RELU:
+      return sycl::fmax(val, sycl::float4(0.0f));
+    case ACTIVATION_MISH: {
+      const sycl::float4 c = sycl::fmin(val, sycl::float4(20.0f));
+      const sycl::float4 e = sycl::exp(c);
+      const sycl::float4 n = e * e + 2.0f * e;
+      const sycl::float4 d = c / (n + 2.0f);
+      const sycl::float4 m =
+          sycl::select(c - 2.0f * d, n * d, sycl::islessequal(c, sycl::float4(-0.6f)));
+      return sycl::select(m, val, sycl::isgreater(val, sycl::float4(20.0f)));
+    }
+    case ACTIVATION_SWISH:
+      return val / (1.0f + sycl::exp(-val));
+    case ACTIVATION_SELU:
+      return sycl::select(1.75809934f * (sycl::exp(val) - 1.0f),
+                          1.05070098f * val,
+                          sycl::isgreater(val, sycl::float4(0.0f)));
+    case ACTIVATION_TANH:
+      return sycl::tanh(val);
+    case ACTIVATION_SIGMOID:
+      return 1.0f / (1.0f + sycl::exp(-val));
+    case ACTIVATION_NONE:
+    default:
+      return val;
+  }
+}
+
 template <ActivationFunction kAct>
 inline float activateCompileTime(float val) {
   if constexpr (kAct == ACTIVATION_RELU) {
@@ -2088,6 +2121,23 @@ inline float activateCompileTime(float val) {
     return val <= -0.6f ? n * d : val - 2.0f * d;
   } else {
     return activateScalarInt8Epilogue(val, kAct);
+  }
+}
+
+template <ActivationFunction kAct>
+inline sycl::float4 activateFloat4CompileTime(sycl::float4 val) {
+  if constexpr (kAct == ACTIVATION_RELU) {
+    return sycl::fmax(val, sycl::float4(0.0f));
+  } else if constexpr (kAct == ACTIVATION_MISH) {
+    const sycl::float4 c = sycl::fmin(val, sycl::float4(20.0f));
+    const sycl::float4 e = sycl::exp(c);
+    const sycl::float4 n = e * e + 2.0f * e;
+    const sycl::float4 d = c / (n + 2.0f);
+    const sycl::float4 m =
+        sycl::select(c - 2.0f * d, n * d, sycl::islessequal(c, sycl::float4(-0.6f)));
+    return sycl::select(m, val, sycl::isgreater(val, sycl::float4(20.0f)));
+  } else {
+    return activateFloat4(val, kAct);
   }
 }
 
@@ -2118,10 +2168,7 @@ void fusedSE_SkipAct_Fp16_NHWC_Fast(sycl::half* output, const sycl::half* skip,
           for (int j = 0; j < 16; ++j) {
             const sycl::half4 v = in4[(hw0 + j) * c4 + vc];
             loc[j] = v;
-            sum += sycl::float4(static_cast<float>(v.x()),
-                                static_cast<float>(v.y()),
-                                static_cast<float>(v.z()),
-                                static_cast<float>(v.w()));
+            sum += v.convert<float>();
           }
           float* dst = &smem[chunk * C + (vc << 2)];
           dst[0] = sum.x();
@@ -2169,21 +2216,9 @@ void fusedSE_SkipAct_Fp16_NHWC_Fast(sycl::half* output, const sycl::half* skip,
           auto* out4 = reinterpret_cast<sycl::half4*>(output) + (n * 64 * c4);
           for (int j = 0; j < 16; ++j) {
             const int idx = (hw0 + j) * c4 + vc;
-            const sycl::half4 x = loc[j];
-            const sycl::half4 s = sk4[idx];
-            out4[idx] = sycl::half4(
-                static_cast<sycl::half>(activateCompileTime<kAct>(
-                    static_cast<float>(s.x()) +
-                    static_cast<float>(x.x()) * vsc.x() + vsh.x())),
-                static_cast<sycl::half>(activateCompileTime<kAct>(
-                    static_cast<float>(s.y()) +
-                    static_cast<float>(x.y()) * vsc.y() + vsh.y())),
-                static_cast<sycl::half>(activateCompileTime<kAct>(
-                    static_cast<float>(s.z()) +
-                    static_cast<float>(x.z()) * vsc.z() + vsh.z())),
-                static_cast<sycl::half>(activateCompileTime<kAct>(
-                    static_cast<float>(s.w()) +
-                    static_cast<float>(x.w()) * vsc.w() + vsh.w())));
+            const sycl::float4 y =
+                sk4[idx].convert<float>() + loc[j].convert<float>() * vsc + vsh;
+            out4[idx] = activateFloat4CompileTime<kAct>(y).convert<sycl::half>();
           }
         });
   });
@@ -2198,7 +2233,7 @@ void quantizeToU8(uint8_t* dst, const SrcType* src, int total_elems,
   if ((total_elems & 3) == 0) {
     const int n4 = total_elems >> 2;
     const int blocks = DivUp(n4, kBlockSize);
-    auto* dst4 = reinterpret_cast<uint32_t*>(dst);
+    auto* dst4 = reinterpret_cast<sycl::uchar4*>(dst);
     const auto* src4 = reinterpret_cast<const sycl::vec<SrcType, 4>*>(src);
     sycl_queue.parallel_for(
         sycl::nd_range<1>(sycl::range<1>(blocks * kBlockSize),
@@ -2206,14 +2241,10 @@ void quantizeToU8(uint8_t* dst, const SrcType* src, int total_elems,
         [=](sycl::nd_item<1> item) {
           const int tid = static_cast<int>(item.get_global_linear_id());
           if (tid >= n4) return;
-          const auto v = src4[tid];
-          auto q1 = [&](SrcType x) -> uint32_t {
-            int qi = static_cast<int>(
-                sycl::rint(static_cast<float>(x) * inv_scale + fzp));
-            return static_cast<uint32_t>(qi < 0 ? 0 : (qi > 255 ? 255 : qi));
-          };
-          dst4[tid] = q1(v.x()) | (q1(v.y()) << 8) | (q1(v.z()) << 16) |
-                      (q1(v.w()) << 24);
+          const sycl::float4 qf = sycl::clamp(
+              sycl::rint(src4[tid].template convert<float>() * inv_scale + fzp),
+              sycl::float4(0.0f), sycl::float4(255.0f));
+          dst4[tid] = qf.convert<uint8_t>();
         });
     return;
   }
@@ -2224,10 +2255,10 @@ void quantizeToU8(uint8_t* dst, const SrcType* src, int total_elems,
       [=](sycl::nd_item<1> item) {
         const int tid = static_cast<int>(item.get_global_linear_id());
         if (tid >= total_elems) return;
-        int qi = static_cast<int>(
-            sycl::rint(static_cast<float>(src[tid]) * inv_scale + fzp));
-        qi = qi < 0 ? 0 : (qi > 255 ? 255 : qi);
-        dst[tid] = static_cast<uint8_t>(qi);
+        const float qf = sycl::clamp(
+            sycl::rint(static_cast<float>(src[tid]) * inv_scale + fzp), 0.0f,
+            255.0f);
+        dst[tid] = static_cast<uint8_t>(qf);
       });
 }
 
@@ -2255,18 +2286,9 @@ void dequantBiasUnpackQKV(DstType* q_out, DstType* k_out, DstType* v_out,
           const int vc = static_cast<int>(item.get_global_id(1));
           if (vc >= vec_3d) return;
           const int idx = tok * vec_3d + vc;
-          const sycl::int4 s = in4[idx];
-          const sycl::float4 sc = sc4[vc];
-          const auto bv = b4[vc];
-          sycl::vec<DstType, 4> out(
-              static_cast<DstType>(static_cast<float>(s.x()) * sc.x() +
-                                   static_cast<float>(bv.x())),
-              static_cast<DstType>(static_cast<float>(s.y()) * sc.y() +
-                                   static_cast<float>(bv.y())),
-              static_cast<DstType>(static_cast<float>(s.z()) * sc.z() +
-                                   static_cast<float>(bv.z())),
-              static_cast<DstType>(static_cast<float>(s.w()) * sc.w() +
-                                   static_cast<float>(bv.w())));
+          const sycl::float4 out_f =
+              in4[idx].convert<float>() * sc4[vc] + b4[vc].template convert<float>();
+          const auto out = out_f.convert<DstType>();
           if (vc < vec_d) {
             q4[tok * vec_d + vc] = out;
           } else if (vc < 2 * vec_d) {
@@ -2318,13 +2340,7 @@ void dequantS32ToDataType(DstType* dst, const int32_t* s32_in,
           const int vc = static_cast<int>(item.get_global_id(1));
           if (vc >= vec_c) return;
           const int idx = tok * vec_c + vc;
-          const sycl::int4 s = in4[idx];
-          const sycl::float4 sc = sc4[vc];
-          out4[idx] = sycl::vec<DstType, 4>(
-              static_cast<DstType>(static_cast<float>(s.x()) * sc.x()),
-              static_cast<DstType>(static_cast<float>(s.y()) * sc.y()),
-              static_cast<DstType>(static_cast<float>(s.z()) * sc.z()),
-              static_cast<DstType>(static_cast<float>(s.w()) * sc.w()));
+          out4[idx] = (in4[idx].convert<float>() * sc4[vc]).convert<DstType>();
         });
     return;
   }
@@ -2356,7 +2372,7 @@ void dequantBiasActQuantizeU8(uint8_t* dst_u8, const int32_t* s32_in,
     const auto* in4 = reinterpret_cast<const sycl::int4*>(s32_in);
     const auto* sc4 = reinterpret_cast<const sycl::float4*>(comb_scales);
     const auto* b4 = reinterpret_cast<const sycl::vec<BiasType, 4>*>(bias);
-    auto* out4 = reinterpret_cast<uint32_t*>(dst_u8);
+    auto* out4 = reinterpret_cast<sycl::uchar4*>(dst_u8);
     sycl_queue.parallel_for(
         sycl::nd_range<2>(
             sycl::range<2>(batch_tokens,
@@ -2367,19 +2383,13 @@ void dequantBiasActQuantizeU8(uint8_t* dst_u8, const int32_t* s32_in,
           const int vc = static_cast<int>(item.get_global_id(1));
           if (vc >= vec_c) return;
           const int idx = tok * vec_c + vc;
-          const sycl::int4 s = in4[idx];
-          const sycl::float4 sc = sc4[vc];
-          const auto bv = b4[vc];
-          auto fq = [&](int32_t sv, float scv, BiasType bval) -> uint32_t {
-            float v = static_cast<float>(sv) * scv + static_cast<float>(bval);
-            v = activateScalarInt8Epilogue(v, act);
-            int qi = static_cast<int>(sycl::rint(v * next_inv_scale + fzp));
-            return static_cast<uint32_t>(qi < 0 ? 0 : (qi > 255 ? 255 : qi));
-          };
-          out4[idx] = fq(s.x(), sc.x(), bv.x()) |
-                      (fq(s.y(), sc.y(), bv.y()) << 8) |
-                      (fq(s.z(), sc.z(), bv.z()) << 16) |
-                      (fq(s.w(), sc.w(), bv.w()) << 24);
+          sycl::float4 v =
+              in4[idx].convert<float>() * sc4[vc] + b4[vc].template convert<float>();
+          v = activateFloat4(v, act);
+          const sycl::float4 qf = sycl::clamp(
+              sycl::rint(v * next_inv_scale + fzp), sycl::float4(0.0f),
+              sycl::float4(255.0f));
+          out4[idx] = qf.convert<uint8_t>();
         });
     return;
   }
@@ -2396,9 +2406,9 @@ void dequantBiasActQuantizeU8(uint8_t* dst_u8, const int32_t* s32_in,
         float val = static_cast<float>(s32_in[tid]) * comb_scales[ch] +
                     static_cast<float>(bias[ch]);
         val = activateScalarInt8Epilogue(val, act);
-        int qi = static_cast<int>(sycl::rint(val * next_inv_scale + fzp));
-        qi = qi < 0 ? 0 : (qi > 255 ? 255 : qi);
-        dst_u8[tid] = static_cast<uint8_t>(qi);
+        const float qf = sycl::clamp(
+            sycl::rint(val * next_inv_scale + fzp), 0.0f, 255.0f);
+        dst_u8[tid] = static_cast<uint8_t>(qf);
       });
 }
 
