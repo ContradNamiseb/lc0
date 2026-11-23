@@ -45,6 +45,7 @@ message Weights {
       FLOAT16 = 2;
       BFLOAT16 = 3;
       FLOAT32 = 4;
+      INT8 = 5;
     }
     optional Encoding encoding = 4;
     repeated uint32 dims = 5;
@@ -57,6 +58,11 @@ message Weights {
     optional Layer bn_stddivs = 4;
     optional Layer bn_gammas = 5;
     optional Layer bn_betas = 6;
+
+    // Optional W8A8 static INT8 quantization parameters (used when weights has Encoding::INT8).
+    optional Layer w_scales = 7;
+    optional float act_scale = 8;
+    optional uint32 act_zp = 9;
   }
 
   message SEunit {
@@ -102,7 +108,16 @@ message Weights {
     optional Layer rpe_k = 11;
     optional Layer rpe_v = 12;
 
-    // reserved 13 - 22 for int8 quantization
+    // INT8 quantization parameters (fields 13-22 reserved for int8).
+    optional Layer q_w_scales = 13;
+    optional Layer k_w_scales = 14;
+    optional Layer v_w_scales = 15;
+    optional Layer dense_w_scales = 16;
+    optional float qkv_act_scale = 17;
+    optional uint32 qkv_act_zp = 18;
+    optional float dense_act_scale = 19;
+    optional uint32 dense_act_zp = 20;
+    // reserved 21 - 22 for future int8 quantization
   }
 
   message FFN {
@@ -110,7 +125,13 @@ message Weights {
     optional Layer dense1_b = 2;
     optional Layer dense2_w = 3;
     optional Layer dense2_b = 4;
-    // reserved 5 - 10 for int8 quantization
+    // INT8 quantization parameters (fields 5-10 reserved for int8).
+    optional Layer dense1_w_scales = 5;
+    optional Layer dense2_w_scales = 6;
+    optional float dense1_act_scale = 7;
+    optional uint32 dense1_act_zp = 8;
+    optional float dense2_act_scale = 9;
+    optional uint32 dense2_act_zp = 10;
   }
 
   message EncoderLayer {

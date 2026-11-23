@@ -903,6 +903,12 @@ if get_option('build_backends')
         deps += cc.find_library('mkl_sequential', required: true)
         deps += cc.find_library('mkl_core', required: true)
         deps += cc.find_library('OpenCL', required: true)
+        if dnnl_lib.found() and fs.is_dir(get_option('dnnl_dir') + '/include')
+          message('Enabling oneDNN SYCL INT8 residual convolutions from: ' + get_option('dnnl_dir'))
+          includes += include_directories(get_option('dnnl_dir') + '/include')
+          deps += dnnl_lib
+          add_project_arguments('-DUSE_SYCL_DNNL', language : 'cpp')
+        endif
       elif get_option('sycl') == 'amd'
         hip_libdirs = get_option('hip_libdirs')
         hip_args = []

@@ -28,6 +28,25 @@
 namespace lczero {
 namespace {
 static constexpr float kEpsilon = 1e-5f;
+
+std::vector<float> DequantizeInt8RowMajor(const std::vector<int8_t>& w_i8,
+                                          const std::vector<float>& scales,
+                                          const char* name) {
+  if (scales.empty() || w_i8.size() % scales.size() != 0) {
+    throw Exception(std::string("Invalid INT8 weight/scale dims for ") + name);
+  }
+  const size_t rows = scales.size();
+  const size_t cols = w_i8.size() / rows;
+  std::vector<float> out(w_i8.size());
+  for (size_t r = 0; r < rows; ++r) {
+    const float s = scales[r];
+    const size_t base = r * cols;
+    for (size_t c = 0; c < cols; ++c) {
+      out[base + c] = static_cast<float>(w_i8[base + c]) * s;
+    }
+  }
+  return out;
+}
 }  // namespace
 
 BaseWeights::BaseWeights(const pblczero::Weights& weights)
@@ -76,12 +95,33 @@ BaseWeights::Residual::Residual(const pblczero::Weights::Residual& residual)
       has_se(residual.has_se()) {}
 
 BaseWeights::ConvBlock::ConvBlock(const pblczero::Weights::ConvBlock& block)
-    : weights(LayerAdapter(block.weights()).as_vector()),
-      biases(LayerAdapter(block.biases()).as_vector()),
+    : biases(LayerAdapter(block.biases()).as_vector()),
       bn_gammas(LayerAdapter(block.bn_gammas()).as_vector()),
       bn_betas(LayerAdapter(block.bn_betas()).as_vector()),
       bn_means(LayerAdapter(block.bn_means()).as_vector()),
       bn_stddivs(LayerAdapter(block.bn_stddivs()).as_vector()) {
+  const bool int8_mode =
+      block.weights().encoding() == pblczero::Weights::Layer::INT8 &&
+      block.has_w_scales();
+  if (int8_mode) {
+    if (block.act_scale() <= 0.0f || block.act_zp() > 255) {
+      throw Exception("Invalid ConvBlock INT8 activation scale or zero-point.");
+    }
+    if (!bn_means.empty() || !bn_stddivs.empty() || !bn_gammas.empty() ||
+        !bn_betas.empty()) {
+      throw Exception("INT8 ConvBlock weights must have BatchNorm pre-folded.");
+    }
+    has_int8 = true;
+    weights_i8 = LayerAdapter(block.weights()).as_int8_vector();
+    w_scales = LayerAdapter(block.w_scales()).as_vector();
+    act_scale = block.act_scale();
+    act_zp = static_cast<uint8_t>(block.act_zp());
+    // Populate dequantized FP32 weights so non-INT8 backends stay functional.
+    weights = DequantizeInt8RowMajor(weights_i8, w_scales, "conv.weights");
+    return;
+  }
+
+  weights = LayerAdapter(block.weights()).as_vector();
   if (weights.size() == 0) {
     // Empty ConvBlock.
     return;
@@ -133,26 +173,83 @@ BaseWeights::ConvBlock::ConvBlock(const pblczero::Weights::ConvBlock& block)
 }
 
 BaseWeights::MHA::MHA(const pblczero::Weights::MHA& mha)
-    : q_w(LayerAdapter(mha.q_w()).as_vector()),
-      q_b(LayerAdapter(mha.q_b()).as_vector()),
-      k_w(LayerAdapter(mha.k_w()).as_vector()),
+    : q_b(LayerAdapter(mha.q_b()).as_vector()),
       k_b(LayerAdapter(mha.k_b()).as_vector()),
-      v_w(LayerAdapter(mha.v_w()).as_vector()),
       v_b(LayerAdapter(mha.v_b()).as_vector()),
-      dense_w(LayerAdapter(mha.dense_w()).as_vector()),
       dense_b(LayerAdapter(mha.dense_b()).as_vector()),
       smolgen(Smolgen(mha.smolgen())),
       has_smolgen(mha.has_smolgen()) {
   if (mha.has_rpe_q() || mha.has_rpe_k() || mha.has_rpe_v()) {
     throw Exception("RPE weights file not supported.");
   }
+  const bool int8_mode =
+      mha.q_w().encoding() == pblczero::Weights::Layer::INT8 &&
+      mha.k_w().encoding() == pblczero::Weights::Layer::INT8 &&
+      mha.v_w().encoding() == pblczero::Weights::Layer::INT8 &&
+      mha.dense_w().encoding() == pblczero::Weights::Layer::INT8 &&
+      mha.has_q_w_scales() && mha.has_k_w_scales() &&
+      mha.has_v_w_scales() && mha.has_dense_w_scales();
+  if (int8_mode) {
+    if (mha.qkv_act_scale() <= 0.0f || mha.dense_act_scale() <= 0.0f ||
+        mha.qkv_act_zp() > 255 || mha.dense_act_zp() > 255) {
+      throw Exception("Invalid MHA INT8 activation scale or zero-point.");
+    }
+    has_int8 = true;
+    q_w_i8 = LayerAdapter(mha.q_w()).as_int8_vector();
+    k_w_i8 = LayerAdapter(mha.k_w()).as_int8_vector();
+    v_w_i8 = LayerAdapter(mha.v_w()).as_int8_vector();
+    dense_w_i8 = LayerAdapter(mha.dense_w()).as_int8_vector();
+    q_w_scales = LayerAdapter(mha.q_w_scales()).as_vector();
+    k_w_scales = LayerAdapter(mha.k_w_scales()).as_vector();
+    v_w_scales = LayerAdapter(mha.v_w_scales()).as_vector();
+    dense_w_scales = LayerAdapter(mha.dense_w_scales()).as_vector();
+    qkv_act_scale = mha.qkv_act_scale();
+    qkv_act_zp = static_cast<uint8_t>(mha.qkv_act_zp());
+    dense_act_scale = mha.dense_act_scale();
+    dense_act_zp = static_cast<uint8_t>(mha.dense_act_zp());
+    // Also populate dequantized FP32 vectors so non-INT8 backends stay functional.
+    q_w = DequantizeInt8RowMajor(q_w_i8, q_w_scales, "mha.q_w");
+    k_w = DequantizeInt8RowMajor(k_w_i8, k_w_scales, "mha.k_w");
+    v_w = DequantizeInt8RowMajor(v_w_i8, v_w_scales, "mha.v_w");
+    dense_w = DequantizeInt8RowMajor(dense_w_i8, dense_w_scales, "mha.dense_w");
+  } else {
+    q_w = LayerAdapter(mha.q_w()).as_vector();
+    k_w = LayerAdapter(mha.k_w()).as_vector();
+    v_w = LayerAdapter(mha.v_w()).as_vector();
+    dense_w = LayerAdapter(mha.dense_w()).as_vector();
+  }
 }
 
 BaseWeights::FFN::FFN(const pblczero::Weights::FFN& ffn)
-    : dense1_w(LayerAdapter(ffn.dense1_w()).as_vector()),
-      dense1_b(LayerAdapter(ffn.dense1_b()).as_vector()),
-      dense2_w(LayerAdapter(ffn.dense2_w()).as_vector()),
-      dense2_b(LayerAdapter(ffn.dense2_b()).as_vector()) {}
+    : dense1_b(LayerAdapter(ffn.dense1_b()).as_vector()),
+      dense2_b(LayerAdapter(ffn.dense2_b()).as_vector()) {
+  const bool int8_mode =
+      ffn.dense1_w().encoding() == pblczero::Weights::Layer::INT8 &&
+      ffn.dense2_w().encoding() == pblczero::Weights::Layer::INT8 &&
+      ffn.has_dense1_w_scales() && ffn.has_dense2_w_scales();
+  if (int8_mode) {
+    if (ffn.dense1_act_scale() <= 0.0f || ffn.dense2_act_scale() <= 0.0f ||
+        ffn.dense1_act_zp() > 255 || ffn.dense2_act_zp() > 255) {
+      throw Exception("Invalid FFN INT8 activation scale or zero-point.");
+    }
+    has_int8 = true;
+    dense1_w_i8 = LayerAdapter(ffn.dense1_w()).as_int8_vector();
+    dense2_w_i8 = LayerAdapter(ffn.dense2_w()).as_int8_vector();
+    dense1_w_scales = LayerAdapter(ffn.dense1_w_scales()).as_vector();
+    dense2_w_scales = LayerAdapter(ffn.dense2_w_scales()).as_vector();
+    dense1_act_scale = ffn.dense1_act_scale();
+    dense1_act_zp = static_cast<uint8_t>(ffn.dense1_act_zp());
+    dense2_act_scale = ffn.dense2_act_scale();
+    dense2_act_zp = static_cast<uint8_t>(ffn.dense2_act_zp());
+    dense1_w =
+        DequantizeInt8RowMajor(dense1_w_i8, dense1_w_scales, "ffn.dense1_w");
+    dense2_w =
+        DequantizeInt8RowMajor(dense2_w_i8, dense2_w_scales, "ffn.dense2_w");
+  } else {
+    dense1_w = LayerAdapter(ffn.dense1_w()).as_vector();
+    dense2_w = LayerAdapter(ffn.dense2_w()).as_vector();
+  }
+}
 
 BaseWeights::EncoderLayer::EncoderLayer(
     const pblczero::Weights::EncoderLayer& encoder)

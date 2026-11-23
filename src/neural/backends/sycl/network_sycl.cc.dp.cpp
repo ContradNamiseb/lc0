@@ -252,6 +252,34 @@ class SyclNetwork : public Network {
     // Select GPU to run on (for *the current* thread).
     multi_stream_ = options.GetOrDefault<bool>("multi_stream", false);
 
+    bool has_int8_encoder_weights = false;
+    for (const auto& enc : weights.encoder) {
+      if (enc.mha.has_int8 && enc.ffn.has_int8) {
+        has_int8_encoder_weights = true;
+        break;
+      }
+    }
+    bool has_int8_residual_weights = !weights.residual.empty();
+    for (const auto& res : weights.residual) {
+      if (!res.conv1.has_int8 || !res.conv2.has_int8) {
+        has_int8_residual_weights = false;
+        break;
+      }
+    }
+    const bool want_int8 = options.GetOrDefault<bool>("int8", true);
+    use_int8_ = want_int8 && has_int8_encoder_weights;
+#ifdef USE_SYCL_DNNL
+    use_int8_residual_ =
+        std::is_same<sycl::half, DataType>::value && want_int8 &&
+        has_int8_residual_weights;
+#else
+    use_int8_residual_ = false;
+#endif
+    if ((use_int8_ || use_int8_residual_) && multi_stream_) {
+      CERR << "SYCL INT8: disabling multi_stream for shared INT8 scratch safety.";
+      multi_stream_ = false;
+    }
+
     // layout used by cuda backend is nchw.
     has_tensor_cores_ = false;
     constexpr bool fp16 = std::is_same<sycl::half, DataType>::value;
@@ -393,7 +421,15 @@ class SyclNetwork : public Network {
         network_.emplace_back(std::move(inputConv));
       }
 
-      // Residual block.
+      // Residual block(s).
+#ifdef USE_SYCL_DNNL
+      if (use_int8_residual_) {
+        auto tower = std::make_unique<Int8ResidualTower<DataType>>(
+            getLastLayer(), weights.residual, kNumFilters, act, *sycl_queue_);
+        CERR << "Using SYCL W8A8 INT8 residual tower (oneDNN DP4A convs + FP32 SE + FP16 input/heads).";
+        network_.emplace_back(std::move(tower));
+      } else
+#endif
       for (int block = 0; block < numBlocks_; block++) {
         bool has_se = weights.residual[block].has_se;
         int se_k = (int)weights.residual[block].se.b1.size();
@@ -467,7 +503,10 @@ class SyclNetwork : public Network {
           static_cast<InputEmbedding>(
               file.format().network_format().input_embedding()) ==
               InputEmbedding::INPUT_EMBEDDING_PE_DENSE,
-          *sycl_queue_);
+          *sycl_queue_, use_int8_);
+      if (use_int8_) {
+        CERR << "Using SYCL W8A8 INT8 Transformer trunk (FP16 attention/smolgen/heads).";
+      }
       network_.emplace_back(std::move(attention_body));
 
       encoder_last_ = getLastLayer();
@@ -716,22 +755,25 @@ class SyclNetwork : public Network {
                           scratch_mem, scratch_size_, io_sycl_queue_, nullptr);  // input conv
       
 
-      // Residual block.
-      for (int block = 0; block < numBlocks_; block++) {
-        if (use_res_block_winograd_fuse_opt_) {
-          network_[l++]->Eval(batchSize, tensor_mem[2], skip_connection,
-                              nullptr, enableCacheOpt ? nullptr : scratch_mem,
-                              scratch_size_, io_sycl_queue_, nullptr);  // block
-        } else {
-          network_[l++]->Eval(batchSize, tensor_mem[0], tensor_mem[2], nullptr,
-                              scratch_mem, scratch_size_, io_sycl_queue_, nullptr);  // conv1
+      // Residual block(s).
+      if (use_int8_residual_) {
+        network_[l++]->Eval(batchSize, tensor_mem[2], tensor_mem[2], nullptr,
+                            scratch_mem, scratch_size_, io_sycl_queue_, nullptr);
+      } else {
+        for (int block = 0; block < numBlocks_; block++) {
+          if (use_res_block_winograd_fuse_opt_) {
+            network_[l++]->Eval(batchSize, tensor_mem[2], skip_connection,
+                                nullptr, enableCacheOpt ? nullptr : scratch_mem,
+                                scratch_size_, io_sycl_queue_, nullptr);  // block
+          } else {
+            network_[l++]->Eval(batchSize, tensor_mem[0], tensor_mem[2], nullptr,
+                                scratch_mem, scratch_size_, io_sycl_queue_, nullptr);  // conv1
 
-          network_[l++]->Eval(batchSize, tensor_mem[2], tensor_mem[0],
-                              tensor_mem[2], scratch_mem, scratch_size_,
-                              io_sycl_queue_, nullptr);  // conv2
+            network_[l++]->Eval(batchSize, tensor_mem[2], tensor_mem[0],
+                                tensor_mem[2], scratch_mem, scratch_size_,
+                                io_sycl_queue_, nullptr);  // conv2
+          }
         }
-
-        
       }
 
       flow = tensor_mem[2];
@@ -956,7 +998,9 @@ class SyclNetwork : public Network {
   bool moves_left_;
   bool use_res_block_winograd_fuse_opt_;  // fuse operations inside the residual
                                           // tower
-  bool multi_stream_;                     // run multiple parallel network evals
+  bool multi_stream_;
+  bool use_int8_ = false;
+  bool use_int8_residual_ = false;
   bool allow_cache_opt_;  // try to fit residual block activations in L2 cache
 
 
@@ -1157,5 +1201,6 @@ std::unique_ptr<Network> MakeSyclNetworkAuto(
 REGISTER_NETWORK("sycl-auto", MakeSyclNetworkAuto, 132)
 REGISTER_NETWORK("sycl", MakeSyclNetwork<float>, 131)
 REGISTER_NETWORK("sycl-fp16", MakeSyclNetwork<sycl::half>, 130)
+REGISTER_NETWORK("sycl-int8", MakeSyclNetwork<sycl::half>, 129)
 
 }  // namespace lczero

@@ -291,12 +291,20 @@ class EncoderBlock {
                int heads, int size, float alpha,
                DataType* smolgen_global_scratch, int smolgen_global_size,
                int max_batch_size, ActivationFunction smolgen_act,
-               ActivationFunction ffn_act, float default_eps, sycl::queue &sycl_queue);
+               ActivationFunction ffn_act, float default_eps, sycl::queue &sycl_queue,
+               bool use_int8 = false);
   ~EncoderBlock();
 
   void Eval(int N, DataType* inpop, DataType* scratch0, DataType* scratch1,
             DataType* scratch2, sycl::queue &sycl_queue,
-            DataType*** offset_pointers);
+            DataType*** offset_pointers,
+            uint8_t* int8_act_buf = nullptr,
+            int32_t* int32_gemm_buf = nullptr,
+            const int32_t* int32_zero_co = nullptr);
+
+  bool uses_int8() const { return use_int8_; }
+  int d_model() const { return mha_q_size_; }
+  int d_ff() const { return ffn_dense1_size_; }
 
   // all GPU side pointers
   DataType *mha_q_w, *mha_q_b;
@@ -318,6 +326,28 @@ class EncoderBlock {
   DataType *smol_ln1_gammas, *smol_ln1_betas;
   DataType *smol_ln2_gammas, *smol_ln2_betas;
   DataType *smol_global;
+
+  // Optional W8A8 INT8 weights & pre-multiplied combined dequant scales
+  bool use_int8_ = false;
+  int8_t* mha_qkv_w_s8_ = nullptr;
+  float* mha_qkv_comb_scales_ = nullptr;
+  float qkv_inv_act_scale_ = 0.0f;
+  uint8_t qkv_act_zp_ = 0;
+
+  int8_t* mha_dense_w_s8_ = nullptr;
+  float* mha_dense_comb_scales_ = nullptr;
+  float dense_inv_act_scale_ = 0.0f;
+  uint8_t dense_act_zp_ = 0;
+
+  int8_t* ffn_dense1_w_s8_ = nullptr;
+  float* ffn_dense1_comb_scales_ = nullptr;
+  float ffn_dense1_inv_act_scale_ = 0.0f;
+  uint8_t ffn_dense1_act_zp_ = 0;
+
+  int8_t* ffn_dense2_w_s8_ = nullptr;
+  float* ffn_dense2_comb_scales_ = nullptr;
+  float ffn_dense2_inv_act_scale_ = 0.0f;
+  uint8_t ffn_dense2_act_zp_ = 0;
 
   int mha_q_size_;
   int mha_k_size_;
@@ -437,7 +467,7 @@ class AttentionBody : public BaseLayer<DataType> {
   AttentionBody(const MultiHeadWeights& weights, void* scratch,
                 Activations activations, int num_res_blocks, int input_c,
                 int max_batch_size, bool is_pe_dense_embedding,
-                sycl::queue &sycl_queue);
+                sycl::queue &sycl_queue, bool use_int8 = false);
   ~AttentionBody();
   //void Eval(int N, DataType* output, const DataType* input,
   //          const DataType* input2, void* scratch, size_t scratch_size,
@@ -472,6 +502,16 @@ class AttentionBody : public BaseLayer<DataType> {
   int smolgen_global_size_;
   const bool has_gating_;
   const bool has_smolgen_;
+
+  // Dedicated W8A8 INT8 staging buffers (allocated only when INT8 encoders are active).
+  void ensureInt8Scratch(int N, sycl::queue& sycl_queue);
+  bool has_int8_encoders_ = false;
+  int int8_scratch_cap_batch_ = 0;
+  size_t int8_act_per_pos_ = 0;
+  size_t int32_gemm_per_pos_ = 0;
+  uint8_t* int8_act_buf_ = nullptr;
+  int32_t* int32_gemm_buf_ = nullptr;
+  int32_t* int32_zero_co_ = nullptr;
 };
 
 // The value head implementation
@@ -512,6 +552,37 @@ class ValueHead : public BaseLayer<DataType> {
   bool attention_body_;
   ActivationFunction act_;
 };
+
+#ifdef USE_SYCL_DNNL
+// W8A8 static INT8 residual tower backed by oneDNN SYCL direct INT8 convolutions
+// (Variant C: fused NHWC f16->blocked u8 reorder, conv1+act, conv2->NHWC f16)
+// bridged directly into FP32-accumulated NHWC SE + skip + activation.
+template <typename DataType>
+class Int8ResidualTower : public BaseLayer<DataType> {
+  using BaseLayer<DataType>::C;
+  using BaseLayer<DataType>::H;
+  using BaseLayer<DataType>::W;
+  using BaseLayer<DataType>::GetC;
+  using BaseLayer<DataType>::GetH;
+  using BaseLayer<DataType>::GetW;
+  using BaseLayer<DataType>::sycl_queue_;
+
+ public:
+  Int8ResidualTower(BaseLayer<DataType>* ip,
+                    const std::vector<MultiHeadWeights::Residual>& residuals,
+                    int num_filters, ActivationFunction act,
+                    sycl::queue& sycl_queue);
+  ~Int8ResidualTower();
+
+  void Eval(int N, DataType* output, const DataType* input,
+            const DataType* input2, void* scratch, size_t scratch_size,
+            sycl::queue& sycl_queue, DataType*** = nullptr) override;
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+#endif
 
 
 }  // namespace sycldnn_backend

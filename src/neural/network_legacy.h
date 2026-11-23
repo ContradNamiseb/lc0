@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <unordered_map>
 #include <vector>
 
@@ -38,6 +39,13 @@ struct BaseWeights {
     Vec bn_betas;
     Vec bn_means;
     Vec bn_stddivs;
+
+    // Optional W8A8 static INT8 quantization payloads (when weights use INT8 encoding).
+    bool has_int8 = false;
+    std::vector<int8_t> weights_i8;
+    Vec w_scales;
+    float act_scale = 0.0f;
+    uint8_t act_zp = 0;
   };
 
   struct SEunit {
@@ -81,6 +89,21 @@ struct BaseWeights {
     Vec dense_b;
     Smolgen smolgen;
     bool has_smolgen;
+
+    // Optional W8A8 static INT8 quantization payloads (when weights use INT8 encoding).
+    bool has_int8 = false;
+    std::vector<int8_t> q_w_i8;
+    std::vector<int8_t> k_w_i8;
+    std::vector<int8_t> v_w_i8;
+    std::vector<int8_t> dense_w_i8;
+    Vec q_w_scales;
+    Vec k_w_scales;
+    Vec v_w_scales;
+    Vec dense_w_scales;
+    float qkv_act_scale = 0.0f;
+    uint8_t qkv_act_zp = 0;
+    float dense_act_scale = 0.0f;
+    uint8_t dense_act_zp = 0;
   };
 
   struct FFN {
@@ -89,6 +112,17 @@ struct BaseWeights {
     Vec dense1_b;
     Vec dense2_w;
     Vec dense2_b;
+
+    // Optional W8A8 static INT8 quantization payloads (when weights use INT8 encoding).
+    bool has_int8 = false;
+    std::vector<int8_t> dense1_w_i8;
+    std::vector<int8_t> dense2_w_i8;
+    Vec dense1_w_scales;
+    Vec dense2_w_scales;
+    float dense1_act_scale = 0.0f;
+    uint8_t dense1_act_zp = 0;
+    float dense2_act_scale = 0.0f;
+    uint8_t dense2_act_zp = 0;
   };
 
   struct EncoderLayer {
