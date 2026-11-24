@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <sycl/sycl.hpp>
 
 #include "utils/exception.h"
@@ -56,6 +57,44 @@ void CublasError(int status, const char* file, const int& line);
 #endif
 
 inline int DivUp(int a, int b) { return (a + b - 1) / b; }
+
+// Compile-time precision traits for SyclNetwork<DataType>.
+// Member DataType is the inter-layer activation buffer type (float or
+// sycl::half); kEnableInt8 enables W8A8 DP4A INT8 execution for quantized
+// trunk layers.
+struct SyclFp32 {
+  using DataType = float;
+  static constexpr bool kEnableInt8 = false;
+  static constexpr const char* kBackendSuffix = "";
+};
+
+struct SyclFp16 {
+  using DataType = sycl::half;
+  static constexpr bool kEnableInt8 = false;
+  static constexpr const char* kBackendSuffix = "-fp16";
+};
+
+struct SyclInt8 {
+  using DataType = sycl::half;
+  using WeightType = int8_t;
+  using ActType = uint8_t;
+  using AccType = int32_t;
+  static constexpr bool kEnableInt8 = true;
+  static constexpr const char* kBackendSuffix = "-int8";
+};
+
+template <typename T>
+struct SyclPrecisionTraits {
+  using DataType = typename T::DataType;
+  static constexpr bool kEnableInt8 = T::kEnableInt8;
+  static constexpr const char* kBackendSuffix = T::kBackendSuffix;
+};
+
+template <>
+struct SyclPrecisionTraits<float> : SyclFp32 {};
+
+template <>
+struct SyclPrecisionTraits<sycl::half> : SyclFp16 {};
 
 }  // namespace sycldnn_backend
 }  // namespace lczero

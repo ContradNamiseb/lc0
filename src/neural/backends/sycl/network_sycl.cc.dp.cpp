@@ -45,7 +45,7 @@
 namespace lczero {
 using namespace sycldnn_backend;
 
-template <typename DataType, bool kEnableInt8 = false>
+template <typename DataType>
 class SyclNetwork;
 
 static size_t getMaxAttentionHeadSize(
@@ -117,10 +117,10 @@ static size_t getMaxAttentionBodySize(const MultiHeadWeights& weights, int N) {
   return size;
 }
 
-template <typename DataType, bool kEnableInt8 = false>
+template <typename DataType>
 class SyclNetworkComputation : public NetworkComputation {
  public:
-  SyclNetworkComputation(SyclNetwork<DataType, kEnableInt8>* network, bool wdl,
+  SyclNetworkComputation(SyclNetwork<DataType>* network, bool wdl,
                          bool moves_left);
   ~SyclNetworkComputation();
 
@@ -179,11 +179,15 @@ class SyclNetworkComputation : public NetworkComputation {
   bool wdl_;
   bool moves_left_;
 
-  SyclNetwork<DataType, kEnableInt8>* network_;
+  SyclNetwork<DataType>* network_;
 };
 
-template <typename DataType, bool kEnableInt8>
+template <typename DataType>
 class SyclNetwork : public Network {
+  using Traits = SyclPrecisionTraits<DataType>;
+  using BufferType = typename Traits::DataType;
+  static constexpr bool kEnableInt8 = Traits::kEnableInt8;
+
  public:
   SyclNetwork(const WeightsFile& file, const OptionsDict& options)
       : capabilities_{file.format().network_format().input(),
@@ -280,7 +284,7 @@ class SyclNetwork : public Network {
 
     // layout used by cuda backend is nchw.
     has_tensor_cores_ = false;
-    constexpr bool fp16 = std::is_same<sycl::half, DataType>::value;
+    constexpr bool fp16 = std::is_same<sycl::half, BufferType>::value;
 
     //dpct::device_info deviceProp = {};
     //sycl_queue_->get_device().get_device_info(deviceProp);
@@ -309,7 +313,7 @@ class SyclNetwork : public Network {
     // going to exceed 40% of total video memory, force custom_winograd off
     // if it's going to exceed 50% of memory.
     size_t residual_single_layer_weight_size =
-        3 * 3 * kNumFilters * kNumFilters * sizeof(DataType);
+        3 * 3 * kNumFilters * kNumFilters * sizeof(BufferType);
     size_t residual_weight_size =
         residual_single_layer_weight_size * numBlocks_ * 2;
     size_t transformed_residual_weight_size = residual_weight_size * 4;
@@ -327,9 +331,9 @@ class SyclNetwork : public Network {
     // works only when filter count is <= 384 (pre-Ampere), or less than 512
     // (Ampere)
     // It turns dynamically off based on filter count (see
-    // ResidualBlock<DataType>::Eval)
+    // ResidualBlock<BufferType>::Eval)
     // TODO: fix res_block_fusing.
-    if (kNumFilters % 32 == 0 && std::is_same<sycl::half, DataType>::value) {
+    if (kNumFilters % 32 == 0 && std::is_same<sycl::half, BufferType>::value) {
       use_res_block_winograd_fuse_opt_ = false;
     } else {
       use_res_block_winograd_fuse_opt_ = false;
@@ -367,7 +371,7 @@ class SyclNetwork : public Network {
     if (numBlocks_ > 0) {
       const size_t transformed_tensor_size =
           (size_t)(max_batch_size_ * kNumFilters * 64 * (36.0 / 16.0) *
-                   sizeof(DataType));
+                   sizeof(BufferType));
       scratch_size_ = std::max(scratch_size_, 2 * transformed_tensor_size);
     }
 
@@ -390,10 +394,10 @@ class SyclNetwork : public Network {
     const size_t attentionPolicySize =
         getMaxAttentionHeadSize(weights.policy_heads.at(policy_head),
                                 max_batch_size_) *
-        sizeof(DataType);
+        sizeof(BufferType);
 
     const size_t attentionBodySize =
-        getMaxAttentionBodySize(weights, max_batch_size_) * sizeof(DataType);
+        getMaxAttentionBodySize(weights, max_batch_size_) * sizeof(BufferType);
     scratch_size_ = std::max(scratch_size_,
                              std::max(attentionPolicySize, attentionBodySize));
 
@@ -410,7 +414,7 @@ class SyclNetwork : public Network {
     if (numBlocks_ > 0) {
       // Input.
       {
-        auto inputConv = std::make_unique<FusedWinogradConvSELayer<DataType>>(
+        auto inputConv = std::make_unique<FusedWinogradConvSELayer<BufferType>>(
             nullptr, kNumFilters, 8, 8, kNumInputPlanes, act, true, false,
             false, 0,  *sycl_queue_, use_res_block_winograd_fuse_opt_);
 
@@ -423,7 +427,7 @@ class SyclNetwork : public Network {
 #ifdef USE_SYCL_DNNL
       if constexpr (kEnableInt8) {
         if (use_int8_residual_) {
-          auto tower = std::make_unique<Int8ResidualTower<DataType>>(
+          auto tower = std::make_unique<Int8ResidualTower<BufferType>>(
               getLastLayer(), weights.residual, kNumFilters, act, *sycl_queue_);
           CERR << "Using SYCL W8A8 INT8 residual tower (oneDNN DP4A convs + FP32 SE + FP16 input/heads).";
           network_.emplace_back(std::move(tower));
@@ -437,7 +441,7 @@ class SyclNetwork : public Network {
 
         /*   
         if (use_res_block_winograd_fuse_opt_) {
-          auto layer = std::make_unique<ResidualBlock<DataType>>(
+          auto layer = std::make_unique<ResidualBlock<BufferType>>(
               getLastLayer(), kNumFilters, has_se, se_k,
               block == 0, block == (numBlocks_ - 1), act,
               deviceProp.sharedMemPerBlockOptin);
@@ -455,7 +459,7 @@ class SyclNetwork : public Network {
                                  scratch_mem_);
           network_.emplace_back(std::move(layer));
         } else { */
-          auto conv1 = std::make_unique<FusedWinogradConvSELayer<DataType>>(
+          auto conv1 = std::make_unique<FusedWinogradConvSELayer<BufferType>>(
               getLastLayer(), kNumFilters, 8, 8, kNumFilters, act, true, false,
               false, 0, *sycl_queue_);
 
@@ -464,7 +468,7 @@ class SyclNetwork : public Network {
                              scratch_mem_);
           network_.emplace_back(std::move(conv1));
 
-          auto conv2 = std::make_unique<FusedWinogradConvSELayer<DataType>>(
+          auto conv2 = std::make_unique<FusedWinogradConvSELayer<BufferType>>(
               getLastLayer(), kNumFilters, 8, 8, kNumFilters, act, true, true,
               has_se, se_k, *sycl_queue_);
           conv2->LoadWeights(&weights.residual[block].conv2.weights[0],
@@ -498,7 +502,7 @@ class SyclNetwork : public Network {
               : static_cast<ActivationFunction>(ffn_activation);
       activations.default_activation = act;
 
-      auto attention_body = std::make_unique<AttentionBody<DataType>>(
+      auto attention_body = std::make_unique<AttentionBody<BufferType>>(
           weights, scratch_mem_, activations, numBlocks_,
           numBlocks_ > 0 ? kNumFilters : kInputPlanes, max_batch_size_,
           static_cast<InputEmbedding>(
@@ -517,12 +521,12 @@ class SyclNetwork : public Network {
     {
       MultiHeadWeights::PolicyHead& head = weights.policy_heads.at(policy_head);
       if (attn_policy_) {
-        auto AttentionPolicy = std::make_unique<AttentionPolicyHead<DataType>>(
+        auto AttentionPolicy = std::make_unique<AttentionPolicyHead<BufferType>>(
             getLastLayer(), head, scratch_mem_, attn_body_, act,
             max_batch_size_, *sycl_queue_);
         network_.emplace_back(std::move(AttentionPolicy));
 
-        auto policymap = std::make_unique<PolicyMapLayer<DataType>>(
+        auto policymap = std::make_unique<PolicyMapLayer<BufferType>>(
             getLastLayer(), kNumOutputPolicy, 1, 1, 64 * 64 + 8 * 24, true, *sycl_queue_);
         policymap->LoadWeights(kAttnPolicyMap, scratch_mem_);
         network_.emplace_back(std::move(policymap));
@@ -530,7 +534,7 @@ class SyclNetwork : public Network {
       } else {
         if (conv_policy_) {
           assert(!attn_body_);  // not supported with attention body
-          auto conv1 = std::make_unique<FusedWinogradConvSELayer<DataType>>(
+          auto conv1 = std::make_unique<FusedWinogradConvSELayer<BufferType>>(
               resi_last_, kNumFilters, 8, 8, kNumFilters, act, true, false,
               false, 0, *sycl_queue_);
           conv1->LoadWeights(&head.policy1.weights[0], &head.policy1.biases[0],
@@ -540,28 +544,28 @@ class SyclNetwork : public Network {
           auto pol_channels = head.policy.biases.size();
 
           // No relu
-          auto conv2 = std::make_unique<FusedWinogradConvSELayer<DataType>>(
+          auto conv2 = std::make_unique<FusedWinogradConvSELayer<BufferType>>(
               getLastLayer(), pol_channels, 8, 8, kNumFilters, ACTIVATION_NONE,
               true, false, false, 0, *sycl_queue_);
           conv2->LoadWeights(&head.policy.weights[0], &head.policy.biases[0],
                              scratch_mem_);
           network_.emplace_back(std::move(conv2));
 
-          auto policymap = std::make_unique<PolicyMapLayer<DataType>>(
+          auto policymap = std::make_unique<PolicyMapLayer<BufferType>>(
               getLastLayer(), kNumOutputPolicy, 1, 1, 73 * 8 * 8, false, *sycl_queue_);
           policymap->LoadWeights(kConvPolicyMap, scratch_mem_);
 
           network_.emplace_back(std::move(policymap));
         } else {
           assert(!attn_body_);  // not supported with attention body
-          auto convPol = std::make_unique<Conv1Layer<DataType>>(
+          auto convPol = std::make_unique<Conv1Layer<BufferType>>(
               resi_last_, head.policy.biases.size(), 8, 8, kNumFilters, act,
               true, *sycl_queue_);
           convPol->LoadWeights(&head.policy.weights[0], &head.policy.biases[0],
                                scratch_mem_);
           network_.emplace_back(std::move(convPol));
 
-          auto FCPol = std::make_unique<FCLayer<DataType>>(
+          auto FCPol = std::make_unique<FCLayer<BufferType>>(
               getLastLayer(), head.ip_pol_b.size(), 1, 1, true,
               ACTIVATION_NONE, *sycl_queue_);
           FCPol->LoadWeights(&head.ip_pol_w[0], &head.ip_pol_b[0],
@@ -578,8 +582,8 @@ class SyclNetwork : public Network {
       wdl_ = file.format().network_format().value() ==
              pblczero::NetworkFormat::VALUE_WDL;
 
-      BaseLayer<DataType>* lastlayer = attn_body_ ? encoder_last_ : resi_last_;
-      auto value_main = std::make_unique<ValueHead<DataType>>(
+      BaseLayer<BufferType>* lastlayer = attn_body_ ? encoder_last_ : resi_last_;
+      auto value_main = std::make_unique<ValueHead<BufferType>>(
           lastlayer, head, scratch_mem_, attn_body_, wdl_, act,
           max_batch_size_, *sycl_queue_);
       network_.emplace_back(std::move(value_main));
@@ -591,26 +595,26 @@ class SyclNetwork : public Network {
                   options.GetOrDefault<bool>("mlh", true);
     if (moves_left_) {
       if (attn_body_) {
-        auto embedded_mov = std::make_unique<EmbeddingLayer<DataType>>(
+        auto embedded_mov = std::make_unique<EmbeddingLayer<BufferType>>(
             encoder_last_, weights.ip_mov_w, weights.ip_mov_b, scratch_mem_,
             act, *sycl_queue_);
         network_.emplace_back(std::move(embedded_mov));
       } else {
-        auto convMov = std::make_unique<Conv1Layer<DataType>>(
+        auto convMov = std::make_unique<Conv1Layer<BufferType>>(
             resi_last_, weights.moves_left.biases.size(), 8, 8, kNumFilters,
             act, true, *sycl_queue_);
         convMov->LoadWeights(&weights.moves_left.weights[0],
                              &weights.moves_left.biases[0], scratch_mem_);
         network_.emplace_back(std::move(convMov));
       }
-      auto FCMov1 = std::make_unique<FCLayer<DataType>>(
+      auto FCMov1 = std::make_unique<FCLayer<BufferType>>(
           getLastLayer(), weights.ip1_mov_b.size(), 1, 1, true, act, *sycl_queue_);
       FCMov1->LoadWeights(&weights.ip1_mov_w[0], &weights.ip1_mov_b[0],
                           scratch_mem_);
       network_.emplace_back(std::move(FCMov1));
 
-      auto FCMov2 = std::make_unique<FCLayer<DataType>>(getLastLayer(), 1, 1, 1,
-                                                        true, ACTIVATION_RELU, *sycl_queue_);
+      auto FCMov2 = std::make_unique<FCLayer<BufferType>>(getLastLayer(), 1, 1, 1,
+                                                          true, ACTIVATION_RELU, *sycl_queue_);
       FCMov2->LoadWeights(&weights.ip2_mov_w[0], &weights.ip2_mov_b[0],
                           scratch_mem_);
       network_.emplace_back(std::move(FCMov2));
@@ -621,7 +625,7 @@ class SyclNetwork : public Network {
     //      hold output and third to hold skip connection's input).
 
     // size of input to the network
-    size_t maxSize = max_batch_size_ * kNumInputPlanes * 64 * sizeof(DataType);
+    size_t maxSize = max_batch_size_ * kNumInputPlanes * 64 * sizeof(BufferType);
 
     // take max size of all layers
     for (auto& layer : network_) {
@@ -636,7 +640,7 @@ class SyclNetwork : public Network {
     if (!multi_stream_) {
       for (auto& mem : tensor_mem_) {
             //mem = (typename std::remove_reference<decltype(mem)>::type)
-            mem = (DataType *)sycl::malloc_device(maxSize, *sycl_queue_);
+            mem = (BufferType *)sycl::malloc_device(maxSize, *sycl_queue_);
             sycl_queue_->memset(mem, 0, maxSize).wait();
       }
     }
@@ -665,33 +669,33 @@ class SyclNetwork : public Network {
     float* ipDataValues = io->input_val_mem_shared_;
     sycl::queue io_sycl_queue_ = io->q_ct1;
 
-    DataType* tensor_mem[3];
+    BufferType* tensor_mem[3];
     void* scratch_mem;
-    DataType*** offset_pointers;
-    DataType*** head_offset_pointers;
+    BufferType*** offset_pointers;
+    BufferType*** head_offset_pointers;
 
     if (multi_stream_) {
       
       // We use tensor and scratch memory from InputOutputs (so that multiple
       // requests can run in parallel)
-      for (int i = 0; i < 3; i++) tensor_mem[i] = (DataType*)io->tensor_mem_[i];
+      for (int i = 0; i < 3; i++) tensor_mem[i] = (BufferType*)io->tensor_mem_[i];
       scratch_mem = io->scratch_mem_;
-      offset_pointers = (DataType***)&io->offset_pointers_;
-      head_offset_pointers = (DataType***)&io->head_offset_pointers_;
+      offset_pointers = (BufferType***)&io->offset_pointers_;
+      head_offset_pointers = (BufferType***)&io->head_offset_pointers_;
       //stream = io->stream_;
       //cublas = io->cublas_;
     } else {
       
       for (int i = 0; i < 3; i++) tensor_mem[i] = tensor_mem_[i];
       scratch_mem = scratch_mem_;
-      offset_pointers = (DataType***)&offset_pointers_;
-      head_offset_pointers = (DataType***)&head_offset_pointers_;
+      offset_pointers = (BufferType***)&offset_pointers_;
+      head_offset_pointers = (BufferType***)&head_offset_pointers_;
       //stream = &dpct::get_default_queue();  // default stream
       //cublas = cublas_;
     }
 
     
-    bool fp16 = std::is_same<sycl::half, DataType>::value;
+    bool fp16 = std::is_same<sycl::half, BufferType>::value;
     if (fp16) {
       expandPlanes_Fp16_NCHW((sycl::half*)(tensor_mem[0]), ipDataMasks, ipDataValues,
                              batchSize * kInputPlanes, io_sycl_queue_);
@@ -710,13 +714,13 @@ class SyclNetwork : public Network {
     // Figure out if the memory requirment for running the res block would fit
     // in the L2 cache.
     bool enableCacheOpt = false;
-    DataType* skip_connection =
+    BufferType* skip_connection =
         use_res_block_winograd_fuse_opt_ ? tensor_mem[1] : tensor_mem[2];
 
     
 //#if DPCT_COMPAT_RT_VERSION >= 11000
     const int pre_transform_tensor_size =
-        batchSize * numFilters_ * 8 * 8 * sizeof(DataType);
+        batchSize * numFilters_ * 8 * 8 * sizeof(BufferType);
     const int transformed_tensor_size = pre_transform_tensor_size * 36 / 16;
     const int res_block_mem =
         transformed_tensor_size * 2 + pre_transform_tensor_size;
@@ -739,15 +743,15 @@ class SyclNetwork : public Network {
 
      // enableCacheOpt = true;
     //  skip_connection =
-    //      tensor_mem[2] + 2 * transformed_tensor_size / sizeof(DataType);
+    //      tensor_mem[2] + 2 * transformed_tensor_size / sizeof(BufferType);
    // }
 //#endif
 
     int l = 0;
 
-    DataType* flow = tensor_mem[0];
-    DataType* spare1 = tensor_mem[1];
-    DataType* spare2 = tensor_mem[2];
+    BufferType* flow = tensor_mem[0];
+    BufferType* spare1 = tensor_mem[1];
+    BufferType* spare2 = tensor_mem[2];
     
 
     if (numBlocks_ > 0) {
@@ -816,7 +820,7 @@ class SyclNetwork : public Network {
                           batchSize * kNumOutputPolicy,
                           io_sycl_queue_);  // POLICY output
       } else {
-        network_[l++]->Eval(batchSize, (DataType*)opPol, spare1, nullptr,
+        network_[l++]->Eval(batchSize, (BufferType*)opPol, spare1, nullptr,
                             scratch_mem, scratch_size_, io_sycl_queue_, nullptr);  // policy map layer  // POLICY output
         
       }
@@ -839,7 +843,7 @@ class SyclNetwork : public Network {
 
 
       } else {
-        network_[l++]->Eval(batchSize, (DataType*)opPol, spare2, nullptr,
+        network_[l++]->Eval(batchSize, (BufferType*)opPol, spare2, nullptr,
                             scratch_mem, scratch_size_, io_sycl_queue_, nullptr);  
                             // policy map layer  // POLICY output
       }
@@ -857,7 +861,7 @@ class SyclNetwork : public Network {
                           batchSize * kNumOutputPolicy,
                           io_sycl_queue_);  // POLICY
       } else {
-        network_[l++]->Eval(batchSize, (DataType*)opPol, spare1, nullptr,
+        network_[l++]->Eval(batchSize, (BufferType*)opPol, spare1, nullptr,
                             scratch_mem, scratch_size_, io_sycl_queue_, nullptr);  // pol FC  // POLICY
       }
     }
@@ -871,7 +875,7 @@ class SyclNetwork : public Network {
       copyTypeConverted(opVal, (sycl::half*)spare1, wdl_ ? 3 * batchSize : batchSize,
                         io_sycl_queue_);
     } else {
-      network_[l++]->Eval(batchSize, (DataType*)opVal, flow, spare2,
+      network_[l++]->Eval(batchSize, (BufferType*)opVal, flow, spare2,
                           scratch_mem, scratch_size_, io_sycl_queue_, nullptr);  // value head
     }
 
@@ -897,7 +901,7 @@ class SyclNetwork : public Network {
       
       } else {
 
-        network_[l++]->Eval(batchSize, (DataType*)opMov, spare2, nullptr,
+        network_[l++]->Eval(batchSize, (BufferType*)opMov, spare2, nullptr,
                             scratch_mem, scratch_size_, io_sycl_queue_, nullptr);
 
       }
@@ -968,7 +972,7 @@ class SyclNetwork : public Network {
     }
   
   std::unique_ptr<NetworkComputation> NewComputation() override {
-    return std::make_unique<SyclNetworkComputation<DataType, kEnableInt8>>(
+    return std::make_unique<SyclNetworkComputation<DataType>>(
         this, wdl_, moves_left_);
   }
 
@@ -977,7 +981,7 @@ class SyclNetwork : public Network {
     if (free_inputs_outputs_.empty()) {
       return std::make_unique<InputsOutputs>(
           max_batch_size_, wdl_, moves_left_, *sycl_queue_, tensor_mem_size_, scratch_size_,
-          !has_tensor_cores_ && std::is_same<sycl::half, DataType>::value);
+          !has_tensor_cores_ && std::is_same<sycl::half, BufferType>::value);
     } else {
       std::unique_ptr<InputsOutputs> resource =
           std::move(free_inputs_outputs_.front());
@@ -1022,11 +1026,11 @@ class SyclNetwork : public Network {
   bool attn_policy_;
   bool attn_body_;
   int num_encoder_blocks_;
-  std::vector<std::unique_ptr<BaseLayer<DataType>>> network_;
-  BaseLayer<DataType>* getLastLayer() { return network_.back().get(); }
+  std::vector<std::unique_ptr<BaseLayer<BufferType>>> network_;
+  BaseLayer<BufferType>* getLastLayer() { return network_.back().get(); }
 
-  BaseLayer<DataType>* resi_last_;
-  BaseLayer<DataType>* encoder_last_;
+  BaseLayer<BufferType>* resi_last_;
+  BaseLayer<BufferType>* encoder_last_;
 
   size_t tensor_mem_size_;
   size_t scratch_size_;
@@ -1041,7 +1045,7 @@ class SyclNetwork : public Network {
 
   // not used when multi-steam is enabled
   //dpct::queue_ptr cublas_;
-  DataType* tensor_mem_[3];
+  BufferType* tensor_mem_[3];
 
   mutable std::mutex inputs_outputs_lock_;
   std::list<std::unique_ptr<InputsOutputs>> free_inputs_outputs_;
@@ -1094,33 +1098,31 @@ class SyclNetwork : public Network {
     }
 };
 
-template <typename DataType, bool kEnableInt8>
-SyclNetworkComputation<DataType, kEnableInt8>::SyclNetworkComputation(
-    SyclNetwork<DataType, kEnableInt8>* network, bool wdl, bool moves_left)
+template <typename DataType>
+SyclNetworkComputation<DataType>::SyclNetworkComputation(
+    SyclNetwork<DataType>* network, bool wdl, bool moves_left)
     : wdl_(wdl), moves_left_(moves_left), network_(network) {
   batch_size_ = 0;
   inputs_outputs_ = network_->GetInputsOutputs();
 }
 
-template <typename DataType, bool kEnableInt8>
-SyclNetworkComputation<DataType, kEnableInt8>::~SyclNetworkComputation() {
+template <typename DataType>
+SyclNetworkComputation<DataType>::~SyclNetworkComputation() {
   network_->ReleaseInputsOutputs(std::move(inputs_outputs_));
 }
 
-template <typename DataType, bool kEnableInt8>
-void SyclNetworkComputation<DataType, kEnableInt8>::ComputeBlocking() {
+template <typename DataType>
+void SyclNetworkComputation<DataType>::ComputeBlocking() {
   network_->forwardEval(inputs_outputs_.get(), GetBatchSize());
 }
 
-template <typename DataType, bool kEnableInt8 = false>
+template <typename DataType>
 std::unique_ptr<Network> MakeSyclNetwork(const std::optional<WeightsFile>& w,
                                          const OptionsDict& options) {
   if (!w) {
-    const char* suffix =
-        kEnableInt8 ? "-int8"
-                    : (std::is_same<sycl::half, DataType>::value ? "-fp16" : "");
-    throw Exception(std::string("The sycl") + suffix +
-                    " backend requires a network file.");
+    throw Exception(
+        std::string("The sycl") + SyclPrecisionTraits<DataType>::kBackendSuffix +
+        " backend requires a network file.");
   }
   const WeightsFile& weights = *w;
   auto nf = weights.format().network_format();
@@ -1181,12 +1183,7 @@ std::unique_ptr<Network> MakeSyclNetwork(const std::optional<WeightsFile>& w,
                       NF::InputEmbeddingFormat_Name(nf.input_embedding()) +
                       " is not supported by the SYCL backend.");
   }
-  return std::make_unique<SyclNetwork<DataType, kEnableInt8>>(weights, options);
-}
-
-std::unique_ptr<Network> MakeSyclInt8Network(
-    const std::optional<WeightsFile>& weights, const OptionsDict& options) {
-  return MakeSyclNetwork<sycl::half, true>(weights, options);
+  return std::make_unique<SyclNetwork<DataType>>(weights, options);
 }
 
 std::unique_ptr<Network> MakeSyclNetworkAuto(
@@ -1200,17 +1197,17 @@ std::unique_ptr<Network> MakeSyclNetworkAuto(
   CERR << "Trying to switch to [sycl-fp16]...";
   if (devices[gpu_id].has(sycl::aspect::fp16)) {
     CERR << "Switched to [sycl-fp16]..."; 
-    return MakeSyclNetwork<sycl::half>(weights, options);     
+    return MakeSyclNetwork<SyclFp16>(weights, options);     
   } else {
     CERR << "Device does not support sycl-fp16";
   }
   CERR << "Switched to [sycl]...";
-  return MakeSyclNetwork<float>(weights, options);
+  return MakeSyclNetwork<SyclFp32>(weights, options);
 }
 
 REGISTER_NETWORK("sycl-auto", MakeSyclNetworkAuto, 132)
-REGISTER_NETWORK("sycl", MakeSyclNetwork<float>, 131)
-REGISTER_NETWORK("sycl-fp16", MakeSyclNetwork<sycl::half>, 130)
-REGISTER_NETWORK("sycl-int8", MakeSyclInt8Network, 129)
+REGISTER_NETWORK("sycl", MakeSyclNetwork<SyclFp32>, 131)
+REGISTER_NETWORK("sycl-fp16", MakeSyclNetwork<SyclFp16>, 130)
+REGISTER_NETWORK("sycl-int8", MakeSyclNetwork<SyclInt8>, 129)
 
 }  // namespace lczero
