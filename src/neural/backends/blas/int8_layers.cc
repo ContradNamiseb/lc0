@@ -25,6 +25,10 @@
 #include "neural/backends/blas/layers.h"
 #include "utils/exception.h"
 
+#ifdef USE_ISPC
+#include "int8_layers_ispc.h"
+#endif
+
 namespace lczero {
 namespace blas_backend {
 namespace {
@@ -88,6 +92,11 @@ void Int8Weights::QuantizeInput(size_t count, const float* input,
                                 uint8_t* output) const {
   const float inverse_scale = inverse_input_scale_;
   const float zero_point = input_zero_point_;
+#ifdef USE_ISPC
+  ispc::QuantizeToUint8(static_cast<uint32_t>(count), input, inverse_scale,
+                        zero_point, output);
+  return;
+#endif
   for (size_t i = 0; i < count; i++) {
     const float value =
         std::min(std::max(input[i] * inverse_scale + zero_point, 0.0f), 255.0f);
@@ -120,6 +129,17 @@ void Int8Weights::Forward(size_t rows, const uint8_t* quantized_input,
                           float* output, Int8Scratch& scratch) const {
   GrowBuffer(scratch.accumulators, rows * outputs_);
   MatrixMultiply(rows, quantized_input, scratch.accumulators.data());
+#ifdef USE_ISPC
+  ispc::DequantizeRows(static_cast<uint32_t>(rows),
+                       static_cast<uint32_t>(outputs_),
+                       scratch.accumulators.data(), output_scales_.data(),
+                       zero_point_corrections_.data(), output);
+  for (size_t row = 0; row < rows; row++) {
+    float* values = output + row * outputs_;
+    Activate(outputs_, values, biases, values, activation);
+  }
+  return;
+#endif
   for (size_t row = 0; row < rows; row++) {
     const int32_t* accumulators = &scratch.accumulators[row * outputs_];
     float* values = output + row * outputs_;
