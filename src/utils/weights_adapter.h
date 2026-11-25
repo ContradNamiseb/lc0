@@ -83,6 +83,8 @@ class LayerAdapter {
 
   LayerAdapter(const pblczero::Weights::Layer& layer);
   std::vector<float> as_vector() const;
+  std::vector<int8_t> as_int8_vector() const;
+  pblczero::Weights::Layer::Encoding encoding() const { return encoding_; }
   size_t size() const { return size_; }
   float operator[](size_t idx) const { return begin()[idx]; }
   Iterator begin() const { return {this, data_}; }

@@ -50,6 +50,9 @@ float LayerAdapter::Iterator::ExtractValue(const std::byte* ptr,
     case pblczero::Weights::Layer::FLOAT32: {
       return *reinterpret_cast<const float*>(ptr);
     }
+    case pblczero::Weights::Layer::INT8: {
+      return static_cast<float>(*reinterpret_cast<const int8_t*>(ptr));
+    }
     [[unlikely]] default:  // To silence a couple of warnings.
 #if defined(ABSL_UNREACHABLE)
       ABSL_UNREACHABLE();
@@ -66,7 +69,9 @@ LayerAdapter::LayerAdapter(const pblczero::Weights::Layer& layer)
                                      : pblczero::Weights::Layer::LINEAR16),
       element_size_(encoding_ == pblczero::Weights::Layer::FLOAT32
                         ? sizeof(float)
-                        : sizeof(uint16_t)),
+                        : (encoding_ == pblczero::Weights::Layer::INT8
+                               ? sizeof(int8_t)
+                               : sizeof(uint16_t))),
       data_(reinterpret_cast<const std::byte*>(layer.params().data())),
       size_(layer.params().size() / element_size_),
       min_(layer.min_val()),
@@ -76,6 +81,7 @@ LayerAdapter::LayerAdapter(const pblczero::Weights::Layer& layer)
     case pblczero::Weights::Layer::FLOAT16:
     case pblczero::Weights::Layer::BFLOAT16:
     case pblczero::Weights::Layer::FLOAT32:
+    case pblczero::Weights::Layer::INT8:
       break;
     default:
       throw Exception("Unknown layer encoding " +
@@ -85,6 +91,14 @@ LayerAdapter::LayerAdapter(const pblczero::Weights::Layer& layer)
 
 std::vector<float> LayerAdapter::as_vector() const {
   return std::vector<float>(begin(), end());
+}
+
+std::vector<int8_t> LayerAdapter::as_int8_vector() const {
+  if (encoding_ != pblczero::Weights::Layer::INT8) {
+    throw Exception("LayerAdapter::as_int8_vector called on non-INT8 layer");
+  }
+  const auto* ptr = reinterpret_cast<const int8_t*>(data_);
+  return std::vector<int8_t>(ptr, ptr + size_);
 }
 float LayerAdapter::Iterator::operator*() const {
   return ExtractValue(data_, adapter_);
