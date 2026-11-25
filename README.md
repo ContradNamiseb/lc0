@@ -49,29 +49,38 @@ lc0 --weights=nets/t74-744021-sycl-int8.pb.gz --backend=sycl-fp16 --backend-opts
 
 Measured on an Intel Core i5-1135G7 with Iris Xe graphics (80 EUs), comparing
 `sycl-int8` on these nets with `sycl-fp16` on the original nets, both on the
-`feature/sycl-int8` build:
+`feature/sycl-int8` build. Nodes per second in `backendbench`, by batch size:
 
-| Net | `backendbench`, batch 160 (nps) | Top move vs FP32, 256 held-out positions |
-| --- | --- | --- |
-| T1 | 358 → 477 (+33%) | 93.0% |
-| T74 | 4,646 → 5,137 (+11%) | 96.5% |
-| T79 | 1,750 → 1,598 (−9%) | 95.7% |
+| Batch | T1 | T74 | T79 |
+| --- | --- | --- | --- |
+| 16 | 390 → 510 (+31%) | 2,653 → 3,692 (+39%) | 1,184 → 1,375 (+16%) |
+| 30 | 417 → 512 (+23%) | 4,486 → 4,783 (+7%) | 1,669 → 1,408 (−16%) |
+| 80 | 371 → 482 (+30%) | 4,799 → 4,890 (+2%) | 1,655 → 1,434 (−13%) |
+| 160 | 358 → 477 (+33%) | 4,646 → 5,137 (+11%) | 1,750 → 1,598 (−9%) |
+| 240 | 409 → 491 (+20%) | 4,000 → 5,199 (+30%) | 1,597 → 1,442 (−10%) |
 
-The speeds are medians of three alternating rounds of 100 batches each, from
-2026-11-25. They vary with the laptop's temperature: T74's three rounds gave
-+6% to +26%. An earlier run on 2026-11-23 measured +20%, +26% and −7% in
-`backendbench`, and +36%, +15% and −3% in real search at minibatch 160.
+Each figure is the median of three rounds of 100 batches, from 2026-11-25. The
+FP16 and INT8 runs alternated, so the two numbers in one cell are fair to
+compare. Different batch sizes were measured at different times, and the
+laptop's speed varies with its temperature, so comparing across rows is less
+reliable: T74's three rounds at batch 160 alone gave +6% to +26%. An earlier
+run on 2026-11-23 measured +20%, +26% and −7% at batch 160, and +36%, +15% and
+−3% in real search at minibatch 160.
 
-The last column compares the quantized model's best move with the original
-FP32 net's on 256 positions not used for calibration. That check ran in
-OpenVINO on the GPU, using exactly the same int8 weights and scales as the
-SYCL nets.
+The ResNets' INT8 convolutions round every batch above 16 up to a multiple of
+32, so batch 30 runs as 32, batch 80 as 96 and batch 240 as 256, with the extra
+entries wasted. The transformer (T1) has no such rounding.
 
-T1 is clearly faster in INT8 and T74 somewhat faster. T79 isn't: on this GPU,
-the FP16 Winograd convolutions it replaces are about as fast as INT8 at large
-batches, and its Mish activations need extra zero-point work. It was faster at
-batch 16 (+13% on 2026-11-23). No game match has been played with the SYCL INT8
-nets yet, so their playing strength is unmeasured.
+T1 and T74 are faster in INT8 at every batch size, T74 by the most at batch 16.
+T79 is faster only at batch 16, and 9% to 16% slower from batch 30 up: on this
+GPU, the FP16 Winograd convolutions it replaces are about as fast as INT8, and
+its Mish activations need extra zero-point work.
+
+The quantized models pick the same best move as the original FP32 nets on
+93.0% (T1), 96.5% (T74) and 95.7% (T79) of 256 positions not used for
+calibration. That check ran in OpenVINO on the GPU, using exactly the same int8
+weights and scales as the SYCL nets. No game match has been played with the
+SYCL INT8 nets yet, so their playing strength is unmeasured.
 
 ## How they were made
 

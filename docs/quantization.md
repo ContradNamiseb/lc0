@@ -268,6 +268,7 @@ About the scripts:
 - No game match has been played with the SYCL INT8 nets. The OpenVINO INT8
   version of T74 beat OpenVINO FP16 by about +150 Elo in a 60-game match at
   10 s + 0.1 s, but that win comes from the speed gain and a different backend.
-- T79 is not faster than FP16 at large batches on this GPU.
+- T79 is faster than FP16 only at batch 16 on this GPU (+16%), and 9% to
+  16% slower from batch 30 up.
 - Only the classical 112-plane input format is supported by the calibration
   script.
