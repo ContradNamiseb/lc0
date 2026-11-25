@@ -42,6 +42,24 @@ namespace lczero {
 namespace blas_backend {
 namespace {
 
+// Number of layers stored with INT8 weights.
+size_t CountInt8Layers(const MultiHeadWeights& weights,
+                       const MultiHeadWeights::PolicyHead& policy_head) {
+  size_t layers = 0;
+  for (const auto& residual : weights.residual) {
+    layers += residual.conv1.has_int8 + residual.conv2.has_int8;
+  }
+  const auto count_encoders =
+      [&layers](const std::vector<MultiHeadWeights::EncoderLayer>& encoders) {
+        for (const auto& encoder : encoders) {
+          layers += 4 * encoder.mha.has_int8 + 2 * encoder.ffn.has_int8;
+        }
+      };
+  count_encoders(weights.encoder);
+  count_encoders(policy_head.pol_encoder);
+  return layers;
+}
+
 template <bool use_eigen>
 class BlasNetwork;
 
@@ -336,6 +354,11 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
     max_batch_size_ = kHardMaxBatchSize;
   }
 
+  // Layers stored in INT8 run in INT8 unless int8=false or the build can't
+  // (Eigen, or a BLAS other than MKL); then they use the dequantized weights.
+  const bool int8_requested = options.GetOrDefault<bool>("int8", true);
+  const bool use_int8 = !use_eigen && kInt8Available && int8_requested;
+
   const std::string policy_head =
       options.GetOrDefault<std::string>("policy_head", "vanilla");
   // Check that selected policy head exists.
@@ -383,8 +406,8 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
     AddLayer(std::make_unique<ConvLayer<use_eigen>>(
         weights_.input, kInputPlanes, 3, default_activation));
     for (const auto& residual : weights_.residual) {
-      AddLayer(std::make_unique<ResidualBlock<use_eigen>>(residual, channels,
-                                                          default_activation));
+      AddLayer(std::make_unique<ResidualBlock<use_eigen>>(
+          residual, channels, default_activation, use_int8));
     }
   }
 
@@ -393,7 +416,7 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
     AddLayer(std::make_unique<AttentionBody<use_eigen>>(
         weights_, num_residual_blocks_ > 0 ? channels : kInputPlanes,
         num_residual_blocks_ > 0, is_pe_dense_embedding, default_activation,
-        smolgen_activation, ffn_activation));
+        smolgen_activation, ffn_activation, use_int8));
     body_channels = weights_.ip_emb_b.size();
   }
 
@@ -401,7 +424,7 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
   if (attn_policy_) {
     AddLayer(std::make_unique<AttentionPolicyHead<use_eigen>>(
         policy_weights, weights_.smolgen_w, body_channels, attn_body_,
-        default_activation, smolgen_activation, ffn_activation));
+        default_activation, smolgen_activation, ffn_activation, use_int8));
     AddLayer(std::make_unique<PolicyMapLayer<use_eigen>>(
         kAttnPolicyMap, 64 * 64 + 8 * 24, 64 * 64 + 8 * 24));
   } else if (conv_policy_) {
@@ -495,6 +518,17 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
     CERR << "BLAS vendor: Apple vecLib.";
 #endif
     CERR << "BLAS max batch size is " << max_batch_size_ << ".";
+  }
+
+  const size_t int8_layers = CountInt8Layers(weights_, policy_weights);
+  if (int8_layers > 0 && use_int8) {
+    CERR << "Using W8A8 INT8 for " << int8_layers
+         << " layers (MKL cblas_gemm_s8u8s32).";
+  } else if (int8_layers > 0) {
+    CERR << "The net has " << int8_layers
+         << " INT8 layers; running them in FP32 from the dequantized weights"
+         << (int8_requested ? " (INT8 needs a blas build with MKL)."
+                            : " (int8=false).");
   }
 }
 

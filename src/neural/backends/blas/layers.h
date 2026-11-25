@@ -20,8 +20,10 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <vector>
 
+#include "neural/backends/blas/int8_layers.h"
 #include "neural/backends/blas/winograd_convolution3.h"
 #include "neural/backends/shared/activation.h"
 #include "neural/network_legacy.h"
@@ -34,7 +36,10 @@ constexpr size_t kNumOutputPolicy = 1858;
 
 // Grows a buffer to at least `size` elements. Buffers never shrink, so a
 // workspace reaches its final size after the first full batch.
-void GrowBuffer(std::vector<float>& buffer, size_t size);
+template <typename T>
+void GrowBuffer(std::vector<T>& buffer, size_t size) {
+  if (buffer.size() < size) buffer.resize(size);
+}
 
 // Memory one computation owns while it runs the network. The network keeps
 // a pool of these, so the buffers are allocated once and reused. Layers hold
@@ -54,6 +59,7 @@ class Workspace {
   std::vector<float> tensors[3];
   // Scratch for the layers' temporaries.
   std::vector<float> buffers[4];
+  Int8Scratch int8;
 
  private:
   const size_t max_convolution_input_channels_;
@@ -110,11 +116,12 @@ class ConvLayer : public BaseLayer<use_eigen> {
 
 // Two 3x3 convolutions, the optional squeeze-and-excitation unit and the skip
 // connection. NCHW in and out; `output` may be the same tensor as `input`.
+// With `use_int8`, a convolution that has INT8 weights runs in INT8.
 template <bool use_eigen>
 class ResidualBlock : public BaseLayer<use_eigen> {
  public:
   ResidualBlock(const MultiHeadWeights::Residual& weights, size_t channels,
-                ActivationFunction activation);
+                ActivationFunction activation, bool use_int8);
 
   void Eval(size_t batch_size, float* output, const float* input,
             const float* input2,
@@ -124,6 +131,8 @@ class ResidualBlock : public BaseLayer<use_eigen> {
   const MultiHeadWeights::Residual& weights_;
   const size_t channels_;
   const ActivationFunction activation_;
+  std::optional<Int8Weights> conv1_int8_;
+  std::optional<Int8Weights> conv2_int8_;
 };
 
 // A fully connected layer over each sample's whole input.
@@ -183,7 +192,9 @@ class PolicyMapLayer : public BaseLayer<use_eigen> {
 
 // One transformer encoder layer (smolgen, multi-head attention, feed-forward
 // network, two layer norms). Not a BaseLayer: it runs in place on the
-// attention body's or policy head's NHWC tensor.
+// attention body's or policy head's NHWC tensor. With `use_int8`, the Q, K,
+// V and output projections and the two feed-forward layers run in INT8 when
+// the layer has INT8 weights.
 template <bool use_eigen>
 class EncoderBlock {
  public:
@@ -192,13 +203,13 @@ class EncoderBlock {
                size_t embedding_size, size_t heads,
                ActivationFunction smolgen_activation,
                ActivationFunction ffn_activation, float alpha,
-               float default_epsilon);
+               float default_epsilon, bool use_int8);
 
   // The result is left in `flow`. The other buffers are scratch; the vectors
   // may be swapped with `flow`.
   void Eval(size_t batch_size, std::vector<float>& flow,
             std::vector<float>& buffer2, std::vector<float>& buffer3,
-            std::vector<float>& buffer4) const;
+            std::vector<float>& buffer4, Int8Scratch& int8_scratch) const;
 
  private:
   const MultiHeadWeights::EncoderLayer& weights_;
@@ -209,6 +220,12 @@ class EncoderBlock {
   const ActivationFunction ffn_activation_;
   const float alpha_;
   const float default_epsilon_;
+  std::optional<Int8Weights> q_int8_;
+  std::optional<Int8Weights> k_int8_;
+  std::optional<Int8Weights> v_int8_;
+  std::optional<Int8Weights> dense_int8_;
+  std::optional<Int8Weights> ffn_dense1_int8_;
+  std::optional<Int8Weights> ffn_dense2_int8_;
 };
 
 // The whole attention body: input preprocessing and position encoding, the
@@ -222,7 +239,7 @@ class AttentionBody : public BaseLayer<use_eigen> {
                 bool has_residual_tower, bool is_pe_dense_embedding,
                 ActivationFunction default_activation,
                 ActivationFunction smolgen_activation,
-                ActivationFunction ffn_activation);
+                ActivationFunction ffn_activation, bool use_int8);
 
   void Eval(size_t batch_size, float* output, const float* input,
             const float* input2,
@@ -252,7 +269,7 @@ class AttentionPolicyHead : public BaseLayer<use_eigen> {
                       size_t input_channels, bool attention_body,
                       ActivationFunction default_activation,
                       ActivationFunction smolgen_activation,
-                      ActivationFunction ffn_activation);
+                      ActivationFunction ffn_activation, bool use_int8);
 
   void Eval(size_t batch_size, float* output, const float* input,
             const float* input2,

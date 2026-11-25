@@ -72,10 +72,6 @@ void NchwToNhwc(size_t batch_size, size_t channels, const float* input,
 
 }  // namespace
 
-void GrowBuffer(std::vector<float>& buffer, size_t size) {
-  if (buffer.size() < size) buffer.resize(size);
-}
-
 template <bool use_eigen>
 Workspace<use_eigen>::Workspace(size_t max_convolution_input_channels,
                                 size_t max_convolution_output_channels)
@@ -127,11 +123,23 @@ void ConvLayer<use_eigen>::Eval(size_t batch_size, float* output,
 template <bool use_eigen>
 ResidualBlock<use_eigen>::ResidualBlock(
     const MultiHeadWeights::Residual& weights, size_t channels,
-    ActivationFunction activation)
+    ActivationFunction activation, bool use_int8)
     : BaseLayer<use_eigen>(channels * kSquares),
       weights_(weights),
       channels_(channels),
-      activation_(activation) {}
+      activation_(activation) {
+  if (!use_int8) return;
+  const auto& conv1 = weights.conv1;
+  const auto& conv2 = weights.conv2;
+  if (conv1.has_int8) {
+    conv1_int8_.emplace(conv1.weights_i8, conv1.w_scales, conv1.act_scale,
+                        conv1.act_zp);
+  }
+  if (conv2.has_int8) {
+    conv2_int8_.emplace(conv2.weights_i8, conv2.w_scales, conv2.act_scale,
+                        conv2.act_zp);
+  }
+}
 
 template <bool use_eigen>
 void ResidualBlock<use_eigen>::Eval(size_t batch_size, float* output,
@@ -148,12 +156,22 @@ void ResidualBlock<use_eigen>::Eval(size_t batch_size, float* output,
 
   const auto& conv1 = weights_.conv1;
   const auto& conv2 = weights_.conv2;
-  winograd.Forward(batch_size, channels_, channels_, output,
-                   conv1.weights.data(), conv1_output.data());
+  if (conv1_int8_) {
+    conv1_int8_->Convolve3(batch_size, output, conv1_output.data(),
+                           workspace.int8);
+  } else {
+    winograd.Forward(batch_size, channels_, channels_, output,
+                     conv1.weights.data(), conv1_output.data());
+  }
   BiasActivate(batch_size, channels_, conv1_output.data(), conv1.biases.data(),
                activation_);
-  winograd.Forward(batch_size, channels_, channels_, conv1_output.data(),
-                   conv2.weights.data(), conv2_output.data());
+  if (conv2_int8_) {
+    conv2_int8_->Convolve3(batch_size, conv1_output.data(), conv2_output.data(),
+                           workspace.int8);
+  } else {
+    winograd.Forward(batch_size, channels_, channels_, conv1_output.data(),
+                     conv2.weights.data(), conv2_output.data());
+  }
 
   if (weights_.has_se) {
     // No activation here: the SE unit adds the bias and the skip connection
@@ -237,7 +255,8 @@ EncoderBlock<use_eigen>::EncoderBlock(
     const MultiHeadWeights::EncoderLayer& weights,
     const std::vector<float>& smolgen_global_weights, size_t embedding_size,
     size_t heads, ActivationFunction smolgen_activation,
-    ActivationFunction ffn_activation, float alpha, float default_epsilon)
+    ActivationFunction ffn_activation, float alpha, float default_epsilon,
+    bool use_int8)
     : weights_(weights),
       smolgen_global_weights_(smolgen_global_weights),
       embedding_size_(embedding_size),
@@ -245,13 +264,34 @@ EncoderBlock<use_eigen>::EncoderBlock(
       smolgen_activation_(smolgen_activation),
       ffn_activation_(ffn_activation),
       alpha_(alpha),
-      default_epsilon_(default_epsilon) {}
+      default_epsilon_(default_epsilon) {
+  if (!use_int8) return;
+  const auto& mha = weights.mha;
+  if (mha.has_int8) {
+    q_int8_.emplace(mha.q_w_i8, mha.q_w_scales, mha.qkv_act_scale,
+                    mha.qkv_act_zp);
+    k_int8_.emplace(mha.k_w_i8, mha.k_w_scales, mha.qkv_act_scale,
+                    mha.qkv_act_zp);
+    v_int8_.emplace(mha.v_w_i8, mha.v_w_scales, mha.qkv_act_scale,
+                    mha.qkv_act_zp);
+    dense_int8_.emplace(mha.dense_w_i8, mha.dense_w_scales, mha.dense_act_scale,
+                        mha.dense_act_zp);
+  }
+  const auto& ffn = weights.ffn;
+  if (ffn.has_int8) {
+    ffn_dense1_int8_.emplace(ffn.dense1_w_i8, ffn.dense1_w_scales,
+                             ffn.dense1_act_scale, ffn.dense1_act_zp);
+    ffn_dense2_int8_.emplace(ffn.dense2_w_i8, ffn.dense2_w_scales,
+                             ffn.dense2_act_scale, ffn.dense2_act_zp);
+  }
+}
 
 template <bool use_eigen>
 void EncoderBlock<use_eigen>::Eval(size_t batch_size, std::vector<float>& flow,
                                    std::vector<float>& buffer2,
                                    std::vector<float>& buffer3,
-                                   std::vector<float>& buffer4) const {
+                                   std::vector<float>& buffer4,
+                                   Int8Scratch& int8_scratch) const {
   const auto& mha = weights_.mha;
   const auto& ffn = weights_.ffn;
   const size_t d_model = mha.q_b.size();
@@ -309,13 +349,24 @@ void EncoderBlock<use_eigen>::Eval(size_t batch_size, std::vector<float>& flow,
   }
 
   // Q
-  FullyConnectedLayer<use_eigen>::Forward1D(
-      batch_size * kSquares, embedding_size_, d_model, flow.data(),
-      mha.q_w.data(), mha.q_b.data(), ACTIVATION_NONE, buffer2.data());
+  const size_t rows = batch_size * kSquares;
+  if (q_int8_) {
+    q_int8_->Forward(rows, flow.data(), mha.q_b.data(), ACTIVATION_NONE,
+                     buffer2.data(), int8_scratch);
+  } else {
+    FullyConnectedLayer<use_eigen>::Forward1D(
+        rows, embedding_size_, d_model, flow.data(), mha.q_w.data(),
+        mha.q_b.data(), ACTIVATION_NONE, buffer2.data());
+  }
   // K
-  FullyConnectedLayer<use_eigen>::Forward1D(
-      batch_size * kSquares, embedding_size_, d_model, flow.data(),
-      mha.k_w.data(), mha.k_b.data(), ACTIVATION_NONE, buffer3.data());
+  if (k_int8_) {
+    k_int8_->Forward(rows, flow.data(), mha.k_b.data(), ACTIVATION_NONE,
+                     buffer3.data(), int8_scratch);
+  } else {
+    FullyConnectedLayer<use_eigen>::Forward1D(
+        rows, embedding_size_, d_model, flow.data(), mha.k_w.data(),
+        mha.k_b.data(), ACTIVATION_NONE, buffer3.data());
+  }
 
   // MHA (Q, K, V)
   const int depth = static_cast<int>(d_model / heads);
@@ -374,9 +425,14 @@ void EncoderBlock<use_eigen>::Eval(size_t batch_size, std::vector<float>& flow,
   }
 
   // V
-  FullyConnectedLayer<use_eigen>::Forward1D(
-      batch_size * kSquares, embedding_size_, d_model, flow.data(),
-      mha.v_w.data(), mha.v_b.data(), ACTIVATION_NONE, buffer3.data());
+  if (v_int8_) {
+    v_int8_->Forward(rows, flow.data(), mha.v_b.data(), ACTIVATION_NONE,
+                     buffer3.data(), int8_scratch);
+  } else {
+    FullyConnectedLayer<use_eigen>::Forward1D(
+        rows, embedding_size_, d_model, flow.data(), mha.v_w.data(),
+        mha.v_b.data(), ACTIVATION_NONE, buffer3.data());
+  }
 
   for (size_t batch = 0; batch < batch_size; batch++) {
     const size_t batch_start = batch * kSquares * d_model;
@@ -406,9 +462,14 @@ void EncoderBlock<use_eigen>::Eval(size_t batch_size, std::vector<float>& flow,
   }
 
   // Fully connected final MHA layer.
-  FullyConnectedLayer<use_eigen>::Forward1D(
-      batch_size * kSquares, d_model, embedding_size_, buffer2.data(),
-      mha.dense_w.data(), mha.dense_b.data(), ACTIVATION_NONE, buffer3.data());
+  if (dense_int8_) {
+    dense_int8_->Forward(rows, buffer2.data(), mha.dense_b.data(),
+                         ACTIVATION_NONE, buffer3.data(), int8_scratch);
+  } else {
+    FullyConnectedLayer<use_eigen>::Forward1D(
+        rows, d_model, embedding_size_, buffer2.data(), mha.dense_w.data(),
+        mha.dense_b.data(), ACTIVATION_NONE, buffer3.data());
+  }
 
   // Layer Norm + skip connection.
   LayerNorm2DWithSkipConnection(batch_size * kSquares, embedding_size_,
@@ -418,15 +479,24 @@ void EncoderBlock<use_eigen>::Eval(size_t batch_size, std::vector<float>& flow,
   std::swap(buffer3, flow);
 
   // FFN.
-  FullyConnectedLayer<use_eigen>::Forward1D(
-      batch_size * kSquares, embedding_size_, dff_size, flow.data(),
-      ffn.dense1_w.data(), ffn.dense1_b.data(), ffn_activation_,
-      buffer4.data());
+  if (ffn_dense1_int8_) {
+    ffn_dense1_int8_->Forward(rows, flow.data(), ffn.dense1_b.data(),
+                              ffn_activation_, buffer4.data(), int8_scratch);
+  } else {
+    FullyConnectedLayer<use_eigen>::Forward1D(
+        rows, embedding_size_, dff_size, flow.data(), ffn.dense1_w.data(),
+        ffn.dense1_b.data(), ffn_activation_, buffer4.data());
+  }
 
-  FullyConnectedLayer<use_eigen>::Forward1D(
-      batch_size * kSquares, dff_size, ffn.dense2_b.size(), buffer4.data(),
-      ffn.dense2_w.data(), ffn.dense2_b.data(), ACTIVATION_NONE,
-      buffer3.data());
+  if (ffn_dense2_int8_) {
+    ffn_dense2_int8_->Forward(rows, buffer4.data(), ffn.dense2_b.data(),
+                              ACTIVATION_NONE, buffer3.data(), int8_scratch);
+  } else {
+    FullyConnectedLayer<use_eigen>::Forward1D(
+        rows, dff_size, ffn.dense2_b.size(), buffer4.data(),
+        ffn.dense2_w.data(), ffn.dense2_b.data(), ACTIVATION_NONE,
+        buffer3.data());
+  }
 
   // Layer Norm + skip connection.
   LayerNorm2DWithSkipConnection(batch_size * kSquares, embedding_size_,
@@ -443,7 +513,8 @@ AttentionBody<use_eigen>::AttentionBody(const MultiHeadWeights& weights,
                                         bool is_pe_dense_embedding,
                                         ActivationFunction default_activation,
                                         ActivationFunction smolgen_activation,
-                                        ActivationFunction ffn_activation)
+                                        ActivationFunction ffn_activation,
+                                        bool use_int8)
     : BaseLayer<use_eigen>(weights.ip_emb_b.size() * kSquares),
       weights_(weights),
       input_channels_(input_channels),
@@ -461,7 +532,7 @@ AttentionBody<use_eigen>::AttentionBody(const MultiHeadWeights& weights,
     encoders_.emplace_back(layer, weights.smolgen_w, embedding_size_,
                            weights.encoder_head_count, smolgen_activation,
                            ffn_activation, alpha_,
-                           is_pe_dense_embedding ? 1e-3f : 1e-6f);
+                           is_pe_dense_embedding ? 1e-3f : 1e-6f, use_int8);
   }
 }
 
@@ -582,7 +653,7 @@ void AttentionBody<use_eigen>::Eval(size_t batch_size, float* output,
 
   // Attention body encoders.
   for (const auto& encoder : encoders_) {
-    encoder.Eval(batch_size, flow, buffer2, buffer3, buffer4);
+    encoder.Eval(batch_size, flow, buffer2, buffer3, buffer4, workspace.int8);
   }
 
   std::memcpy(output, flow.data(),
@@ -594,7 +665,8 @@ AttentionPolicyHead<use_eigen>::AttentionPolicyHead(
     const MultiHeadWeights::PolicyHead& weights,
     const std::vector<float>& smolgen_global_weights, size_t input_channels,
     bool attention_body, ActivationFunction default_activation,
-    ActivationFunction smolgen_activation, ActivationFunction ffn_activation)
+    ActivationFunction smolgen_activation, ActivationFunction ffn_activation,
+    bool use_int8)
     : BaseLayer<use_eigen>(kAttentionPolicyOutputs),
       weights_(weights),
       input_channels_(input_channels),
@@ -606,7 +678,8 @@ AttentionPolicyHead<use_eigen>::AttentionPolicyHead(
         layer, smolgen_global_weights, policy_embedding_size,
         weights.pol_encoder_head_count,
         attention_body ? smolgen_activation : ACTIVATION_NONE,
-        attention_body ? ffn_activation : ACTIVATION_SELU, 1.0f, 1e-6f);
+        attention_body ? ffn_activation : ACTIVATION_SELU, 1.0f, 1e-6f,
+        use_int8);
   }
 }
 
@@ -638,7 +711,7 @@ void AttentionPolicyHead<use_eigen>::Eval(
       flow.data());
 
   for (const auto& encoder : encoders_) {
-    encoder.Eval(batch_size, flow, buffer2, buffer3, buffer4);
+    encoder.Eval(batch_size, flow, buffer2, buffer3, buffer4, workspace.int8);
   }
 
   const size_t policy_d_model = weights_.ip2_pol_b.size();

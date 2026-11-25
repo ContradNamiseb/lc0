@@ -380,6 +380,7 @@ if get_option('build_backends')
     blas_files = [
     'src/neural/backends/blas/convolution1.cc',
     'src/neural/backends/blas/fully_connected_layer.cc',
+    'src/neural/backends/blas/int8_layers.cc',
     'src/neural/backends/blas/layers.cc',
     'src/neural/backends/blas/se_unit.cc',
     'src/neural/backends/blas/network_blas.cc',
