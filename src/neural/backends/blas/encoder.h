@@ -26,11 +26,11 @@
 
 namespace lczero {
 
-void LayerNorm2DWithSkipConnection(const size_t batch_size,
-                                   const size_t channels, float* data,
-                                   const float alpha, const float* skip,
-                                   const float* gammas, const float* betas,
-                                   float epsilon) {
+inline void LayerNorm2DWithSkipConnection(const size_t batch_size,
+                                          const size_t channels, float* data,
+                                          const float alpha, const float* skip,
+                                          const float* gammas,
+                                          const float* betas, float epsilon) {
   for (size_t i = 0; i < batch_size; i++) {
 #ifndef USE_ISPC
     // Mean taken in dimension C.
