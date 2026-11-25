@@ -1,0 +1,14 @@
+# Quantized nets in this folder
+b03f93122c64fb665d9e4ad4663245403880751961f4e7078024c04dfb575d6b  t1-256x10-sycl-int8.pb.gz
+d830597e2f8fdf01660549db7b432143eae3bd00472b1dcaecee0d6a06dd26dd  t74-744021-sycl-int8.pb.gz
+9246498952e2dcd00744d813f62689496117a5f075af2b611533cc93cb593ea3  t79-791556-sycl-int8.pb.gz
+
+# Source nets they were made from (not included here)
+bc27a6cae8ad36f2b9a80a6ad9dabb0d6fda25b1e7f481a79bc359e14f563406  t1-256x10-distilled-swa-2432500.pb.gz
+cbda6fe39c54bca948b7e10bd7d8ee7bbf9d3ade4e06830d7fa8b0f8991dcce1  744021.pb.gz
+b1c7047582a8ad37620849bf328935cb46f2ccbbecb7f2696c30c6b913ed690d  791556.pb.gz
+
+# Quantized ONNX models the nets were packed from (not included here)
+febfd7aa5bc612cda2934fb78938913b115a6023ae0032add45b48f337aad58d  t1_256x10_int8.onnx
+4a2c886778d1e8a0ff171f4c3d3718c9e210da156d1e9dafaeb01bddd5db18d0  t74_744021_int8.onnx
+585167bf656c952c90da4258d17963ed3e8d31230e8b78089308226bad846cf6  t79_791556_int8.onnx

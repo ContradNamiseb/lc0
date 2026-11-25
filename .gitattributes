@@ -1,0 +1,3 @@
+# Keep the nets and calibration games byte-for-byte, so the checksums hold.
+*.pb.gz binary
+*.pgn -text

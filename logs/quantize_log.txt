@@ -1,0 +1,32 @@
+Sampled 819 calib + 204 eval positions from sprt_dagfix_vs12a3852_local.pgn (400 games)
+Sampled 205 calib + 52 eval positions from endgame_935532_vs_825532.pgn (40 games)
+Dataset ready: X_cal=(1024, 112, 8, 8), X_ev=(256, 112, 8, 8)
+
+==================== Quantizing t74_744021 (resnet) ====================
+[Encoder Parity Check 6-ply Ruy Lopez] Python WDL=[0.329  0.4379 0.2331] vs lc0.exe=[0.329 0.439 0.232] (max diff=0.00113)
+  [1] Naive MinMax trunk (n=40)       | Top1= 94.1% | KL=0.00286 | Q_MAE=0.01330 | Q_p95=0.04575 | Q_Max=0.24386 | Q_Bias=-0.00882
+  [2] Clean+MSE(+ZeroOpSQ) (n=20)    | Top1= 93.8% | KL=0.00358 | Q_MAE=0.00986 | Q_p95=0.03444 | Q_Max=0.17891 | Q_Bias=+0.00067
+  [Fast Bias Correction] Corrected 20 layers in 11.6s (max |db|=0.23669).
+  [3] Full + FastBiasCorr  (n=20)    | Top1= 95.7% | KL=0.00308 | Q_MAE=0.00912 | Q_p95=0.03242 | Q_Max=0.19089 | Q_Bias=-0.00322
+  [OV GPU Verified (Full+FBC)]         | Top1= 96.5% | KL=0.00299 | Q_MAE=0.00903 | Q_p95=0.03053 | Q_Max=0.19890 | Q_Bias=-0.00343
+  [OV CPU Verified (Full+FBC)]         | Top1= 95.7% | KL=0.00298 | Q_MAE=0.00930 | Q_p95=0.03408 | Q_Max=0.19286 | Q_Bias=-0.00399
+  Saved OpenVINO INT8 IR: C:\Users\Contrad\Documents\lc0-Engine\openvino-int8\t74_744021_int8.xml
+
+==================== Quantizing t79_791556 (resnet) ====================
+  [1] Naive MinMax trunk (n=60)       | Top1= 93.4% | KL=0.00499 | Q_MAE=0.01766 | Q_p95=0.06311 | Q_Max=0.15551 | Q_Bias=-0.00211
+  [2] Clean+MSE(+ZeroOpSQ) (n=30)    | Top1= 93.8% | KL=0.00357 | Q_MAE=0.01620 | Q_p95=0.04903 | Q_Max=0.25166 | Q_Bias=-0.01223
+  [Fast Bias Correction] Corrected 30 layers in 90.7s (max |db|=0.28583).
+  [3] Full + FastBiasCorr  (n=30)    | Top1= 96.5% | KL=0.00285 | Q_MAE=0.01036 | Q_p95=0.03037 | Q_Max=0.25041 | Q_Bias=-0.00316
+  [OV GPU Verified (Full+FBC)]         | Top1= 95.7% | KL=0.00293 | Q_MAE=0.01107 | Q_p95=0.03655 | Q_Max=0.22637 | Q_Bias=-0.00013
+  [OV CPU Verified (Full+FBC)]         | Top1= 96.5% | KL=0.00284 | Q_MAE=0.01056 | Q_p95=0.03285 | Q_Max=0.24158 | Q_Bias=-0.00277
+  Saved OpenVINO INT8 IR: C:\Users\Contrad\Documents\lc0-Engine\openvino-int8\t79_791556_int8.xml
+
+==================== Quantizing t1_256x10 (transformer) ====================
+  [1] Naive MinMax trunk (n=100)       | Top1= 91.4% | KL=0.00865 | Q_MAE=0.01815 | Q_p95=0.06666 | Q_Max=0.21480 | Q_Bias=+0.00513
+  [Zero-Op SmoothQuant] Folded ReLU^2 smoothing (alpha=0.5) into 10 FFN blocks (0 extra ops).
+  [2] Clean+MSE(+ZeroOpSQ) (n=60)    | Top1= 93.0% | KL=0.00591 | Q_MAE=0.01961 | Q_p95=0.08080 | Q_Max=0.18578 | Q_Bias=+0.01223
+  [Fast Bias Correction] Corrected 60 layers in 190.1s (max |db|=0.31376).
+  [3] Full + FastBiasCorr  (n=60)    | Top1= 93.0% | KL=0.00566 | Q_MAE=0.01446 | Q_p95=0.05499 | Q_Max=0.13928 | Q_Bias=-0.00496
+  [OV GPU Verified (Full+FBC)]         | Top1= 93.0% | KL=0.00550 | Q_MAE=0.01371 | Q_p95=0.05074 | Q_Max=0.08939 | Q_Bias=-0.00251
+  [OV CPU Verified (Full+FBC)]         | Top1= 92.2% | KL=0.00585 | Q_MAE=0.01551 | Q_p95=0.05952 | Q_Max=0.10103 | Q_Bias=-0.00336
+  Saved OpenVINO INT8 IR: C:\Users\Contrad\Documents\lc0-Engine\openvino-int8\t1_256x10_int8.xml
