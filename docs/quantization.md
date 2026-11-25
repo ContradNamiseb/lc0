@@ -183,7 +183,7 @@ On `feature/sycl-int8`, `--backend=sycl-int8` picks the engine by net type:
   (1, 4, 8, 16, then multiples of 32) that are compiled ahead of time, so
   oneDNN doesn't compile a new kernel during search.
 
-`--backend=sycl-fp16 --backend-opts=int8=false` runs the same file in FP16
+`--backend=sycl-fp16` runs the same file in FP16
 from dequantized weights. Multi-stream is switched off while INT8 is active.
 
 ### Building the engine

@@ -42,7 +42,7 @@ The log line `Using SYCL W8A8 INT8 ...` confirms the INT8 path is active. The
 same files also run in FP16 on that build, using their dequantized weights:
 
 ```
-lc0 --weights=nets/t74-744021-sycl-int8.pb.gz --backend=sycl-fp16 --backend-opts=int8=false
+lc0 --weights=nets/t74-744021-sycl-int8.pb.gz --backend=sycl-fp16
 ```
 
 ## Speed and accuracy
@@ -82,6 +82,25 @@ calibration. That check ran in OpenVINO on the GPU, using exactly the same int8
 weights and scales as the SYCL nets. No game match has been played with the
 SYCL INT8 nets yet, so their playing strength is unmeasured.
 
+### On the CPU
+
+The [`feature/blas-int8`](https://github.com/ContradNamiseb/lc0/tree/feature/blas-int8)
+branch runs the same files in INT8 on the CPU with `--backend=blas` (built with
+MKL), using MKL's integer matrix multiply. On the same laptop's i5-1135G7 CPU,
+`backendbench` with one MKL thread (the blas default), FP32 on the original
+nets against INT8 on these files, medians of three alternating rounds:
+
+| Batch | T1 | T74 | T79 |
+| --- | --- | --- | --- |
+| 16 | 69 → 105 (+52%) | 346 → 416 (+20%) | 116 → 162 (+40%) |
+| 64 | 69 → 104 (+51%) | 316 → 403 (+28%) | 112 → 156 (+39%) |
+| 256 | 69 → 103 (+49%) | 307 → 384 (+25%) | 109 → 153 (+40%) |
+| 64, `threads=4` | 107 → 107 (0%) | 438 → 479 (+9%) | 168 → 193 (+15%) |
+
+With more MKL threads the gain shrinks, because quantizing the inputs runs on
+one thread. On 300 held-out positions, blas INT8 picks the same best move as
+the original FP32 net on 91.3% (T1), 95.3% (T74) and 96.0% (T79).
+
 ## How they were made
 
 Two steps, both scripts in [`scripts/`](scripts):
@@ -106,6 +125,8 @@ is the log of the calibration run that produced them.
 
 - [`feature/sycl-int8`](https://github.com/ContradNamiseb/lc0/tree/feature/sycl-int8):
   the SYCL INT8 engine that runs these nets.
+- [`feature/blas-int8`](https://github.com/ContradNamiseb/lc0/tree/feature/blas-int8):
+  the blas backend rebuilt from layer classes, with INT8 on the CPU.
 - [`feature/openvino-int8-static`](https://github.com/ContradNamiseb/lc0/tree/feature/openvino-int8-static):
   the OpenVINO backend for the INT8 IR from step 1; the quantize script comes
   from there.
