@@ -85,10 +85,39 @@ SYCL INT8 nets yet, so their playing strength is unmeasured.
 ### On the CPU
 
 The [`feature/blas-int8`](https://github.com/ContradNamiseb/lc0/tree/feature/blas-int8)
-branch runs the same files in INT8 on the CPU with `--backend=blas` (built with
-MKL), using MKL's integer matrix multiply. On the same laptop's i5-1135G7 CPU,
-`backendbench` with one MKL thread (the blas default), FP32 on the original
-nets against INT8 on these files, medians of three alternating rounds:
+branch runs the same files in INT8 on the CPU with `--backend=blas` or
+`--backend=eigen`. On x86-64 CPUs with AVX-512 VNNI or AVX-VNNI it uses custom
+runtime-dispatched VNNI kernels by default (no MKL required), and falls back to
+MKL's `cblas_gemm_s8u8s32` when VNNI is unavailable (selectable with
+`--backend-opts=int8_kernel=auto|vnni|avx512|avx|mkl`).
+
+**AVX-512 VNNI (`int8_kernel=auto` / `avx512`):** pre-packed weight panels,
+fused epilogues, direct 9-tap NHWC residual-tower convolutions with fused SE
+pooling, and whole-layer threading. On the same laptop's i5-1135G7 CPU,
+`backendbench` comparing `master` (`fd41ee6b`) FP32 on the original nets against
+`feature/blas-int8` (`097a16be`) AVX-512 VNNI INT8 on these files, medians of
+three alternating rounds:
+
+| Batch | T1 | T74 | T79 |
+| --- | --- | --- | --- |
+| 7 | 67 → 144 (+115%) | 367 → 807 (+120%) | 123 → 270 (+120%) |
+| 16 | 71 → 151 (+113%) | 347 → 794 (+129%) | 119 → 277 (+133%) |
+| 64 | 71 → 150 (+111%) | 322 → 775 (+141%) | 116 → 269 (+132%) |
+| 256 | 71 → 147 (+107%) | 323 → 778 (+141%) | 112 → 269 (+140%) |
+| 7, `threads=4` | 95 → 188 (+98%) | 396 → 1,054 (+166%) | 158 → 395 (+150%) |
+| 16, `threads=4` | 100 → 215 (+115%) | 395 → 1,005 (+154%) | 148 → 379 (+156%) |
+| 64, `threads=4` | 109 → 215 (+97%) | 378 → 1,035 (+174%) | 145 → 383 (+164%) |
+
+In real search (`lc0 benchmark --threads=2 --minibatch-size=7 --backend-opts=threads=4`,
+3 positions, 4,000 / 1,500 / 1,000 nodes, median of three alternating rounds),
+AVX-512 VNNI speeds up `master` FP32 from 86 → 165 nps (+92%) on T1,
+412 → 1,087 nps (+164%) on T74, and 129 → 343 nps (+166%) on T79. On 300
+held-out positions against `master` FP32, AVX-512 VNNI picks the same best move
+on 91.0% (T1), 95.3% (T74), and 96.7% (T79).
+
+**MKL (`int8_kernel=mkl`, `cblas_gemm_s8u8s32`):** earlier baseline using MKL's
+integer matrix multiply with one MKL thread (the blas default), FP32 on the
+original nets against INT8 on these files, medians of three alternating rounds:
 
 | Batch | T1 | T74 | T79 |
 | --- | --- | --- | --- |
@@ -97,9 +126,10 @@ nets against INT8 on these files, medians of three alternating rounds:
 | 256 | 69 → 103 (+49%) | 307 → 384 (+25%) | 109 → 153 (+40%) |
 | 64, `threads=4` | 107 → 107 (0%) | 438 → 479 (+9%) | 168 → 193 (+15%) |
 
-With more MKL threads the gain shrinks, because quantizing the inputs runs on
-one thread. On 300 held-out positions, blas INT8 picks the same best move as
-the original FP32 net on 91.3% (T1), 95.3% (T74) and 96.0% (T79).
+With more MKL threads the MKL-path gain shrinks, because quantizing the inputs
+and `im2col` run on one thread. On 300 held-out positions, MKL INT8 picks the
+same best move as the original FP32 net on 91.3% (T1), 95.3% (T74) and 96.0%
+(T79).
 
 ## How they were made
 
