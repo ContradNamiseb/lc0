@@ -11,12 +11,23 @@ order over three tensors and a workspace that the network pools and reuses.
 ## INT8 nets
 
 Nets whose layers are stored as W8A8 INT8 (encoding `INT8` in `net.proto`)
-run those layers in INT8 when lc0 is built with MKL: the residual blocks' 3x3
-convolutions, and the Q, K, V, output and feed-forward projections of the
-attention body. Each layer quantizes its input to uint8 with the scale and
-zero point stored in the net and multiplies with `cblas_gemm_s8u8s32`.
-`--backend-opts=int8=false`, the Eigen backend and other BLAS libraries run
-the same nets in FP32 from the dequantized weights.
+run those layers in INT8: the residual blocks' 3x3 convolutions, and the Q, K,
+V, output and feed-forward projections of the attention body.
+
+On x86-64 CPUs with AVX-512 VNNI or AVX-VNNI, custom runtime-dispatched VNNI
+intrinsic kernels (`int8_vnni_avx512.cc`, `int8_vnni_avx.cc`) execute these
+layers for both the `blas` and `eigen` backends without requiring MKL:
+- Linear layers pre-pack weights into 64-byte aligned panels and fuse
+  dequantization, bias, and activation in registers.
+- Residual towers convert once to NHWC and run a direct 9-tap 10x10 padded
+  L1-resident convolution, fusing `conv1` epilogue directly into `conv2`'s
+  quantized input pad and fusing global average pooling into `conv2`.
+- Multi-threading (`threads > 1`) parallelizes whole layers across boards and
+  row tiles via a lightweight spin-then-park thread pool.
+
+When VNNI is unavailable, MKL builds fall back to `cblas_gemm_s8u8s32`.
+Use `--backend-opts=int8_kernel=auto|vnni|avx512|avx|mkl` to select a kernel
+explicitly, or `--backend-opts=int8=false` to run the dequantized FP32 weights.
 
 ## License
 

@@ -395,6 +395,28 @@ if get_option('build_backends')
     files += blas_files
     has_backends = true
 
+    if host_machine.cpu_family() == 'x86_64'
+      if cc.get_id() == 'msvc'
+        avx512_vnni_args = ['/arch:AVX512']
+        avx_vnni_args = ['/arch:AVX2']
+      else
+        avx512_vnni_args = ['-mavx512f', '-mavx512dq', '-mavx512bw', '-mavx512vl', '-mavx512vnni']
+        avx_vnni_args = ['-mavx2', '-mfma', '-mavxvnni']
+      endif
+      if cc.compiles('''#include <immintrin.h>
+__m512i f(__m512i a, __m512i b, __m512i c) { return _mm512_dpbusd_epi32(a, b, c); }''',
+                     args: avx512_vnni_args, name: 'AVX-512 VNNI intrinsics')
+        add_project_arguments('-DLC0_HAS_AVX512_VNNI', language : 'cpp')
+        blas_vnni_avx512_file = 'src/neural/backends/blas/int8_vnni_avx512.cc'
+      endif
+      if cc.compiles('''#include <immintrin.h>
+__m256i f(__m256i a, __m256i b, __m256i c) { return _mm256_dpbusd_avx_epi32(a, b, c); }''',
+                     args: avx_vnni_args, name: 'AVX-VNNI intrinsics')
+        add_project_arguments('-DLC0_HAS_AVX_VNNI', language : 'cpp')
+        blas_vnni_avx_file = 'src/neural/backends/blas/int8_vnni_avx.cc'
+      endif
+    endif
+
     if get_option('ispc') and ispc.found()
       files += iscp_gen.process('src/neural/backends/blas/winograd_transform.ispc')
       files += iscp_gen.process('src/neural/backends/blas/layer_norm.ispc')
@@ -1089,6 +1111,27 @@ configure_file(output : 'default_backend.h',
 
 
 backend_objects = []
+blas_vnni_objects = []
+
+if is_variable('blas_vnni_avx512_file')
+  blas_vnni_avx512_lib = static_library(
+      'blas_vnni_avx512', [blas_vnni_avx512_file],
+      cpp_args: avx512_vnni_args,
+      include_directories: includes,
+      install: false, build_by_default: false)
+  blas_vnni_objects += blas_vnni_avx512_lib.extract_objects(blas_vnni_avx512_file)
+endif
+
+if is_variable('blas_vnni_avx_file')
+  blas_vnni_avx_lib = static_library(
+      'blas_vnni_avx', [blas_vnni_avx_file],
+      cpp_args: avx_vnni_args,
+      include_directories: includes,
+      install: false, build_by_default: false)
+  blas_vnni_objects += blas_vnni_avx_lib.extract_objects(blas_vnni_avx_file)
+endif
+
+backend_objects += blas_vnni_objects
 
 if is_variable('cuda_files')
   cudasl = static_library('cuda_backend', cuda_files + pb_files,
@@ -1194,6 +1237,23 @@ if get_option('gtest')
                'src/neural/memcache.cc', pb_files,
     include_directories: includes, link_with: lc0_lib, dependencies: [gtest, gmock]),
     args: '--gtest_output=xml:engine_test.xml', timeout: 90)
+
+  if get_option('build_backends') and get_option('blas')
+    blas_int8_test_files = [
+      'src/neural/backends/blas/int8_vnni_test.cc',
+      'src/neural/backends/blas/int8_layers.cc',
+      'src/neural/backends/shared/activation.cc',
+    ]
+    if get_option('ispc') and ispc.found()
+      blas_int8_test_files += iscp_gen.process('src/neural/backends/blas/int8_layers.ispc')
+      blas_int8_test_files += iscp_gen.process('src/neural/backends/shared/activation.ispc')
+    endif
+    test('BlasInt8VnniTest',
+      executable('blas_int8_vnni_test', blas_int8_test_files + pb_files,
+                 include_directories: includes, link_with: lc0_lib,
+                 objects: blas_vnni_objects, dependencies: [deps, gtest]),
+      args: '--gtest_output=xml:blas_int8_vnni_test.xml', timeout: 90)
+  endif
 endif
 
 

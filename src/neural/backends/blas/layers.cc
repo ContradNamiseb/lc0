@@ -123,21 +123,23 @@ void ConvLayer<use_eigen>::Eval(size_t batch_size, float* output,
 template <bool use_eigen>
 ResidualBlock<use_eigen>::ResidualBlock(
     const MultiHeadWeights::Residual& weights, size_t channels,
-    ActivationFunction activation, bool use_int8)
+    ActivationFunction activation, bool use_int8, Int8Kernel int8_kernel,
+    bool nhwc_layout)
     : BaseLayer<use_eigen>(channels * kSquares),
       weights_(weights),
       channels_(channels),
-      activation_(activation) {
+      activation_(activation),
+      nhwc_layout_(nhwc_layout) {
   if (!use_int8) return;
   const auto& conv1 = weights.conv1;
   const auto& conv2 = weights.conv2;
   if (conv1.has_int8) {
     conv1_int8_.emplace(conv1.weights_i8, conv1.w_scales, conv1.act_scale,
-                        conv1.act_zp);
+                        conv1.act_zp, int8_kernel, /*is_conv3x3=*/true);
   }
   if (conv2.has_int8) {
     conv2_int8_.emplace(conv2.weights_i8, conv2.w_scales, conv2.act_scale,
-                        conv2.act_zp);
+                        conv2.act_zp, int8_kernel, /*is_conv3x3=*/true);
   }
 }
 
@@ -148,20 +150,38 @@ void ResidualBlock<use_eigen>::Eval(size_t batch_size, float* output,
   const size_t tensor_size = batch_size * channels_ * kSquares;
   // The skip connection is added into `output` in place.
   if (output != input) std::memcpy(output, input, tensor_size * sizeof(float));
+
+  const auto& conv1 = weights_.conv1;
+  const auto& conv2 = weights_.conv2;
+  if (nhwc_layout_ && conv1_int8_ && conv2_int8_) {
+    ResidualSeParams se_params;
+    if (weights_.has_se) {
+      se_params.has_se = true;
+      se_params.se_fc_outputs = weights_.se.b1.size();
+      se_params.w1 = weights_.se.w1.data();
+      se_params.b1 = weights_.se.b1.data();
+      se_params.w2 = weights_.se.w2.data();
+      se_params.b2 = weights_.se.b2.data();
+    }
+    Int8Weights::RunResidualBlockNhwc(batch_size, channels_, output,
+                                      *conv1_int8_, conv1.biases.data(),
+                                      *conv2_int8_, conv2.biases.data(),
+                                      activation_, se_params, workspace.int8);
+    return;
+  }
+
   std::vector<float>& conv1_output = workspace.buffers[0];
   std::vector<float>& conv2_output = workspace.buffers[1];
   GrowBuffer(conv1_output, tensor_size);
   GrowBuffer(conv2_output, tensor_size);
-  auto& winograd = workspace.Winograd(batch_size);
 
-  const auto& conv1 = weights_.conv1;
-  const auto& conv2 = weights_.conv2;
   if (conv1_int8_) {
     conv1_int8_->Convolve3(batch_size, output, conv1_output.data(),
                            workspace.int8);
   } else {
-    winograd.Forward(batch_size, channels_, channels_, output,
-                     conv1.weights.data(), conv1_output.data());
+    workspace.Winograd(batch_size)
+        .Forward(batch_size, channels_, channels_, output, conv1.weights.data(),
+                 conv1_output.data());
   }
   BiasActivate(batch_size, channels_, conv1_output.data(), conv1.biases.data(),
                activation_);
@@ -169,8 +189,9 @@ void ResidualBlock<use_eigen>::Eval(size_t batch_size, float* output,
     conv2_int8_->Convolve3(batch_size, conv1_output.data(), conv2_output.data(),
                            workspace.int8);
   } else {
-    winograd.Forward(batch_size, channels_, channels_, conv1_output.data(),
-                     conv2.weights.data(), conv2_output.data());
+    workspace.Winograd(batch_size)
+        .Forward(batch_size, channels_, channels_, conv1_output.data(),
+                 conv2.weights.data(), conv2_output.data());
   }
 
   if (weights_.has_se) {
@@ -256,7 +277,7 @@ EncoderBlock<use_eigen>::EncoderBlock(
     const std::vector<float>& smolgen_global_weights, size_t embedding_size,
     size_t heads, ActivationFunction smolgen_activation,
     ActivationFunction ffn_activation, float alpha, float default_epsilon,
-    bool use_int8)
+    bool use_int8, Int8Kernel int8_kernel)
     : weights_(weights),
       smolgen_global_weights_(smolgen_global_weights),
       embedding_size_(embedding_size),
@@ -269,20 +290,22 @@ EncoderBlock<use_eigen>::EncoderBlock(
   const auto& mha = weights.mha;
   if (mha.has_int8) {
     q_int8_.emplace(mha.q_w_i8, mha.q_w_scales, mha.qkv_act_scale,
-                    mha.qkv_act_zp);
+                    mha.qkv_act_zp, int8_kernel);
     k_int8_.emplace(mha.k_w_i8, mha.k_w_scales, mha.qkv_act_scale,
-                    mha.qkv_act_zp);
+                    mha.qkv_act_zp, int8_kernel);
     v_int8_.emplace(mha.v_w_i8, mha.v_w_scales, mha.qkv_act_scale,
-                    mha.qkv_act_zp);
+                    mha.qkv_act_zp, int8_kernel);
     dense_int8_.emplace(mha.dense_w_i8, mha.dense_w_scales, mha.dense_act_scale,
-                        mha.dense_act_zp);
+                        mha.dense_act_zp, int8_kernel);
   }
   const auto& ffn = weights.ffn;
   if (ffn.has_int8) {
     ffn_dense1_int8_.emplace(ffn.dense1_w_i8, ffn.dense1_w_scales,
-                             ffn.dense1_act_scale, ffn.dense1_act_zp);
+                             ffn.dense1_act_scale, ffn.dense1_act_zp,
+                             int8_kernel);
     ffn_dense2_int8_.emplace(ffn.dense2_w_i8, ffn.dense2_w_scales,
-                             ffn.dense2_act_scale, ffn.dense2_act_zp);
+                             ffn.dense2_act_scale, ffn.dense2_act_zp,
+                             int8_kernel);
   }
 }
 
@@ -348,10 +371,21 @@ void EncoderBlock<use_eigen>::Eval(size_t batch_size, std::vector<float>& flow,
         ACTIVATION_NONE, qk);
   }
 
-  // Q
+  // Q, K, V share the same input tensor `flow` and (qkv_act_scale, qkv_act_zp),
+  // so quantize `flow` once and reuse across all three projections.
   const size_t rows = batch_size * kSquares;
+  const uint8_t* qkv_quantized = nullptr;
   if (q_int8_) {
-    q_int8_->Forward(rows, flow.data(), mha.q_b.data(), ACTIVATION_NONE,
+    int8_scratch.quantized_input.Resize(rows * embedding_size_);
+    q_int8_->QuantizeInput(rows * embedding_size_, flow.data(),
+                           int8_scratch.quantized_input.data(),
+                           int8_scratch.pool);
+    qkv_quantized = int8_scratch.quantized_input.data();
+  }
+
+  // Q
+  if (q_int8_) {
+    q_int8_->Forward(rows, qkv_quantized, mha.q_b.data(), ACTIVATION_NONE,
                      buffer2.data(), int8_scratch);
   } else {
     FullyConnectedLayer<use_eigen>::Forward1D(
@@ -360,7 +394,7 @@ void EncoderBlock<use_eigen>::Eval(size_t batch_size, std::vector<float>& flow,
   }
   // K
   if (k_int8_) {
-    k_int8_->Forward(rows, flow.data(), mha.k_b.data(), ACTIVATION_NONE,
+    k_int8_->Forward(rows, qkv_quantized, mha.k_b.data(), ACTIVATION_NONE,
                      buffer3.data(), int8_scratch);
   } else {
     FullyConnectedLayer<use_eigen>::Forward1D(
@@ -372,61 +406,87 @@ void EncoderBlock<use_eigen>::Eval(size_t batch_size, std::vector<float>& flow,
   const int depth = static_cast<int>(d_model / heads);
   const int row_stride = static_cast<int>(d_model);  // heads * depth
   const float scaling = 1.0f / sqrtf(static_cast<float>(depth));
+  Int8ThreadPool* pool = int8_scratch.pool;
 
   // MHA is done per batch since there's a fourth dimension introduced.
-  for (size_t batch = 0; batch < batch_size; batch++) {
-    const size_t batch_start = batch * kSquares * d_model;
-
-    float* qk = &buffer4[batch * kSquares * kSquares * heads];
-
-    const float* q = &buffer2[batch_start];
-    const float* k = &buffer3[batch_start];
-
-    // matmul(Q, K) for all heads per batch.
-    for (size_t h = 0; h < heads; h++) {
-      const float* a = &q[h * depth];
-      const float* b = &k[h * depth];
-      float* c = &qk[h * kSquares * kSquares];
-      const float beta = mha.has_smolgen ? 1.0f : 0.0f;
-      if (use_eigen) {
-        auto c_mat = EigenMatrixMap<float>(c, kSquares, kSquares);
-        c_mat.noalias() =
-            beta * c_mat +
-            scaling *
-                ConstEigenStridedMatrixMap<float>(
-                    b, depth, kSquares, Eigen::OuterStride<>(row_stride))
-                    .transpose() *
-                ConstEigenStridedMatrixMap<float>(
-                    a, depth, kSquares, Eigen::OuterStride<>(row_stride));
-      } else {
-#ifdef USE_BLAS
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, kSquares, kSquares,
-                    depth, scaling, a, row_stride, b, row_stride, beta, c,
-                    kSquares);
-#else
-        // Should never get here.
-        throw Exception("Blas backend internal error");
+  auto run_qk_batches = [&](size_t b0, size_t b1, size_t) {
+#ifdef USE_MKL
+    if (pool && pool->num_threads() > 1 && batch_size > 1) {
+      mkl_set_num_threads_local(1);
+    }
 #endif
+    for (size_t batch = b0; batch < b1; batch++) {
+      const size_t batch_start = batch * kSquares * d_model;
+      float* qk = &buffer4[batch * kSquares * kSquares * heads];
+      const float* q = &buffer2[batch_start];
+      const float* k = &buffer3[batch_start];
+
+      for (size_t h = 0; h < heads; h++) {
+        const float* a = &q[h * depth];
+        const float* b = &k[h * depth];
+        float* c = &qk[h * kSquares * kSquares];
+        const float beta = mha.has_smolgen ? 1.0f : 0.0f;
+        if (use_eigen) {
+          auto c_mat = EigenMatrixMap<float>(c, kSquares, kSquares);
+          c_mat.noalias() =
+              beta * c_mat +
+              scaling *
+                  ConstEigenStridedMatrixMap<float>(
+                      b, depth, kSquares, Eigen::OuterStride<>(row_stride))
+                      .transpose() *
+                  ConstEigenStridedMatrixMap<float>(
+                      a, depth, kSquares, Eigen::OuterStride<>(row_stride));
+        } else {
+#ifdef USE_BLAS
+          cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, kSquares,
+                      kSquares, depth, scaling, a, row_stride, b, row_stride,
+                      beta, c, kSquares);
+#else
+          throw Exception("Blas backend internal error");
+#endif
+        }
       }
     }
+#ifdef USE_MKL
+    if (pool && pool->num_threads() > 1 && batch_size > 1) {
+      mkl_set_num_threads_local(0);
+    }
+#endif
+  };
+  if (pool && pool->num_threads() > 1 && batch_size > 1) {
+    pool->ParallelFor(batch_size, 1, run_qk_batches);
+  } else {
+    run_qk_batches(0, batch_size, 0);
   }
 
   // Apply Softmax.
   float* qk = buffer4.data();
-  for (size_t h = 0; h < batch_size * heads * kSquares * kSquares;
-       h += kSquares) {
+  const size_t total_heads = batch_size * heads;
+  auto run_softmax = [&](size_t h0, size_t h1, size_t) {
+    for (size_t bh = h0; bh < h1; ++bh) {
+      float* head_qk = qk + bh * kSquares * kSquares;
+      for (size_t sq = 0; sq < kSquares; ++sq) {
 #if defined(USE_ISPC)
-    if (!use_eigen) {
-      ispc::SoftmaxActivation(kSquares, qk + h, qk + h);
-      continue;
-    }
+        if (!use_eigen) {
+          ispc::SoftmaxActivation(kSquares, head_qk + sq * kSquares,
+                                  head_qk + sq * kSquares);
+          continue;
+        }
 #endif
-    SoftmaxActivation(kSquares, qk + h, qk + h);
+        SoftmaxActivation(kSquares, head_qk + sq * kSquares,
+                          head_qk + sq * kSquares);
+      }
+    }
+  };
+  if (pool && pool->num_threads() > 1 && total_heads >= 4) {
+    pool->ParallelFor(total_heads, 1, run_softmax);
+  } else {
+    run_softmax(0, total_heads, 0);
   }
 
-  // V
+  // V (reuses `qkv_quantized` from Q and K).
   if (v_int8_) {
-    v_int8_->Forward(rows, flow.data(), mha.v_b.data(), ACTIVATION_NONE,
+    v_int8_->Forward(rows, qkv_quantized, mha.v_b.data(), ACTIVATION_NONE,
                      buffer3.data(), int8_scratch);
   } else {
     FullyConnectedLayer<use_eigen>::Forward1D(
@@ -434,31 +494,47 @@ void EncoderBlock<use_eigen>::Eval(size_t batch_size, std::vector<float>& flow,
         mha.v_b.data(), ACTIVATION_NONE, buffer3.data());
   }
 
-  for (size_t batch = 0; batch < batch_size; batch++) {
-    const size_t batch_start = batch * kSquares * d_model;
-    // matmul(softmax(QK), V) for all heads per batch.
-    float* attention = &buffer2[batch_start];
-    const float* v = &buffer3[batch_start];
-    const float* batch_qk = &buffer4[batch * kSquares * kSquares * heads];
-    for (size_t h = 0; h < heads; h++) {
-      const float* a = &batch_qk[h * kSquares * kSquares];
-      const float* b = &v[h * depth];
-      float* c = &attention[h * depth];
-      if (use_eigen) {
-        auto c_mat = EigenStridedMatrixMap<float>(
-            c, depth, kSquares, Eigen::OuterStride<>(row_stride));
-        c_mat.noalias() =
-            ConstEigenStridedMatrixMap<float>(
-                b, depth, kSquares, Eigen::OuterStride<>(row_stride)) *
-            ConstEigenMatrixMap<float>(a, kSquares, kSquares);
-      } else {
-#ifdef USE_BLAS
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, kSquares, depth,
-                    kSquares, 1.0f, a, kSquares, b, row_stride, 0.0f, c,
-                    row_stride);
+  auto run_sv_batches = [&](size_t b0, size_t b1, size_t) {
+#ifdef USE_MKL
+    if (pool && pool->num_threads() > 1 && batch_size > 1) {
+      mkl_set_num_threads_local(1);
+    }
 #endif
+    for (size_t batch = b0; batch < b1; batch++) {
+      const size_t batch_start = batch * kSquares * d_model;
+      float* attention = &buffer2[batch_start];
+      const float* v = &buffer3[batch_start];
+      const float* batch_qk = &buffer4[batch * kSquares * kSquares * heads];
+      for (size_t h = 0; h < heads; h++) {
+        const float* a = &batch_qk[h * kSquares * kSquares];
+        const float* b = &v[h * depth];
+        float* c = &attention[h * depth];
+        if (use_eigen) {
+          auto c_mat = EigenStridedMatrixMap<float>(
+              c, depth, kSquares, Eigen::OuterStride<>(row_stride));
+          c_mat.noalias() =
+              ConstEigenStridedMatrixMap<float>(
+                  b, depth, kSquares, Eigen::OuterStride<>(row_stride)) *
+              ConstEigenMatrixMap<float>(a, kSquares, kSquares);
+        } else {
+#ifdef USE_BLAS
+          cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, kSquares,
+                      depth, kSquares, 1.0f, a, kSquares, b, row_stride, 0.0f,
+                      c, row_stride);
+#endif
+        }
       }
     }
+#ifdef USE_MKL
+    if (pool && pool->num_threads() > 1 && batch_size > 1) {
+      mkl_set_num_threads_local(0);
+    }
+#endif
+  };
+  if (pool && pool->num_threads() > 1 && batch_size > 1) {
+    pool->ParallelFor(batch_size, 1, run_sv_batches);
+  } else {
+    run_sv_batches(0, batch_size, 0);
   }
 
   // Fully connected final MHA layer.
@@ -472,10 +548,21 @@ void EncoderBlock<use_eigen>::Eval(size_t batch_size, std::vector<float>& flow,
   }
 
   // Layer Norm + skip connection.
-  LayerNorm2DWithSkipConnection(batch_size * kSquares, embedding_size_,
-                                buffer3.data(), alpha_, flow.data(),
-                                weights_.ln1_gammas.data(),
-                                weights_.ln1_betas.data(), default_epsilon_);
+  auto run_ln = [&](float* data, const float* skip, const float* gammas,
+                    const float* betas) {
+    if (pool && pool->num_threads() > 1 && rows >= 64) {
+      pool->ParallelFor(rows, 16, [&](size_t r0, size_t r1, size_t) {
+        LayerNorm2DWithSkipConnection(
+            r1 - r0, embedding_size_, data + r0 * embedding_size_, alpha_,
+            skip + r0 * embedding_size_, gammas, betas, default_epsilon_);
+      });
+    } else {
+      LayerNorm2DWithSkipConnection(rows, embedding_size_, data, alpha_, skip,
+                                    gammas, betas, default_epsilon_);
+    }
+  };
+  run_ln(buffer3.data(), flow.data(), weights_.ln1_gammas.data(),
+         weights_.ln1_betas.data());
   std::swap(buffer3, flow);
 
   // FFN.
@@ -499,10 +586,8 @@ void EncoderBlock<use_eigen>::Eval(size_t batch_size, std::vector<float>& flow,
   }
 
   // Layer Norm + skip connection.
-  LayerNorm2DWithSkipConnection(batch_size * kSquares, embedding_size_,
-                                buffer3.data(), alpha_, flow.data(),
-                                weights_.ln2_gammas.data(),
-                                weights_.ln2_betas.data(), default_epsilon_);
+  run_ln(buffer3.data(), flow.data(), weights_.ln2_gammas.data(),
+         weights_.ln2_betas.data());
   std::swap(buffer3, flow);
 }
 
@@ -514,7 +599,7 @@ AttentionBody<use_eigen>::AttentionBody(const MultiHeadWeights& weights,
                                         ActivationFunction default_activation,
                                         ActivationFunction smolgen_activation,
                                         ActivationFunction ffn_activation,
-                                        bool use_int8)
+                                        bool use_int8, Int8Kernel int8_kernel)
     : BaseLayer<use_eigen>(weights.ip_emb_b.size() * kSquares),
       weights_(weights),
       input_channels_(input_channels),
@@ -529,10 +614,10 @@ AttentionBody<use_eigen>::AttentionBody(const MultiHeadWeights& weights,
       alpha_(static_cast<float>(pow(2.0 * weights.encoder.size(), -0.25))) {
   assert(embedding_size_ > 0);
   for (const auto& layer : weights.encoder) {
-    encoders_.emplace_back(layer, weights.smolgen_w, embedding_size_,
-                           weights.encoder_head_count, smolgen_activation,
-                           ffn_activation, alpha_,
-                           is_pe_dense_embedding ? 1e-3f : 1e-6f, use_int8);
+    encoders_.emplace_back(
+        layer, weights.smolgen_w, embedding_size_, weights.encoder_head_count,
+        smolgen_activation, ffn_activation, alpha_,
+        is_pe_dense_embedding ? 1e-3f : 1e-6f, use_int8, int8_kernel);
   }
 }
 
@@ -666,7 +751,7 @@ AttentionPolicyHead<use_eigen>::AttentionPolicyHead(
     const std::vector<float>& smolgen_global_weights, size_t input_channels,
     bool attention_body, ActivationFunction default_activation,
     ActivationFunction smolgen_activation, ActivationFunction ffn_activation,
-    bool use_int8)
+    bool use_int8, Int8Kernel int8_kernel)
     : BaseLayer<use_eigen>(kAttentionPolicyOutputs),
       weights_(weights),
       input_channels_(input_channels),
@@ -679,7 +764,7 @@ AttentionPolicyHead<use_eigen>::AttentionPolicyHead(
         weights.pol_encoder_head_count,
         attention_body ? smolgen_activation : ACTIVATION_NONE,
         attention_body ? ffn_activation : ACTIVATION_SELU, 1.0f, 1e-6f,
-        use_int8);
+        use_int8, int8_kernel);
   }
 }
 

@@ -121,7 +121,9 @@ template <bool use_eigen>
 class ResidualBlock : public BaseLayer<use_eigen> {
  public:
   ResidualBlock(const MultiHeadWeights::Residual& weights, size_t channels,
-                ActivationFunction activation, bool use_int8);
+                ActivationFunction activation, bool use_int8,
+                Int8Kernel int8_kernel = Int8Kernel::kMkl,
+                bool nhwc_layout = false);
 
   void Eval(size_t batch_size, float* output, const float* input,
             const float* input2,
@@ -131,6 +133,7 @@ class ResidualBlock : public BaseLayer<use_eigen> {
   const MultiHeadWeights::Residual& weights_;
   const size_t channels_;
   const ActivationFunction activation_;
+  const bool nhwc_layout_;
   std::optional<Int8Weights> conv1_int8_;
   std::optional<Int8Weights> conv2_int8_;
 };
@@ -203,7 +206,8 @@ class EncoderBlock {
                size_t embedding_size, size_t heads,
                ActivationFunction smolgen_activation,
                ActivationFunction ffn_activation, float alpha,
-               float default_epsilon, bool use_int8);
+               float default_epsilon, bool use_int8,
+               Int8Kernel int8_kernel = Int8Kernel::kMkl);
 
   // The result is left in `flow`. The other buffers are scratch; the vectors
   // may be swapped with `flow`.
@@ -239,7 +243,8 @@ class AttentionBody : public BaseLayer<use_eigen> {
                 bool has_residual_tower, bool is_pe_dense_embedding,
                 ActivationFunction default_activation,
                 ActivationFunction smolgen_activation,
-                ActivationFunction ffn_activation, bool use_int8);
+                ActivationFunction ffn_activation, bool use_int8,
+                Int8Kernel int8_kernel = Int8Kernel::kMkl);
 
   void Eval(size_t batch_size, float* output, const float* input,
             const float* input2,
@@ -269,7 +274,8 @@ class AttentionPolicyHead : public BaseLayer<use_eigen> {
                       size_t input_channels, bool attention_body,
                       ActivationFunction default_activation,
                       ActivationFunction smolgen_activation,
-                      ActivationFunction ffn_activation, bool use_int8);
+                      ActivationFunction ffn_activation, bool use_int8,
+                      Int8Kernel int8_kernel = Int8Kernel::kMkl);
 
   void Eval(size_t batch_size, float* output, const float* input,
             const float* input2,

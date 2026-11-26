@@ -164,6 +164,10 @@ class BlasNetwork : public Network {
   bool attn_policy_;
   bool attn_body_;
   size_t num_residual_blocks_;
+  size_t residual_channels_ = 0;
+  bool use_nhwc_residual_tower_ = false;
+  Int8Kernel int8_kernel_ = Int8Kernel::kMkl;
+  std::unique_ptr<Int8ThreadPool> int8_pool_;
   size_t max_convolution_input_channels_ = 0;
   size_t max_convolution_output_channels_ = 0;
   size_t tensor_size_ = 0;
@@ -233,9 +237,20 @@ void BlasNetwork<use_eigen>::Forward(size_t batch_size, float* policies,
   if (num_residual_blocks_ > 0) {
     network_[layer++]->Eval(batch_size, tensors[1], tensors[0], nullptr,
                             workspace);  // input conv
-    for (size_t block = 0; block < num_residual_blocks_; block++) {
-      network_[layer++]->Eval(batch_size, tensors[1], tensors[1], nullptr,
-                              workspace);  // residual block, in place
+    if (use_nhwc_residual_tower_) {
+      NchwToNhwcFast(batch_size, residual_channels_, tensors[1], tensors[2],
+                     workspace.int8.pool);
+      for (size_t block = 0; block < num_residual_blocks_; block++) {
+        network_[layer++]->Eval(batch_size, tensors[2], tensors[2], nullptr,
+                                workspace);  // residual block, in place NHWC
+      }
+      NhwcToNchwFast(batch_size, residual_channels_, tensors[2], tensors[1],
+                     workspace.int8.pool);
+    } else {
+      for (size_t block = 0; block < num_residual_blocks_; block++) {
+        network_[layer++]->Eval(batch_size, tensors[1], tensors[1], nullptr,
+                                workspace);  // residual block, in place
+      }
     }
     flow = 1;
   }
@@ -287,11 +302,14 @@ template <bool use_eigen>
 std::unique_ptr<Workspace<use_eigen>> BlasNetwork<use_eigen>::GetWorkspace() {
   std::lock_guard<std::mutex> lock(workspaces_lock_);
   if (free_workspaces_.empty()) {
-    return std::make_unique<Workspace<use_eigen>>(
+    auto workspace = std::make_unique<Workspace<use_eigen>>(
         max_convolution_input_channels_, max_convolution_output_channels_);
+    workspace->int8.pool = int8_pool_.get();
+    return workspace;
   }
   auto workspace = std::move(free_workspaces_.back());
   free_workspaces_.pop_back();
+  workspace->int8.pool = int8_pool_.get();
   return workspace;
 }
 
@@ -354,10 +372,17 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
     max_batch_size_ = kHardMaxBatchSize;
   }
 
-  // Layers stored in INT8 run in INT8 unless int8=false or the build can't
-  // (Eigen, or a BLAS other than MKL); then they use the dequantized weights.
+  // Layers stored in INT8 run in INT8 unless int8=false or neither VNNI nor
+  // MKL is available; then they use the dequantized FP32 weights.
   const bool int8_requested = options.GetOrDefault<bool>("int8", true);
-  const bool use_int8 = !use_eigen && kInt8Available && int8_requested;
+  const std::string int8_kernel_opt =
+      options.GetOrDefault<std::string>("int8_kernel", "auto");
+  const bool allow_mkl = !use_eigen && kMklInt8Available;
+  const bool int8_supported = IsInt8SupportedOnHost(allow_mkl);
+  const bool use_int8 = int8_requested && int8_supported;
+  if (use_int8) {
+    int8_kernel_ = SelectInt8Kernel(int8_kernel_opt, allow_mkl);
+  }
 
   const std::string policy_head =
       options.GetOrDefault<std::string>("policy_head", "vanilla");
@@ -375,22 +400,44 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
                     "' does not exist in this net.");
   }
 
+  auto& policy_weights = weights_.policy_heads.at(policy_head);
+  const size_t int8_layers = CountInt8Layers(weights_, policy_weights);
+
+  const bool vnni_kernel = (int8_kernel_ == Int8Kernel::kVnniAvx512 ||
+                            int8_kernel_ == Int8Kernel::kVnniAvx);
+  if (use_int8 && int8_layers > 0 && vnni_kernel && threads_ > 1) {
+    int8_pool_ = std::make_unique<Int8ThreadPool>(threads_);
+  }
+
   // 1. Transform the 3x3 convolution filters for Winograd, in place.
   const size_t channels = weights_.input.biases.size();
+  residual_channels_ = channels;
   num_residual_blocks_ = weights_.residual.size();
   if (num_residual_blocks_ > 0) {
+    bool all_res_int8 = use_int8 && vnni_kernel;
+    for (const auto& residual : weights_.residual) {
+      if (!residual.conv1.has_int8 || !residual.conv2.has_int8) {
+        all_res_int8 = false;
+        break;
+      }
+    }
+    use_nhwc_residual_tower_ = all_res_int8;
+
     weights_.input.weights = WinogradFilterTransformF(weights_.input.weights,
                                                       channels, kInputPlanes);
     for (auto& residual : weights_.residual) {
-      residual.conv1.weights =
-          WinogradFilterTransformF(residual.conv1.weights, channels, channels);
-      residual.conv2.weights =
-          WinogradFilterTransformF(residual.conv2.weights, channels, channels);
+      if (!(use_int8 && residual.conv1.has_int8)) {
+        residual.conv1.weights = WinogradFilterTransformF(
+            residual.conv1.weights, channels, channels);
+      }
+      if (!(use_int8 && residual.conv2.has_int8)) {
+        residual.conv2.weights = WinogradFilterTransformF(
+            residual.conv2.weights, channels, channels);
+      }
     }
     max_convolution_input_channels_ = std::max<size_t>(kInputPlanes, channels);
     max_convolution_output_channels_ = channels;
   }
-  auto& policy_weights = weights_.policy_heads.at(policy_head);
   if (conv_policy_) {
     policy_weights.policy1.weights = WinogradFilterTransformF(
         policy_weights.policy1.weights, channels, channels);
@@ -407,7 +454,8 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
         weights_.input, kInputPlanes, 3, default_activation));
     for (const auto& residual : weights_.residual) {
       AddLayer(std::make_unique<ResidualBlock<use_eigen>>(
-          residual, channels, default_activation, use_int8));
+          residual, channels, default_activation, use_int8, int8_kernel_,
+          use_nhwc_residual_tower_));
     }
   }
 
@@ -416,7 +464,7 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
     AddLayer(std::make_unique<AttentionBody<use_eigen>>(
         weights_, num_residual_blocks_ > 0 ? channels : kInputPlanes,
         num_residual_blocks_ > 0, is_pe_dense_embedding, default_activation,
-        smolgen_activation, ffn_activation, use_int8));
+        smolgen_activation, ffn_activation, use_int8, int8_kernel_));
     body_channels = weights_.ip_emb_b.size();
   }
 
@@ -424,7 +472,8 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
   if (attn_policy_) {
     AddLayer(std::make_unique<AttentionPolicyHead<use_eigen>>(
         policy_weights, weights_.smolgen_w, body_channels, attn_body_,
-        default_activation, smolgen_activation, ffn_activation, use_int8));
+        default_activation, smolgen_activation, ffn_activation, use_int8,
+        int8_kernel_));
     AddLayer(std::make_unique<PolicyMapLayer<use_eigen>>(
         kAttnPolicyMap, 64 * 64 + 8 * 24, 64 * 64 + 8 * 24));
   } else if (conv_policy_) {
@@ -520,14 +569,13 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
     CERR << "BLAS max batch size is " << max_batch_size_ << ".";
   }
 
-  const size_t int8_layers = CountInt8Layers(weights_, policy_weights);
   if (int8_layers > 0 && use_int8) {
-    CERR << "Using W8A8 INT8 for " << int8_layers
-         << " layers (MKL cblas_gemm_s8u8s32).";
+    CERR << "Using W8A8 INT8 for " << int8_layers << " layers ("
+         << Int8KernelName(int8_kernel_) << ").";
   } else if (int8_layers > 0) {
     CERR << "The net has " << int8_layers
          << " INT8 layers; running them in FP32 from the dequantized weights"
-         << (int8_requested ? " (INT8 needs a blas build with MKL)."
+         << (int8_requested ? " (no VNNI or MKL INT8 kernel available)."
                             : " (int8=false).");
   }
 }
