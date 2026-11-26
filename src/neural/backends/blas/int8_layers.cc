@@ -451,7 +451,7 @@ void NhwcToNchwFast(size_t batch_size, size_t channels, const float* input,
 Int8Weights::Int8Weights(const std::vector<int8_t>& weights,
                          const std::vector<float>& weight_scales,
                          float input_scale, uint8_t input_zero_point,
-                         Int8Kernel kernel, bool is_conv3x3)
+                         Int8Kernel kernel, bool is_conv3x3, bool allow_nr48)
     : weights_(weights.data()),
       outputs_(weight_scales.size()),
       kernel_(kernel),
@@ -475,13 +475,16 @@ Int8Weights::Int8Weights(const std::vector<int8_t>& weights,
 
   if (kernel_ == Int8Kernel::kVnniAvx512) {
     if (is_conv3x3) {
-      PackConv3x3Weights(weights_, outputs_, inputs_ / kFilterTaps, 32,
-                         packed_weights_);
+      const size_t in_c = inputs_ / kFilterTaps;
+      conv_nr_ =
+          (allow_nr48 && outputs_ == in_c && (outputs_ % 48) == 0) ? 48 : 32;
+      PackConv3x3Weights(weights_, outputs_, in_c, conv_nr_, packed_weights_);
     } else {
       PackGemmWeights(weights_, outputs_, inputs_, 32, packed_weights_);
     }
   } else if (kernel_ == Int8Kernel::kVnniAvx) {
     if (is_conv3x3) {
+      conv_nr_ = 16;
       PackConv3x3Weights(weights_, outputs_, inputs_ / kFilterTaps, 16,
                          packed_weights_);
     } else {
@@ -633,6 +636,49 @@ void Int8Weights::Forward(size_t rows, const uint8_t* quantized_input,
   }
 }
 
+void Int8Weights::ForwardQuantized(size_t rows, const uint8_t* quantized_input,
+                                   const float* biases,
+                                   ActivationFunction activation,
+                                   float out_inverse_scale,
+                                   uint8_t out_zero_point,
+                                   uint8_t* quantized_output,
+                                   Int8Scratch& scratch) const {
+#ifdef LC0_HAS_AVX512_VNNI
+  if (kernel_ == Int8Kernel::kVnniAvx512) {
+    const float out_zp_f = static_cast<float>(out_zero_point);
+    if (scratch.pool && scratch.pool->num_threads() > 1 && rows >= 16) {
+      const size_t strips = (rows + 7) / 8;
+      scratch.pool->ParallelFor(strips, 2, [&](size_t s0, size_t s1, size_t) {
+        const size_t r0 = s0 * 8;
+        const size_t r1 = std::min(rows, s1 * 8);
+        if (r0 < r1) {
+          GemmEpilogueQuantizeAvx512(
+              r0, r1, outputs_, inputs_, quantized_input,
+              packed_weights_.data(), output_scales_.data(),
+              zero_point_corrections_.data(), biases, activation,
+              out_inverse_scale, out_zp_f, quantized_output);
+        }
+      });
+    } else {
+      GemmEpilogueQuantizeAvx512(
+          0, rows, outputs_, inputs_, quantized_input, packed_weights_.data(),
+          output_scales_.data(), zero_point_corrections_.data(), biases,
+          activation, out_inverse_scale, out_zp_f, quantized_output);
+    }
+    return;
+  }
+#endif
+  (void)rows;
+  (void)quantized_input;
+  (void)biases;
+  (void)activation;
+  (void)out_inverse_scale;
+  (void)out_zero_point;
+  (void)quantized_output;
+  (void)scratch;
+  throw Exception("ForwardQuantized called without AVX-512 VNNI kernel.");
+}
+
 void Int8Weights::Forward(size_t rows, const float* input, const float* biases,
                           ActivationFunction activation, float* output,
                           Int8Scratch& scratch) const {
@@ -659,6 +705,36 @@ void Int8Weights::RunResidualBlockNhwc(
 
   auto run_boards = [&](size_t b0, size_t b1, size_t tid) {
     Conv3x3ThreadScratch& thread_scratch = scratch.conv3_scratch[tid];
+    const size_t n_boards = b1 - b0;
+#ifdef LC0_HAS_AVX512_VNNI
+    if (conv1.kernel_ == Int8Kernel::kVnniAvx512) {
+      thread_scratch.pad1.Resize(kPadSquares * padded_channels);
+      thread_scratch.pad2.Resize(kPadSquares * padded_channels);
+      Conv3x3ScratchView view;
+      view.pad1 = thread_scratch.pad1.data();
+      view.pad2 = thread_scratch.pad2.data();
+      if (se.has_se) {
+        thread_scratch.conv2_output.Resize(kSquares * channels);
+        thread_scratch.avg_pool.Resize(channels);
+        thread_scratch.se_fc1.Resize(se.se_fc_outputs);
+        thread_scratch.se_fc2.Resize(2 * channels);
+        view.conv2_output = thread_scratch.conv2_output.data();
+        view.avg_pool = thread_scratch.avg_pool.data();
+        view.se_fc1 = thread_scratch.se_fc1.data();
+        view.se_fc2 = thread_scratch.se_fc2.data();
+      }
+      ResidualBlockBoardsAvx512(
+          n_boards, channels, tensor_nhwc + b0 * kSquares * channels,
+          conv1.packed_weights_.data(), conv1.output_scales_.data(),
+          conv1.zero_point_corrections_.data(), conv1_biases,
+          conv1.inverse_input_scale_, conv1.input_zero_point_,
+          conv2.packed_weights_.data(), conv2.output_scales_.data(),
+          conv2.zero_point_corrections_.data(), conv2_biases,
+          conv2.inverse_input_scale_, conv2.input_zero_point_, activation, se,
+          view, conv1.conv_nr_);
+      return;
+    }
+#endif
     thread_scratch.pad1.Resize(kPadSquares * padded_channels);
     thread_scratch.pad2.Resize(kPadSquares * padded_channels);
     Conv3x3ScratchView view;
@@ -677,19 +753,6 @@ void Int8Weights::RunResidualBlockNhwc(
 
     for (size_t batch = b0; batch < b1; ++batch) {
       float* board_io = tensor_nhwc + batch * kSquares * channels;
-#ifdef LC0_HAS_AVX512_VNNI
-      if (conv1.kernel_ == Int8Kernel::kVnniAvx512) {
-        ResidualBlockBoardAvx512(
-            channels, board_io, conv1.packed_weights_.data(),
-            conv1.output_scales_.data(), conv1.zero_point_corrections_.data(),
-            conv1_biases, conv1.inverse_input_scale_, conv1.input_zero_point_,
-            conv2.packed_weights_.data(), conv2.output_scales_.data(),
-            conv2.zero_point_corrections_.data(), conv2_biases,
-            conv2.inverse_input_scale_, conv2.input_zero_point_, activation, se,
-            view);
-        continue;
-      }
-#endif
 #ifdef LC0_HAS_AVX_VNNI
       if (conv1.kernel_ == Int8Kernel::kVnniAvx) {
         ResidualBlockBoardAvx(
@@ -715,8 +778,9 @@ void Int8Weights::RunResidualBlockNhwc(
 }
 
 void Int8Weights::Convolve3Nhwc(size_t batch_size, const float* input_nhwc,
-                                float* output_nhwc,
-                                Int8Scratch& scratch) const {
+                                float* output_nhwc, Int8Scratch& scratch,
+                                const float* biases,
+                                ActivationFunction activation) const {
   const size_t input_channels = inputs_ / kFilterTaps;
   const size_t padded_channels = ((input_channels + 3) / 4) * 4;
   constexpr size_t kPadSquares = 10 * 10;
@@ -736,10 +800,11 @@ void Int8Weights::Convolve3Nhwc(size_t batch_size, const float* input_nhwc,
       float* out_board = output_nhwc + batch * kSquares * outputs_;
 #ifdef LC0_HAS_AVX512_VNNI
       if (kernel_ == Int8Kernel::kVnniAvx512) {
-        Conv3x3NhwcBoardAvx512(
-            input_channels, outputs_, in_board, packed_weights_.data(),
-            output_scales_.data(), zero_point_corrections_.data(),
-            inverse_input_scale_, input_zero_point_, out_board, view);
+        Conv3x3NhwcBoardAvx512(input_channels, outputs_, in_board,
+                               packed_weights_.data(), output_scales_.data(),
+                               zero_point_corrections_.data(),
+                               inverse_input_scale_, input_zero_point_,
+                               out_board, view, biases, activation);
         continue;
       }
 #endif
@@ -821,6 +886,117 @@ void Int8Weights::Convolve3(size_t batch_size, const float* input,
       }
     }
   }
+}
+
+// DynamicInt8Weights
+
+DynamicInt8Weights::DynamicInt8Weights(const float* weights_fp32,
+                                       size_t outputs, size_t inputs)
+    : inputs_(inputs),
+      outputs_(outputs),
+      weight_scales_(outputs, 0.0f),
+      weight_sum_scaled_(outputs, 0.0f) {
+  std::vector<int8_t> w_q(outputs * inputs, 0);
+  for (size_t o = 0; o < outputs; ++o) {
+    const float* row = weights_fp32 + o * inputs;
+    float max_abs = 0.0f;
+    for (size_t k = 0; k < inputs; ++k) {
+      max_abs = std::max(max_abs, std::abs(row[k]));
+    }
+    if (max_abs == 0.0f) continue;
+    const float scale = max_abs / 127.0f;
+    const float inv_scale = 127.0f / max_abs;
+    int32_t w_sum = 0;
+    int8_t* dst = w_q.data() + o * inputs;
+    for (size_t k = 0; k < inputs; ++k) {
+      const float qf = std::clamp(row[k] * inv_scale, -127.0f, 127.0f);
+      const int32_t qi = static_cast<int32_t>(std::lround(qf));
+      dst[k] = static_cast<int8_t>(qi);
+      w_sum += qi;
+    }
+    weight_scales_[o] = scale;
+    weight_sum_scaled_[o] = scale * static_cast<float>(w_sum);
+  }
+  PackGemmWeights(w_q.data(), outputs_, inputs_, 32, packed_weights_);
+}
+
+void DynamicInt8Weights::Forward(size_t rows, const float* input,
+                                 const float* biases,
+                                 ActivationFunction activation, float* output,
+                                 Int8Scratch& scratch) const {
+#ifdef LC0_HAS_AVX512_VNNI
+  // Use quantized_input2 so any pre-quantized QKV buffer in quantized_input
+  // stays intact across Smolgen.
+  scratch.quantized_input2.Resize(rows * inputs_);
+  if (scratch.dynamic_scales.size() < rows) {
+    scratch.dynamic_scales.resize(rows);
+  }
+  if (scratch.dynamic_mins.size() < rows) {
+    scratch.dynamic_mins.resize(rows);
+  }
+  uint8_t* q_in = scratch.quantized_input2.data();
+  float* r_scales = scratch.dynamic_scales.data();
+  float* r_mins = scratch.dynamic_mins.data();
+
+  Int8ThreadPool* pool = scratch.pool;
+  if (pool && pool->num_threads() > 1 && rows * inputs_ >= 16384 && rows >= 8) {
+    pool->ParallelFor(rows, 4, [&](size_t r0, size_t r1, size_t) {
+      QuantizeDynamicRowsAvx512(r1 - r0, inputs_, input + r0 * inputs_,
+                                q_in + r0 * inputs_, r_scales + r0,
+                                r_mins + r0);
+    });
+  } else {
+    QuantizeDynamicRowsAvx512(rows, inputs_, input, q_in, r_scales, r_mins);
+  }
+
+  const size_t n_blocks = (outputs_ + 31) / 32;
+  if (pool && pool->num_threads() > 1) {
+    const size_t num_threads = static_cast<size_t>(pool->num_threads());
+    const size_t row_strips = (rows + 7) / 8;
+    // Partition by rows when there are enough 8-row strips for all threads;
+    // otherwise partition by 32-column output blocks (crucial for small-M
+    // Smolgen dense1/dense2 where rows == batch_size == 16!).
+    if (row_strips >= num_threads * 2) {
+      pool->ParallelFor(row_strips, 2, [&](size_t s0, size_t s1, size_t) {
+        const size_t r0 = s0 * 8;
+        const size_t r1 = std::min(rows, s1 * 8);
+        if (r0 < r1) {
+          GemmDynamicEpilogueAvx512(
+              r0, r1, 0, n_blocks, outputs_, inputs_, q_in, r_scales, r_mins,
+              packed_weights_.data(), weight_scales_.data(),
+              weight_sum_scaled_.data(), biases, activation, output);
+        }
+      });
+    } else if (n_blocks >= 2) {
+      pool->ParallelFor(n_blocks, 1, [&](size_t nb0, size_t nb1, size_t) {
+        if (nb0 < nb1) {
+          GemmDynamicEpilogueAvx512(
+              0, rows, nb0, nb1, outputs_, inputs_, q_in, r_scales, r_mins,
+              packed_weights_.data(), weight_scales_.data(),
+              weight_sum_scaled_.data(), biases, activation, output);
+        }
+      });
+    } else {
+      GemmDynamicEpilogueAvx512(
+          0, rows, 0, n_blocks, outputs_, inputs_, q_in, r_scales, r_mins,
+          packed_weights_.data(), weight_scales_.data(),
+          weight_sum_scaled_.data(), biases, activation, output);
+    }
+  } else {
+    GemmDynamicEpilogueAvx512(0, rows, 0, n_blocks, outputs_, inputs_, q_in,
+                              r_scales, r_mins, packed_weights_.data(),
+                              weight_scales_.data(), weight_sum_scaled_.data(),
+                              biases, activation, output);
+  }
+#else
+  (void)rows;
+  (void)input;
+  (void)biases;
+  (void)activation;
+  (void)output;
+  (void)scratch;
+  throw Exception("DynamicInt8Weights requires AVX-512 VNNI.");
+#endif
 }
 
 }  // namespace blas_backend

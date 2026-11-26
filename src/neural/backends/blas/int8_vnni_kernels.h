@@ -70,6 +70,52 @@ void GemmEpilogueAvx512(size_t row_begin, size_t row_end, size_t outputs,
                         const float* biases, ActivationFunction activation,
                         float* output);
 
+void GemmEpilogueQuantizeAvx512(
+    size_t row_begin, size_t row_end, size_t outputs, size_t inputs,
+    const uint8_t* quantized_input, const int8_t* packed_weights,
+    const float* output_scales, const int32_t* zero_point_corrections,
+    const float* biases, ActivationFunction activation, float out_inverse_scale,
+    float out_zero_point, uint8_t* quantized_output);
+
+// Single-pass AVX-512 LayerNorm with optional skip connection and optional
+// fused uint8 quantization into `quantized_out` (pass nullptr to skip).
+void LayerNorm2DWithSkipAndQuantizeAvx512(
+    size_t rows, size_t channels, float* data, float alpha, const float* skip,
+    const float* gammas, const float* betas, float epsilon,
+    uint8_t* quantized_out, float inverse_scale, float zero_point);
+
+// In-place AVX-512 Softmax over `rows` rows of exactly 64 floats each.
+void Softmax64Avx512(size_t rows, float* data);
+
+// Per-row dynamic asymmetric uint8 quantization: x[r][k] ~= row_mins[r] +
+// row_scales[r] * q_out[r][k].
+void QuantizeDynamicRowsAvx512(size_t rows, size_t inputs, const float* input,
+                               uint8_t* q_out, float* row_scales,
+                               float* row_mins);
+
+// Dynamic per-row W8A8 GEMM over [row_begin, row_end) x [n_block_begin,
+// n_block_end) (in 32-column blocks). Computes:
+//   y[r][o] = act((row_scales[r] * weight_scales[o]) * acc[r][o]
+//                 + row_mins[r] * weight_sum_scaled[o] + biases[o]).
+void GemmDynamicEpilogueAvx512(
+    size_t row_begin, size_t row_end, size_t n_block_begin, size_t n_block_end,
+    size_t outputs, size_t inputs, const uint8_t* quantized_input,
+    const float* row_scales, const float* row_mins,
+    const int8_t* packed_weights, const float* weight_scales,
+    const float* weight_sum_scaled, const float* biases,
+    ActivationFunction activation, float* output);
+
+void ResidualBlockBoardsAvx512(
+    size_t num_boards, size_t channels, float* boards_io,
+    const int8_t* conv1_packed_weights, const float* conv1_output_scales,
+    const int32_t* conv1_zero_point_corrections, const float* conv1_biases,
+    float conv1_inverse_scale, uint8_t conv1_zero_point,
+    const int8_t* conv2_packed_weights, const float* conv2_output_scales,
+    const int32_t* conv2_zero_point_corrections, const float* conv2_biases,
+    float conv2_inverse_scale, uint8_t conv2_zero_point,
+    ActivationFunction activation, const ResidualSeParams& se,
+    const Conv3x3ScratchView& scratch, size_t conv_nr = 32);
+
 void ResidualBlockBoardAvx512(
     size_t channels, float* board_io, const int8_t* conv1_packed_weights,
     const float* conv1_output_scales,
@@ -85,7 +131,9 @@ void Conv3x3NhwcBoardAvx512(
     size_t input_channels, size_t output_channels, const float* input_nhwc,
     const int8_t* packed_weights, const float* output_scales,
     const int32_t* zero_point_corrections, float inverse_scale,
-    uint8_t zero_point, float* output_nhwc, const Conv3x3ScratchView& scratch);
+    uint8_t zero_point, float* output_nhwc, const Conv3x3ScratchView& scratch,
+    const float* biases = nullptr,
+    ActivationFunction activation = ACTIVATION_NONE);
 
 void NchwToNhwcAvx512(size_t batch_size, size_t channels, const float* input,
                       float* output);

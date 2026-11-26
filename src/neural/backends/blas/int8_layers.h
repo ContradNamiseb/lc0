@@ -41,6 +41,12 @@ bool IsInt8SupportedOnHost(bool allow_mkl);
 // Temporaries of the INT8 layers, kept in the computation's workspace.
 struct Int8Scratch {
   AlignedBuffer<uint8_t> quantized_input;
+  // Secondary uint8 buffer for fused producer->consumer pipelines (e.g. FFN1
+  // writing quantized input directly for FFN2 without touching FP32 scratch).
+  AlignedBuffer<uint8_t> quantized_input2;
+  // Per-row dynamic activation scale/min buffers for dynamic W8A8 layers.
+  std::vector<float> dynamic_scales;
+  std::vector<float> dynamic_mins;
   // The 3x3 convolution's input (MKL im2col fallback), one square's
   // neighbourhood per row.
   std::vector<uint8_t> columns;
@@ -76,11 +82,13 @@ class Int8Weights {
   Int8Weights(const std::vector<int8_t>& weights,
               const std::vector<float>& weight_scales, float input_scale,
               uint8_t input_zero_point, Int8Kernel kernel = Int8Kernel::kMkl,
-              bool is_conv3x3 = false);
+              bool is_conv3x3 = false, bool allow_nr48 = false);
 
   size_t inputs() const { return inputs_; }
   size_t outputs() const { return outputs_; }
   Int8Kernel kernel() const { return kernel_; }
+  float inverse_input_scale() const { return inverse_input_scale_; }
+  uint8_t input_zero_point() const { return input_zero_point_; }
   bool uses_vnni() const {
     return kernel_ == Int8Kernel::kVnniAvx512 ||
            kernel_ == Int8Kernel::kVnniAvx;
@@ -96,6 +104,13 @@ class Int8Weights {
                ActivationFunction activation, float* output,
                Int8Scratch& scratch) const;
 
+  // Fused GEMM + activation + requantization directly to uint8 output for a
+  // downstream INT8 layer (currently AVX-512 VNNI).
+  void ForwardQuantized(size_t rows, const uint8_t* quantized_input,
+                        const float* biases, ActivationFunction activation,
+                        float out_inverse_scale, uint8_t out_zero_point,
+                        uint8_t* quantized_output, Int8Scratch& scratch) const;
+
   // Quantizes `input` [rows][inputs] and runs Forward().
   void Forward(size_t rows, const float* input, const float* biases,
                ActivationFunction activation, float* output,
@@ -107,9 +122,12 @@ class Int8Weights {
   void Convolve3(size_t batch_size, const float* input, float* output,
                  Int8Scratch& scratch) const;
 
-  // A 3x3 convolution on an NHWC tensor [batch_size][64][in_c] -> [64][out_c].
+  // A 3x3 convolution on an NHWC tensor [batch_size][64][in_c] -> [64][out_c],
+  // with optional fused bias and activation (AVX-512 VNNI).
   void Convolve3Nhwc(size_t batch_size, const float* input_nhwc,
-                     float* output_nhwc, Int8Scratch& scratch) const;
+                     float* output_nhwc, Int8Scratch& scratch,
+                     const float* biases = nullptr,
+                     ActivationFunction activation = ACTIVATION_NONE) const;
 
   // Runs a complete fused NHWC residual block (conv1 -> bias1 + act ->
   // requant -> conv2 -> optional SE + skip + act) in-place on `tensor_nhwc`.
@@ -131,11 +149,34 @@ class Int8Weights {
   size_t inputs_;
   size_t outputs_;
   Int8Kernel kernel_;
+  size_t conv_nr_ = 32;
   AlignedBuffer<int8_t> packed_weights_;
   std::vector<float> output_scales_;
   std::vector<int32_t> zero_point_corrections_;
   float inverse_input_scale_;
   uint8_t input_zero_point_;
+};
+
+// Runtime-quantized W8A8 linear layer (per-channel symmetric int8 weights +
+// per-row dynamic asymmetric uint8 activations). Packs FP32 weights once at
+// network load time without requiring calibrated INT8 weights in the net file.
+class DynamicInt8Weights {
+ public:
+  DynamicInt8Weights(const float* weights_fp32, size_t outputs, size_t inputs);
+
+  size_t inputs() const { return inputs_; }
+  size_t outputs() const { return outputs_; }
+
+  void Forward(size_t rows, const float* input, const float* biases,
+               ActivationFunction activation, float* output,
+               Int8Scratch& scratch) const;
+
+ private:
+  size_t inputs_;
+  size_t outputs_;
+  AlignedBuffer<int8_t> packed_weights_;
+  std::vector<float> weight_scales_;
+  std::vector<float> weight_sum_scaled_;
 };
 
 }  // namespace blas_backend

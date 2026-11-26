@@ -313,8 +313,8 @@ TEST(BlasInt8VnniTest, ResidualBlockNhwcParity) {
                 in2_scale, in2_zp, b2.data(), act, se);
           }
 
-          Int8Weights conv1(w1, s1, in1_scale, in1_zp, kernel, true);
-          Int8Weights conv2(w2, s2, in2_scale, in2_zp, kernel, true);
+          Int8Weights conv1(w1, s1, in1_scale, in1_zp, kernel, true, true);
+          Int8Weights conv2(w2, s2, in2_scale, in2_zp, kernel, true, true);
           std::vector<float> got = input;
           Int8Scratch scratch;
           scratch.pool = &pool;
@@ -448,6 +448,235 @@ TEST(BlasInt8VnniTest, Convolve3NchwVnniParity) {
     }
   }
 }
+
+#ifdef LC0_HAS_AVX512_VNNI
+TEST(BlasInt8VnniTest, FusedLayerNormQuantizeAndSoftmaxAvx512) {
+  if (!CpuSupportsAvx512Vnni()) GTEST_SKIP();
+  std::mt19937 rng(2026);
+  std::uniform_real_distribution<float> f_dist(-2.0f, 2.0f);
+
+  // 1. LayerNorm2DWithSkipAndQuantizeAvx512 (both C=256 fast path & general C)
+  for (size_t channels : {size_t{256}, size_t{37}, size_t{512}}) {
+    for (bool with_skip : {false, true}) {
+      for (bool with_quant : {false, true}) {
+        const size_t rows = 17;
+        const float alpha = 0.75f;
+        const float eps = 1e-3f;
+        const float inv_scale = 23.5f;
+        const float zp = 128.0f;
+        std::vector<float> data(rows * channels), skip(rows * channels);
+        std::vector<float> gamma(channels), beta(channels);
+        for (auto& v : data) v = f_dist(rng);
+        for (auto& v : skip) v = f_dist(rng);
+        for (auto& v : gamma) v = 0.5f + std::abs(f_dist(rng));
+        for (auto& v : beta) v = f_dist(rng) * 0.25f;
+
+        std::vector<float> ref = data;
+        std::vector<uint8_t> ref_q(rows * channels, 0);
+        for (size_t r = 0; r < rows; ++r) {
+          float mean = 0.0f;
+          for (size_t c = 0; c < channels; ++c) {
+            float x = ref[r * channels + c] * alpha +
+                      (with_skip ? skip[r * channels + c] : 0.0f);
+            ref[r * channels + c] = x;
+            mean += x;
+          }
+          mean /= static_cast<float>(channels);
+          float var = 0.0f;
+          for (size_t c = 0; c < channels; ++c) {
+            float d = ref[r * channels + c] - mean;
+            var += d * d;
+          }
+          var /= static_cast<float>(channels);
+          const float inv_std = 1.0f / std::sqrt(var + eps);
+          for (size_t c = 0; c < channels; ++c) {
+            float y =
+                beta[c] + gamma[c] * (ref[r * channels + c] - mean) * inv_std;
+            ref[r * channels + c] = y;
+            if (with_quant) {
+              float s = std::clamp(y * inv_scale + zp, 0.0f, 255.0f);
+              ref_q[r * channels + c] = static_cast<uint8_t>(std::nearbyint(s));
+            }
+          }
+        }
+
+        std::vector<float> got = data;
+        std::vector<uint8_t> got_q(rows * channels, 0xA5);
+        LayerNorm2DWithSkipAndQuantizeAvx512(
+            rows, channels, got.data(), alpha,
+            with_skip ? skip.data() : nullptr, gamma.data(), beta.data(), eps,
+            with_quant ? got_q.data() : nullptr, inv_scale, zp);
+
+        for (size_t i = 0; i < ref.size(); ++i) {
+          ASSERT_NEAR(got[i], ref[i], 1e-5f * std::max(1.0f, std::abs(ref[i])))
+              << "C=" << channels << " skip=" << with_skip << " idx=" << i;
+          if (with_quant) {
+            ASSERT_LE(std::abs(int(got_q[i]) - int(ref_q[i])), 1)
+                << "C=" << channels << " idx=" << i;
+          }
+        }
+      }
+    }
+  }
+
+  // 2. Softmax64Avx512
+  {
+    const size_t rows = 33;
+    std::vector<float> data(rows * 64);
+    for (auto& v : data) v = f_dist(rng) * 3.0f;
+    std::vector<float> ref = data;
+    for (size_t r = 0; r < rows; ++r) {
+      float mx = ref[r * 64];
+      for (size_t c = 1; c < 64; ++c) mx = std::max(mx, ref[r * 64 + c]);
+      float sum = 0.0f;
+      for (size_t c = 0; c < 64; ++c) {
+        ref[r * 64 + c] = std::exp(ref[r * 64 + c] - mx);
+        sum += ref[r * 64 + c];
+      }
+      for (size_t c = 0; c < 64; ++c) ref[r * 64 + c] /= sum;
+    }
+    std::vector<float> got = data;
+    Softmax64Avx512(rows, got.data());
+    for (size_t i = 0; i < ref.size(); ++i) {
+      ASSERT_NEAR(got[i], ref[i], 1e-6f) << "idx=" << i;
+    }
+  }
+
+  // 3. ForwardQuantized (FFN1 + RELU_2 + Quantize(FFN2))
+  {
+    Int8ThreadPool pool(4);
+    const size_t rows = 67, inputs = 256, outputs = 100;
+    std::uniform_int_distribution<int> w_dist(-127, 127);
+    std::vector<int8_t> w(outputs * inputs);
+    for (auto& v : w) v = static_cast<int8_t>(w_dist(rng));
+    std::vector<float> scales(outputs), bias(outputs);
+    for (auto& v : scales) v = 0.002f + std::abs(f_dist(rng)) * 0.004f;
+    for (auto& v : bias) v = f_dist(rng) * 0.2f;
+    std::vector<float> x(rows * inputs);
+    for (auto& v : x) v = f_dist(rng);
+
+    Int8Weights layer(w, scales, 0.02f, 128, Int8Kernel::kVnniAvx512);
+    Int8Scratch scratch;
+    scratch.pool = &pool;
+    std::vector<float> fp_out(rows * outputs);
+    layer.Forward(rows, x.data(), bias.data(), ACTIVATION_RELU_2, fp_out.data(),
+                  scratch);
+    const float out_inv_scale = 18.0f;
+    const uint8_t out_zp = 12;
+    std::vector<uint8_t> ref_q(rows * outputs);
+    QuantizeToUint8Avx512(fp_out.size(), fp_out.data(), out_inv_scale,
+                          static_cast<float>(out_zp), ref_q.data());
+
+    std::vector<uint8_t> in_q(rows * inputs);
+    layer.QuantizeInput(x.size(), x.data(), in_q.data(), &pool);
+    std::vector<uint8_t> got_q(rows * outputs, 0x5A);
+    layer.ForwardQuantized(rows, in_q.data(), bias.data(), ACTIVATION_RELU_2,
+                           out_inv_scale, out_zp, got_q.data(), scratch);
+    EXPECT_EQ(got_q, ref_q);
+  }
+
+  // 4. DynamicInt8Weights (both row-parallel and n_block-parallel regimes)
+  {
+    Int8ThreadPool pool(4);
+    for (auto [rows, inputs, outputs] :
+         std::vector<std::tuple<size_t, size_t, size_t>>{{16, 256, 2048},
+                                                         {16, 2048, 256},
+                                                         {128, 256, 512},
+                                                         {17, 192, 100}}) {
+      std::vector<float> w(outputs * inputs), b(outputs), x(rows * inputs);
+      for (auto& v : w) v = f_dist(rng) * 0.25f;
+      for (auto& v : b) v = f_dist(rng) * 0.1f;
+      for (auto& v : x) v = f_dist(rng);
+
+      std::vector<float> ref(rows * outputs, 0.0f);
+      for (size_t r = 0; r < rows; ++r) {
+        for (size_t o = 0; o < outputs; ++o) {
+          float acc = b[o];
+          for (size_t k = 0; k < inputs; ++k) {
+            acc += x[r * inputs + k] * w[o * inputs + k];
+          }
+          ref[r * outputs + o] = Activate(acc, ACTIVATION_SWISH);
+        }
+      }
+
+      DynamicInt8Weights dyn(w.data(), outputs, inputs);
+      Int8Scratch scratch;
+      scratch.pool = &pool;
+      std::vector<float> got(rows * outputs, -999.0f);
+      dyn.Forward(rows, x.data(), b.data(), ACTIVATION_SWISH, got.data(),
+                  scratch);
+
+      double sum_sq_err = 0.0, sum_sq_ref = 0.0;
+      for (size_t i = 0; i < ref.size(); ++i) {
+        double d = static_cast<double>(got[i]) - static_cast<double>(ref[i]);
+        sum_sq_err += d * d;
+        sum_sq_ref += static_cast<double>(ref[i]) * static_cast<double>(ref[i]);
+      }
+      const double rel_rmse = std::sqrt(sum_sq_err / (sum_sq_ref + 1e-12));
+      EXPECT_LT(rel_rmse, 0.02)
+          << "Shape (" << rows << "," << outputs << "," << inputs << ")";
+    }
+  }
+
+  // 5. Conv3x3Nhwc with fused bias and Mish activation
+  {
+    Int8ThreadPool pool(4);
+    const size_t batch = 3, in_c = 112, out_c = 192;
+    std::uniform_int_distribution<int> w_dist(-64, 64);
+    std::vector<int8_t> w(out_c * in_c * 9);
+    for (auto& v : w) v = static_cast<int8_t>(w_dist(rng));
+    std::vector<float> scales(out_c), bias(out_c);
+    for (auto& v : scales) v = 0.001f + std::abs(f_dist(rng)) * 0.002f;
+    for (auto& v : bias) v = f_dist(rng) * 0.2f;
+    std::vector<float> x_nhwc(batch * kSquares * in_c);
+    for (auto& v : x_nhwc) v = (f_dist(rng) > 0.0f) ? 1.0f : 0.0f;
+
+    std::vector<float> ref_nhwc(batch * kSquares * out_c, 0.0f);
+    for (size_t b = 0; b < batch; ++b) {
+      const float* in_b = x_nhwc.data() + b * kSquares * in_c;
+      float* out_b = ref_nhwc.data() + b * kSquares * out_c;
+      for (int y = 0; y < 8; ++y) {
+        for (int x = 0; x < 8; ++x) {
+          for (size_t o = 0; o < out_c; ++o) {
+            int32_t acc = 0;
+            for (size_t c = 0; c < in_c; ++c) {
+              for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                  int sy = y + dy, sx = x + dx;
+                  uint8_t q = 0;
+                  if (sy >= 0 && sy < 8 && sx >= 0 && sx < 8) {
+                    q = static_cast<uint8_t>(
+                        std::lround(in_b[(sy * 8 + sx) * in_c + c] * 255.0f));
+                  }
+                  int tap = (dy + 1) * 3 + (dx + 1);
+                  acc += static_cast<int32_t>(q) *
+                         static_cast<int32_t>(w[(o * in_c + c) * 9 + tap]);
+                }
+              }
+            }
+            float val =
+                scales[o] * (1.0f / 255.0f) * static_cast<float>(acc) + bias[o];
+            out_b[(y * 8 + x) * out_c + o] = Activate(val, ACTIVATION_MISH);
+          }
+        }
+      }
+    }
+
+    Int8Weights layer(w, scales, 1.0f / 255.0f, uint8_t{0},
+                      Int8Kernel::kVnniAvx512, /*is_conv3x3=*/true);
+    Int8Scratch scratch;
+    scratch.pool = &pool;
+    std::vector<float> got_nhwc(batch * kSquares * out_c, -999.0f);
+    layer.Convolve3Nhwc(batch, x_nhwc.data(), got_nhwc.data(), scratch,
+                        bias.data(), ACTIVATION_MISH);
+    for (size_t i = 0; i < ref_nhwc.size(); ++i) {
+      ASSERT_NEAR(got_nhwc[i], ref_nhwc[i],
+                  1e-3f * std::max(1.0f, std::abs(ref_nhwc[i])))
+          << "idx=" << i;
+    }
+  }
+}
+#endif
 
 }  // namespace
 }  // namespace blas_backend

@@ -93,20 +93,76 @@ WinogradConvolution3<use_eigen>& Workspace<use_eigen>::Winograd(
 template <bool use_eigen>
 ConvLayer<use_eigen>::ConvLayer(const MultiHeadWeights::ConvBlock& weights,
                                 size_t input_channels, size_t filter_size,
-                                ActivationFunction activation)
+                                ActivationFunction activation,
+                                const std::vector<float>* raw_int8_weights,
+                                float plane109_scale)
     : BaseLayer<use_eigen>(weights.biases.size() * kSquares),
       weights_(weights),
       input_channels_(input_channels),
       output_channels_(weights.biases.size()),
       filter_size_(filter_size),
-      activation_(activation) {
+      activation_(activation),
+      plane109_scale_(plane109_scale) {
   assert(filter_size == 1 || filter_size == 3);
+#ifdef LC0_HAS_AVX512_VNNI
+  if (raw_int8_weights != nullptr && filter_size == 3 &&
+      CpuSupportsAvx512Vnni() &&
+      raw_int8_weights->size() == output_channels_ * input_channels_ * 9) {
+    const size_t row_len = input_channels_ * 9;
+    int8_w_storage_.assign(raw_int8_weights->size(), 0);
+    int8_s_storage_.assign(output_channels_, 0.0f);
+    const float inv_p109 =
+        (plane109_scale_ > 0.0f) ? (1.0f / plane109_scale_) : 1.0f;
+    for (size_t o = 0; o < output_channels_; ++o) {
+      const float* src = raw_int8_weights->data() + o * row_len;
+      float max_abs = 0.0f;
+      for (size_t c = 0; c < input_channels_; ++c) {
+        const float mul = (c == 109) ? inv_p109 : 1.0f;
+        for (size_t t = 0; t < 9; ++t) {
+          max_abs = std::max(max_abs, std::abs(src[c * 9 + t] * mul));
+        }
+      }
+      if (max_abs == 0.0f) continue;
+      int8_s_storage_[o] = max_abs / 127.0f;
+      const float inv_s = 127.0f / max_abs;
+      int8_t* dst = int8_w_storage_.data() + o * row_len;
+      for (size_t c = 0; c < input_channels_; ++c) {
+        const float mul = (c == 109) ? inv_p109 : 1.0f;
+        for (size_t t = 0; t < 9; ++t) {
+          const float qf =
+              std::clamp(src[c * 9 + t] * mul * inv_s, -127.0f, 127.0f);
+          dst[c * 9 + t] = static_cast<int8_t>(std::lround(qf));
+        }
+      }
+    }
+    int8_conv_.emplace(int8_w_storage_, int8_s_storage_, 1.0f / 255.0f,
+                       uint8_t{0}, Int8Kernel::kVnniAvx512,
+                       /*is_conv3x3=*/true);
+  }
+#else
+  (void)raw_int8_weights;
+#endif
 }
 
 template <bool use_eigen>
 void ConvLayer<use_eigen>::Eval(size_t batch_size, float* output,
                                 const float* input, const float* /*input2*/,
                                 Workspace<use_eigen>& workspace) const {
+  if (int8_conv_) {
+    workspace.int8.nhwc_input.Resize(batch_size * kSquares * input_channels_);
+    float* nhwc_in = workspace.int8.nhwc_input.data();
+    NchwToNhwcFast(batch_size, input_channels_, input, nhwc_in,
+                   workspace.int8.pool);
+    if (plane109_scale_ != 1.0f && input_channels_ > 109) {
+      const size_t total_sq = batch_size * kSquares;
+      for (size_t sq = 0; sq < total_sq; ++sq) {
+        nhwc_in[sq * input_channels_ + 109] *= plane109_scale_;
+      }
+    }
+    int8_conv_->Convolve3Nhwc(batch_size, nhwc_in, output, workspace.int8,
+                              weights_.biases.data(), activation_);
+    return;
+  }
   if (filter_size_ == 3) {
     workspace.Winograd(batch_size)
         .Forward(batch_size, input_channels_, output_channels_, input,
@@ -133,13 +189,16 @@ ResidualBlock<use_eigen>::ResidualBlock(
   if (!use_int8) return;
   const auto& conv1 = weights.conv1;
   const auto& conv2 = weights.conv2;
+  const bool allow_nr48 = nhwc_layout_ && conv1.has_int8 && conv2.has_int8;
   if (conv1.has_int8) {
     conv1_int8_.emplace(conv1.weights_i8, conv1.w_scales, conv1.act_scale,
-                        conv1.act_zp, int8_kernel, /*is_conv3x3=*/true);
+                        conv1.act_zp, int8_kernel, /*is_conv3x3=*/true,
+                        allow_nr48);
   }
   if (conv2.has_int8) {
     conv2_int8_.emplace(conv2.weights_i8, conv2.w_scales, conv2.act_scale,
-                        conv2.act_zp, int8_kernel, /*is_conv3x3=*/true);
+                        conv2.act_zp, int8_kernel, /*is_conv3x3=*/true,
+                        allow_nr48);
   }
 }
 
@@ -277,7 +336,8 @@ EncoderBlock<use_eigen>::EncoderBlock(
     const std::vector<float>& smolgen_global_weights, size_t embedding_size,
     size_t heads, ActivationFunction smolgen_activation,
     ActivationFunction ffn_activation, float alpha, float default_epsilon,
-    bool use_int8, Int8Kernel int8_kernel)
+    bool use_int8, Int8Kernel int8_kernel,
+    const DynamicInt8Weights* smolgen_global_int8)
     : weights_(weights),
       smolgen_global_weights_(smolgen_global_weights),
       embedding_size_(embedding_size),
@@ -285,7 +345,8 @@ EncoderBlock<use_eigen>::EncoderBlock(
       smolgen_activation_(smolgen_activation),
       ffn_activation_(ffn_activation),
       alpha_(alpha),
-      default_epsilon_(default_epsilon) {
+      default_epsilon_(default_epsilon),
+      smolgen_global_int8_(smolgen_global_int8) {
   if (!use_int8) return;
   const auto& mha = weights.mha;
   if (mha.has_int8) {
@@ -297,6 +358,21 @@ EncoderBlock<use_eigen>::EncoderBlock(
                     mha.qkv_act_zp, int8_kernel);
     dense_int8_.emplace(mha.dense_w_i8, mha.dense_w_scales, mha.dense_act_scale,
                         mha.dense_act_zp, int8_kernel);
+#ifdef LC0_HAS_AVX512_VNNI
+    if (mha.has_smolgen && int8_kernel == Int8Kernel::kVnniAvx512 &&
+        CpuSupportsAvx512Vnni()) {
+      const size_t hidden_channels =
+          mha.smolgen.compress.size() / embedding_size;
+      const size_t hidden_size = mha.smolgen.dense1_b.size();
+      const size_t generated_size = mha.smolgen.dense2_b.size();
+      smolgen_compress_int8_.emplace(mha.smolgen.compress.data(),
+                                     hidden_channels, embedding_size);
+      smolgen_dense1_int8_.emplace(mha.smolgen.dense1_w.data(), hidden_size,
+                                   kSquares * hidden_channels);
+      smolgen_dense2_int8_.emplace(mha.smolgen.dense2_w.data(), generated_size,
+                                   hidden_size);
+    }
+#endif
   }
   const auto& ffn = weights.ffn;
   if (ffn.has_int8) {
@@ -310,11 +386,13 @@ EncoderBlock<use_eigen>::EncoderBlock(
 }
 
 template <bool use_eigen>
-void EncoderBlock<use_eigen>::Eval(size_t batch_size, std::vector<float>& flow,
+bool EncoderBlock<use_eigen>::Eval(size_t batch_size, std::vector<float>& flow,
                                    std::vector<float>& buffer2,
                                    std::vector<float>& buffer3,
                                    std::vector<float>& buffer4,
-                                   Int8Scratch& int8_scratch) const {
+                                   Int8Scratch& int8_scratch,
+                                   bool qkv_already_quantized,
+                                   const Int8Weights* next_qkv_int8) const {
   const auto& mha = weights_.mha;
   const auto& ffn = weights_.ffn;
   const size_t d_model = mha.q_b.size();
@@ -325,6 +403,43 @@ void EncoderBlock<use_eigen>::Eval(size_t batch_size, std::vector<float>& flow,
   const size_t generated_size =
       mha.has_smolgen ? mha.smolgen.dense2_b.size() : 0;
   const size_t heads = heads_;
+  Int8ThreadPool* pool = int8_scratch.pool;
+
+  auto run_ln = [&](size_t ln_rows, size_t channels, float* data, float alpha,
+                    const float* skip, const float* gammas, const float* betas,
+                    float eps, uint8_t* quant_out = nullptr,
+                    float inv_scale = 0.0f, float zp = 0.0f) {
+#ifdef LC0_HAS_AVX512_VNNI
+    if (CpuSupportsAvx512Vnni()) {
+      if (pool && pool->num_threads() > 1 && ln_rows >= 64) {
+        pool->ParallelFor(ln_rows, 16, [&](size_t r0, size_t r1, size_t) {
+          LayerNorm2DWithSkipAndQuantizeAvx512(
+              r1 - r0, channels, data + r0 * channels, alpha,
+              skip ? skip + r0 * channels : nullptr, gammas, betas, eps,
+              quant_out ? quant_out + r0 * channels : nullptr, inv_scale, zp);
+        });
+      } else {
+        LayerNorm2DWithSkipAndQuantizeAvx512(ln_rows, channels, data, alpha,
+                                             skip, gammas, betas, eps,
+                                             quant_out, inv_scale, zp);
+      }
+      return;
+    }
+#endif
+    (void)quant_out;
+    (void)inv_scale;
+    (void)zp;
+    if (pool && pool->num_threads() > 1 && ln_rows >= 64) {
+      pool->ParallelFor(ln_rows, 16, [&](size_t r0, size_t r1, size_t) {
+        LayerNorm2DWithSkipConnection(
+            r1 - r0, channels, data + r0 * channels, alpha,
+            skip ? skip + r0 * channels : nullptr, gammas, betas, eps);
+      });
+    } else {
+      LayerNorm2DWithSkipConnection(ln_rows, channels, data, alpha, skip,
+                                    gammas, betas, eps);
+    }
+  };
 
   GrowBuffer(flow, batch_size * d_model * kSquares);
   GrowBuffer(buffer2, batch_size * std::max(std::max(d_model, hidden_channels) *
@@ -339,47 +454,71 @@ void EncoderBlock<use_eigen>::Eval(size_t batch_size, std::vector<float>& flow,
     float* qk = buffer4.data();
 
     // Compress.
-    FullyConnectedLayer<use_eigen>::Forward1D(
-        batch_size * kSquares, embedding_size_, hidden_channels, flow.data(),
-        mha.smolgen.compress.data(), (const float*)nullptr, ACTIVATION_NONE,
-        buffer2.data());
+    if (smolgen_compress_int8_) {
+      smolgen_compress_int8_->Forward(batch_size * kSquares, flow.data(),
+                                      nullptr, ACTIVATION_NONE, buffer2.data(),
+                                      int8_scratch);
+    } else {
+      FullyConnectedLayer<use_eigen>::Forward1D(
+          batch_size * kSquares, embedding_size_, hidden_channels, flow.data(),
+          mha.smolgen.compress.data(), (const float*)nullptr, ACTIVATION_NONE,
+          buffer2.data());
+    }
 
     // Dense 1.
-    FullyConnectedLayer<use_eigen>::Forward1D(
-        batch_size, kSquares * hidden_channels, hidden_size, buffer2.data(),
-        mha.smolgen.dense1_w.data(), mha.smolgen.dense1_b.data(),
-        smolgen_activation_, buffer3.data());
+    if (smolgen_dense1_int8_) {
+      smolgen_dense1_int8_->Forward(
+          batch_size, buffer2.data(), mha.smolgen.dense1_b.data(),
+          smolgen_activation_, buffer3.data(), int8_scratch);
+    } else {
+      FullyConnectedLayer<use_eigen>::Forward1D(
+          batch_size, kSquares * hidden_channels, hidden_size, buffer2.data(),
+          mha.smolgen.dense1_w.data(), mha.smolgen.dense1_b.data(),
+          smolgen_activation_, buffer3.data());
+    }
     // Layer Norm.
-    LayerNorm2DWithSkipConnection(
-        batch_size, hidden_size, buffer3.data(), 1.0f, (const float*)nullptr,
-        mha.smolgen.ln1_gammas.data(), mha.smolgen.ln1_betas.data(), 1e-3f);
+    run_ln(batch_size, hidden_size, buffer3.data(), 1.0f, nullptr,
+           mha.smolgen.ln1_gammas.data(), mha.smolgen.ln1_betas.data(), 1e-3f);
 
     // Dense 2.
-    FullyConnectedLayer<use_eigen>::Forward1D(
-        batch_size, hidden_size, generated_size, buffer3.data(),
-        mha.smolgen.dense2_w.data(), mha.smolgen.dense2_b.data(),
-        smolgen_activation_, buffer2.data());
+    if (smolgen_dense2_int8_) {
+      smolgen_dense2_int8_->Forward(
+          batch_size, buffer3.data(), mha.smolgen.dense2_b.data(),
+          smolgen_activation_, buffer2.data(), int8_scratch);
+    } else {
+      FullyConnectedLayer<use_eigen>::Forward1D(
+          batch_size, hidden_size, generated_size, buffer3.data(),
+          mha.smolgen.dense2_w.data(), mha.smolgen.dense2_b.data(),
+          smolgen_activation_, buffer2.data());
+    }
     // Layer Norm.
-    LayerNorm2DWithSkipConnection(
-        batch_size, generated_size, buffer2.data(), 1.0f, (const float*)nullptr,
-        mha.smolgen.ln2_gammas.data(), mha.smolgen.ln2_betas.data(), 1e-3f);
+    run_ln(batch_size, generated_size, buffer2.data(), 1.0f, nullptr,
+           mha.smolgen.ln2_gammas.data(), mha.smolgen.ln2_betas.data(), 1e-3f);
 
     // Global smolgen weights.
-    FullyConnectedLayer<use_eigen>::Forward1D(
-        batch_size * heads, generated_size / heads, kSquares * kSquares,
-        buffer2.data(), smolgen_global_weights_.data(), (const float*)nullptr,
-        ACTIVATION_NONE, qk);
+    if (smolgen_global_int8_) {
+      smolgen_global_int8_->Forward(batch_size * heads, buffer2.data(), nullptr,
+                                    ACTIVATION_NONE, qk, int8_scratch);
+    } else {
+      FullyConnectedLayer<use_eigen>::Forward1D(
+          batch_size * heads, generated_size / heads, kSquares * kSquares,
+          buffer2.data(), smolgen_global_weights_.data(), (const float*)nullptr,
+          ACTIVATION_NONE, qk);
+    }
   }
 
   // Q, K, V share the same input tensor `flow` and (qkv_act_scale, qkv_act_zp),
-  // so quantize `flow` once and reuse across all three projections.
+  // so quantize `flow` once and reuse across all three projections (or reuse
+  // the fused quantized output written by the preceding LayerNorm).
   const size_t rows = batch_size * kSquares;
   const uint8_t* qkv_quantized = nullptr;
   if (q_int8_) {
-    int8_scratch.quantized_input.Resize(rows * embedding_size_);
-    q_int8_->QuantizeInput(rows * embedding_size_, flow.data(),
-                           int8_scratch.quantized_input.data(),
-                           int8_scratch.pool);
+    if (!qkv_already_quantized) {
+      int8_scratch.quantized_input.Resize(rows * embedding_size_);
+      q_int8_->QuantizeInput(rows * embedding_size_, flow.data(),
+                             int8_scratch.quantized_input.data(),
+                             int8_scratch.pool);
+    }
     qkv_quantized = int8_scratch.quantized_input.data();
   }
 
@@ -406,7 +545,6 @@ void EncoderBlock<use_eigen>::Eval(size_t batch_size, std::vector<float>& flow,
   const int depth = static_cast<int>(d_model / heads);
   const int row_stride = static_cast<int>(d_model);  // heads * depth
   const float scaling = 1.0f / sqrtf(static_cast<float>(depth));
-  Int8ThreadPool* pool = int8_scratch.pool;
 
   // MHA is done per batch since there's a fourth dimension introduced.
   auto run_qk_batches = [&](size_t b0, size_t b1, size_t) {
@@ -463,6 +601,12 @@ void EncoderBlock<use_eigen>::Eval(size_t batch_size, std::vector<float>& flow,
   float* qk = buffer4.data();
   const size_t total_heads = batch_size * heads;
   auto run_softmax = [&](size_t h0, size_t h1, size_t) {
+#ifdef LC0_HAS_AVX512_VNNI
+    if (CpuSupportsAvx512Vnni()) {
+      Softmax64Avx512((h1 - h0) * kSquares, qk + h0 * kSquares * kSquares);
+      return;
+    }
+#endif
     for (size_t bh = h0; bh < h1; ++bh) {
       float* head_qk = qk + bh * kSquares * kSquares;
       for (size_t sq = 0; sq < kSquares; ++sq) {
@@ -547,48 +691,103 @@ void EncoderBlock<use_eigen>::Eval(size_t batch_size, std::vector<float>& flow,
         mha.dense_b.data(), ACTIVATION_NONE, buffer3.data());
   }
 
-  // Layer Norm + skip connection.
-  auto run_ln = [&](float* data, const float* skip, const float* gammas,
-                    const float* betas) {
-    if (pool && pool->num_threads() > 1 && rows >= 64) {
-      pool->ParallelFor(rows, 16, [&](size_t r0, size_t r1, size_t) {
-        LayerNorm2DWithSkipConnection(
-            r1 - r0, embedding_size_, data + r0 * embedding_size_, alpha_,
-            skip + r0 * embedding_size_, gammas, betas, default_epsilon_);
-      });
-    } else {
-      LayerNorm2DWithSkipConnection(rows, embedding_size_, data, alpha_, skip,
-                                    gammas, betas, default_epsilon_);
+  // Layer Norm + skip connection, fused with FFN1 input quantization on
+  // AVX-512.
+  bool ffn1_prequantized = false;
+#ifdef LC0_HAS_AVX512_VNNI
+  if (ffn_dense1_int8_ && CpuSupportsAvx512Vnni()) {
+    int8_scratch.quantized_input.Resize(rows * embedding_size_);
+    run_ln(rows, embedding_size_, buffer3.data(), alpha_, flow.data(),
+           weights_.ln1_gammas.data(), weights_.ln1_betas.data(),
+           default_epsilon_, int8_scratch.quantized_input.data(),
+           ffn_dense1_int8_->inverse_input_scale(),
+           static_cast<float>(ffn_dense1_int8_->input_zero_point()));
+    ffn1_prequantized = true;
+  }
+#endif
+  if (!ffn1_prequantized) {
+    run_ln(rows, embedding_size_, buffer3.data(), alpha_, flow.data(),
+           weights_.ln1_gammas.data(), weights_.ln1_betas.data(),
+           default_epsilon_);
+  }
+  std::swap(buffer3, flow);
+
+  // FFN: on AVX-512 VNNI when both FFN layers are INT8, fuse FFN1 activation +
+  // requantization directly into `quantized_input2` so FFN2 skips FP32 buffer4
+  // write/read and the 2048-wide QuantizeInput pass completely.
+#ifdef LC0_HAS_AVX512_VNNI
+  const bool fuse_ffn_pair =
+      ffn_dense1_int8_ && ffn_dense2_int8_ &&
+      ffn_dense1_int8_->kernel() == Int8Kernel::kVnniAvx512 &&
+      ffn_dense2_int8_->kernel() == Int8Kernel::kVnniAvx512;
+#else
+  const bool fuse_ffn_pair = false;
+#endif
+  if (fuse_ffn_pair) {
+    if (!ffn1_prequantized) {
+      int8_scratch.quantized_input.Resize(rows * embedding_size_);
+      ffn_dense1_int8_->QuantizeInput(rows * embedding_size_, flow.data(),
+                                      int8_scratch.quantized_input.data(),
+                                      pool);
     }
-  };
-  run_ln(buffer3.data(), flow.data(), weights_.ln1_gammas.data(),
-         weights_.ln1_betas.data());
-  std::swap(buffer3, flow);
-
-  // FFN.
-  if (ffn_dense1_int8_) {
-    ffn_dense1_int8_->Forward(rows, flow.data(), ffn.dense1_b.data(),
-                              ffn_activation_, buffer4.data(), int8_scratch);
+    int8_scratch.quantized_input2.Resize(rows * dff_size);
+    ffn_dense1_int8_->ForwardQuantized(
+        rows, int8_scratch.quantized_input.data(), ffn.dense1_b.data(),
+        ffn_activation_, ffn_dense2_int8_->inverse_input_scale(),
+        ffn_dense2_int8_->input_zero_point(),
+        int8_scratch.quantized_input2.data(), int8_scratch);
+    ffn_dense2_int8_->Forward(rows, int8_scratch.quantized_input2.data(),
+                              ffn.dense2_b.data(), ACTIVATION_NONE,
+                              buffer3.data(), int8_scratch);
   } else {
-    FullyConnectedLayer<use_eigen>::Forward1D(
-        rows, embedding_size_, dff_size, flow.data(), ffn.dense1_w.data(),
-        ffn.dense1_b.data(), ffn_activation_, buffer4.data());
+    if (ffn_dense1_int8_) {
+      if (ffn1_prequantized) {
+        ffn_dense1_int8_->Forward(rows, int8_scratch.quantized_input.data(),
+                                  ffn.dense1_b.data(), ffn_activation_,
+                                  buffer4.data(), int8_scratch);
+      } else {
+        ffn_dense1_int8_->Forward(rows, flow.data(), ffn.dense1_b.data(),
+                                  ffn_activation_, buffer4.data(),
+                                  int8_scratch);
+      }
+    } else {
+      FullyConnectedLayer<use_eigen>::Forward1D(
+          rows, embedding_size_, dff_size, flow.data(), ffn.dense1_w.data(),
+          ffn.dense1_b.data(), ffn_activation_, buffer4.data());
+    }
+
+    if (ffn_dense2_int8_) {
+      ffn_dense2_int8_->Forward(rows, buffer4.data(), ffn.dense2_b.data(),
+                                ACTIVATION_NONE, buffer3.data(), int8_scratch);
+    } else {
+      FullyConnectedLayer<use_eigen>::Forward1D(
+          rows, dff_size, ffn.dense2_b.size(), buffer4.data(),
+          ffn.dense2_w.data(), ffn.dense2_b.data(), ACTIVATION_NONE,
+          buffer3.data());
+    }
   }
 
-  if (ffn_dense2_int8_) {
-    ffn_dense2_int8_->Forward(rows, buffer4.data(), ffn.dense2_b.data(),
-                              ACTIVATION_NONE, buffer3.data(), int8_scratch);
-  } else {
-    FullyConnectedLayer<use_eigen>::Forward1D(
-        rows, dff_size, ffn.dense2_b.size(), buffer4.data(),
-        ffn.dense2_w.data(), ffn.dense2_b.data(), ACTIVATION_NONE,
-        buffer3.data());
+  // Layer Norm + skip connection, optionally fused with next encoder's QKV
+  // input quantization.
+  bool next_qkv_quantized = false;
+#ifdef LC0_HAS_AVX512_VNNI
+  if (next_qkv_int8 && CpuSupportsAvx512Vnni()) {
+    int8_scratch.quantized_input.Resize(rows * embedding_size_);
+    run_ln(rows, embedding_size_, buffer3.data(), alpha_, flow.data(),
+           weights_.ln2_gammas.data(), weights_.ln2_betas.data(),
+           default_epsilon_, int8_scratch.quantized_input.data(),
+           next_qkv_int8->inverse_input_scale(),
+           static_cast<float>(next_qkv_int8->input_zero_point()));
+    next_qkv_quantized = true;
   }
-
-  // Layer Norm + skip connection.
-  run_ln(buffer3.data(), flow.data(), weights_.ln2_gammas.data(),
-         weights_.ln2_betas.data());
+#endif
+  if (!next_qkv_quantized) {
+    run_ln(rows, embedding_size_, buffer3.data(), alpha_, flow.data(),
+           weights_.ln2_gammas.data(), weights_.ln2_betas.data(),
+           default_epsilon_);
+  }
   std::swap(buffer3, flow);
+  return next_qkv_quantized;
 }
 
 template <bool use_eigen>
@@ -613,11 +812,50 @@ AttentionBody<use_eigen>::AttentionBody(const MultiHeadWeights& weights,
       ffn_activation_(ffn_activation),
       alpha_(static_cast<float>(pow(2.0 * weights.encoder.size(), -0.25))) {
   assert(embedding_size_ > 0);
+  const DynamicInt8Weights* smolgen_global_ptr = nullptr;
+#ifdef LC0_HAS_AVX512_VNNI
+  if (use_int8 && int8_kernel == Int8Kernel::kVnniAvx512 &&
+      CpuSupportsAvx512Vnni() && !weights.smolgen_w.empty()) {
+    bool any_int8_smolgen = false;
+    size_t gen_per_head = 0;
+    for (const auto& layer : weights.encoder) {
+      if (layer.mha.has_int8 && layer.mha.has_smolgen) {
+        any_int8_smolgen = true;
+        gen_per_head =
+            layer.mha.smolgen.dense2_b.size() / weights.encoder_head_count;
+        break;
+      }
+    }
+    if (any_int8_smolgen && gen_per_head > 0 &&
+        weights.smolgen_w.size() == kSquares * kSquares * gen_per_head) {
+      smolgen_global_int8_.emplace(weights.smolgen_w.data(),
+                                   kSquares * kSquares, gen_per_head);
+      smolgen_global_ptr = &(*smolgen_global_int8_);
+    }
+    bool any_int8_enc = false;
+    for (const auto& layer : weights.encoder) {
+      if (layer.mha.has_int8 || layer.ffn.has_int8) {
+        any_int8_enc = true;
+        break;
+      }
+    }
+    if (any_int8_enc && is_pe_dense_embedding &&
+        !weights.ip_emb_ffn.dense1_b.empty()) {
+      const auto& ffn = weights.ip_emb_ffn;
+      const size_t dff_size = ffn.dense1_b.size();
+      ip_emb_ffn_d1_int8_.emplace(ffn.dense1_w.data(), dff_size,
+                                  embedding_size_);
+      ip_emb_ffn_d2_int8_.emplace(ffn.dense2_w.data(), ffn.dense2_b.size(),
+                                  dff_size);
+    }
+  }
+#endif
   for (const auto& layer : weights.encoder) {
-    encoders_.emplace_back(
-        layer, weights.smolgen_w, embedding_size_, weights.encoder_head_count,
-        smolgen_activation, ffn_activation, alpha_,
-        is_pe_dense_embedding ? 1e-3f : 1e-6f, use_int8, int8_kernel);
+    encoders_.emplace_back(layer, weights.smolgen_w, embedding_size_,
+                           weights.encoder_head_count, smolgen_activation,
+                           ffn_activation, alpha_,
+                           is_pe_dense_embedding ? 1e-3f : 1e-6f, use_int8,
+                           int8_kernel, smolgen_global_ptr);
   }
 }
 
@@ -716,29 +954,91 @@ void AttentionBody<use_eigen>::Eval(size_t batch_size, float* output,
     GrowBuffer(buffer3, batch_size * kSquares * dff_size);
     GrowBuffer(buffer2, batch_size * kSquares * ffn.dense2_b.size());
     // FFN dense 1.
-    FullyConnectedLayer<use_eigen>::Forward1D(
-        batch_size * kSquares, embedding_size_, dff_size, flow.data(),
-        ffn.dense1_w.data(), ffn.dense1_b.data(), ffn_activation_,
-        buffer3.data());
+    if (ip_emb_ffn_d1_int8_) {
+      ip_emb_ffn_d1_int8_->Forward(batch_size * kSquares, flow.data(),
+                                   ffn.dense1_b.data(), ffn_activation_,
+                                   buffer3.data(), workspace.int8);
+    } else {
+      FullyConnectedLayer<use_eigen>::Forward1D(
+          batch_size * kSquares, embedding_size_, dff_size, flow.data(),
+          ffn.dense1_w.data(), ffn.dense1_b.data(), ffn_activation_,
+          buffer3.data());
+    }
 
     // FFN dense 2.
-    FullyConnectedLayer<use_eigen>::Forward1D(
-        batch_size * kSquares, dff_size, ffn.dense2_b.size(), buffer3.data(),
-        ffn.dense2_w.data(), ffn.dense2_b.data(), ACTIVATION_NONE,
-        buffer2.data());
+    if (ip_emb_ffn_d2_int8_) {
+      ip_emb_ffn_d2_int8_->Forward(batch_size * kSquares, buffer3.data(),
+                                   ffn.dense2_b.data(), ACTIVATION_NONE,
+                                   buffer2.data(), workspace.int8);
+    } else {
+      FullyConnectedLayer<use_eigen>::Forward1D(
+          batch_size * kSquares, dff_size, ffn.dense2_b.size(), buffer3.data(),
+          ffn.dense2_w.data(), ffn.dense2_b.data(), ACTIVATION_NONE,
+          buffer2.data());
+    }
 
-    // Layer Norm.
-    LayerNorm2DWithSkipConnection(batch_size * kSquares, ffn.dense2_b.size(),
-                                  buffer2.data(), alpha_, flow.data(),
-                                  weights_.ip_emb_ffn_ln_gammas.data(),
-                                  weights_.ip_emb_ffn_ln_betas.data(), 1e-3f);
+    // Layer Norm (optionally fused with encoder[0]'s QKV quantization).
+    bool qkv_quantized = false;
+    const Int8Weights* first_qkv =
+        !encoders_.empty() ? encoders_[0].q_int8() : nullptr;
+#ifdef LC0_HAS_AVX512_VNNI
+    if (CpuSupportsAvx512Vnni()) {
+      const size_t ln_rows = batch_size * kSquares;
+      const size_t ln_c = ffn.dense2_b.size();
+      uint8_t* q_out = nullptr;
+      float inv_s = 0.0f;
+      float zp = 0.0f;
+      if (first_qkv && ln_c == embedding_size_) {
+        workspace.int8.quantized_input.Resize(ln_rows * ln_c);
+        q_out = workspace.int8.quantized_input.data();
+        inv_s = first_qkv->inverse_input_scale();
+        zp = static_cast<float>(first_qkv->input_zero_point());
+        qkv_quantized = true;
+      }
+      Int8ThreadPool* pool = workspace.int8.pool;
+      if (pool && pool->num_threads() > 1 && ln_rows >= 64) {
+        pool->ParallelFor(ln_rows, 16, [&](size_t r0, size_t r1, size_t) {
+          LayerNorm2DWithSkipAndQuantizeAvx512(
+              r1 - r0, ln_c, buffer2.data() + r0 * ln_c, alpha_,
+              flow.data() + r0 * ln_c, weights_.ip_emb_ffn_ln_gammas.data(),
+              weights_.ip_emb_ffn_ln_betas.data(), 1e-3f,
+              q_out ? q_out + r0 * ln_c : nullptr, inv_s, zp);
+        });
+      } else {
+        LayerNorm2DWithSkipAndQuantizeAvx512(
+            ln_rows, ln_c, buffer2.data(), alpha_, flow.data(),
+            weights_.ip_emb_ffn_ln_gammas.data(),
+            weights_.ip_emb_ffn_ln_betas.data(), 1e-3f, q_out, inv_s, zp);
+      }
+    } else
+#endif
+    {
+      LayerNorm2DWithSkipConnection(batch_size * kSquares, ffn.dense2_b.size(),
+                                    buffer2.data(), alpha_, flow.data(),
+                                    weights_.ip_emb_ffn_ln_gammas.data(),
+                                    weights_.ip_emb_ffn_ln_betas.data(), 1e-3f);
+    }
 
     std::swap(flow, buffer2);
-  }
 
-  // Attention body encoders.
-  for (const auto& encoder : encoders_) {
-    encoder.Eval(batch_size, flow, buffer2, buffer3, buffer4, workspace.int8);
+    // Attention body encoders.
+    for (size_t i = 0; i < encoders_.size(); ++i) {
+      const Int8Weights* next_qkv =
+          (i + 1 < encoders_.size()) ? encoders_[i + 1].q_int8() : nullptr;
+      qkv_quantized =
+          encoders_[i].Eval(batch_size, flow, buffer2, buffer3, buffer4,
+                            workspace.int8, qkv_quantized, next_qkv);
+    }
+  } else {
+    // Attention body encoders.
+    bool qkv_quantized = false;
+    for (size_t i = 0; i < encoders_.size(); ++i) {
+      const Int8Weights* next_qkv =
+          (i + 1 < encoders_.size()) ? encoders_[i + 1].q_int8() : nullptr;
+      qkv_quantized =
+          encoders_[i].Eval(batch_size, flow, buffer2, buffer3, buffer4,
+                            workspace.int8, qkv_quantized, next_qkv);
+    }
   }
 
   std::memcpy(output, flow.data(),
@@ -751,13 +1051,26 @@ AttentionPolicyHead<use_eigen>::AttentionPolicyHead(
     const std::vector<float>& smolgen_global_weights, size_t input_channels,
     bool attention_body, ActivationFunction default_activation,
     ActivationFunction smolgen_activation, ActivationFunction ffn_activation,
-    bool use_int8, Int8Kernel int8_kernel)
+    bool use_int8, Int8Kernel int8_kernel, bool input_is_nhwc)
     : BaseLayer<use_eigen>(kAttentionPolicyOutputs),
       weights_(weights),
       input_channels_(input_channels),
       attention_body_(attention_body),
+      input_is_nhwc_(input_is_nhwc || attention_body),
       default_activation_(default_activation) {
   const size_t policy_embedding_size = weights.ip_pol_b.size();
+#ifdef LC0_HAS_AVX512_VNNI
+  if (use_int8 && int8_kernel == Int8Kernel::kVnniAvx512 &&
+      CpuSupportsAvx512Vnni() && !weights.ip_pol_w.empty()) {
+    const size_t policy_d_model = weights.ip2_pol_b.size();
+    ip_pol_int8_.emplace(weights.ip_pol_w.data(), policy_embedding_size,
+                         input_channels_);
+    ip2_pol_int8_.emplace(weights.ip2_pol_w.data(), policy_d_model,
+                          policy_embedding_size);
+    ip3_pol_int8_.emplace(weights.ip3_pol_w.data(), policy_d_model,
+                          policy_embedding_size);
+  }
+#endif
   for (const auto& layer : weights.pol_encoder) {
     encoders_.emplace_back(
         layer, smolgen_global_weights, policy_embedding_size,
@@ -778,22 +1091,28 @@ void AttentionPolicyHead<use_eigen>::Eval(
   std::vector<float>& buffer4 = workspace.buffers[3];
 
   const float* embedding_input = input;
-  if (!attention_body_) {
+  if (!input_is_nhwc_) {
     GrowBuffer(buffer2, batch_size * kSquares * input_channels_);
-    NchwToNhwc(batch_size, input_channels_, input, buffer2.data());
+    NchwToNhwcFast(batch_size, input_channels_, input, buffer2.data(),
+                   workspace.int8.pool);
     embedding_input = buffer2.data();
   }
 
   const size_t policy_embedding_size = weights_.ip_pol_b.size();
   GrowBuffer(flow, batch_size * kSquares * policy_embedding_size);
+  const ActivationFunction pol_act =
+      attention_body_ ? default_activation_ : ACTIVATION_SELU;
   // Policy Embedding.
-  FullyConnectedLayer<use_eigen>::Forward1D(
-      batch_size * kSquares, input_channels_, policy_embedding_size,
-      embedding_input, weights_.ip_pol_w.data(), weights_.ip_pol_b.data(),
-      attention_body_
-          ? default_activation_
-          : ACTIVATION_SELU,  // SELU activation hardcoded for apmish nets.
-      flow.data());
+  if (ip_pol_int8_) {
+    ip_pol_int8_->Forward(batch_size * kSquares, embedding_input,
+                          weights_.ip_pol_b.data(), pol_act, flow.data(),
+                          workspace.int8);
+  } else {
+    FullyConnectedLayer<use_eigen>::Forward1D(
+        batch_size * kSquares, input_channels_, policy_embedding_size,
+        embedding_input, weights_.ip_pol_w.data(), weights_.ip_pol_b.data(),
+        pol_act, flow.data());
+  }
 
   for (const auto& encoder : encoders_) {
     encoder.Eval(batch_size, flow, buffer2, buffer3, buffer4, workspace.int8);
@@ -804,36 +1123,67 @@ void AttentionPolicyHead<use_eigen>::Eval(
   GrowBuffer(buffer3, batch_size * kSquares * policy_d_model);
 
   // Q
-  FullyConnectedLayer<use_eigen>::Forward1D(
-      batch_size * kSquares, policy_embedding_size, policy_d_model, flow.data(),
-      weights_.ip2_pol_w.data(), weights_.ip2_pol_b.data(), ACTIVATION_NONE,
-      buffer2.data());
+  if (ip2_pol_int8_) {
+    ip2_pol_int8_->Forward(batch_size * kSquares, flow.data(),
+                           weights_.ip2_pol_b.data(), ACTIVATION_NONE,
+                           buffer2.data(), workspace.int8);
+  } else {
+    FullyConnectedLayer<use_eigen>::Forward1D(
+        batch_size * kSquares, policy_embedding_size, policy_d_model,
+        flow.data(), weights_.ip2_pol_w.data(), weights_.ip2_pol_b.data(),
+        ACTIVATION_NONE, buffer2.data());
+  }
   // K
-  FullyConnectedLayer<use_eigen>::Forward1D(
-      batch_size * kSquares, policy_embedding_size, policy_d_model, flow.data(),
-      weights_.ip3_pol_w.data(), weights_.ip3_pol_b.data(), ACTIVATION_NONE,
-      buffer3.data());
+  if (ip3_pol_int8_) {
+    ip3_pol_int8_->Forward(batch_size * kSquares, flow.data(),
+                           weights_.ip3_pol_b.data(), ACTIVATION_NONE,
+                           buffer3.data(), workspace.int8);
+  } else {
+    FullyConnectedLayer<use_eigen>::Forward1D(
+        batch_size * kSquares, policy_embedding_size, policy_d_model,
+        flow.data(), weights_.ip3_pol_w.data(), weights_.ip3_pol_b.data(),
+        ACTIVATION_NONE, buffer3.data());
+  }
   const int d_model = static_cast<int>(policy_d_model);
   const float scaling = 1.0f / sqrtf(static_cast<float>(d_model));
-  for (size_t batch = 0; batch < batch_size; batch++) {
-    const float* a = &buffer2[batch * kSquares * policy_d_model];
-    const float* b = &buffer3[batch * kSquares * policy_d_model];
-    float* c = output + batch * kAttentionPolicyOutputs;
-    if (use_eigen) {
-      auto c_mat = EigenMatrixMap<float>(c, kSquares, kSquares);
-      c_mat.noalias() =
-          scaling *
-          ConstEigenMatrixMap<float>(b, d_model, kSquares).transpose() *
-          ConstEigenMatrixMap<float>(a, d_model, kSquares);
-    } else {
-#ifdef USE_BLAS
-      cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, kSquares, kSquares,
-                  d_model, scaling, a, d_model, b, d_model, 0.0f, c, kSquares);
-#else
-      // Should never get here.
-      throw Exception("Blas backend internal error");
-#endif
+  Int8ThreadPool* pool = workspace.int8.pool;
+  auto run_pol_qk = [&](size_t b0, size_t b1, size_t) {
+#ifdef USE_MKL
+    if (pool && pool->num_threads() > 1 && batch_size > 1) {
+      mkl_set_num_threads_local(1);
     }
+#endif
+    for (size_t batch = b0; batch < b1; batch++) {
+      const float* a = &buffer2[batch * kSquares * policy_d_model];
+      const float* b = &buffer3[batch * kSquares * policy_d_model];
+      float* c = output + batch * kAttentionPolicyOutputs;
+      if (use_eigen) {
+        auto c_mat = EigenMatrixMap<float>(c, kSquares, kSquares);
+        c_mat.noalias() =
+            scaling *
+            ConstEigenMatrixMap<float>(b, d_model, kSquares).transpose() *
+            ConstEigenMatrixMap<float>(a, d_model, kSquares);
+      } else {
+#ifdef USE_BLAS
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, kSquares, kSquares,
+                    d_model, scaling, a, d_model, b, d_model, 0.0f, c,
+                    kSquares);
+#else
+        // Should never get here.
+        throw Exception("Blas backend internal error");
+#endif
+      }
+    }
+#ifdef USE_MKL
+    if (pool && pool->num_threads() > 1 && batch_size > 1) {
+      mkl_set_num_threads_local(0);
+    }
+#endif
+  };
+  if (pool && pool->num_threads() > 1 && batch_size > 1) {
+    pool->ParallelFor(batch_size, 1, run_pol_qk);
+  } else {
+    run_pol_qk(0, batch_size, 0);
   }
   // Promotion offset calculation.
   for (size_t batch = 0; batch < batch_size; batch++) {

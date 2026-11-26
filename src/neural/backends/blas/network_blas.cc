@@ -166,6 +166,7 @@ class BlasNetwork : public Network {
   size_t num_residual_blocks_;
   size_t residual_channels_ = 0;
   bool use_nhwc_residual_tower_ = false;
+  bool use_int8_input_conv_ = false;
   Int8Kernel int8_kernel_ = Int8Kernel::kMkl;
   std::unique_ptr<Int8ThreadPool> int8_pool_;
   size_t max_convolution_input_channels_ = 0;
@@ -235,9 +236,19 @@ void BlasNetwork<use_eigen>::Forward(size_t batch_size, float* policies,
   // The planes are in tensors[0]; `flow` is the body's output.
   int flow = 0;
   if (num_residual_blocks_ > 0) {
-    network_[layer++]->Eval(batch_size, tensors[1], tensors[0], nullptr,
-                            workspace);  // input conv
-    if (use_nhwc_residual_tower_) {
+    if (use_int8_input_conv_) {
+      // SmoothQuant-109 INT8 input conv writes NHWC directly into tensors[2].
+      network_[layer++]->Eval(batch_size, tensors[2], tensors[0], nullptr,
+                              workspace);
+      for (size_t block = 0; block < num_residual_blocks_; block++) {
+        network_[layer++]->Eval(batch_size, tensors[2], tensors[2], nullptr,
+                                workspace);  // residual block, in place NHWC
+      }
+      NhwcToNchwFast(batch_size, residual_channels_, tensors[2], tensors[1],
+                     workspace.int8.pool);
+    } else if (use_nhwc_residual_tower_) {
+      network_[layer++]->Eval(batch_size, tensors[1], tensors[0], nullptr,
+                              workspace);  // input conv
       NchwToNhwcFast(batch_size, residual_channels_, tensors[1], tensors[2],
                      workspace.int8.pool);
       for (size_t block = 0; block < num_residual_blocks_; block++) {
@@ -247,6 +258,8 @@ void BlasNetwork<use_eigen>::Forward(size_t batch_size, float* policies,
       NhwcToNchwFast(batch_size, residual_channels_, tensors[2], tensors[1],
                      workspace.int8.pool);
     } else {
+      network_[layer++]->Eval(batch_size, tensors[1], tensors[0], nullptr,
+                              workspace);  // input conv
       for (size_t block = 0; block < num_residual_blocks_; block++) {
         network_[layer++]->Eval(batch_size, tensors[1], tensors[1], nullptr,
                                 workspace);  // residual block, in place
@@ -265,9 +278,15 @@ void BlasNetwork<use_eigen>::Forward(size_t batch_size, float* policies,
 
   // Policy head.
   if (attn_policy_) {
-    network_[layer++]->Eval(batch_size, spare1, body, nullptr,
+    // When the residual tower ran in NHWC and there is no attention body,
+    // `tensors[2]` (which is `spare1`) still holds the NHWC body output, so
+    // pass it directly and write logits into `spare2` to skip NCHW->NHWC.
+    const bool direct_nhwc = use_nhwc_residual_tower_ && !attn_body_;
+    const float* pol_in = direct_nhwc ? spare1 : body;
+    float* pol_out = direct_nhwc ? spare2 : spare1;
+    network_[layer++]->Eval(batch_size, pol_out, pol_in, nullptr,
                             workspace);  // attention policy head
-    network_[layer++]->Eval(batch_size, policies, spare1, nullptr,
+    network_[layer++]->Eval(batch_size, policies, pol_out, nullptr,
                             workspace);  // policy map
   } else if (conv_policy_) {
     network_[layer++]->Eval(batch_size, spare1, body, nullptr,
@@ -402,10 +421,11 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
 
   auto& policy_weights = weights_.policy_heads.at(policy_head);
   const size_t int8_layers = CountInt8Layers(weights_, policy_weights);
+  const bool net_uses_int8 = use_int8 && int8_layers > 0;
 
   const bool vnni_kernel = (int8_kernel_ == Int8Kernel::kVnniAvx512 ||
                             int8_kernel_ == Int8Kernel::kVnniAvx);
-  if (use_int8 && int8_layers > 0 && vnni_kernel && threads_ > 1) {
+  if (net_uses_int8 && vnni_kernel && threads_ > 1) {
     int8_pool_ = std::make_unique<Int8ThreadPool>(threads_);
   }
 
@@ -422,9 +442,16 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
       }
     }
     use_nhwc_residual_tower_ = all_res_int8;
+#ifdef LC0_HAS_AVX512_VNNI
+    use_int8_input_conv_ = use_nhwc_residual_tower_ &&
+                           int8_kernel_ == Int8Kernel::kVnniAvx512 &&
+                           CpuSupportsAvx512Vnni();
+#endif
 
-    weights_.input.weights = WinogradFilterTransformF(weights_.input.weights,
-                                                      channels, kInputPlanes);
+    if (!use_int8_input_conv_) {
+      weights_.input.weights = WinogradFilterTransformF(weights_.input.weights,
+                                                        channels, kInputPlanes);
+    }
     for (auto& residual : weights_.residual) {
       if (!(use_int8 && residual.conv1.has_int8)) {
         residual.conv1.weights = WinogradFilterTransformF(
@@ -450,8 +477,16 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
 
   // 2. Build the network.
   if (num_residual_blocks_ > 0) {
-    AddLayer(std::make_unique<ConvLayer<use_eigen>>(
-        weights_.input, kInputPlanes, 3, default_activation));
+    if (use_int8_input_conv_) {
+      const bool hectoplies =
+          nf.input() >= NF::INPUT_112_WITH_CANONICALIZATION_HECTOPLIES;
+      AddLayer(std::make_unique<ConvLayer<use_eigen>>(
+          weights_.input, kInputPlanes, 3, default_activation,
+          &weights_.input.weights, hectoplies ? 1.0f : 0.01f));
+    } else {
+      AddLayer(std::make_unique<ConvLayer<use_eigen>>(
+          weights_.input, kInputPlanes, 3, default_activation));
+    }
     for (const auto& residual : weights_.residual) {
       AddLayer(std::make_unique<ResidualBlock<use_eigen>>(
           residual, channels, default_activation, use_int8, int8_kernel_,
@@ -472,8 +507,8 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
   if (attn_policy_) {
     AddLayer(std::make_unique<AttentionPolicyHead<use_eigen>>(
         policy_weights, weights_.smolgen_w, body_channels, attn_body_,
-        default_activation, smolgen_activation, ffn_activation, use_int8,
-        int8_kernel_));
+        default_activation, smolgen_activation, ffn_activation, net_uses_int8,
+        int8_kernel_, use_nhwc_residual_tower_ && !attn_body_));
     AddLayer(std::make_unique<PolicyMapLayer<use_eigen>>(
         kAttnPolicyMap, 64 * 64 + 8 * 24, 64 * 64 + 8 * 24));
   } else if (conv_policy_) {

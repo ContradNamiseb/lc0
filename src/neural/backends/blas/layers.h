@@ -95,12 +95,15 @@ class BaseLayer {
 };
 
 // A 3x3 convolution (Winograd) or 1x1 convolution, followed by bias and
-// activation. NCHW in and out.
+// activation. NCHW in and out, unless constructed with `raw_int8_weights`
+// (SmoothQuant-109 INT8 direct-NHWC input convolution).
 template <bool use_eigen>
 class ConvLayer : public BaseLayer<use_eigen> {
  public:
   ConvLayer(const MultiHeadWeights::ConvBlock& weights, size_t input_channels,
-            size_t filter_size, ActivationFunction activation);
+            size_t filter_size, ActivationFunction activation,
+            const std::vector<float>* raw_int8_weights = nullptr,
+            float plane109_scale = 1.0f);
 
   void Eval(size_t batch_size, float* output, const float* input,
             const float* input2,
@@ -112,6 +115,10 @@ class ConvLayer : public BaseLayer<use_eigen> {
   const size_t output_channels_;
   const size_t filter_size_;
   const ActivationFunction activation_;
+  const float plane109_scale_;
+  std::vector<int8_t> int8_w_storage_;
+  std::vector<float> int8_s_storage_;
+  std::optional<Int8Weights> int8_conv_;
 };
 
 // Two 3x3 convolutions, the optional squeeze-and-excitation unit and the skip
@@ -207,13 +214,21 @@ class EncoderBlock {
                ActivationFunction smolgen_activation,
                ActivationFunction ffn_activation, float alpha,
                float default_epsilon, bool use_int8,
-               Int8Kernel int8_kernel = Int8Kernel::kMkl);
+               Int8Kernel int8_kernel = Int8Kernel::kMkl,
+               const DynamicInt8Weights* smolgen_global_int8 = nullptr);
 
   // The result is left in `flow`. The other buffers are scratch; the vectors
-  // may be swapped with `flow`.
-  void Eval(size_t batch_size, std::vector<float>& flow,
+  // may be swapped with `flow`. When `qkv_already_quantized` is true,
+  // `int8_scratch.quantized_input` already holds `flow` quantized for Q/K/V.
+  // When `next_qkv_int8` is non-null, LN2 may fuse quantization of the output
+  // into `int8_scratch.quantized_input` and return true.
+  bool Eval(size_t batch_size, std::vector<float>& flow,
             std::vector<float>& buffer2, std::vector<float>& buffer3,
-            std::vector<float>& buffer4, Int8Scratch& int8_scratch) const;
+            std::vector<float>& buffer4, Int8Scratch& int8_scratch,
+            bool qkv_already_quantized = false,
+            const Int8Weights* next_qkv_int8 = nullptr) const;
+
+  const Int8Weights* q_int8() const { return q_int8_ ? &(*q_int8_) : nullptr; }
 
  private:
   const MultiHeadWeights::EncoderLayer& weights_;
@@ -230,6 +245,10 @@ class EncoderBlock {
   std::optional<Int8Weights> dense_int8_;
   std::optional<Int8Weights> ffn_dense1_int8_;
   std::optional<Int8Weights> ffn_dense2_int8_;
+  std::optional<DynamicInt8Weights> smolgen_compress_int8_;
+  std::optional<DynamicInt8Weights> smolgen_dense1_int8_;
+  std::optional<DynamicInt8Weights> smolgen_dense2_int8_;
+  const DynamicInt8Weights* smolgen_global_int8_ = nullptr;
 };
 
 // The whole attention body: input preprocessing and position encoding, the
@@ -260,6 +279,9 @@ class AttentionBody : public BaseLayer<use_eigen> {
   const ActivationFunction default_activation_;
   const ActivationFunction ffn_activation_;
   const float alpha_;
+  std::optional<DynamicInt8Weights> ip_emb_ffn_d1_int8_;
+  std::optional<DynamicInt8Weights> ip_emb_ffn_d2_int8_;
+  std::optional<DynamicInt8Weights> smolgen_global_int8_;
   std::vector<EncoderBlock<use_eigen>> encoders_;
 };
 
@@ -275,7 +297,8 @@ class AttentionPolicyHead : public BaseLayer<use_eigen> {
                       ActivationFunction default_activation,
                       ActivationFunction smolgen_activation,
                       ActivationFunction ffn_activation, bool use_int8,
-                      Int8Kernel int8_kernel = Int8Kernel::kMkl);
+                      Int8Kernel int8_kernel = Int8Kernel::kMkl,
+                      bool input_is_nhwc = false);
 
   void Eval(size_t batch_size, float* output, const float* input,
             const float* input2,
@@ -285,7 +308,11 @@ class AttentionPolicyHead : public BaseLayer<use_eigen> {
   const MultiHeadWeights::PolicyHead& weights_;
   const size_t input_channels_;
   const bool attention_body_;
+  const bool input_is_nhwc_;
   const ActivationFunction default_activation_;
+  std::optional<DynamicInt8Weights> ip_pol_int8_;
+  std::optional<DynamicInt8Weights> ip2_pol_int8_;
+  std::optional<DynamicInt8Weights> ip3_pol_int8_;
   std::vector<EncoderBlock<use_eigen>> encoders_;
 };
 
