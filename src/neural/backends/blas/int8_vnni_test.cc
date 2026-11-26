@@ -675,6 +675,57 @@ TEST(BlasInt8VnniTest, FusedLayerNormQuantizeAndSoftmaxAvx512) {
           << "idx=" << i;
     }
   }
+
+  // 6. DynamicConv3x3Int8 (direct-NHWC policy1/policy path)
+  {
+    Int8ThreadPool pool(4);
+    const size_t batch = 3, in_c = 128, out_c = 80;
+    std::vector<float> w(out_c * in_c * 9), bias(out_c);
+    for (auto& v : w) v = f_dist(rng) * 0.1f;
+    for (auto& v : bias) v = f_dist(rng) * 0.2f;
+    std::vector<float> x_nhwc(batch * kSquares * in_c);
+    for (auto& v : x_nhwc) v = std::max(0.0f, f_dist(rng));
+
+    std::vector<float> ref(batch * kSquares * out_c, 0.0f);
+    for (size_t b = 0; b < batch; ++b) {
+      const float* in_b = x_nhwc.data() + b * kSquares * in_c;
+      float* out_b = ref.data() + b * kSquares * out_c;
+      for (int y = 0; y < 8; ++y) {
+        for (int x = 0; x < 8; ++x) {
+          for (size_t o = 0; o < out_c; ++o) {
+            float acc = bias[o];
+            for (size_t c = 0; c < in_c; ++c) {
+              for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                  int sy = y + dy, sx = x + dx;
+                  if (sy >= 0 && sy < 8 && sx >= 0 && sx < 8) {
+                    int tap = (dy + 1) * 3 + (dx + 1);
+                    acc += in_b[(sy * 8 + sx) * in_c + c] *
+                           w[(o * in_c + c) * 9 + tap];
+                  }
+                }
+              }
+            }
+            out_b[(y * 8 + x) * out_c + o] = acc;
+          }
+        }
+      }
+    }
+
+    DynamicConv3x3Int8 layer(w.data(), out_c, in_c);
+    Int8Scratch scratch;
+    scratch.pool = &pool;
+    std::vector<float> got(batch * kSquares * out_c, -999.0f);
+    layer.ForwardNhwc(batch, x_nhwc.data(), bias.data(), ACTIVATION_NONE,
+                      got.data(), scratch);
+    double sum_sq_err = 0.0, sum_sq_ref = 0.0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+      double d = static_cast<double>(got[i]) - static_cast<double>(ref[i]);
+      sum_sq_err += d * d;
+      sum_sq_ref += static_cast<double>(ref[i]) * static_cast<double>(ref[i]);
+    }
+    EXPECT_LT(std::sqrt(sum_sq_err / (sum_sq_ref + 1e-12)), 0.02);
+  }
 }
 #endif
 

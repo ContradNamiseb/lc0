@@ -179,5 +179,24 @@ class DynamicInt8Weights {
   std::vector<float> weight_sum_scaled_;
 };
 
+// Runtime-quantized W8A8 3x3 direct-NHWC convolution (per-channel symmetric
+// int8 weights + per-board dynamic uint8 activations).
+class DynamicConv3x3Int8 {
+ public:
+  DynamicConv3x3Int8(const float* weights_oihw, size_t output_channels,
+                     size_t input_channels);
+
+  void ForwardNhwc(size_t batch_size, const float* input_nhwc,
+                   const float* biases, ActivationFunction activation,
+                   float* output_nhwc, Int8Scratch& scratch) const;
+
+ private:
+  size_t input_channels_;
+  size_t output_channels_;
+  AlignedBuffer<int8_t> packed_weights_;
+  std::vector<float> weight_scales_;
+  std::vector<int32_t> weight_sums_;
+};
+
 }  // namespace blas_backend
 }  // namespace lczero

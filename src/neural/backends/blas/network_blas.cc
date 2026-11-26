@@ -167,6 +167,7 @@ class BlasNetwork : public Network {
   size_t residual_channels_ = 0;
   bool use_nhwc_residual_tower_ = false;
   bool use_int8_input_conv_ = false;
+  bool use_int8_conv_policy_ = false;
   Int8Kernel int8_kernel_ = Int8Kernel::kMkl;
   std::unique_ptr<Int8ThreadPool> int8_pool_;
   size_t max_convolution_input_channels_ = 0;
@@ -289,12 +290,25 @@ void BlasNetwork<use_eigen>::Forward(size_t batch_size, float* policies,
     network_[layer++]->Eval(batch_size, policies, pol_out, nullptr,
                             workspace);  // policy map
   } else if (conv_policy_) {
-    network_[layer++]->Eval(batch_size, spare1, body, nullptr,
-                            workspace);  // policy conv1
-    network_[layer++]->Eval(batch_size, spare2, spare1, nullptr,
-                            workspace);  // policy conv2
-    network_[layer++]->Eval(batch_size, policies, spare2, nullptr,
-                            workspace);  // policy map
+    if (use_int8_conv_policy_) {
+      // `spare1` (`tensors[2]`) still holds the NHWC residual tower output.
+      // policy1: NHWC spare1 -> NHWC spare2; policy: NHWC spare2 -> NCHW spare1
+      // (converted inside ConvLayer), then PolicyMapLayer reads spare1 ->
+      // policies.
+      network_[layer++]->Eval(batch_size, spare2, spare1, nullptr,
+                              workspace);  // policy conv1 (NHWC -> NHWC)
+      network_[layer++]->Eval(batch_size, spare1, spare2, nullptr,
+                              workspace);  // policy conv2 (NHWC -> NCHW)
+      network_[layer++]->Eval(batch_size, policies, spare1, nullptr,
+                              workspace);  // policy map
+    } else {
+      network_[layer++]->Eval(batch_size, spare1, body, nullptr,
+                              workspace);  // policy conv1
+      network_[layer++]->Eval(batch_size, spare2, spare1, nullptr,
+                              workspace);  // policy conv2
+      network_[layer++]->Eval(batch_size, policies, spare2, nullptr,
+                              workspace);  // policy map
+    }
   } else {
     network_[layer++]->Eval(batch_size, spare1, body, nullptr,
                             workspace);  // policy conv
@@ -466,11 +480,18 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
     max_convolution_output_channels_ = channels;
   }
   if (conv_policy_) {
-    policy_weights.policy1.weights = WinogradFilterTransformF(
-        policy_weights.policy1.weights, channels, channels);
+#ifdef LC0_HAS_AVX512_VNNI
+    use_int8_conv_policy_ = use_nhwc_residual_tower_ && !attn_body_ &&
+                            int8_kernel_ == Int8Kernel::kVnniAvx512 &&
+                            CpuSupportsAvx512Vnni();
+#endif
     const size_t policy_channels = policy_weights.policy.biases.size();
-    policy_weights.policy.weights = WinogradFilterTransformF(
-        policy_weights.policy.weights, policy_channels, channels);
+    if (!use_int8_conv_policy_) {
+      policy_weights.policy1.weights = WinogradFilterTransformF(
+          policy_weights.policy1.weights, channels, channels);
+      policy_weights.policy.weights = WinogradFilterTransformF(
+          policy_weights.policy.weights, policy_channels, channels);
+    }
     max_convolution_output_channels_ =
         std::max(max_convolution_output_channels_, policy_channels);
   }
@@ -513,16 +534,31 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
         kAttnPolicyMap, 64 * 64 + 8 * 24, 64 * 64 + 8 * 24));
   } else if (conv_policy_) {
     assert(!attn_body_);  // not supported with attention body
-    AddLayer(std::make_unique<ConvLayer<use_eigen>>(
-        policy_weights.policy1, channels, 3, default_activation));
-    const auto* policy_conv = AddLayer(std::make_unique<ConvLayer<use_eigen>>(
-        policy_weights.policy, channels, 3, ACTIVATION_NONE));
-    // Number of used planes with convolutional policy. The real number of
-    // planes is higher because of padding.
-    constexpr size_t kPolicyUsedPlanes = 73;
-    AddLayer(std::make_unique<PolicyMapLayer<use_eigen>>(
-        kConvPolicyMap, kPolicyUsedPlanes * kSquares,
-        policy_conv->GetOutputSize()));
+    if (use_int8_conv_policy_) {
+      AddLayer(std::make_unique<ConvLayer<use_eigen>>(
+          policy_weights.policy1, channels, 3, default_activation,
+          &policy_weights.policy1.weights, 1.0f, /*dynamic_int8_nhwc=*/true,
+          /*convert_output_to_nchw=*/false));
+      const auto* policy_conv = AddLayer(std::make_unique<ConvLayer<use_eigen>>(
+          policy_weights.policy, channels, 3, ACTIVATION_NONE,
+          &policy_weights.policy.weights, 1.0f, /*dynamic_int8_nhwc=*/true,
+          /*convert_output_to_nchw=*/true));
+      constexpr size_t kPolicyUsedPlanes = 73;
+      AddLayer(std::make_unique<PolicyMapLayer<use_eigen>>(
+          kConvPolicyMap, kPolicyUsedPlanes * kSquares,
+          policy_conv->GetOutputSize()));
+    } else {
+      AddLayer(std::make_unique<ConvLayer<use_eigen>>(
+          policy_weights.policy1, channels, 3, default_activation));
+      const auto* policy_conv = AddLayer(std::make_unique<ConvLayer<use_eigen>>(
+          policy_weights.policy, channels, 3, ACTIVATION_NONE));
+      // Number of used planes with convolutional policy. The real number of
+      // planes is higher because of padding.
+      constexpr size_t kPolicyUsedPlanes = 73;
+      AddLayer(std::make_unique<PolicyMapLayer<use_eigen>>(
+          kConvPolicyMap, kPolicyUsedPlanes * kSquares,
+          policy_conv->GetOutputSize()));
+    }
   } else {
     assert(!attn_body_);  // not supported with attention body
     const auto* policy_conv = AddLayer(std::make_unique<ConvLayer<use_eigen>>(

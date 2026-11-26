@@ -999,5 +999,115 @@ void DynamicInt8Weights::Forward(size_t rows, const float* input,
 #endif
 }
 
+// DynamicConv3x3Int8
+
+DynamicConv3x3Int8::DynamicConv3x3Int8(const float* weights_oihw,
+                                       size_t output_channels,
+                                       size_t input_channels)
+    : input_channels_(input_channels),
+      output_channels_(output_channels),
+      weight_scales_(output_channels, 0.0f),
+      weight_sums_(output_channels, 0) {
+  const size_t row_len = input_channels * kFilterTaps;
+  std::vector<int8_t> w_q(output_channels * row_len, 0);
+  for (size_t o = 0; o < output_channels; ++o) {
+    const float* src = weights_oihw + o * row_len;
+    float max_abs = 0.0f;
+    for (size_t i = 0; i < row_len; ++i) {
+      max_abs = std::max(max_abs, std::abs(src[i]));
+    }
+    if (max_abs == 0.0f) continue;
+    const float scale = max_abs / 127.0f;
+    const float inv_s = 127.0f / max_abs;
+    int32_t w_sum = 0;
+    int8_t* dst = w_q.data() + o * row_len;
+    for (size_t i = 0; i < row_len; ++i) {
+      const float qf = std::clamp(src[i] * inv_s, -127.0f, 127.0f);
+      const int32_t qi = static_cast<int32_t>(std::lround(qf));
+      dst[i] = static_cast<int8_t>(qi);
+      w_sum += qi;
+    }
+    weight_scales_[o] = scale;
+    weight_sums_[o] = w_sum;
+  }
+  PackConv3x3Weights(w_q.data(), output_channels_, input_channels_, 32,
+                     packed_weights_);
+}
+
+void DynamicConv3x3Int8::ForwardNhwc(size_t batch_size, const float* input_nhwc,
+                                     const float* biases,
+                                     ActivationFunction activation,
+                                     float* output_nhwc,
+                                     Int8Scratch& scratch) const {
+#ifdef LC0_HAS_AVX512_VNNI
+  const size_t padded_channels = ((input_channels_ + 3) / 4) * 4;
+  constexpr size_t kPadSquares = 10 * 10;
+  const size_t max_threads =
+      scratch.pool ? static_cast<size_t>(scratch.pool->num_threads()) : 1;
+  if (scratch.conv3_scratch.size() < max_threads) {
+    scratch.conv3_scratch.resize(max_threads);
+  }
+
+  auto run_boards = [&](size_t b0, size_t b1, size_t tid) {
+    Conv3x3ThreadScratch& thread_scratch = scratch.conv3_scratch[tid];
+    thread_scratch.pad1.Resize(kPadSquares * padded_channels);
+    Conv3x3ScratchView view;
+    view.pad1 = thread_scratch.pad1.data();
+
+    std::vector<float> board_scales(output_channels_);
+    std::vector<int32_t> board_zp_corr(output_channels_);
+    const size_t board_in_elems = kSquares * input_channels_;
+
+    for (size_t batch = b0; batch < b1; ++batch) {
+      const float* in_board = input_nhwc + batch * board_in_elems;
+      float* out_board = output_nhwc + batch * kSquares * output_channels_;
+
+      float mn = in_board[0];
+      float mx = mn;
+      for (size_t i = 1; i < board_in_elems; ++i) {
+        const float v = in_board[i];
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+      }
+      // Include 0.0f so zero-padded board borders are represented accurately.
+      if (mn > 0.0f) mn = 0.0f;
+      if (mx < 0.0f) mx = 0.0f;
+      const float range = mx - mn;
+      const float in_scale = (range > 1e-12f) ? (range / 255.0f) : 1.0f;
+      const float inv_in_scale = (range > 1e-12f) ? (255.0f / range) : 0.0f;
+      const uint8_t zp =
+          (mn == 0.0f)
+              ? uint8_t{0}
+              : static_cast<uint8_t>(std::clamp<int>(
+                    static_cast<int>(std::lround(-mn * inv_in_scale)), 0, 255));
+
+      for (size_t o = 0; o < output_channels_; ++o) {
+        board_scales[o] = in_scale * weight_scales_[o];
+        board_zp_corr[o] = static_cast<int32_t>(zp) * weight_sums_[o];
+      }
+
+      Conv3x3NhwcBoardAvx512(input_channels_, output_channels_, in_board,
+                             packed_weights_.data(), board_scales.data(),
+                             board_zp_corr.data(), inv_in_scale, zp, out_board,
+                             view, biases, activation);
+    }
+  };
+
+  if (scratch.pool && scratch.pool->num_threads() > 1 && batch_size > 1) {
+    scratch.pool->ParallelFor(batch_size, 1, run_boards);
+  } else {
+    run_boards(0, batch_size, 0);
+  }
+#else
+  (void)batch_size;
+  (void)input_nhwc;
+  (void)biases;
+  (void)activation;
+  (void)output_nhwc;
+  (void)scratch;
+  throw Exception("DynamicConv3x3Int8 requires AVX-512 VNNI.");
+#endif
+}
+
 }  // namespace blas_backend
 }  // namespace lczero

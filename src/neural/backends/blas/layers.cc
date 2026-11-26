@@ -95,16 +95,25 @@ ConvLayer<use_eigen>::ConvLayer(const MultiHeadWeights::ConvBlock& weights,
                                 size_t input_channels, size_t filter_size,
                                 ActivationFunction activation,
                                 const std::vector<float>* raw_int8_weights,
-                                float plane109_scale)
+                                float plane109_scale, bool dynamic_int8_nhwc,
+                                bool convert_output_to_nchw)
     : BaseLayer<use_eigen>(weights.biases.size() * kSquares),
       weights_(weights),
       input_channels_(input_channels),
       output_channels_(weights.biases.size()),
       filter_size_(filter_size),
       activation_(activation),
-      plane109_scale_(plane109_scale) {
+      plane109_scale_(plane109_scale),
+      convert_output_to_nchw_(convert_output_to_nchw) {
   assert(filter_size == 1 || filter_size == 3);
 #ifdef LC0_HAS_AVX512_VNNI
+  if (dynamic_int8_nhwc && raw_int8_weights != nullptr && filter_size == 3 &&
+      CpuSupportsAvx512Vnni() &&
+      raw_int8_weights->size() == output_channels_ * input_channels_ * 9) {
+    dyn_int8_conv_.emplace(raw_int8_weights->data(), output_channels_,
+                           input_channels_);
+    return;
+  }
   if (raw_int8_weights != nullptr && filter_size == 3 &&
       CpuSupportsAvx512Vnni() &&
       raw_int8_weights->size() == output_channels_ * input_channels_ * 9) {
@@ -148,6 +157,22 @@ template <bool use_eigen>
 void ConvLayer<use_eigen>::Eval(size_t batch_size, float* output,
                                 const float* input, const float* /*input2*/,
                                 Workspace<use_eigen>& workspace) const {
+  if (dyn_int8_conv_) {
+    if (convert_output_to_nchw_) {
+      workspace.int8.nhwc_output.Resize(batch_size * kSquares *
+                                        output_channels_);
+      dyn_int8_conv_->ForwardNhwc(
+          batch_size, input, weights_.biases.data(), activation_,
+          workspace.int8.nhwc_output.data(), workspace.int8);
+      NhwcToNchwFast(batch_size, output_channels_,
+                     workspace.int8.nhwc_output.data(), output,
+                     workspace.int8.pool);
+    } else {
+      dyn_int8_conv_->ForwardNhwc(batch_size, input, weights_.biases.data(),
+                                  activation_, output, workspace.int8);
+    }
+    return;
+  }
   if (int8_conv_) {
     workspace.int8.nhwc_input.Resize(batch_size * kSquares * input_channels_);
     float* nhwc_in = workspace.int8.nhwc_input.data();

@@ -96,14 +96,16 @@ class BaseLayer {
 
 // A 3x3 convolution (Winograd) or 1x1 convolution, followed by bias and
 // activation. NCHW in and out, unless constructed with `raw_int8_weights`
-// (SmoothQuant-109 INT8 direct-NHWC input convolution).
+// (SmoothQuant-109 INT8 direct-NHWC input convolution) or `dynamic_int8_nhwc`
+// (dynamic per-board W8A8 direct-NHWC 3x3 convolution).
 template <bool use_eigen>
 class ConvLayer : public BaseLayer<use_eigen> {
  public:
   ConvLayer(const MultiHeadWeights::ConvBlock& weights, size_t input_channels,
             size_t filter_size, ActivationFunction activation,
             const std::vector<float>* raw_int8_weights = nullptr,
-            float plane109_scale = 1.0f);
+            float plane109_scale = 1.0f, bool dynamic_int8_nhwc = false,
+            bool convert_output_to_nchw = false);
 
   void Eval(size_t batch_size, float* output, const float* input,
             const float* input2,
@@ -116,9 +118,11 @@ class ConvLayer : public BaseLayer<use_eigen> {
   const size_t filter_size_;
   const ActivationFunction activation_;
   const float plane109_scale_;
+  const bool convert_output_to_nchw_;
   std::vector<int8_t> int8_w_storage_;
   std::vector<float> int8_s_storage_;
   std::optional<Int8Weights> int8_conv_;
+  std::optional<DynamicConv3x3Int8> dyn_int8_conv_;
 };
 
 // Two 3x3 convolutions, the optional squeeze-and-excitation unit and the skip
