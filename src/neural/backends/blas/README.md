@@ -37,6 +37,99 @@ When VNNI is unavailable, MKL builds fall back to `cblas_gemm_s8u8s32`.
 Use `--backend-opts=int8_kernel=auto|vnni|avx512|avx|mkl` to select a kernel
 explicitly, or `--backend-opts=int8=false` to run the dequantized FP32 weights.
 
+## Building blas-int8
+
+On `x86_64`, enabling `-Dblas=true` (the default) automatically probes compiler
+support for AVX-512 VNNI (`int8_vnni_avx512.cc`, `-DLC0_HAS_AVX512_VNNI`) and
+AVX-VNNI (`int8_vnni_avx.cc`, `-DLC0_HAS_AVX_VNNI`). Only those two translation
+units are compiled with VNNI flags; dispatch happens at runtime via `cpuid` and
+`xgetbv`, so one binary runs safely on both VNNI and non-VNNI CPUs.
+
+Installing [ISPC](https://ispc.github.io/) (`-Dispc=true`, on by default when
+`ispc` is on `PATH`) is recommended for fast FP32 Winograd, LayerNorm, and
+activation helpers. Pass `-Dispc_native_only=false` if distributing the binary
+to different x86-64 microarchitectures.
+
+### 1. Windows (MSVC + Intel oneAPI MKL + ISPC — recommended)
+
+Provides the `blas` (MKL + VNNI) and `eigen` (Eigen + VNNI) backends, including
+the MKL `cblas_gemm_s8u8s32` fallback on non-VNNI CPUs. From an x64 Native
+Tools Command Prompt (or after calling `vcvars64.bat`) with `ispc` and oneAPI
+on `PATH`:
+
+```cmd
+meson setup build-blas ^
+  -Dbuildtype=release -Db_lto=false -Ddefault_library=static -Db_vscrt=md ^
+  -Dblas=true -Dmkl=true -Dopenblas=false -Ddnnl=false -Donednn=false ^
+  -Ddx=false -Dcudnn=false -Dplain_cuda=false -Dopencl=false -Dsycl=off ^
+  -Dgtest=true ^
+  "-Dmkl_include=C:\Program Files (x86)\Intel\oneAPI\mkl\latest\include" ^
+  "-Dmkl_libdirs=C:\Program Files (x86)\Intel\oneAPI\mkl\latest\lib"
+ninja -C build-blas lc0.exe
+```
+
+To run `lc0.exe` standalone without oneAPI on `PATH`, place the MKL runtime DLLs
+(`mkl_rt.*.dll`, `mkl_core.*.dll`, `mkl_intel_thread.*.dll`, `mkl_avx512.*.dll`,
+`mkl_avx2.*.dll`, `mkl_def.*.dll`) and `libiomp5md.dll` next to `lc0.exe`.
+
+### 2. Standalone VNNI without MKL/OpenBLAS (Windows or Linux, `eigen` backend)
+
+Requires no external BLAS library (uses the bundled Eigen subproject for the
+remaining FP32 layers and custom VNNI intrinsics for INT8 layers):
+
+```sh
+meson setup build-eigen-int8 \
+  -Dbuildtype=release -Dblas=true \
+  -Dmkl=false -Dopenblas=false -Ddnnl=false -Daccelerate=false \
+  -Dplain_cuda=false -Dcudnn=false -Dopencl=false -Ddx=false -Dsycl=off -Donednn=false
+ninja -C build-eigen-int8 lc0
+```
+
+Run with `--backend=eigen` (the VNNI INT8 kernels activate automatically).
+
+### 3. Linux (GCC/Clang + OpenBLAS or Intel oneAPI MKL + ISPC)
+
+With OpenBLAS (`libopenblas-dev` + `ispc`):
+
+```sh
+meson setup build-blas \
+  -Dbuildtype=release -Dblas=true -Dopenblas=true -Dmkl=false -Ddnnl=false \
+  -Dplain_cuda=false -Dcudnn=false -Dopencl=false -Dsycl=off -Donednn=false
+ninja -C build-blas lc0
+```
+
+With Intel oneAPI MKL:
+
+```sh
+meson setup build-blas \
+  -Dbuildtype=release -Dblas=true -Dmkl=true -Dopenblas=false -Ddnnl=false \
+  -Dplain_cuda=false -Dcudnn=false -Dopencl=false -Dsycl=off -Donednn=false \
+  -Dmkl_include=/opt/intel/oneapi/mkl/latest/include \
+  -Dmkl_libdirs=/opt/intel/oneapi/mkl/latest/lib
+ninja -C build-blas lc0
+```
+
+### Verifying and running
+
+Run the VNNI unit tests (when configured with `-Dgtest=true`):
+
+```sh
+ninja -C build-blas blas_int8_vnni_test
+meson test -C build-blas BlasInt8VnniTest
+```
+
+Quick benchmark check (confirm `Using W8A8 INT8 ... (AVX-512 VNNI)` or
+`(AVX-VNNI)` in the output):
+
+```sh
+lc0 benchmark --weights=t74-744021-sycl-int8.pb.gz \
+  --backend=blas --backend-opts="threads=8" --threads=1 --minibatch-size=16
+```
+
+For CPU match play on a 4C/8T machine, `--threads=1` with
+`--backend-opts="threads=8"` and `--minibatch-size=16` avoids search/backend
+thread oversubscription and gives peak VNNI throughput.
+
 ## Benchmarks and match results
 
 Measured on an Intel Core i5-1135G7 (4C/8T, AVX-512 VNNI) using the quantized
