@@ -79,8 +79,8 @@ its Mish activations need extra zero-point work.
 The quantized models pick the same best move as the original FP32 nets on
 93.0% (T1), 96.5% (T74) and 95.7% (T79) of 256 positions not used for
 calibration. That check ran in OpenVINO on the GPU, using exactly the same int8
-weights and scales as the SYCL nets. No game match has been played with the
-SYCL INT8 nets yet, so their playing strength is unmeasured.
+weights and scales as the SYCL nets. No game match has been played on the GPU
+with the SYCL INT8 nets yet (see the CPU FastChess match results below).
 
 ### On the CPU
 
@@ -114,6 +114,58 @@ AVX-512 VNNI speeds up `master` FP32 from 86 → 165 nps (+92%) on T1,
 412 → 1,087 nps (+164%) on T74, and 129 → 343 nps (+166%) on T79. On 300
 held-out positions against `master` FP32, AVX-512 VNNI picks the same best move
 on 91.0% (T1), 95.3% (T74), and 96.7% (T79).
+
+**Latest AVX-512 VNNI optimizations (`df0089da` + `7b1cc65e`):** fused
+register-resident `LayerNorm + Skip + Quantize`, fused `FFN1 + ReLU² + Quantize`,
+register-resident `Softmax64`, dynamic W8A8 for T1 `Smolgen` / `ip_emb_ffn` /
+`AttentionPolicyHead` (with parallel `Q × K^T`), SmoothQuant-109 INT8 direct-NHWC
+`in_conv`, 9-tap fused `8×32` and `8×48` (`C=192`) leaf VNNI microkernels,
+fast reciprocal Mish/Swish/Sigmoid, and dynamic W8A8 direct-NHWC 3×3 conv policy
+head (`policy1` + `policy`). On the same i5-1135G7 (`backendbench`, `threads=4`,
+batch 16), `7b1cc65e` raises mean throughput over `097a16be` VNNI to:
+
+| Net | `097a16be` VNNI (`t=4, B=16`) | `7b1cc65e` VNNI (`t=4, B=16`) | Gain over `097a16be` |
+| --- | ---: | ---: | ---: |
+| T1 | 314 nps (50.95 ms) | 490 nps (32.65 ms) | +56.1% |
+| T79 | 539 nps (29.70 ms) | 610 nps (26.22 ms) | +13.2% |
+| T74 | 1,394 nps (11.48 ms) | 1,838 nps (8.70 ms, peak 2,849) | +31.8% |
+
+#### Playing strength on CPU (FastChess matches)
+
+Four 100-game (50 opening pairs, swapped colors, `UHO_2024_8mvs_+085_+094.epd`,
+`concurrency=1`, `0` forfeits) FastChess matches on the same i5-1135G7 (4C/8T)
+comparing `T74_blas_int8` (`feature/blas-int8` @ `7b1cc65e`,
+`t74-744021-sycl-int8.pb.gz`, `Backend=blas`, `threads=8`, `Threads=1`,
+`MinibatchSize=16`) against clean `upstream/master` (`fd41ee6b`, ISPC + MKL
+AVX-512, `744021.pb.gz` and `791556.pb.gz`, `Backend=blas`, `threads=4`,
+`Threads=1`, `MinibatchSize=32`, peak settings for each engine; resign
+adjudication `500` cp on the first match and `900` cp on the other three):
+
+| Match (100 games each) | Control | W / L / D (`T74_blas_int8`) | Score | Elo (±95%) | Ptnml (0–2) | Median NPS (INT8 vs FP32) |
+| --- | --- | ---: | ---: | ---: | --- | ---: |
+| `T74_blas_int8` vs `T74_master_fp32` | `30+0.5` | 80 / 0 / 20 | 90.0% | +381.70 ± 73.89 | `[0, 0, 1, 18, 31]` | 2,046 vs 419 (4.88×) |
+| `T74_blas_int8` vs `T74_master_fp32` | 1,000 nodes | 31 / 25 / 44 | 53.0% | +20.87 ± 34.48 | `[0, 9, 27, 13, 1]` | 2,147 vs 484 (4.44×) |
+| `T74_blas_int8` vs `T79_master_fp32` | `30+0.5` | 81 / 0 / 19 | 90.5% | +391.57 ± 70.75 | `[0, 0, 0, 19, 31]` | 2,075 vs 138 (15.0×) |
+| `T74_blas_int8` vs `T79_master_fp32` | 1,000 nodes | 5 / 51 / 44 | 27.0% | −172.78 ± 44.16 | `[9, 30, 9, 2, 0]` | 2,196 vs 175 (12.5×) |
+
+At equal 1,000 nodes/move, `T74_blas_int8` is within noise of `T74_master_fp32`
+(+20.9 ± 34.5 Elo, with the slight positive edge likely aided by
+`MinibatchSize=16` vs `32`), confirming negligible quantization Elo loss per
+node; under `30+0.5`, the 4.9× NPS speedup converts cleanly into +381.7 Elo
+(80W–0L–20D). Against the larger `T79` FP32 net, `T79` is +172.8 Elo stronger
+per node, but `T74_blas_int8`'s 15× NPS advantage swings the `30+0.5` match by
++564 Elo to +391.6 Elo (81W–0L–19D).
+
+Against an earlier all-INT8 ONNX T74 (`744204_int8_5.pb.gz`, `onnx-cpu`),
+`T74_blas_int8` (even before the `7b1cc65e` conv policy head quantization) won
+an 18-game `30+0.5` match 6W–2L–10D (~+79 Elo, 0 lost pairs) thanks to keeping
+SE, residual adds, and the value head in FP32 and scaling `rule50` plane 109
+(SmoothQuant-109): on 12 test positions vs FP32 `744021`, `T74_blas_int8`
+(`7b1cc65e`) has `mean|dQ| = 0.0121`, `max|dQ| = 0.0434`, `meanKL(P) = 0.0184`,
+and 12/12 legal Top-1 agreement, whereas a static ONNX model rebuilt with
+SmoothQuant-109 and FP32 SE/residual-add/value reaches matching accuracy
+(`mean|dQ| = 0.0114`, `max|dQ| = 0.0468`) at 1,619 nps (`onnx-cpu`, `t=4, B=16`)
+versus 1,838 nps for `blas-int8`.
 
 **MKL (`int8_kernel=mkl`, `cblas_gemm_s8u8s32`):** earlier baseline using MKL's
 integer matrix multiply with one MKL thread (the blas default), FP32 on the
