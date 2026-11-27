@@ -271,11 +271,14 @@ class SyclNetwork : public Network {
           break;
         }
       }
-      const bool want_int8 = options.GetOrDefault<bool>("int8", true);
-      use_int8_ = want_int8 && has_int8_encoder_weights;
+      use_int8_ = has_int8_encoder_weights;
 #ifdef USE_SYCL_DNNL
-      use_int8_residual_ = want_int8 && has_int8_residual_weights;
+      use_int8_residual_ = has_int8_residual_weights;
 #endif
+      if (!use_int8_ && !use_int8_residual_) {
+        CERR << "WARNING: sycl-int8 requested, but no usable INT8 layers were "
+                "found in this net/build; running in FP16.";
+      }
       if ((use_int8_ || use_int8_residual_) && multi_stream_) {
         CERR << "SYCL INT8: disabling multi_stream for shared INT8 scratch safety.";
         multi_stream_ = false;
@@ -1188,16 +1191,31 @@ std::unique_ptr<Network> MakeSyclNetwork(const std::optional<WeightsFile>& w,
 
 std::unique_ptr<Network> MakeSyclNetworkAuto(
     const std::optional<WeightsFile>& weights, const OptionsDict& options) {
+  if (!weights) {
+    throw Exception("The sycl-auto backend requires a network file.");
+  }
   int gpu_id = options.GetOrDefault<int>("gpu", 0);
 
   auto devices = sycl::device::get_devices();
-  if (gpu_id >= devices.size()) {
-      throw Exception("Invalid GPU ID");
-   }
+  if (gpu_id < 0 || gpu_id >= static_cast<int>(devices.size())) {
+    throw Exception("Invalid GPU ID");
+  }
+  const bool has_fp16 = devices[gpu_id].has(sycl::aspect::fp16);
+  const bool has_int8_enc = WeightsHaveInt8Encoders(weights->weights());
+  const bool has_int8_res = WeightsHaveInt8Residual(weights->weights());
+#ifdef USE_SYCL_DNNL
+  constexpr bool kSyclDnnlAvailable = true;
+#else
+  constexpr bool kSyclDnnlAvailable = false;
+#endif
+  if (has_fp16 && (has_int8_enc || (kSyclDnnlAvailable && has_int8_res))) {
+    CERR << "Switched to [sycl-int8]...";
+    return MakeSyclNetwork<SyclInt8>(weights, options);
+  }
   CERR << "Trying to switch to [sycl-fp16]...";
-  if (devices[gpu_id].has(sycl::aspect::fp16)) {
-    CERR << "Switched to [sycl-fp16]..."; 
-    return MakeSyclNetwork<SyclFp16>(weights, options);     
+  if (has_fp16) {
+    CERR << "Switched to [sycl-fp16]...";
+    return MakeSyclNetwork<SyclFp16>(weights, options);
   } else {
     CERR << "Device does not support sycl-fp16";
   }
@@ -1206,8 +1224,8 @@ std::unique_ptr<Network> MakeSyclNetworkAuto(
 }
 
 REGISTER_NETWORK("sycl-auto", MakeSyclNetworkAuto, 132)
-REGISTER_NETWORK("sycl", MakeSyclNetwork<SyclFp32>, 131)
+REGISTER_NETWORK("sycl-int8", MakeSyclNetwork<SyclInt8>, 131)
 REGISTER_NETWORK("sycl-fp16", MakeSyclNetwork<SyclFp16>, 130)
-REGISTER_NETWORK("sycl-int8", MakeSyclNetwork<SyclInt8>, 129)
+REGISTER_NETWORK("sycl", MakeSyclNetwork<SyclFp32>, 129)
 
 }  // namespace lczero
