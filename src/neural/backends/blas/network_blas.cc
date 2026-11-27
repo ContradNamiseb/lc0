@@ -60,6 +60,8 @@ size_t CountInt8Layers(const MultiHeadWeights& weights,
   return layers;
 }
 
+enum class BlasPrecision { kFp32, kInt8 };
+
 template <bool use_eigen>
 class BlasNetwork;
 
@@ -112,7 +114,8 @@ class BlasComputation : public NetworkComputation {
 template <bool use_eigen>
 class BlasNetwork : public Network {
  public:
-  BlasNetwork(const WeightsFile& weights, const OptionsDict& options);
+  BlasNetwork(const WeightsFile& weights, const OptionsDict& options,
+              BlasPrecision precision);
 
   std::unique_ptr<NetworkComputation> NewComputation() override {
     return std::make_unique<BlasComputation<use_eigen>>(this, threads_);
@@ -355,7 +358,8 @@ void BlasNetwork<use_eigen>::ReleaseWorkspace(
 
 template <bool use_eigen>
 BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
-                                    const OptionsDict& options)
+                                    const OptionsDict& options,
+                                    BlasPrecision precision)
     : capabilities_{file.format().network_format().input(),
                     file.format().network_format().output(),
                     file.format().network_format().moves_left()},
@@ -405,18 +409,6 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
     max_batch_size_ = kHardMaxBatchSize;
   }
 
-  // Layers stored in INT8 run in INT8 unless int8=false or neither VNNI nor
-  // MKL is available; then they use the dequantized FP32 weights.
-  const bool int8_requested = options.GetOrDefault<bool>("int8", true);
-  const std::string int8_kernel_opt =
-      options.GetOrDefault<std::string>("int8_kernel", "auto");
-  const bool allow_mkl = !use_eigen && kMklInt8Available;
-  const bool int8_supported = IsInt8SupportedOnHost(allow_mkl);
-  const bool use_int8 = int8_requested && int8_supported;
-  if (use_int8) {
-    int8_kernel_ = SelectInt8Kernel(int8_kernel_opt, allow_mkl);
-  }
-
   const std::string policy_head =
       options.GetOrDefault<std::string>("policy_head", "vanilla");
   // Check that selected policy head exists.
@@ -435,6 +427,29 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
 
   auto& policy_weights = weights_.policy_heads.at(policy_head);
   const size_t int8_layers = CountInt8Layers(weights_, policy_weights);
+
+  // Layers stored in INT8 run in INT8 when BlasPrecision::kInt8 is selected and
+  // the host/build supports a VNNI or MKL INT8 kernel; otherwise fall back
+  // cleanly to the dequantized FP32 weights.
+  bool use_int8 = false;
+  if (precision == BlasPrecision::kInt8) {
+    const std::string int8_kernel_opt =
+        options.GetOrDefault<std::string>("int8_kernel", "auto");
+    const bool allow_mkl = !use_eigen && kMklInt8Available;
+    const bool int8_supported = IsInt8SupportedOnHost(allow_mkl);
+    if (!int8_supported) {
+      CERR << "WARNING: " << (use_eigen ? "eigen-int8" : "blas-int8")
+           << " requested, but no VNNI"
+           << (use_eigen ? "" : " or MKL INT8")
+           << " kernel is available; falling back to FP32.";
+    } else if (int8_layers == 0) {
+      CERR << "WARNING: " << (use_eigen ? "eigen-int8" : "blas-int8")
+           << " requested, but the net has no INT8 layers; falling back to FP32.";
+    } else {
+      int8_kernel_ = SelectInt8Kernel(int8_kernel_opt, allow_mkl);
+      use_int8 = true;
+    }
+  }
   const bool net_uses_int8 = use_int8 && int8_layers > 0;
 
   const bool vnni_kernel = (int8_kernel_ == Int8Kernel::kVnniAvx512 ||
@@ -643,19 +658,19 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
   if (int8_layers > 0 && use_int8) {
     CERR << "Using W8A8 INT8 for " << int8_layers << " layers ("
          << Int8KernelName(int8_kernel_) << ").";
-  } else if (int8_layers > 0) {
+  } else if (int8_layers > 0 && precision == BlasPrecision::kFp32) {
     CERR << "The net has " << int8_layers
-         << " INT8 layers; running them in FP32 from the dequantized weights"
-         << (int8_requested ? " (no VNNI or MKL INT8 kernel available)."
-                            : " (int8=false).");
+         << " INT8 layers; running them in FP32 from the dequantized weights ("
+         << (use_eigen ? "eigen-fp32" : "blas-fp32") << ").";
   }
 }
 
-template <bool use_eigen>
+template <bool use_eigen, BlasPrecision precision>
 std::unique_ptr<Network> MakeBlasNetwork(const std::optional<WeightsFile>& w,
                                          const OptionsDict& options) {
   if (!w) {
     throw Exception("The " + std::string(use_eigen ? "eigen" : "blas") +
+                    (precision == BlasPrecision::kInt8 ? "-int8" : "-fp32") +
                     " backend requires a network file.");
   }
   const WeightsFile& weights = *w;
@@ -717,13 +732,55 @@ std::unique_ptr<Network> MakeBlasNetwork(const std::optional<WeightsFile>& w,
                       NF::InputEmbeddingFormat_Name(nf.input_embedding()) +
                       " is not supported by the BLAS backend.");
   }
-  return std::make_unique<BlasNetwork<use_eigen>>(weights, options);
+  return std::make_unique<BlasNetwork<use_eigen>>(weights, options, precision);
+}
+
+template <bool use_eigen>
+std::unique_ptr<Network> MakeBlasNetworkAuto(
+    const std::optional<WeightsFile>& w, const OptionsDict& options) {
+  const char* base = use_eigen ? "eigen" : "blas";
+  if (!w) {
+    throw Exception(std::string("The ") + base +
+                    "-auto backend requires a network file.");
+  }
+  const bool allow_mkl = !use_eigen && kMklInt8Available;
+  const bool has_int8 = WeightsHaveInt8(w->weights());
+  const bool int8_supported = IsInt8SupportedOnHost(allow_mkl);
+  if (has_int8 && int8_supported) {
+    CERR << "Switched to [" << base << "-int8]...";
+    return MakeBlasNetwork<use_eigen, BlasPrecision::kInt8>(w, options);
+  }
+  if (has_int8 && !int8_supported) {
+    CERR << "No VNNI" << (use_eigen ? "" : " or MKL INT8")
+         << " kernel available; falling back to [" << base << "-fp32]...";
+  } else {
+    CERR << "Switched to [" << base << "-fp32]...";
+  }
+  return MakeBlasNetwork<use_eigen, BlasPrecision::kFp32>(w, options);
+}
+
+template <bool use_eigen>
+std::unique_ptr<Network> MakeBlasInt8Network(
+    const std::optional<WeightsFile>& w, const OptionsDict& options) {
+  return MakeBlasNetwork<use_eigen, BlasPrecision::kInt8>(w, options);
+}
+
+template <bool use_eigen>
+std::unique_ptr<Network> MakeBlasFp32Network(
+    const std::optional<WeightsFile>& w, const OptionsDict& options) {
+  return MakeBlasNetwork<use_eigen, BlasPrecision::kFp32>(w, options);
 }
 
 #ifdef USE_BLAS
-REGISTER_NETWORK("blas", MakeBlasNetwork<false>, 50)
+REGISTER_NETWORK("blas-auto", MakeBlasNetworkAuto<false>, 53)
+REGISTER_NETWORK("blas-int8", MakeBlasInt8Network<false>, 52)
+REGISTER_NETWORK("blas-fp32", MakeBlasFp32Network<false>, 51)
+REGISTER_NETWORK("blas", MakeBlasNetworkAuto<false>, 50)
 #endif
-REGISTER_NETWORK("eigen", MakeBlasNetwork<true>, 49)
+REGISTER_NETWORK("eigen-auto", MakeBlasNetworkAuto<true>, 49)
+REGISTER_NETWORK("eigen-int8", MakeBlasInt8Network<true>, 48)
+REGISTER_NETWORK("eigen-fp32", MakeBlasFp32Network<true>, 47)
+REGISTER_NETWORK("eigen", MakeBlasNetworkAuto<true>, 46)
 
 }  // namespace
 }  // namespace blas_backend

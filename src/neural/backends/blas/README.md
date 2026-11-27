@@ -16,7 +16,11 @@ V, output and feed-forward projections of the attention body.
 
 On x86-64 CPUs with AVX-512 VNNI or AVX-VNNI, custom runtime-dispatched VNNI
 intrinsic kernels (`int8_vnni_avx512.cc`, `int8_vnni_avx.cc`) execute these
-layers for both the `blas` and `eigen` backends without requiring MKL:
+layers for both `blas` and `eigen` backends without requiring MKL:
+- Backend selection in UCI / `--backend`: `blas-auto` (default), `blas-int8`,
+  `blas-fp32`, and `blas` alias, plus matching `eigen-auto`, `eigen-int8`,
+  `eigen-fp32`, and `eigen` options. `*-int8` falls back to FP32 with a warning
+  if the net or host lacks INT8 support.
 - Linear layers pre-pack weights into 64-byte aligned panels and fuse
   dequantization, bias, and activation in registers.
 - Residual towers convert once to NHWC and run a direct 9-tap 10x10 padded
@@ -26,8 +30,9 @@ layers for both the `blas` and `eigen` backends without requiring MKL:
   row tiles via a lightweight spin-then-park thread pool.
 
 When VNNI is unavailable, MKL builds fall back to `cblas_gemm_s8u8s32`.
-Use `--backend-opts=int8_kernel=auto|vnni|avx512|avx|mkl` to select a kernel
-explicitly, or `--backend-opts=int8=false` to run the dequantized FP32 weights.
+Select `--backend=blas-fp32` (or `eigen-fp32`) to run dequantized FP32 weights,
+or use `--backend-opts=int8_kernel=auto|vnni|avx512|avx|mkl` to select an INT8
+kernel explicitly.
 
 ## License
 

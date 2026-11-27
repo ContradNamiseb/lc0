@@ -15,8 +15,14 @@ branch (`t1-256x10-sycl-int8.pb.gz`, `t74-744021-sycl-int8.pb.gz`,
 
 On x86-64 CPUs with AVX-512 VNNI or AVX-VNNI, custom runtime-dispatched VNNI
 intrinsic kernels (`int8_vnni_avx512.cc`, `int8_vnni_avx.cc`) execute quantized
-layers for both `--backend=blas` and `--backend=eigen` without requiring MKL:
+layers for both `blas` and `eigen` backends without requiring MKL:
 
+- Backend selection in UCI / `--backend`: `blas-auto` (default, auto-selects
+  `blas-int8` for INT8 nets and `blas-fp32` for FP32 nets or non-INT8 hosts),
+  `blas-int8` (permissive: warns and falls back to FP32 if the net/host lacks
+  INT8), `blas-fp32` (forces dequantized FP32), and `blas` (alias for
+  `blas-auto`), plus matching `eigen-auto`, `eigen-int8`, `eigen-fp32`, and
+  `eigen` options.
 - Linear layers pre-pack weights into 64-byte aligned panels and fuse
   dequantization, bias, activation, and optional downstream requantization
   (e.g., `FFN1 + ReLU² + Quantize`) in registers.
@@ -33,9 +39,11 @@ layers for both `--backend=blas` and `--backend=eigen` without requiring MKL:
 - Multi-threading (`threads > 1`) parallelizes whole layers across boards and
   row tiles via a lightweight spin-then-park thread pool.
 
-When VNNI is unavailable, MKL builds fall back to `cblas_gemm_s8u8s32`.
-Use `--backend-opts=int8_kernel=auto|vnni|avx512|avx|mkl` to select a kernel
-explicitly, or `--backend-opts=int8=false` to run the dequantized FP32 weights.
+When VNNI is unavailable, MKL builds fall back to `cblas_gemm_s8u8s32` (while
+`eigen-int8` requires VNNI). Select `--backend=blas-fp32` (or `eigen-fp32`) to
+run dequantized FP32 weights, or use
+`--backend-opts=int8_kernel=auto|vnni|avx512|avx|mkl` to override the INT8
+kernel explicitly.
 
 ### Building `blas-int8`
 

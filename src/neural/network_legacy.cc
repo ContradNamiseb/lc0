@@ -403,4 +403,61 @@ MultiHeadWeights::MultiHeadWeights(const pblczero::Weights& weights)
   }
 }
 
+namespace {
+
+bool ConvBlockHasInt8(const pblczero::Weights::ConvBlock& block) {
+  return block.weights().encoding() == pblczero::Weights::Layer::INT8 &&
+         block.has_w_scales();
+}
+
+bool MhaHasInt8(const pblczero::Weights::MHA& mha) {
+  return mha.q_w().encoding() == pblczero::Weights::Layer::INT8 &&
+         mha.k_w().encoding() == pblczero::Weights::Layer::INT8 &&
+         mha.v_w().encoding() == pblczero::Weights::Layer::INT8 &&
+         mha.dense_w().encoding() == pblczero::Weights::Layer::INT8 &&
+         mha.has_q_w_scales() && mha.has_k_w_scales() &&
+         mha.has_v_w_scales() && mha.has_dense_w_scales();
+}
+
+bool FfnHasInt8(const pblczero::Weights::FFN& ffn) {
+  return ffn.dense1_w().encoding() == pblczero::Weights::Layer::INT8 &&
+         ffn.dense2_w().encoding() == pblczero::Weights::Layer::INT8 &&
+         ffn.has_dense1_w_scales() && ffn.has_dense2_w_scales();
+}
+
+bool EncodersHaveInt8(
+    const std::vector<pblczero::Weights::EncoderLayer>& encoders) {
+  for (const auto& enc : encoders) {
+    if (MhaHasInt8(enc.mha()) || FfnHasInt8(enc.ffn())) return true;
+  }
+  return false;
+}
+
+}  // namespace
+
+bool WeightsHaveInt8Residual(const pblczero::Weights& weights) {
+  for (const auto& res : weights.residual()) {
+    if (ConvBlockHasInt8(res.conv1()) || ConvBlockHasInt8(res.conv2())) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool WeightsHaveInt8Encoders(const pblczero::Weights& weights) {
+  if (EncodersHaveInt8(weights.encoder()) ||
+      EncodersHaveInt8(weights.pol_encoder())) {
+    return true;
+  }
+  if (weights.has_policy_heads() &&
+      EncodersHaveInt8(weights.policy_heads().vanilla().pol_encoder())) {
+    return true;
+  }
+  return false;
+}
+
+bool WeightsHaveInt8(const pblczero::Weights& weights) {
+  return WeightsHaveInt8Residual(weights) || WeightsHaveInt8Encoders(weights);
+}
+
 }  // namespace lczero

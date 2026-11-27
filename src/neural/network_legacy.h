@@ -268,4 +268,9 @@ enum InputEmbedding {
   INPUT_EMBEDDING_PE_DENSE = 2,
 };
 
+// Fast protobuf-only checks (no weight decoding) for W8A8 INT8 layers.
+bool WeightsHaveInt8Residual(const pblczero::Weights& weights);
+bool WeightsHaveInt8Encoders(const pblczero::Weights& weights);
+bool WeightsHaveInt8(const pblczero::Weights& weights);
+
 }  // namespace lczero
