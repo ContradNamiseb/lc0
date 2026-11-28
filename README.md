@@ -138,10 +138,14 @@ batch 16), `7b1cc65e` raises mean throughput over `097a16be` VNNI to:
 | T74 | 1,653 / 1,545 nps | 2,326 / 2,547 / 3,739 nps | +40.7% / +64.9% |
 | T1 | 435 / 425 nps | 617 / 679 / 753 nps | +41.8% / +59.6% |
 
-On top of those T79-focused changes, **T1 Transformer & Smolgen ablations (`A + B + C1`)** in `experiment/t79-ablations` parallelized `ip_emb` / PE prep / input gating / `ValueHead` / `MovesLeft` / policy promotion (**A**), fused L1d-resident `depth=32` `Q·K^T + smolgen -> Softmax64 -> Attn·V` (`MhaAttentionHead32Avx512`) with head-sharded `smolgen_global` (`ForwardPreparedRange`) (**B**), and fused `smol_ln1`/`smol_ln2` + dual `ln2` static/dynamic quantization (**C1**) — while discarding a `6×64` VNNI GEMM microkernel (**C2**) that regressed on Tiger Lake (`t=1 B=16`: `239` vs `253–260` median nps). Balanced AB-BA results over the T79-opt baseline:
-- **Live T1 MCTS (`t=4, threads=2, B=7, 400 nodes, 5 pos`):** **`6,927 ms / 296 nps` (`+9.6%`)** vs `7,687 ms / 270 nps` (R1) and **`7,063 ms / 297 nps` (`+11.2%`)** vs `7,671 ms / 267 nps` (R2).
-- **T1 `backendbench`:** `t=8, B=16` **`733` mean (`+8.8%`) / `849` med (`+9.7%`) / `914` peak (`+10.8%`)** vs `674 / 774 / 825`; `t=4, B=16` **`920` peak (`+12.8%`)** vs `815`; `t=1, B=16` **`251` mean (`+3.3%`)** vs `243` (with T79/T74 peak throughput preserved).
-- **Accuracy & parity:** `15/15` `BlasInt8VnniTest` passing, `0.000000` `dQ` (`60/60` Top-1) on T1 FP32 (`blas-fp32`) with fused MHA, **`193/200` (`96.5%`) Top-1** vs FP32 `t1-256x10-distilled-swa-2432500.pb.gz` (matching/edging baseline `191/200` = `95.5%`), and `60/60` (`0.000000` `dQ`) on T79 and T74.
+On top of those T79-focused changes, **T1 Transformer & Smolgen ablations (`A + B + C1`)** in `experiment/t79-ablations` parallelized `ip_emb` / PE prep / input gating / `ValueHead` / `MovesLeft` / policy promotion (**A**), fused L1d-resident `depth=32` `Q·K^T + smolgen -> Softmax64 -> Attn·V` (`MhaAttentionHead32Avx512`, also active on `blas-fp32` within `4.1e-6` of MKL SGEMM) with head-sharded `smolgen_global` (`ForwardPreparedRange`) (**B**), and fused `smol_ln1`/`smol_ln2` + dual `ln2` static/dynamic quantization (**C1**) — while discarding a `6×64` VNNI GEMM microkernel (**C2**) that regressed on Tiger Lake (`t=1 B=16`: `239` vs `253–260` median nps).
+
+In independent 3-round alternating benchmarks (`master` FP32 `fd41ee6b` → `097a16be` → `8cbdce7d` → `1b3540e2` INT8, medians):
+- **`backendbench t=1, B=16`:** T74 `337 → 784 → 903 → 926`, T79 `111 → 263 → 279 → 291`, T1 `67 → 145 → 219 → 224` nps.
+- **`backendbench t=4, B=16`:** T74 `439 → 1,056 → 1,330 → 1,460`, T79 `165 → 397 → 416 → 554`, T1 `107 → 229 → 326 → 462` nps (`+10%` / `+33%` / `+42%` over `8cbdce7d`).
+- **Live search (`--threads=2`, `--minibatch-size=7`, `backend threads=4`, nodes `4000/1500/1000`):** T74 `367 → 981 → 1,218 → 1,445` (`3.9×` `master`), T79 `119 → 320 → 352 → 376` (`3.2×` `master`), T1 `80 → 161 → 224 → 274` nps (`3.4×` `master`).
+
+Accuracy across 300 held-out positions (`097a16be` → `1b3540e2` vs. `master` FP32) shows that load-time and dynamic quantization of the boundary/head layers trades a small accuracy cost relative to trunk-only quantization: T74 `mean|dV| 0.0116 → 0.0134` (`+16%`, Top-1 `95.3% → 94.7%`, KL `0.0019 → 0.0022`), T79 `0.0113 → 0.0120` (`+6%`, Top-1 `96.7% → 96.0%`), and T1 `0.0154 → 0.0157` (`+2%`, Top-1 `91.0% → 91.3%`, `max|dV| 0.131 → 0.201`). On a separate 200-position check vs FP32 `t1-256x10-distilled-swa-2432500.pb.gz`, `1b3540e2` scored `193/200` (`96.5%`) Top-1 (`mean|dQ|=0.0193`), and `threads=4` vs `threads=1` INT8 parity is exact (`0` diff on T74/T79/T1).
 
 #### Playing strength on CPU (FastChess matches)
 
@@ -151,34 +155,36 @@ comparing `T74_blas_int8` (`feature/blas-int8` @ `7b1cc65e`,
 `t74-744021-sycl-int8.pb.gz`, `Backend=blas`, `threads=8`, `Threads=1`,
 `MinibatchSize=16`) against clean `upstream/master` (`fd41ee6b`, ISPC + MKL
 AVX-512, `744021.pb.gz` and `791556.pb.gz`, `Backend=blas`, `threads=4`,
-`Threads=1`, `MinibatchSize=32`, peak settings for each engine; resign
+`Threads=1`, `MinibatchSize=32`, match-tuned settings for each engine; resign
 adjudication `500` cp on the first match and `900` cp on the other three):
 
 | Match (100 games each) | Control | W / L / D (`T74_blas_int8`) | Score | Elo (±95%) | Ptnml (0–2) | Median NPS (INT8 vs FP32) |
 | --- | --- | ---: | ---: | ---: | --- | ---: |
-| `T74_blas_int8` vs `T74_master_fp32` | `30+0.5` | 80 / 0 / 20 | 90.0% | +381.70 ± 73.89 | `[0, 0, 1, 18, 31]` | 2,046 vs 419 (4.88×) |
-| `T74_blas_int8` vs `T74_master_fp32` | 1,000 nodes | 31 / 25 / 44 | 53.0% | +20.87 ± 34.48 | `[0, 9, 27, 13, 1]` | 2,147 vs 484 (4.44×) |
-| `T74_blas_int8` vs `T79_master_fp32` | `30+0.5` | 81 / 0 / 19 | 90.5% | +391.57 ± 70.75 | `[0, 0, 0, 19, 31]` | 2,075 vs 138 (15.0×) |
-| `T74_blas_int8` vs `T79_master_fp32` | 1,000 nodes | 5 / 51 / 44 | 27.0% | −172.78 ± 44.16 | `[9, 30, 9, 2, 0]` | 2,196 vs 175 (12.5×) |
+| `T74_blas_int8` vs `T74_master_fp32` | `30+0.5` | 80 / 0 / 20 | 90.0% | +381.70 ± 73.89 | `[0, 0, 1, 18, 31]` | 2,046 vs 419 (4.88×)* |
+| `T74_blas_int8` vs `T74_master_fp32` | 1,000 nodes | 31 / 25 / 44 | 53.0% | +20.87 ± 34.48 | `[0, 9, 27, 13, 1]` | 2,147 vs 484 (4.44×)* |
+| `T74_blas_int8` vs `T79_master_fp32` | `30+0.5` | 81 / 0 / 19 | 90.5% | +391.57 ± 70.75 | `[0, 0, 0, 19, 31]` | 2,075 vs 138 (15.0×)* |
+| `T74_blas_int8` vs `T79_master_fp32` | 1,000 nodes | 5 / 51 / 44 | 27.0% | −172.78 ± 44.16 | `[9, 30, 9, 2, 0]` | 2,196 vs 175 (12.5×)* |
 
-At equal 1,000 nodes/move, `T74_blas_int8` is within noise of `T74_master_fp32`
-(+20.9 ± 34.5 Elo, with the slight positive edge likely aided by
-`MinibatchSize=16` vs `32`), confirming negligible quantization Elo loss per
-node; under `30+0.5`, the 4.9× NPS speedup converts cleanly into +381.7 Elo
-(80W–0L–20D). Against the larger `T79` FP32 net, `T79` is +172.8 Elo stronger
-per node, but `T74_blas_int8`'s 15× NPS advantage swings the `30+0.5` match by
-+564 Elo to +391.6 Elo (81W–0L–19D).
+At 1,000 nodes/move, `T74_blas_int8` ran at `MinibatchSize=16` vs `32` for
+`T74_master_fp32`, so that per-node comparison is confounded and `+20.9 ± 34.5`
+Elo is within noise either way. Likewise, the `4.88×` (`4.44×` at 1k nodes) NPS
+ratio reflects those match-tuned settings (`threads=8, MinibatchSize=16` vs
+`threads=4, MinibatchSize=32`); under matched search settings (`--threads=2`,
+`--minibatch-size=7`, `backend threads=4`), `7b1cc65e`/`8cbdce7d` T74 search is
+`3.3×` `master` and `1b3540e2` is `3.9×`. Under `30+0.5`, that speed advantage
+converts into +381.7 Elo (80W–0L–20D). Against the larger `T79` FP32 net, `T79`
+is +172.8 Elo stronger per node, but `T74_blas_int8`'s match-setting NPS edge
+swings the `30+0.5` match to +391.6 Elo (81W–0L–19D).
 
 Against an earlier all-INT8 ONNX T74 (`744204_int8_5.pb.gz`, `onnx-cpu`),
-`T74_blas_int8` (even before the `7b1cc65e` conv policy head quantization) won
-an 18-game `30+0.5` match 6W–2L–10D (~+79 Elo, 0 lost pairs) thanks to keeping
-SE, residual adds, and the value head in FP32 and scaling `rule50` plane 109
-(SmoothQuant-109): on 12 test positions vs FP32 `744021`, `T74_blas_int8`
-(`7b1cc65e`) has `mean|dQ| = 0.0121`, `max|dQ| = 0.0434`, `meanKL(P) = 0.0184`,
-and 12/12 legal Top-1 agreement, whereas a static ONNX model rebuilt with
-SmoothQuant-109 and FP32 SE/residual-add/value reaches matching accuracy
-(`mean|dQ| = 0.0114`, `max|dQ| = 0.0468`) at 1,619 nps (`onnx-cpu`, `t=4, B=16`)
-versus 1,838 nps for `blas-int8`.
+`T74_blas_int8` (even before the `7b1cc65e` conv policy head quantization) scored
+`6W–2L–10D` across 18 games at `30+0.5` thanks to keeping SE, residual adds, and
+the value head in FP32 and scaling `rule50` plane 109 (SmoothQuant-109): on 12
+test positions vs FP32 `744021`, `T74_blas_int8` (`7b1cc65e`) has `mean|dQ| =
+0.0121`, `max|dQ| = 0.0434`, `meanKL(P) = 0.0184`, and 12/12 legal Top-1
+agreement, whereas a static ONNX model rebuilt with SmoothQuant-109 and FP32
+SE/residual-add/value reaches matching accuracy (`mean|dQ| = 0.0114`, `max|dQ| =
+0.0468`) at 1,619 nps (`onnx-cpu`, `t=4, B=16`) versus 1,838 nps for `blas-int8`.
 
 **MKL (`int8_kernel=mkl`, `cblas_gemm_s8u8s32`):** earlier baseline using MKL's
 integer matrix multiply with one MKL thread (the blas default), FP32 on the
