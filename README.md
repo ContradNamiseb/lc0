@@ -130,6 +130,19 @@ batch 16), `7b1cc65e` raises mean throughput over `097a16be` VNNI to:
 | T79 | 539 nps (29.70 ms) | 610 nps (26.22 ms) | +13.2% |
 | T74 | 1,394 nps (11.48 ms) | 1,838 nps (8.70 ms, peak 2,849) | +31.8% |
 
+**Further AVX-512 VNNI optimizations (`experiment/t79-ablations` over `8cbdce7d`):** eliminated MKL OpenMP spin-wait contention against `Int8ThreadPool` (`mkl_set_num_threads(1)` + local guard), vectorized `SELU` + `192d` dynamic quantization and reused quantized `flow` across attention policy `Q`/`K`, replaced `Exp` with integer bit-shifting + `Mish3x` + pre-transposed SE FC1/FC2 weights, fused `NCHW→NHWC` + `plane109` into `conv_nr=48` `input_conv`, and added multi-threaded AVX-512 FP32 `GemmFp32Avx512` to keep `ValueHead` / `MovesLeft` / classical policy on NHWC without a `NhwcToNchw` roundtrip. Across 3 alternating A/B rounds on the same i5-1135G7 (`backendbench`, `threads=4`, batch 16):
+
+| Net | `8cbdce7d` (`t=4, B=16` mean / med) | Optimized (`t=4, B=16` mean / med / max) | Gain (mean / med) |
+| --- | ---: | ---: | ---: |
+| T79 | 549 / 532 nps | 848 / 960 / 1,126 nps | +54.5% / +80.6% |
+| T74 | 1,653 / 1,545 nps | 2,326 / 2,547 / 3,739 nps | +40.7% / +64.9% |
+| T1 | 435 / 425 nps | 617 / 679 / 753 nps | +41.8% / +59.6% |
+
+On top of those T79-focused changes, **T1 Transformer & Smolgen ablations (`A + B + C1`)** in `experiment/t79-ablations` parallelized `ip_emb` / PE prep / input gating / `ValueHead` / `MovesLeft` / policy promotion (**A**), fused L1d-resident `depth=32` `Q·K^T + smolgen -> Softmax64 -> Attn·V` (`MhaAttentionHead32Avx512`) with head-sharded `smolgen_global` (`ForwardPreparedRange`) (**B**), and fused `smol_ln1`/`smol_ln2` + dual `ln2` static/dynamic quantization (**C1**) — while discarding a `6×64` VNNI GEMM microkernel (**C2**) that regressed on Tiger Lake (`t=1 B=16`: `239` vs `253–260` median nps). Balanced AB-BA results over the T79-opt baseline:
+- **Live T1 MCTS (`t=4, threads=2, B=7, 400 nodes, 5 pos`):** **`6,927 ms / 296 nps` (`+9.6%`)** vs `7,687 ms / 270 nps` (R1) and **`7,063 ms / 297 nps` (`+11.2%`)** vs `7,671 ms / 267 nps` (R2).
+- **T1 `backendbench`:** `t=8, B=16` **`733` mean (`+8.8%`) / `849` med (`+9.7%`) / `914` peak (`+10.8%`)** vs `674 / 774 / 825`; `t=4, B=16` **`920` peak (`+12.8%`)** vs `815`; `t=1, B=16` **`251` mean (`+3.3%`)** vs `243` (with T79/T74 peak throughput preserved).
+- **Accuracy & parity:** `15/15` `BlasInt8VnniTest` passing, `0.000000` `dQ` (`60/60` Top-1) on T1 FP32 (`blas-fp32`) with fused MHA, **`193/200` (`96.5%`) Top-1** vs FP32 `t1-256x10-distilled-swa-2432500.pb.gz` (matching/edging baseline `191/200` = `95.5%`), and `60/60` (`0.000000` `dQ`) on T79 and T74.
+
 #### Playing strength on CPU (FastChess matches)
 
 Four 100-game (50 opening pairs, swapped colors, `UHO_2024_8mvs_+085_+094.epd`,
@@ -200,8 +213,12 @@ Two steps, both scripts in [`scripts/`](scripts):
 
 [`docs/quantization.md`](docs/quantization.md) explains each step, the number
 format, what is and isn't quantized, the tools and versions used, and the
-commands to rebuild the nets. [`logs/quantize_log.txt`](logs/quantize_log.txt)
-is the log of the calibration run that produced them.
+commands to rebuild the nets. [`docs/runtime-vs-offline-quantization.md`](docs/runtime-vs-offline-quantization.md)
+documents why boundary and head layers (`input_conv`, `Smolgen`, `AttentionPolicy`,
+`ConvPolicy`) stay unquantized on disk and are quantized at load time / runtime in
+`blas-int8`, along with offline-vs-runtime ablation measurements on 256 held-out
+positions. [`logs/quantize_log.txt`](logs/quantize_log.txt) is the log of the
+calibration run that produced the trunk nets.
 
 ## Related branches
 
