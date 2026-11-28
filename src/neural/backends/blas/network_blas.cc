@@ -171,6 +171,7 @@ class BlasNetwork : public Network {
   bool use_nhwc_residual_tower_ = false;
   bool use_int8_input_conv_ = false;
   bool use_int8_conv_policy_ = false;
+  bool nhwc_all_heads_ = false;
   Int8Kernel int8_kernel_ = Int8Kernel::kMkl;
   std::unique_ptr<Int8ThreadPool> int8_pool_;
   size_t max_convolution_input_channels_ = 0;
@@ -233,6 +234,18 @@ template <bool use_eigen>
 void BlasNetwork<use_eigen>::Forward(size_t batch_size, float* policies,
                                      float* values, float* moves_left_values,
                                      Workspace<use_eigen>& workspace) const {
+#ifdef USE_MKL
+  struct MklLocalThreadsGuard {
+    bool active = false;
+    explicit MklLocalThreadsGuard(bool enable) : active(enable) {
+      if (active) mkl_set_num_threads_local(1);
+    }
+    ~MklLocalThreadsGuard() {
+      if (active) mkl_set_num_threads_local(0);
+    }
+  } mkl_guard(int8_pool_ != nullptr);
+#endif
+
   float* tensors[3] = {workspace.tensors[0].data(), workspace.tensors[1].data(),
                        workspace.tensors[2].data()};
   size_t layer = 0;
@@ -248,8 +261,10 @@ void BlasNetwork<use_eigen>::Forward(size_t batch_size, float* policies,
         network_[layer++]->Eval(batch_size, tensors[2], tensors[2], nullptr,
                                 workspace);  // residual block, in place NHWC
       }
-      NhwcToNchwFast(batch_size, residual_channels_, tensors[2], tensors[1],
-                     workspace.int8.pool);
+      if (!nhwc_all_heads_) {
+        NhwcToNchwFast(batch_size, residual_channels_, tensors[2], tensors[1],
+                       workspace.int8.pool);
+      }
     } else if (use_nhwc_residual_tower_) {
       network_[layer++]->Eval(batch_size, tensors[1], tensors[0], nullptr,
                               workspace);  // input conv
@@ -259,8 +274,10 @@ void BlasNetwork<use_eigen>::Forward(size_t batch_size, float* policies,
         network_[layer++]->Eval(batch_size, tensors[2], tensors[2], nullptr,
                                 workspace);  // residual block, in place NHWC
       }
-      NhwcToNchwFast(batch_size, residual_channels_, tensors[2], tensors[1],
-                     workspace.int8.pool);
+      if (!nhwc_all_heads_) {
+        NhwcToNchwFast(batch_size, residual_channels_, tensors[2], tensors[1],
+                       workspace.int8.pool);
+      }
     } else {
       network_[layer++]->Eval(batch_size, tensors[1], tensors[0], nullptr,
                               workspace);  // input conv
@@ -279,6 +296,10 @@ void BlasNetwork<use_eigen>::Forward(size_t batch_size, float* policies,
   float* body = tensors[flow];
   float* spare1 = tensors[(flow + 1) % 3];
   float* spare2 = tensors[(flow + 2) % 3];
+  // When `nhwc_all_heads_` is true, `spare1` (`tensors[2]`) holds the read-only
+  // NHWC residual tower output across all heads, while `body` (`tensors[1]`)
+  // and `spare2` (`tensors[0]`) are free scratch buffers.
+  const float* head_body = nhwc_all_heads_ ? spare1 : body;
 
   // Policy head.
   if (attn_policy_) {
@@ -294,15 +315,16 @@ void BlasNetwork<use_eigen>::Forward(size_t batch_size, float* policies,
                             workspace);  // policy map
   } else if (conv_policy_) {
     if (use_int8_conv_policy_) {
-      // `spare1` (`tensors[2]`) still holds the NHWC residual tower output.
-      // policy1: NHWC spare1 -> NHWC spare2; policy: NHWC spare2 -> NCHW spare1
-      // (converted inside ConvLayer), then PolicyMapLayer reads spare1 ->
-      // policies.
+      // `spare1` (`tensors[2]`) holds the NHWC residual tower output.
+      // policy1: NHWC spare1 -> NHWC spare2; policy2: NHWC spare2 -> NCHW
+      // destination (written to `body` when `nhwc_all_heads_` preserves
+      // `spare1`, else `spare1`), then PolicyMapLayer writes `policies`.
+      float* policy2_out = nhwc_all_heads_ ? body : spare1;
       network_[layer++]->Eval(batch_size, spare2, spare1, nullptr,
                               workspace);  // policy conv1 (NHWC -> NHWC)
-      network_[layer++]->Eval(batch_size, spare1, spare2, nullptr,
+      network_[layer++]->Eval(batch_size, policy2_out, spare2, nullptr,
                               workspace);  // policy conv2 (NHWC -> NCHW)
-      network_[layer++]->Eval(batch_size, policies, spare1, nullptr,
+      network_[layer++]->Eval(batch_size, policies, policy2_out, nullptr,
                               workspace);  // policy map
     } else {
       network_[layer++]->Eval(batch_size, spare1, body, nullptr,
@@ -312,6 +334,11 @@ void BlasNetwork<use_eigen>::Forward(size_t batch_size, float* policies,
       network_[layer++]->Eval(batch_size, policies, spare2, nullptr,
                               workspace);  // policy map
     }
+  } else if (nhwc_all_heads_) {
+    network_[layer++]->Eval(batch_size, spare2, spare1, nullptr,
+                            workspace);  // policy conv (NHWC -> NHWC)
+    network_[layer++]->Eval(batch_size, policies, spare2, nullptr,
+                            workspace);  // policy dense
   } else {
     network_[layer++]->Eval(batch_size, spare1, body, nullptr,
                             workspace);  // policy conv
@@ -320,13 +347,14 @@ void BlasNetwork<use_eigen>::Forward(size_t batch_size, float* policies,
   }
 
   // Value head.
-  network_[layer++]->Eval(batch_size, values, body, nullptr, workspace);
+  network_[layer++]->Eval(batch_size, values, head_body, nullptr, workspace);
 
   // Moves left head.
   if (moves_left_) {
-    network_[layer++]->Eval(batch_size, spare1, body, nullptr,
+    float* mlh_tmp1 = nhwc_all_heads_ ? body : spare1;
+    network_[layer++]->Eval(batch_size, mlh_tmp1, head_body, nullptr,
                             workspace);  // moves left conv or embedding
-    network_[layer++]->Eval(batch_size, spare2, spare1, nullptr,
+    network_[layer++]->Eval(batch_size, spare2, mlh_tmp1, nullptr,
                             workspace);  // moves left dense 1
     network_[layer++]->Eval(batch_size, moves_left_values, spare2, nullptr,
                             workspace);  // moves left dense 2
@@ -511,6 +539,17 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
         std::max(max_convolution_output_channels_, policy_channels);
   }
 
+  const bool use_avx512_fp32 =
+#ifdef LC0_HAS_AVX512_VNNI
+      !use_eigen && CpuSupportsAvx512Vnni();
+#else
+      false;
+#endif
+  const bool policy_supports_nhwc =
+      attn_policy_ || (conv_policy_ ? use_int8_conv_policy_ : use_avx512_fp32);
+  nhwc_all_heads_ = use_avx512_fp32 && use_nhwc_residual_tower_ &&
+                    !attn_body_ && policy_supports_nhwc;
+
   // 2. Build the network.
   if (num_residual_blocks_ > 0) {
     if (use_int8_input_conv_) {
@@ -577,16 +616,22 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
   } else {
     assert(!attn_body_);  // not supported with attention body
     const auto* policy_conv = AddLayer(std::make_unique<ConvLayer<use_eigen>>(
-        policy_weights.policy, channels, 1, default_activation));
+        policy_weights.policy, channels, 1, default_activation, nullptr, 1.0f,
+        false, false, /*input_is_nhwc=*/nhwc_all_heads_,
+        /*use_avx512_fp32=*/use_avx512_fp32));
     AddLayer(std::make_unique<DenseLayer<use_eigen>>(
         policy_weights.ip_pol_w, policy_weights.ip_pol_b,
-        policy_conv->GetOutputSize(), ACTIVATION_NONE));
+        policy_conv->GetOutputSize(), ACTIVATION_NONE,
+        /*use_avx512_fp32=*/use_avx512_fp32,
+        /*nhwc_reorder_channels=*/
+        nhwc_all_heads_ ? policy_weights.policy.biases.size() : 0));
   }
 
   // Value head.
   AddLayer(std::make_unique<ValueHead<use_eigen>>(
       weights_.value_heads.at(value_head), body_channels, attn_body_, wdl_,
-      default_activation));
+      default_activation, /*input_is_nhwc=*/nhwc_all_heads_,
+      /*use_avx512_fp32=*/use_avx512_fp32));
 
   // Moves left head.
   if (moves_left_) {
@@ -594,19 +639,25 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
     if (attn_body_) {
       moves_left_input = AddLayer(std::make_unique<EmbeddingLayer<use_eigen>>(
           weights_.ip_mov_w, weights_.ip_mov_b, body_channels,
-          default_activation));
+          default_activation, use_avx512_fp32));
     } else {
       moves_left_input = AddLayer(std::make_unique<ConvLayer<use_eigen>>(
-          weights_.moves_left, channels, 1, default_activation));
+          weights_.moves_left, channels, 1, default_activation, nullptr, 1.0f,
+          false, false, /*input_is_nhwc=*/nhwc_all_heads_,
+          /*use_avx512_fp32=*/use_avx512_fp32));
     }
     const auto* moves_left_hidden =
         AddLayer(std::make_unique<DenseLayer<use_eigen>>(
             weights_.ip1_mov_w, weights_.ip1_mov_b,
-            moves_left_input->GetOutputSize(), default_activation));
+            moves_left_input->GetOutputSize(), default_activation,
+            /*use_avx512_fp32=*/use_avx512_fp32,
+            /*nhwc_reorder_channels=*/
+            (!attn_body_ && nhwc_all_heads_) ? weights_.moves_left.biases.size()
+                                             : 0));
     AddLayer(std::make_unique<DenseLayer<use_eigen>>(
         weights_.ip2_mov_w, weights_.ip2_mov_b,
-        moves_left_hidden->GetOutputSize(),
-        ACTIVATION_RELU));  // Specifically Relu
+        moves_left_hidden->GetOutputSize(), ACTIVATION_RELU,
+        /*use_avx512_fp32=*/use_avx512_fp32, /*nhwc_reorder_channels=*/0));
   }
 
   // 3. Size the three tensors: the planes and every layer's output must fit.
@@ -631,7 +682,7 @@ BlasNetwork<use_eigen>::BlasNetwork(const WeightsFile& file,
 #endif
 
 #ifdef USE_MKL
-    mkl_set_num_threads(threads_);
+    mkl_set_num_threads(int8_pool_ ? 1 : threads_);
     CERR << "BLAS vendor: MKL.";
     constexpr int len = 256;
     char versionbuf[len];

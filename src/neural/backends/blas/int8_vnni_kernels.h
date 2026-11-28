@@ -40,21 +40,24 @@ namespace blas_backend {
 struct ResidualSeParams {
   bool has_se = false;
   size_t se_fc_outputs = 0;
-  const float* w1 = nullptr;  // [se_fc_outputs][channels] row-major
+  const float* w1 = nullptr;    // [se_fc_outputs][channels] row-major
   const float* b1 = nullptr;
-  const float* w2 = nullptr;  // [2 * channels][se_fc_outputs] row-major
+  const float* w2 = nullptr;    // [2 * channels][se_fc_outputs] row-major
   const float* b2 = nullptr;
+  const float* w1_t = nullptr;  // optional [channels][se_fc_outputs]
+  const float* w2_t = nullptr;  // optional [se_fc_outputs][2 * channels]
 };
 
 // Pre-sized raw scratch pointers passed into the ISA residual-block kernels so
 // those translation units never allocate or instantiate AlignedBuffer methods.
 struct Conv3x3ScratchView {
-  uint8_t* pad1 = nullptr;        // 10 * 10 * padded_channels
-  uint8_t* pad2 = nullptr;        // 10 * 10 * padded_channels
-  float* conv2_output = nullptr;  // 64 * channels
-  float* avg_pool = nullptr;      // channels
-  float* se_fc1 = nullptr;        // se_fc_outputs
-  float* se_fc2 = nullptr;        // 2 * channels
+  uint8_t* pad1 = nullptr;          // 10 * 10 * padded_channels
+  uint8_t* pad2 = nullptr;          // 10 * 10 * padded_channels
+  float* conv2_output = nullptr;    // 64 * channels
+  float* avg_pool = nullptr;        // channels
+  float* se_fc1 = nullptr;          // se_fc_outputs
+  float* se_fc2 = nullptr;          // 2 * channels
+  float* nhwc_board = nullptr;      // optional 64 * input_channels staging
 };
 
 #ifdef LC0_HAS_AVX512_VNNI
@@ -78,11 +81,21 @@ void GemmEpilogueQuantizeAvx512(
     float out_zero_point, uint8_t* quantized_output);
 
 // Single-pass AVX-512 LayerNorm with optional skip connection and optional
-// fused uint8 quantization into `quantized_out` (pass nullptr to skip).
+// fused uint8 quantization into `quantized_out` (pass nullptr to skip), plus
+// optional dynamic per-row uint8 quantization into `dyn_quantized_out`.
 void LayerNorm2DWithSkipAndQuantizeAvx512(
     size_t rows, size_t channels, float* data, float alpha, const float* skip,
     const float* gammas, const float* betas, float epsilon,
-    uint8_t* quantized_out, float inverse_scale, float zero_point);
+    uint8_t* quantized_out, float inverse_scale, float zero_point,
+    uint8_t* dyn_quantized_out = nullptr, float* dyn_scales = nullptr,
+    float* dyn_mins = nullptr);
+
+// Single-pass AVX-512 LayerNorm (alpha=1, no skip, read-only input) fused
+// directly with per-group dynamic uint8 quantization (used by Smolgen LN1/LN2).
+void LayerNormAndDynamicQuantizeAvx512(
+    size_t rows, size_t channels, size_t quant_group_size, const float* input,
+    const float* gammas, const float* betas, float epsilon, uint8_t* q_out,
+    float* group_scales, float* group_mins);
 
 // In-place AVX-512 Softmax over `rows` rows of exactly 64 floats each.
 void Softmax64Avx512(size_t rows, float* data);
@@ -133,12 +146,40 @@ void Conv3x3NhwcBoardAvx512(
     const int32_t* zero_point_corrections, float inverse_scale,
     uint8_t zero_point, float* output_nhwc, const Conv3x3ScratchView& scratch,
     const float* biases = nullptr,
-    ActivationFunction activation = ACTIVATION_NONE);
+    ActivationFunction activation = ACTIVATION_NONE, size_t conv_nr = 32,
+    bool input_is_nchw = false, float plane109_scale = 1.0f);
+
+void GemmFp32Avx512(size_t row_begin, size_t row_end, size_t col_begin,
+                    size_t col_end, size_t outputs, size_t inputs,
+                    const float* input, const float* weights_transposed,
+                    const float* biases, ActivationFunction activation,
+                    float* output);
 
 void NchwToNhwcAvx512(size_t batch_size, size_t channels, const float* input,
                       float* output);
 void NhwcToNchwAvx512(size_t batch_size, size_t channels, const float* input,
                       float* output);
+
+void PrepAttentionInputPeMapAvx512(size_t batch_size, size_t input_channels,
+                                   size_t pe_channels, const float* input_nchw,
+                                   const float* pos_encoding,
+                                   float* output_nhwc);
+
+void ApplyInputGatingAvx512(size_t batch_size, size_t embedding_size,
+                            float* flow_nhwc, const float* mult_nhwc,
+                            const float* add_nhwc);
+
+void AttentionPolicyPromoAvx512(size_t policy_d_model, const float* k_board,
+                                const float* ip4_pol_w, float* logits_board);
+
+// Computes one attention head (head_idx, depth == 32) on a single 64-square
+// board: attn_h = Softmax(Q_h * K_h^T * scaling [+ smolgen_bias]) * V_h.
+// `attn_board` may alias `q_board` because heads write disjoint 128-byte
+// slices after reading their Q row tile.
+void MhaAttentionHead32Avx512(size_t d_model, float scaling,
+                              const float* q_board, const float* k_board,
+                              const float* v_board, const float* smolgen_bias,
+                              size_t head_idx, float* attn_board);
 #endif
 
 #ifdef LC0_HAS_AVX_VNNI

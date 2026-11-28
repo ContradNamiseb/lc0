@@ -52,8 +52,8 @@ inline int32_t LoadTailU32(const uint8_t* ptr, size_t remaining) {
 
 // Fast, overflow-safe AVX-512 exp(x) accurate to ~1-2 ULP across [-87, 88].
 inline __m512 ExpPsAvx512(__m512 x) {
-  const __m512 min_x = _mm512_set1_ps(-87.33654475f);
-  const __m512 max_x = _mm512_set1_ps(88.37626266f);
+  const __m512 min_x = _mm512_set1_ps(-87.3f);
+  const __m512 max_x = _mm512_set1_ps(88.0f);
   x = _mm512_max_ps(_mm512_min_ps(x, max_x), min_x);
 
   const __m512 log2_e = _mm512_set1_ps(1.44269504088896341f);
@@ -74,7 +74,9 @@ inline __m512 ExpPsAvx512(__m512 x) {
   poly = _mm512_fmadd_ps(poly, r, _mm512_set1_ps(1.0f));
   poly = _mm512_fmadd_ps(poly, r, _mm512_set1_ps(1.0f));
 
-  return _mm512_scalef_ps(poly, k);
+  const __m512i exp_bits = _mm512_slli_epi32(
+      _mm512_add_epi32(_mm512_cvtps_epi32(k), _mm512_set1_epi32(127)), 23);
+  return _mm512_mul_ps(poly, _mm512_castsi512_ps(exp_bits));
 }
 
 inline __m512 RcpNrPsAvx512(__m512 d) {
@@ -101,6 +103,107 @@ inline __m512 MishPsAvx512(__m512 x) {
   return _mm512_mask_blend_ps(large_mask, result, x);
 }
 
+// Evaluates 3 independent Mish vectors interleaved to hide Exp+Rcp latency.
+inline void Mish3xPsAvx512(__m512& v0, __m512& v1, __m512& v2) {
+  const __m512 min_x = _mm512_set1_ps(-87.3f);
+  const __m512 cap = _mm512_set1_ps(20.0f);
+  const __m512 log2_e = _mm512_set1_ps(1.44269504088896341f);
+  const __m512 ln2_hi = _mm512_set1_ps(0.693359375f);
+  const __m512 ln2_lo = _mm512_set1_ps(-2.12194440e-4f);
+  const __m512 two = _mm512_set1_ps(2.0f);
+  const __m512 threshold = _mm512_set1_ps(-0.125f);
+  const __m512i bias127 = _mm512_set1_epi32(127);
+
+  const __mmask16 lg0 = _mm512_cmp_ps_mask(v0, cap, _CMP_GT_OQ);
+  const __mmask16 lg1 = _mm512_cmp_ps_mask(v1, cap, _CMP_GT_OQ);
+  const __mmask16 lg2 = _mm512_cmp_ps_mask(v2, cap, _CMP_GT_OQ);
+
+  const __m512 c0 = _mm512_max_ps(_mm512_min_ps(v0, cap), min_x);
+  const __m512 c1 = _mm512_max_ps(_mm512_min_ps(v1, cap), min_x);
+  const __m512 c2 = _mm512_max_ps(_mm512_min_ps(v2, cap), min_x);
+
+  const __m512 k0 =
+      _mm512_roundscale_ps(_mm512_mul_ps(c0, log2_e), _MM_FROUND_TO_NEAREST_INT);
+  const __m512 k1 =
+      _mm512_roundscale_ps(_mm512_mul_ps(c1, log2_e), _MM_FROUND_TO_NEAREST_INT);
+  const __m512 k2 =
+      _mm512_roundscale_ps(_mm512_mul_ps(c2, log2_e), _MM_FROUND_TO_NEAREST_INT);
+
+  __m512 r0 = _mm512_fnmadd_ps(k0, ln2_hi, c0);
+  __m512 r1 = _mm512_fnmadd_ps(k1, ln2_hi, c1);
+  __m512 r2 = _mm512_fnmadd_ps(k2, ln2_hi, c2);
+  r0 = _mm512_fnmadd_ps(k0, ln2_lo, r0);
+  r1 = _mm512_fnmadd_ps(k1, ln2_lo, r1);
+  r2 = _mm512_fnmadd_ps(k2, ln2_lo, r2);
+
+  __m512 p0 = _mm512_set1_ps(1.38888889e-3f);
+  __m512 p1 = p0, p2 = p0;
+  const __m512 a5 = _mm512_set1_ps(8.33333333e-3f);
+  p0 = _mm512_fmadd_ps(p0, r0, a5);
+  p1 = _mm512_fmadd_ps(p1, r1, a5);
+  p2 = _mm512_fmadd_ps(p2, r2, a5);
+  const __m512 a4 = _mm512_set1_ps(4.16666667e-2f);
+  p0 = _mm512_fmadd_ps(p0, r0, a4);
+  p1 = _mm512_fmadd_ps(p1, r1, a4);
+  p2 = _mm512_fmadd_ps(p2, r2, a4);
+  const __m512 a3 = _mm512_set1_ps(1.66666667e-1f);
+  p0 = _mm512_fmadd_ps(p0, r0, a3);
+  p1 = _mm512_fmadd_ps(p1, r1, a3);
+  p2 = _mm512_fmadd_ps(p2, r2, a3);
+  const __m512 a2 = _mm512_set1_ps(0.5f);
+  p0 = _mm512_fmadd_ps(p0, r0, a2);
+  p1 = _mm512_fmadd_ps(p1, r1, a2);
+  p2 = _mm512_fmadd_ps(p2, r2, a2);
+  const __m512 a1 = _mm512_set1_ps(1.0f);
+  p0 = _mm512_fmadd_ps(p0, r0, a1);
+  p1 = _mm512_fmadd_ps(p1, r1, a1);
+  p2 = _mm512_fmadd_ps(p2, r2, a1);
+  p0 = _mm512_fmadd_ps(p0, r0, a1);
+  p1 = _mm512_fmadd_ps(p1, r1, a1);
+  p2 = _mm512_fmadd_ps(p2, r2, a1);
+
+  const __m512i eb0 =
+      _mm512_slli_epi32(_mm512_add_epi32(_mm512_cvtps_epi32(k0), bias127), 23);
+  const __m512i eb1 =
+      _mm512_slli_epi32(_mm512_add_epi32(_mm512_cvtps_epi32(k1), bias127), 23);
+  const __m512i eb2 =
+      _mm512_slli_epi32(_mm512_add_epi32(_mm512_cvtps_epi32(k2), bias127), 23);
+  const __m512 e0 = _mm512_mul_ps(p0, _mm512_castsi512_ps(eb0));
+  const __m512 e1 = _mm512_mul_ps(p1, _mm512_castsi512_ps(eb1));
+  const __m512 e2 = _mm512_mul_ps(p2, _mm512_castsi512_ps(eb2));
+
+  const __m512 num0 = _mm512_fmadd_ps(e0, e0, _mm512_add_ps(e0, e0));
+  const __m512 num1 = _mm512_fmadd_ps(e1, e1, _mm512_add_ps(e1, e1));
+  const __m512 num2 = _mm512_fmadd_ps(e2, e2, _mm512_add_ps(e2, e2));
+
+  const __m512 den0 = _mm512_add_ps(num0, two);
+  const __m512 den1 = _mm512_add_ps(num1, two);
+  const __m512 den2 = _mm512_add_ps(num2, two);
+  const __m512 rc0 = _mm512_rcp14_ps(den0);
+  const __m512 rc1 = _mm512_rcp14_ps(den1);
+  const __m512 rc2 = _mm512_rcp14_ps(den2);
+  const __m512 d0 =
+      _mm512_mul_ps(c0, _mm512_mul_ps(rc0, _mm512_fnmadd_ps(den0, rc0, two)));
+  const __m512 d1 =
+      _mm512_mul_ps(c1, _mm512_mul_ps(rc1, _mm512_fnmadd_ps(den1, rc1, two)));
+  const __m512 d2 =
+      _mm512_mul_ps(c2, _mm512_mul_ps(rc2, _mm512_fnmadd_ps(den2, rc2, two)));
+
+  const __mmask16 nm0 = _mm512_cmp_ps_mask(c0, threshold, _CMP_LE_OQ);
+  const __mmask16 nm1 = _mm512_cmp_ps_mask(c1, threshold, _CMP_LE_OQ);
+  const __mmask16 nm2 = _mm512_cmp_ps_mask(c2, threshold, _CMP_LE_OQ);
+  const __m512 res0 = _mm512_mask_blend_ps(nm0, _mm512_fnmadd_ps(two, d0, c0),
+                                           _mm512_mul_ps(num0, d0));
+  const __m512 res1 = _mm512_mask_blend_ps(nm1, _mm512_fnmadd_ps(two, d1, c1),
+                                           _mm512_mul_ps(num1, d1));
+  const __m512 res2 = _mm512_mask_blend_ps(nm2, _mm512_fnmadd_ps(two, d2, c2),
+                                           _mm512_mul_ps(num2, d2));
+
+  v0 = _mm512_mask_blend_ps(lg0, res0, v0);
+  v1 = _mm512_mask_blend_ps(lg1, res1, v1);
+  v2 = _mm512_mask_blend_ps(lg2, res2, v2);
+}
+
 inline __m512 SwishPsAvx512(__m512 x) {
   const __m512 one = _mm512_set1_ps(1.0f);
   const __m512 neg_x = _mm512_sub_ps(_mm512_setzero_ps(), x);
@@ -112,6 +215,18 @@ inline __m512 SigmoidPsAvx512(__m512 x) {
   const __m512 one = _mm512_set1_ps(1.0f);
   const __m512 neg_x = _mm512_sub_ps(_mm512_setzero_ps(), x);
   return RcpNrPsAvx512(_mm512_add_ps(one, ExpPsAvx512(neg_x)));
+}
+
+inline __m512 SeluPsAvx512(__m512 x) {
+  const __m512 scale = _mm512_set1_ps(1.05070098f);
+  const __m512 alpha_scale = _mm512_set1_ps(1.67326324f * 1.05070098f);
+  const __m512 one = _mm512_set1_ps(1.0f);
+  const __mmask16 pos_mask =
+      _mm512_cmp_ps_mask(x, _mm512_setzero_ps(), _CMP_GT_OQ);
+  const __m512 pos = _mm512_mul_ps(scale, x);
+  const __m512 neg =
+      _mm512_mul_ps(alpha_scale, _mm512_sub_ps(ExpPsAvx512(x), one));
+  return _mm512_mask_blend_ps(pos_mask, neg, pos);
 }
 
 inline __m512 ApplyActivationVec(__m512 values, ActivationFunction activation) {
@@ -126,6 +241,8 @@ inline __m512 ApplyActivationVec(__m512 values, ActivationFunction activation) {
     }
     case ACTIVATION_MISH:
       return MishPsAvx512(values);
+    case ACTIVATION_SELU:
+      return SeluPsAvx512(values);
     case ACTIVATION_SWISH:
       return SwishPsAvx512(values);
     default: {
@@ -536,6 +653,9 @@ void Microkernel8x32Conv3x3(const uint8_t* pad_rank_y, size_t padded_channels,
 // Runs all 9 taps of a 3x3 convolution for one 8-square rank x 48 output
 // channels (24 ZMM accumulators + 3 weight ZMMs + 1 broadcast ZMM = 28/32
 // registers, zero per-tap spills or calls).
+// Runs all 9 taps of a 3x3 convolution for one 8-square rank x 48 output
+// channels (24 ZMM accumulators + 3 weight ZMMs + 1 broadcast ZMM = 28/32
+// registers, zero per-tap spills or calls).
 void Microkernel8x48Conv3x3(const uint8_t* pad_rank_y, size_t padded_channels,
                             const int8_t* weights_block, size_t channel_groups,
                             __m512i acc[8][3]) {
@@ -614,30 +734,14 @@ void Microkernel8x48Conv3x3(const uint8_t* pad_rank_y, size_t padded_channels,
     }
   }
 
-  acc[0][0] = c00;
-  acc[0][1] = c01;
-  acc[0][2] = c02;
-  acc[1][0] = c10;
-  acc[1][1] = c11;
-  acc[1][2] = c12;
-  acc[2][0] = c20;
-  acc[2][1] = c21;
-  acc[2][2] = c22;
-  acc[3][0] = c30;
-  acc[3][1] = c31;
-  acc[3][2] = c32;
-  acc[4][0] = c40;
-  acc[4][1] = c41;
-  acc[4][2] = c42;
-  acc[5][0] = c50;
-  acc[5][1] = c51;
-  acc[5][2] = c52;
-  acc[6][0] = c60;
-  acc[6][1] = c61;
-  acc[6][2] = c62;
-  acc[7][0] = c70;
-  acc[7][1] = c71;
-  acc[7][2] = c72;
+  acc[0][0] = c00; acc[0][1] = c01; acc[0][2] = c02;
+  acc[1][0] = c10; acc[1][1] = c11; acc[1][2] = c12;
+  acc[2][0] = c20; acc[2][1] = c21; acc[2][2] = c22;
+  acc[3][0] = c30; acc[3][1] = c31; acc[3][2] = c32;
+  acc[4][0] = c40; acc[4][1] = c41; acc[4][2] = c42;
+  acc[5][0] = c50; acc[5][1] = c51; acc[5][2] = c52;
+  acc[6][0] = c60; acc[6][1] = c61; acc[6][2] = c62;
+  acc[7][0] = c70; acc[7][1] = c71; acc[7][2] = c72;
 }
 
 inline void FillPadBorder(uint8_t* pad, size_t padded_channels,
@@ -713,6 +817,8 @@ inline __m512 ApplyActivationStatic(__m512 values,
     return _mm512_mul_ps(relu, relu);
   } else if constexpr (Act == ACTIVATION_MISH) {
     return MishPsAvx512(values);
+  } else if constexpr (Act == ACTIVATION_SELU) {
+    return SeluPsAvx512(values);
   } else if constexpr (Act == ACTIVATION_SWISH) {
     return SwishPsAvx512(values);
   } else {
@@ -874,6 +980,97 @@ void GemmEpilogueAvx512Impl(
           }
         }
       }
+    }
+  }
+}
+
+// Computes SE FC1 (channels -> se_fc_outputs) + activation + FC2
+// (se_fc_outputs -> 2*channels) + Sigmoid on first half (gamma).
+template <ActivationFunction Act>
+inline void ComputeSeFcAvx512(size_t channels, const ResidualSeParams& se,
+                              ActivationFunction runtime_activation,
+                              const Conv3x3ScratchView& scratch) {
+  float* fc1 = scratch.se_fc1;
+  float* fc2 = scratch.se_fc2;
+  const float* avg_pool = scratch.avg_pool;
+
+  if (se.w1_t != nullptr && se.w2_t != nullptr && se.se_fc_outputs == 32 &&
+      (channels & 15) == 0) {
+    __m512 a0 = _mm512_loadu_ps(se.b1);
+    __m512 a1 = _mm512_loadu_ps(se.b1 + 16);
+    const float* w1_row = se.w1_t;
+    for (size_t k = 0; k < channels; k += 2) {
+      const __m512 x0 = _mm512_set1_ps(avg_pool[k]);
+      a0 = _mm512_fmadd_ps(x0, _mm512_loadu_ps(w1_row + 0), a0);
+      a1 = _mm512_fmadd_ps(x0, _mm512_loadu_ps(w1_row + 16), a1);
+      const __m512 x1 = _mm512_set1_ps(avg_pool[k + 1]);
+      a0 = _mm512_fmadd_ps(x1, _mm512_loadu_ps(w1_row + 32), a0);
+      a1 = _mm512_fmadd_ps(x1, _mm512_loadu_ps(w1_row + 48), a1);
+      w1_row += 64;
+    }
+    _mm512_storeu_ps(fc1, ApplyActivationStatic<Act>(a0, runtime_activation));
+    _mm512_storeu_ps(fc1 + 16,
+                     ApplyActivationStatic<Act>(a1, runtime_activation));
+
+    const size_t two_c = 2 * channels;
+    auto run_fc2_strip = [&](size_t col_start, size_t col_end,
+                             bool apply_sigmoid) {
+      size_t c = col_start;
+      for (; c + 48 <= col_end; c += 48) {
+        __m512 o0 = _mm512_loadu_ps(se.b2 + c + 0);
+        __m512 o1 = _mm512_loadu_ps(se.b2 + c + 16);
+        __m512 o2 = _mm512_loadu_ps(se.b2 + c + 32);
+        const float* w2 = se.w2_t + c;
+        for (size_t k = 0; k < 32; ++k) {
+          const __m512 xv = _mm512_set1_ps(fc1[k]);
+          o0 = _mm512_fmadd_ps(xv, _mm512_loadu_ps(w2 + 0), o0);
+          o1 = _mm512_fmadd_ps(xv, _mm512_loadu_ps(w2 + 16), o1);
+          o2 = _mm512_fmadd_ps(xv, _mm512_loadu_ps(w2 + 32), o2);
+          w2 += two_c;
+        }
+        if (apply_sigmoid) {
+          o0 = SigmoidPsAvx512(o0);
+          o1 = SigmoidPsAvx512(o1);
+          o2 = SigmoidPsAvx512(o2);
+        }
+        _mm512_storeu_ps(fc2 + c + 0, o0);
+        _mm512_storeu_ps(fc2 + c + 16, o1);
+        _mm512_storeu_ps(fc2 + c + 32, o2);
+      }
+      for (; c < col_end; c += 16) {
+        __m512 o0 = _mm512_loadu_ps(se.b2 + c);
+        const float* w2 = se.w2_t + c;
+        for (size_t k = 0; k < 32; ++k) {
+          o0 = _mm512_fmadd_ps(_mm512_set1_ps(fc1[k]), _mm512_loadu_ps(w2), o0);
+          w2 += two_c;
+        }
+        if (apply_sigmoid) o0 = SigmoidPsAvx512(o0);
+        _mm512_storeu_ps(fc2 + c, o0);
+      }
+    };
+    run_fc2_strip(0, channels, true);
+    run_fc2_strip(channels, two_c, false);
+    return;
+  }
+
+  for (size_t o = 0; o < se.se_fc_outputs; ++o) {
+    const float value =
+        DotProductAvx512(se.w1 + o * channels, avg_pool, channels) + se.b1[o];
+    fc1[o] = Activate(value, runtime_activation);
+  }
+  for (size_t o = 0; o < 2 * channels; ++o) {
+    fc2[o] = DotProductAvx512(se.w2 + o * se.se_fc_outputs, fc1,
+                              se.se_fc_outputs) +
+             se.b2[o];
+  }
+  for (size_t c = 0; c < channels; c += 16) {
+    const size_t remaining = channels - c;
+    if (remaining >= 16) {
+      _mm512_storeu_ps(fc2 + c, SigmoidPsAvx512(_mm512_loadu_ps(fc2 + c)));
+    } else {
+      const __mmask16 mask = static_cast<__mmask16>((1u << remaining) - 1u);
+      _mm512_mask_storeu_ps(
+          fc2 + c, mask, SigmoidPsAvx512(_mm512_maskz_loadu_ps(mask, fc2 + c)));
     }
   }
 }
@@ -1318,6 +1515,12 @@ void GemmEpilogueAvx512(size_t row_begin, size_t row_end, size_t outputs,
           output_scales, zero_point_corrections, biases, activation, output,
           0.0f, 0.0f, nullptr);
       break;
+    case ACTIVATION_SELU:
+      GemmEpilogueAvx512Impl<ACTIVATION_SELU, false>(
+          row_begin, row_end, outputs, inputs, quantized_input, packed_weights,
+          output_scales, zero_point_corrections, biases, activation, output,
+          0.0f, 0.0f, nullptr);
+      break;
     case ACTIVATION_SWISH:
       GemmEpilogueAvx512Impl<ACTIVATION_SWISH, false>(
           row_begin, row_end, outputs, inputs, quantized_input, packed_weights,
@@ -1364,6 +1567,12 @@ void GemmEpilogueQuantizeAvx512(
           output_scales, zero_point_corrections, biases, activation, nullptr,
           out_inverse_scale, out_zero_point, quantized_output);
       break;
+    case ACTIVATION_SELU:
+      GemmEpilogueAvx512Impl<ACTIVATION_SELU, true>(
+          row_begin, row_end, outputs, inputs, quantized_input, packed_weights,
+          output_scales, zero_point_corrections, biases, activation, nullptr,
+          out_inverse_scale, out_zero_point, quantized_output);
+      break;
     case ACTIVATION_SWISH:
       GemmEpilogueAvx512Impl<ACTIVATION_SWISH, true>(
           row_begin, row_end, outputs, inputs, quantized_input, packed_weights,
@@ -1382,7 +1591,8 @@ void GemmEpilogueQuantizeAvx512(
 void LayerNorm2DWithSkipAndQuantizeAvx512(
     size_t rows, size_t channels, float* data, float alpha, const float* skip,
     const float* gammas, const float* betas, float epsilon,
-    uint8_t* quantized_out, float inverse_scale, float zero_point) {
+    uint8_t* quantized_out, float inverse_scale, float zero_point,
+    uint8_t* dyn_quantized_out, float* dyn_scales, float* dyn_mins) {
   const __m512 alpha_vec = _mm512_set1_ps(alpha);
   const __m512 inv_scale_vec = _mm512_set1_ps(inverse_scale);
   const __m512 zp_vec = _mm512_set1_ps(zero_point);
@@ -1463,7 +1673,36 @@ void LayerNorm2DWithSkipAndQuantizeAvx512(
           _mm_div_ss(_mm_set_ss(1.0f), _mm_sqrt_ss(_mm_set_ss(var + epsilon))));
       const __m512 inv_std_vec = _mm512_set1_ps(inv_std);
 
-      if (quantized_out != nullptr) {
+      if (dyn_quantized_out != nullptr) {
+        uint8_t* qrow = quantized_out ? (quantized_out + r * 256) : nullptr;
+        uint8_t* dqrow = dyn_quantized_out + r * 256;
+        __m512 mn_v = _mm512_set1_ps(1e30f);
+        __m512 mx_v = _mm512_set1_ps(-1e30f);
+        for (size_t k = 0; k < 16; ++k) {
+          const size_t c = k * 16;
+          __m512 norm = _mm512_mul_ps(v[k], inv_std_vec);
+          __m512 out = _mm512_fmadd_ps(norm, _mm512_loadu_ps(gammas + c),
+                                       _mm512_loadu_ps(betas + c));
+          v[k] = out;
+          _mm512_storeu_ps(row + c, out);
+          if (qrow) QuantizeStore16(qrow + c, out, inv_scale_vec, zp_vec);
+          mn_v = _mm512_min_ps(mn_v, out);
+          mx_v = _mm512_max_ps(mx_v, out);
+        }
+        const float mn = _mm512_reduce_min_ps(mn_v);
+        const float mx = _mm512_reduce_max_ps(mx_v);
+        const float range = mx - mn;
+        const float d_scale =
+            (range > 1e-12f) ? (range * (1.0f / 255.0f)) : 0.0f;
+        const float d_inv = (range > 1e-12f) ? (255.0f / range) : 0.0f;
+        dyn_scales[r] = d_scale;
+        dyn_mins[r] = mn;
+        const __m512 d_inv_v = _mm512_set1_ps(d_inv);
+        const __m512 d_off_v = _mm512_set1_ps(-mn * d_inv);
+        for (size_t k = 0; k < 16; ++k) {
+          QuantizeStore16(dqrow + k * 16, v[k], d_inv_v, d_off_v);
+        }
+      } else if (quantized_out != nullptr) {
         uint8_t* qrow = quantized_out + r * 256;
         for (size_t k = 0; k < 16; ++k) {
           const size_t c = k * 16;
@@ -1596,6 +1835,215 @@ void LayerNorm2DWithSkipAndQuantizeAvx512(
   }
 }
 
+void LayerNormAndDynamicQuantizeAvx512(
+    size_t rows, size_t channels, size_t quant_group_size, const float* input,
+    const float* gammas, const float* betas, float epsilon, uint8_t* q_out,
+    float* group_scales, float* group_mins) {
+  const float inv_c = 1.0f / static_cast<float>(channels);
+
+  if (channels == 256 && quant_group_size == 256) {
+    // 256 floats fit in 16 ZMM registers -> 1 pass, zero FP32 writeback.
+    for (size_t r = 0; r < rows; ++r) {
+      const float* row = input + r * 256;
+      __m512 v[16];
+      __m512 s0 = _mm512_setzero_ps(), s1 = _mm512_setzero_ps();
+      __m512 s2 = _mm512_setzero_ps(), s3 = _mm512_setzero_ps();
+      for (size_t k = 0; k < 16; k += 4) {
+        v[k + 0] = _mm512_loadu_ps(row + (k + 0) * 16);
+        v[k + 1] = _mm512_loadu_ps(row + (k + 1) * 16);
+        v[k + 2] = _mm512_loadu_ps(row + (k + 2) * 16);
+        v[k + 3] = _mm512_loadu_ps(row + (k + 3) * 16);
+        s0 = _mm512_add_ps(s0, v[k + 0]);
+        s1 = _mm512_add_ps(s1, v[k + 1]);
+        s2 = _mm512_add_ps(s2, v[k + 2]);
+        s3 = _mm512_add_ps(s3, v[k + 3]);
+      }
+      const float mean = _mm512_reduce_add_ps(_mm512_add_ps(
+                             _mm512_add_ps(s0, s1), _mm512_add_ps(s2, s3))) *
+                         inv_c;
+      const __m512 mean_vec = _mm512_set1_ps(mean);
+      __m512 var0 = _mm512_setzero_ps(), var1 = _mm512_setzero_ps();
+      __m512 var2 = _mm512_setzero_ps(), var3 = _mm512_setzero_ps();
+      for (size_t k = 0; k < 16; k += 4) {
+        v[k + 0] = _mm512_sub_ps(v[k + 0], mean_vec);
+        v[k + 1] = _mm512_sub_ps(v[k + 1], mean_vec);
+        v[k + 2] = _mm512_sub_ps(v[k + 2], mean_vec);
+        v[k + 3] = _mm512_sub_ps(v[k + 3], mean_vec);
+        var0 = _mm512_fmadd_ps(v[k + 0], v[k + 0], var0);
+        var1 = _mm512_fmadd_ps(v[k + 1], v[k + 1], var1);
+        var2 = _mm512_fmadd_ps(v[k + 2], v[k + 2], var2);
+        var3 = _mm512_fmadd_ps(v[k + 3], v[k + 3], var3);
+      }
+      const float var =
+          _mm512_reduce_add_ps(_mm512_add_ps(_mm512_add_ps(var0, var1),
+                                             _mm512_add_ps(var2, var3))) *
+          inv_c;
+      const float inv_std = _mm_cvtss_f32(
+          _mm_div_ss(_mm_set_ss(1.0f), _mm_sqrt_ss(_mm_set_ss(var + epsilon))));
+      const __m512 inv_std_vec = _mm512_set1_ps(inv_std);
+
+      __m512 mn_v = _mm512_set1_ps(1e30f);
+      __m512 mx_v = _mm512_set1_ps(-1e30f);
+      for (size_t k = 0; k < 16; ++k) {
+        const size_t c = k * 16;
+        v[k] = _mm512_fmadd_ps(_mm512_mul_ps(v[k], inv_std_vec),
+                               _mm512_loadu_ps(gammas + c),
+                               _mm512_loadu_ps(betas + c));
+        mn_v = _mm512_min_ps(mn_v, v[k]);
+        mx_v = _mm512_max_ps(mx_v, v[k]);
+      }
+      const float mn = _mm512_reduce_min_ps(mn_v);
+      const float mx = _mm512_reduce_max_ps(mx_v);
+      const float range = mx - mn;
+      const float scale = (range > 1e-12f) ? (range * (1.0f / 255.0f)) : 0.0f;
+      const float inv_scale = (range > 1e-12f) ? (255.0f / range) : 0.0f;
+      group_scales[r] = scale;
+      group_mins[r] = mn;
+      const __m512 inv_vec = _mm512_set1_ps(inv_scale);
+      const __m512 offset_vec = _mm512_set1_ps(-mn * inv_scale);
+      uint8_t* qrow = q_out + r * 256;
+      for (size_t k = 0; k < 16; ++k) {
+        QuantizeStore16(qrow + k * 16, v[k], inv_vec, offset_vec);
+      }
+    }
+    return;
+  }
+
+  const size_t num_groups = channels / quant_group_size;
+  const size_t full_c = channels & ~static_cast<size_t>(15);
+  const size_t rem_c = channels - full_c;
+  const __mmask16 rem_mask =
+      rem_c ? static_cast<__mmask16>((1u << rem_c) - 1u) : 0u;
+  const size_t rem_g = quant_group_size & 15;
+  const __mmask16 rem_g_mask =
+      rem_g ? static_cast<__mmask16>((1u << rem_g) - 1u) : 0u;
+
+  for (size_t r = 0; r < rows; ++r) {
+    const float* row = input + r * channels;
+    __m512 sum0 = _mm512_setzero_ps(), sum1 = _mm512_setzero_ps();
+    size_t c = 0;
+    for (; c + 32 <= channels; c += 32) {
+      sum0 = _mm512_add_ps(sum0, _mm512_loadu_ps(row + c));
+      sum1 = _mm512_add_ps(sum1, _mm512_loadu_ps(row + c + 16));
+    }
+    for (; c + 16 <= channels; c += 16) {
+      sum0 = _mm512_add_ps(sum0, _mm512_loadu_ps(row + c));
+    }
+    if (rem_c) {
+      sum0 = _mm512_mask_add_ps(sum0, rem_mask, sum0,
+                                _mm512_maskz_loadu_ps(rem_mask, row + c));
+    }
+    const float mean = _mm512_reduce_add_ps(_mm512_add_ps(sum0, sum1)) * inv_c;
+    const __m512 mean_vec = _mm512_set1_ps(mean);
+
+    __m512 var0 = _mm512_setzero_ps(), var1 = _mm512_setzero_ps();
+    c = 0;
+    for (; c + 32 <= channels; c += 32) {
+      const __m512 d0 = _mm512_sub_ps(_mm512_loadu_ps(row + c), mean_vec);
+      const __m512 d1 = _mm512_sub_ps(_mm512_loadu_ps(row + c + 16), mean_vec);
+      var0 = _mm512_fmadd_ps(d0, d0, var0);
+      var1 = _mm512_fmadd_ps(d1, d1, var1);
+    }
+    for (; c + 16 <= channels; c += 16) {
+      const __m512 d0 = _mm512_sub_ps(_mm512_loadu_ps(row + c), mean_vec);
+      var0 = _mm512_fmadd_ps(d0, d0, var0);
+    }
+    if (rem_c) {
+      const __m512 d0 =
+          _mm512_sub_ps(_mm512_maskz_loadu_ps(rem_mask, row + c), mean_vec);
+      var0 = _mm512_mask3_fmadd_ps(d0, d0, var0, rem_mask);
+    }
+    const float var = _mm512_reduce_add_ps(_mm512_add_ps(var0, var1)) * inv_c;
+    const float inv_std = _mm_cvtss_f32(
+        _mm_div_ss(_mm_set_ss(1.0f), _mm_sqrt_ss(_mm_set_ss(var + epsilon))));
+    const __m512 inv_std_vec = _mm512_set1_ps(inv_std);
+
+    for (size_t g = 0; g < num_groups; ++g) {
+      const size_t base_c = g * quant_group_size;
+      const float* r_g = row + base_c;
+      const float* gam_g = gammas + base_c;
+      const float* bet_g = betas + base_c;
+      uint8_t* q_g = q_out + (r * num_groups + g) * quant_group_size;
+
+      if (quant_group_size == 256) {
+        __m512 v[16];
+        __m512 mn_v = _mm512_set1_ps(1e30f);
+        __m512 mx_v = _mm512_set1_ps(-1e30f);
+        for (size_t k = 0; k < 16; ++k) {
+          const size_t off = k * 16;
+          const __m512 d = _mm512_sub_ps(_mm512_loadu_ps(r_g + off), mean_vec);
+          const __m512 out = _mm512_fmadd_ps(_mm512_mul_ps(d, inv_std_vec),
+                                             _mm512_loadu_ps(gam_g + off),
+                                             _mm512_loadu_ps(bet_g + off));
+          v[k] = out;
+          mn_v = _mm512_min_ps(mn_v, out);
+          mx_v = _mm512_max_ps(mx_v, out);
+        }
+        const float mn = _mm512_reduce_min_ps(mn_v);
+        const float mx = _mm512_reduce_max_ps(mx_v);
+        const float range = mx - mn;
+        const float scale = (range > 1e-12f) ? (range * (1.0f / 255.0f)) : 0.0f;
+        const float inv_scale = (range > 1e-12f) ? (255.0f / range) : 0.0f;
+        group_scales[r * num_groups + g] = scale;
+        group_mins[r * num_groups + g] = mn;
+        const __m512 inv_vec = _mm512_set1_ps(inv_scale);
+        const __m512 offset_vec = _mm512_set1_ps(-mn * inv_scale);
+        for (size_t k = 0; k < 16; ++k) {
+          QuantizeStore16(q_g + k * 16, v[k], inv_vec, offset_vec);
+        }
+      } else {
+        __m512 mn_v = _mm512_set1_ps(1e30f);
+        __m512 mx_v = _mm512_set1_ps(-1e30f);
+        size_t j = 0;
+        for (; j + 16 <= quant_group_size; j += 16) {
+          const __m512 d = _mm512_sub_ps(_mm512_loadu_ps(r_g + j), mean_vec);
+          const __m512 out = _mm512_fmadd_ps(_mm512_mul_ps(d, inv_std_vec),
+                                             _mm512_loadu_ps(gam_g + j),
+                                             _mm512_loadu_ps(bet_g + j));
+          mn_v = _mm512_min_ps(mn_v, out);
+          mx_v = _mm512_max_ps(mx_v, out);
+        }
+        if (rem_g) {
+          const __m512 d = _mm512_sub_ps(
+              _mm512_maskz_loadu_ps(rem_g_mask, r_g + j), mean_vec);
+          const __m512 out =
+              _mm512_fmadd_ps(_mm512_mul_ps(d, inv_std_vec),
+                              _mm512_maskz_loadu_ps(rem_g_mask, gam_g + j),
+                              _mm512_maskz_loadu_ps(rem_g_mask, bet_g + j));
+          mn_v = _mm512_mask_min_ps(mn_v, rem_g_mask, mn_v, out);
+          mx_v = _mm512_mask_max_ps(mx_v, rem_g_mask, mx_v, out);
+        }
+        const float mn = _mm512_reduce_min_ps(mn_v);
+        const float mx = _mm512_reduce_max_ps(mx_v);
+        const float range = mx - mn;
+        const float scale = (range > 1e-12f) ? (range * (1.0f / 255.0f)) : 0.0f;
+        const float inv_scale = (range > 1e-12f) ? (255.0f / range) : 0.0f;
+        group_scales[r * num_groups + g] = scale;
+        group_mins[r * num_groups + g] = mn;
+        const __m512 inv_vec = _mm512_set1_ps(inv_scale);
+        const __m512 offset_vec = _mm512_set1_ps(-mn * inv_scale);
+        j = 0;
+        for (; j + 16 <= quant_group_size; j += 16) {
+          const __m512 d = _mm512_sub_ps(_mm512_loadu_ps(r_g + j), mean_vec);
+          const __m512 out = _mm512_fmadd_ps(_mm512_mul_ps(d, inv_std_vec),
+                                             _mm512_loadu_ps(gam_g + j),
+                                             _mm512_loadu_ps(bet_g + j));
+          QuantizeStore16(q_g + j, out, inv_vec, offset_vec);
+        }
+        if (rem_g) {
+          const __m512 d = _mm512_sub_ps(
+              _mm512_maskz_loadu_ps(rem_g_mask, r_g + j), mean_vec);
+          const __m512 out =
+              _mm512_fmadd_ps(_mm512_mul_ps(d, inv_std_vec),
+                              _mm512_maskz_loadu_ps(rem_g_mask, gam_g + j),
+                              _mm512_maskz_loadu_ps(rem_g_mask, bet_g + j));
+          QuantizeStoreMasked(q_g + j, rem_g_mask, out, inv_vec, offset_vec);
+        }
+      }
+    }
+  }
+}
+
 void Softmax64Avx512(size_t rows, float* data) {
   for (size_t r = 0; r < rows; ++r) {
     float* row = data + r * 64;
@@ -1656,6 +2104,31 @@ void QuantizeDynamicRowsAvx512(size_t rows, size_t inputs, const float* input,
       const __m512 inv_vec = _mm512_set1_ps(inv_scale);
       const __m512 offset_vec = _mm512_set1_ps(-mn * inv_scale);
       for (size_t k = 0; k < 16; ++k) {
+        QuantizeStore16(qrow + k * 16, v[k], inv_vec, offset_vec);
+      }
+      continue;
+    }
+
+    if (inputs == 192) {
+      __m512 v[12];
+      __m512 mn0 = _mm512_loadu_ps(row + 0);
+      __m512 mx0 = mn0;
+      v[0] = mn0;
+      for (size_t k = 1; k < 12; ++k) {
+        v[k] = _mm512_loadu_ps(row + k * 16);
+        mn0 = _mm512_min_ps(mn0, v[k]);
+        mx0 = _mm512_max_ps(mx0, v[k]);
+      }
+      const float mn = _mm512_reduce_min_ps(mn0);
+      const float mx = _mm512_reduce_max_ps(mx0);
+      const float range = mx - mn;
+      const float scale = (range > 1e-12f) ? (range * (1.0f / 255.0f)) : 0.0f;
+      const float inv_scale = (range > 1e-12f) ? (255.0f / range) : 0.0f;
+      row_scales[r] = scale;
+      row_mins[r] = mn;
+      const __m512 inv_vec = _mm512_set1_ps(inv_scale);
+      const __m512 offset_vec = _mm512_set1_ps(-mn * inv_scale);
+      for (size_t k = 0; k < 12; ++k) {
         QuantizeStore16(qrow + k * 16, v[k], inv_vec, offset_vec);
       }
       continue;
@@ -1858,6 +2331,12 @@ void GemmDynamicEpilogueAvx512(
           quantized_input, row_scales, row_mins, packed_weights, weight_scales,
           weight_sum_scaled, biases, activation, output);
       break;
+    case ACTIVATION_SELU:
+      GemmDynamicEpilogueAvx512Impl<ACTIVATION_SELU>(
+          row_begin, row_end, n_block_begin, n_block_end, outputs, inputs,
+          quantized_input, row_scales, row_mins, packed_weights, weight_scales,
+          weight_sum_scaled, biases, activation, output);
+      break;
     case ACTIVATION_SWISH:
       GemmDynamicEpilogueAvx512Impl<ACTIVATION_SWISH>(
           row_begin, row_end, n_block_begin, n_block_end, outputs, inputs,
@@ -1940,9 +2419,13 @@ void ResidualBlockBoardsAvx512Nr48Impl(
               _mm512_cvtepi32_ps(_mm512_sub_epi32(acc[x][1], zp1)), s1, b1);
           __m512 v2 = _mm512_fmadd_ps(
               _mm512_cvtepi32_ps(_mm512_sub_epi32(acc[x][2], zp2)), s2, b2);
-          v0 = ApplyActivationStatic<Act>(v0, runtime_activation);
-          v1 = ApplyActivationStatic<Act>(v1, runtime_activation);
-          v2 = ApplyActivationStatic<Act>(v2, runtime_activation);
+          if constexpr (Act == ACTIVATION_MISH) {
+            Mish3xPsAvx512(v0, v1, v2);
+          } else {
+            v0 = ApplyActivationStatic<Act>(v0, runtime_activation);
+            v1 = ApplyActivationStatic<Act>(v1, runtime_activation);
+            v2 = ApplyActivationStatic<Act>(v2, runtime_activation);
+          }
           uint8_t* destination = destination_row + x * padded_channels;
           QuantizeStore16(destination, v0, conv2_inv_vec, conv2_zp_vec);
           QuantizeStore16(destination + 16, v1, conv2_inv_vec, conv2_zp_vec);
@@ -2007,35 +2490,36 @@ void ResidualBlockBoardsAvx512Nr48Impl(
         _mm512_storeu_ps(avg_pool + n_offset + 32, _mm512_mul_ps(pool2, inv64));
       }
 
-      float* fc1 = scratch.se_fc1;
-      for (size_t o = 0; o < se.se_fc_outputs; ++o) {
-        const float value =
-            DotProductAvx512(se.w1 + o * channels, avg_pool, channels) +
-            se.b1[o];
-        fc1[o] = Activate(value, runtime_activation);
-      }
-      float* fc2 = scratch.se_fc2;
-      for (size_t o = 0; o < 2 * channels; ++o) {
-        fc2[o] = DotProductAvx512(se.w2 + o * se.se_fc_outputs, fc1,
-                                  se.se_fc_outputs) +
-                 se.b2[o];
-      }
-      for (size_t c = 0; c < channels; c += 16) {
-        _mm512_storeu_ps(fc2 + c, SigmoidPsAvx512(_mm512_loadu_ps(fc2 + c)));
-      }
-      const float* gamma = fc2;
-      const float* beta = fc2 + channels;
+      ComputeSeFcAvx512<Act>(channels, se, runtime_activation, scratch);
+
+      const float* gamma = scratch.se_fc2;
+      const float* beta = scratch.se_fc2 + channels;
       for (size_t square = 0; square < kSquares; ++square) {
         const float* in_row = conv2_output + square * channels;
         float* io_row = board_io + square * channels;
-        for (size_t c = 0; c < channels; c += 16) {
-          const __m512 g = _mm512_loadu_ps(gamma + c);
-          const __m512 bt = _mm512_loadu_ps(beta + c);
-          const __m512 in_v = _mm512_loadu_ps(in_row + c);
-          const __m512 skip_v = _mm512_loadu_ps(io_row + c);
-          const __m512 v = _mm512_fmadd_ps(g, in_v, _mm512_add_ps(skip_v, bt));
-          _mm512_storeu_ps(io_row + c,
-                           ApplyActivationStatic<Act>(v, runtime_activation));
+        for (size_t c = 0; c < channels; c += 48) {
+          __m512 v0 = _mm512_fmadd_ps(
+              _mm512_loadu_ps(gamma + c + 0), _mm512_loadu_ps(in_row + c + 0),
+              _mm512_add_ps(_mm512_loadu_ps(io_row + c + 0),
+                            _mm512_loadu_ps(beta + c + 0)));
+          __m512 v1 = _mm512_fmadd_ps(
+              _mm512_loadu_ps(gamma + c + 16), _mm512_loadu_ps(in_row + c + 16),
+              _mm512_add_ps(_mm512_loadu_ps(io_row + c + 16),
+                            _mm512_loadu_ps(beta + c + 16)));
+          __m512 v2 = _mm512_fmadd_ps(
+              _mm512_loadu_ps(gamma + c + 32), _mm512_loadu_ps(in_row + c + 32),
+              _mm512_add_ps(_mm512_loadu_ps(io_row + c + 32),
+                            _mm512_loadu_ps(beta + c + 32)));
+          if constexpr (Act == ACTIVATION_MISH) {
+            Mish3xPsAvx512(v0, v1, v2);
+          } else {
+            v0 = ApplyActivationStatic<Act>(v0, runtime_activation);
+            v1 = ApplyActivationStatic<Act>(v1, runtime_activation);
+            v2 = ApplyActivationStatic<Act>(v2, runtime_activation);
+          }
+          _mm512_storeu_ps(io_row + c + 0, v0);
+          _mm512_storeu_ps(io_row + c + 16, v1);
+          _mm512_storeu_ps(io_row + c + 32, v2);
         }
       }
     } else {
@@ -2187,20 +2671,108 @@ void ResidualBlockBoardAvx512(
       conv2_zero_point, activation, se, scratch);
 }
 
+void NchwToNhwcAvx512(size_t batch_size, size_t channels, const float* input,
+                      float* output) {
+  for (size_t batch = 0; batch < batch_size; ++batch) {
+    const float* source = input + batch * channels * kSquares;
+    float* destination = output + batch * kSquares * channels;
+    size_t channel = 0;
+    for (; channel + 8 <= channels; channel += 8) {
+      for (size_t square = 0; square < kSquares; square += 8) {
+        Transpose8x8(source + channel * kSquares + square, kSquares,
+                     destination + square * channels + channel, channels);
+      }
+    }
+    for (; channel < channels; ++channel) {
+      for (size_t square = 0; square < kSquares; ++square) {
+        destination[square * channels + channel] =
+            source[channel * kSquares + square];
+      }
+    }
+  }
+}
+
 void Conv3x3NhwcBoardAvx512(
     size_t input_channels, size_t output_channels, const float* input_nhwc,
     const int8_t* packed_weights, const float* output_scales,
     const int32_t* zero_point_corrections, float inverse_scale,
     uint8_t zero_point, float* output_nhwc, const Conv3x3ScratchView& scratch,
-    const float* biases, ActivationFunction activation) {
+    const float* biases, ActivationFunction activation, size_t conv_nr,
+    bool input_is_nchw, float plane109_scale) {
+  const float* nhwc_in = input_nhwc;
+  if (input_is_nchw && scratch.nhwc_board != nullptr) {
+    NchwToNhwcAvx512(1, input_channels, input_nhwc, scratch.nhwc_board);
+    if (plane109_scale != 1.0f && input_channels > 109) {
+      for (size_t sq = 0; sq < kSquares; ++sq) {
+        scratch.nhwc_board[sq * input_channels + 109] *= plane109_scale;
+      }
+    }
+    nhwc_in = scratch.nhwc_board;
+  }
+
   const size_t channel_groups = (input_channels + 3) / 4;
   const size_t padded_channels = channel_groups * 4;
+  uint8_t* pad1 = scratch.pad1;
+  QuantizeBoardToPad(input_channels, padded_channels, nhwc_in, inverse_scale,
+                     zero_point, pad1);
+
+  if (conv_nr == 48 && (output_channels % 48) == 0) {
+    const size_t n_blocks48 = output_channels / 48;
+    const size_t tap_stride48 = channel_groups * 192;
+    for (size_t n_block = 0; n_block < n_blocks48; ++n_block) {
+      const size_t n_offset = n_block * 48;
+      const __m512i zp_corr0 =
+          _mm512_loadu_si512(zero_point_corrections + n_offset);
+      const __m512i zp_corr1 =
+          _mm512_loadu_si512(zero_point_corrections + n_offset + 16);
+      const __m512i zp_corr2 =
+          _mm512_loadu_si512(zero_point_corrections + n_offset + 32);
+      const __m512 scale0 = _mm512_loadu_ps(output_scales + n_offset);
+      const __m512 scale1 = _mm512_loadu_ps(output_scales + n_offset + 16);
+      const __m512 scale2 = _mm512_loadu_ps(output_scales + n_offset + 32);
+      const __m512 bias0 = biases ? _mm512_loadu_ps(biases + n_offset)
+                                  : _mm512_setzero_ps();
+      const __m512 bias1 = biases ? _mm512_loadu_ps(biases + n_offset + 16)
+                                  : _mm512_setzero_ps();
+      const __m512 bias2 = biases ? _mm512_loadu_ps(biases + n_offset + 32)
+                                  : _mm512_setzero_ps();
+
+      const int8_t* weights_block = packed_weights + n_block * 9 * tap_stride48;
+      for (size_t y = 0; y < kBoardSize; ++y) {
+        __m512i acc[8][3];
+        Microkernel8x48Conv3x3(pad1 + y * kPadSize * padded_channels,
+                               padded_channels, weights_block, channel_groups,
+                               acc);
+        for (size_t x = 0; x < kBoardSize; ++x) {
+          __m512 v0 = _mm512_fmadd_ps(
+              _mm512_cvtepi32_ps(_mm512_sub_epi32(acc[x][0], zp_corr0)), scale0,
+              bias0);
+          __m512 v1 = _mm512_fmadd_ps(
+              _mm512_cvtepi32_ps(_mm512_sub_epi32(acc[x][1], zp_corr1)), scale1,
+              bias1);
+          __m512 v2 = _mm512_fmadd_ps(
+              _mm512_cvtepi32_ps(_mm512_sub_epi32(acc[x][2], zp_corr2)), scale2,
+              bias2);
+          if (activation == ACTIVATION_MISH) {
+            Mish3xPsAvx512(v0, v1, v2);
+          } else if (activation != ACTIVATION_NONE) {
+            v0 = ApplyActivationVec(v0, activation);
+            v1 = ApplyActivationVec(v1, activation);
+            v2 = ApplyActivationVec(v2, activation);
+          }
+          float* destination =
+              output_nhwc + (y * kBoardSize + x) * output_channels + n_offset;
+          _mm512_storeu_ps(destination, v0);
+          _mm512_storeu_ps(destination + 16, v1);
+          _mm512_storeu_ps(destination + 32, v2);
+        }
+      }
+    }
+    return;
+  }
+
   const size_t n_blocks = (output_channels + kNr - 1) / kNr;
   const size_t tap_stride = channel_groups * 128;
-
-  uint8_t* pad1 = scratch.pad1;
-  QuantizeBoardToPad(input_channels, padded_channels, input_nhwc, inverse_scale,
-                     zero_point, pad1);
 
   for (size_t n_block = 0; n_block < n_blocks; ++n_block) {
     const size_t n_offset = n_block * kNr;
@@ -2271,24 +2843,183 @@ void Conv3x3NhwcBoardAvx512(
   }
 }
 
-void NchwToNhwcAvx512(size_t batch_size, size_t channels, const float* input,
-                      float* output) {
-  for (size_t batch = 0; batch < batch_size; ++batch) {
-    const float* source = input + batch * channels * kSquares;
-    float* destination = output + batch * kSquares * channels;
-    size_t channel = 0;
-    for (; channel + 8 <= channels; channel += 8) {
-      for (size_t square = 0; square < kSquares; square += 8) {
-        Transpose8x8(source + channel * kSquares + square, kSquares,
-                     destination + square * channels + channel, channels);
+namespace {
+
+template <ActivationFunction Act, size_t kRows>
+inline void GemmFp32RowsAvx512(size_t row, size_t col, size_t col_rem,
+                               size_t outputs, size_t inputs,
+                               const float* input,
+                               const float* weights_transposed,
+                               const float* biases,
+                               ActivationFunction runtime_activation,
+                               float* output) {
+  const bool full_n = (col_rem == 32);
+  const __mmask16 mask0 =
+      full_n ? 0xFFFF
+             : static_cast<__mmask16>(
+                   col_rem >= 16 ? 0xFFFF : ((1u << col_rem) - 1u));
+  const __mmask16 mask1 =
+      full_n ? 0xFFFF
+             : static_cast<__mmask16>(
+                   col_rem > 16 ? ((1u << (col_rem - 16)) - 1u) : 0u);
+
+  const float* a_rows[kRows];
+  __m512 c0[kRows];
+  __m512 c1[kRows];
+  for (size_t r = 0; r < kRows; ++r) {
+    a_rows[r] = input + (row + r) * inputs;
+    c0[r] = _mm512_setzero_ps();
+    c1[r] = _mm512_setzero_ps();
+  }
+
+  size_t k = 0;
+  if (full_n) {
+    for (; k + 4 <= inputs; k += 4) {
+      for (size_t u = 0; u < 4; ++u) {
+        const float* w_row = weights_transposed + (k + u) * outputs + col;
+        const __m512 b0 = _mm512_loadu_ps(w_row);
+        const __m512 b1 = _mm512_loadu_ps(w_row + 16);
+        for (size_t r = 0; r < kRows; ++r) {
+          const __m512 av = _mm512_set1_ps(a_rows[r][k + u]);
+          c0[r] = _mm512_fmadd_ps(av, b0, c0[r]);
+          c1[r] = _mm512_fmadd_ps(av, b1, c1[r]);
+        }
       }
     }
-    for (; channel < channels; ++channel) {
-      for (size_t square = 0; square < kSquares; ++square) {
-        destination[square * channels + channel] =
-            source[channel * kSquares + square];
+    for (; k < inputs; ++k) {
+      const float* w_row = weights_transposed + k * outputs + col;
+      const __m512 b0 = _mm512_loadu_ps(w_row);
+      const __m512 b1 = _mm512_loadu_ps(w_row + 16);
+      for (size_t r = 0; r < kRows; ++r) {
+        const __m512 av = _mm512_set1_ps(a_rows[r][k]);
+        c0[r] = _mm512_fmadd_ps(av, b0, c0[r]);
+        c1[r] = _mm512_fmadd_ps(av, b1, c1[r]);
       }
     }
+  } else if (mask1) {
+    for (; k < inputs; ++k) {
+      const float* w_row = weights_transposed + k * outputs + col;
+      const __m512 b0 = _mm512_loadu_ps(w_row);
+      const __m512 b1 = _mm512_maskz_loadu_ps(mask1, w_row + 16);
+      for (size_t r = 0; r < kRows; ++r) {
+        const __m512 av = _mm512_set1_ps(a_rows[r][k]);
+        c0[r] = _mm512_fmadd_ps(av, b0, c0[r]);
+        c1[r] = _mm512_fmadd_ps(av, b1, c1[r]);
+      }
+    }
+  } else {
+    for (; k < inputs; ++k) {
+      const float* w_row = weights_transposed + k * outputs + col;
+      const __m512 b0 = _mm512_maskz_loadu_ps(mask0, w_row);
+      for (size_t r = 0; r < kRows; ++r) {
+        const __m512 av = _mm512_set1_ps(a_rows[r][k]);
+        c0[r] = _mm512_fmadd_ps(av, b0, c0[r]);
+      }
+    }
+  }
+
+  const __m512 bias0 =
+      biases ? (full_n ? _mm512_loadu_ps(biases + col)
+                       : _mm512_maskz_loadu_ps(mask0, biases + col))
+             : _mm512_setzero_ps();
+  const __m512 bias1 =
+      biases && mask1 ? (full_n ? _mm512_loadu_ps(biases + col + 16)
+                                : _mm512_maskz_loadu_ps(mask1, biases + col + 16))
+                      : _mm512_setzero_ps();
+
+  for (size_t r = 0; r < kRows; ++r) {
+    float* dst = output + (row + r) * outputs + col;
+    __m512 v0 = _mm512_add_ps(c0[r], bias0);
+    v0 = ApplyActivationStatic<Act>(v0, runtime_activation);
+    if (full_n) {
+      __m512 v1 = _mm512_add_ps(c1[r], bias1);
+      v1 = ApplyActivationStatic<Act>(v1, runtime_activation);
+      _mm512_storeu_ps(dst, v0);
+      _mm512_storeu_ps(dst + 16, v1);
+    } else if (mask1) {
+      __m512 v1 = _mm512_add_ps(c1[r], bias1);
+      v1 = ApplyActivationStatic<Act>(v1, runtime_activation);
+      _mm512_storeu_ps(dst, v0);
+      _mm512_mask_storeu_ps(dst + 16, mask1, v1);
+    } else {
+      _mm512_mask_storeu_ps(dst, mask0, v0);
+    }
+  }
+}
+
+template <ActivationFunction Act>
+void GemmFp32Avx512Impl(size_t row_begin, size_t row_end, size_t col_begin,
+                         size_t col_end, size_t outputs, size_t inputs,
+                         const float* input, const float* weights_transposed,
+                         const float* biases,
+                         ActivationFunction runtime_activation, float* output) {
+  for (size_t col = col_begin; col < col_end; col += 32) {
+    const size_t col_rem = MinSize(32, col_end - col);
+    size_t row = row_begin;
+    for (; row + 8 <= row_end; row += 8) {
+      GemmFp32RowsAvx512<Act, 8>(row, col, col_rem, outputs, inputs, input,
+                                 weights_transposed, biases,
+                                 runtime_activation, output);
+    }
+    if (row + 4 <= row_end) {
+      GemmFp32RowsAvx512<Act, 4>(row, col, col_rem, outputs, inputs, input,
+                                 weights_transposed, biases,
+                                 runtime_activation, output);
+      row += 4;
+    }
+    for (; row < row_end; ++row) {
+      GemmFp32RowsAvx512<Act, 1>(row, col, col_rem, outputs, inputs, input,
+                                 weights_transposed, biases,
+                                 runtime_activation, output);
+    }
+  }
+}
+
+}  // namespace
+
+void GemmFp32Avx512(size_t row_begin, size_t row_end, size_t col_begin,
+                    size_t col_end, size_t outputs, size_t inputs,
+                    const float* input, const float* weights_transposed,
+                    const float* biases, ActivationFunction activation,
+                    float* output) {
+  if (row_begin >= row_end || col_begin >= col_end) return;
+  switch (activation) {
+    case ACTIVATION_NONE:
+      GemmFp32Avx512Impl<ACTIVATION_NONE>(row_begin, row_end, col_begin,
+                                          col_end, outputs, inputs, input,
+                                          weights_transposed, biases,
+                                          activation, output);
+      break;
+    case ACTIVATION_RELU:
+      GemmFp32Avx512Impl<ACTIVATION_RELU>(row_begin, row_end, col_begin,
+                                          col_end, outputs, inputs, input,
+                                          weights_transposed, biases,
+                                          activation, output);
+      break;
+    case ACTIVATION_MISH:
+      GemmFp32Avx512Impl<ACTIVATION_MISH>(row_begin, row_end, col_begin,
+                                          col_end, outputs, inputs, input,
+                                          weights_transposed, biases,
+                                          activation, output);
+      break;
+    case ACTIVATION_SELU:
+      GemmFp32Avx512Impl<ACTIVATION_SELU>(row_begin, row_end, col_begin,
+                                          col_end, outputs, inputs, input,
+                                          weights_transposed, biases,
+                                          activation, output);
+      break;
+    case ACTIVATION_SWISH:
+      GemmFp32Avx512Impl<ACTIVATION_SWISH>(row_begin, row_end, col_begin,
+                                           col_end, outputs, inputs, input,
+                                           weights_transposed, biases,
+                                           activation, output);
+      break;
+    default:
+      GemmFp32Avx512Impl<ACTIVATION_DEFAULT>(row_begin, row_end, col_begin,
+                                             col_end, outputs, inputs, input,
+                                             weights_transposed, biases,
+                                             activation, output);
+      break;
   }
 }
 
@@ -2310,6 +3041,306 @@ void NhwcToNchwAvx512(size_t batch_size, size_t channels, const float* input,
             source[square * channels + channel];
       }
     }
+  }
+}
+
+void PrepAttentionInputPeMapAvx512(size_t batch_size, size_t input_channels,
+                                   size_t pe_channels, const float* input_nchw,
+                                   const float* pos_encoding,
+                                   float* output_nhwc) {
+  const size_t emb_in = input_channels + pe_channels;
+  const size_t full_pe = pe_channels & ~static_cast<size_t>(15);
+  const size_t rem_pe = pe_channels - full_pe;
+  const __mmask16 pe_mask =
+      rem_pe ? static_cast<__mmask16>((1u << rem_pe) - 1u) : 0u;
+
+  for (size_t b = 0; b < batch_size; ++b) {
+    const float* src = input_nchw + b * kSquares * input_channels;
+    float* dst = output_nhwc + b * kSquares * emb_in;
+    size_t c = 0;
+    for (; c + 8 <= input_channels; c += 8) {
+      for (size_t sq = 0; sq < kSquares; sq += 8) {
+        Transpose8x8(src + c * kSquares + sq, kSquares, dst + sq * emb_in + c,
+                     emb_in);
+      }
+    }
+    for (; c < input_channels; ++c) {
+      for (size_t sq = 0; sq < kSquares; ++sq) {
+        dst[sq * emb_in + c] = src[c * kSquares + sq];
+      }
+    }
+    for (size_t sq = 0; sq < kSquares; ++sq) {
+      const float* pe_src = pos_encoding + sq * pe_channels;
+      float* pe_dst = dst + sq * emb_in + input_channels;
+      size_t j = 0;
+      for (; j + 16 <= pe_channels; j += 16) {
+        _mm512_storeu_ps(pe_dst + j, _mm512_loadu_ps(pe_src + j));
+      }
+      if (rem_pe) {
+        _mm512_mask_storeu_ps(pe_dst + j, pe_mask,
+                              _mm512_maskz_loadu_ps(pe_mask, pe_src + j));
+      }
+    }
+  }
+}
+
+void ApplyInputGatingAvx512(size_t batch_size, size_t embedding_size,
+                            float* flow_nhwc, const float* mult_nhwc,
+                            const float* add_nhwc) {
+  const size_t rem = embedding_size & 15;
+  const __mmask16 rem_mask =
+      rem ? static_cast<__mmask16>((1u << rem) - 1u) : 0u;
+  const size_t board_stride = kSquares * embedding_size;
+
+  for (size_t b = 0; b < batch_size; ++b) {
+    float* board = flow_nhwc + b * board_stride;
+    size_t idx = 0;
+    for (; idx + 16 <= board_stride; idx += 16) {
+      const size_t gate_idx = idx;  // board_stride == kSquares * embedding_size
+      const __m512 f = _mm512_loadu_ps(board + idx);
+      const __m512 m = _mm512_loadu_ps(mult_nhwc + gate_idx);
+      const __m512 a = _mm512_loadu_ps(add_nhwc + gate_idx);
+      _mm512_storeu_ps(board + idx, _mm512_fmadd_ps(f, m, a));
+    }
+    if (rem) {
+      // board_stride is a multiple of 64 * rem; handle non-multiple-of-16 tail.
+      for (; idx < board_stride; ++idx) {
+        board[idx] = board[idx] * mult_nhwc[idx] + add_nhwc[idx];
+      }
+    }
+    (void)rem_mask;
+  }
+}
+
+void AttentionPolicyPromoAvx512(size_t policy_d_model, const float* k_board,
+                                const float* ip4_pol_w, float* logits_board) {
+  float promotion_offsets[4][8];
+  const size_t rem = policy_d_model & 15;
+  const __mmask16 rem_mask =
+      rem ? static_cast<__mmask16>((1u << rem) - 1u) : 0u;
+
+  for (int j = 0; j < 8; ++j) {
+    const float* k_row = k_board + (56 + j) * policy_d_model;
+    for (int i = 0; i < 4; ++i) {
+      const float* w_row = ip4_pol_w + i * policy_d_model;
+      __m512 acc0 = _mm512_setzero_ps();
+      __m512 acc1 = _mm512_setzero_ps();
+      size_t k = 0;
+      for (; k + 32 <= policy_d_model; k += 32) {
+        acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(k_row + k),
+                               _mm512_loadu_ps(w_row + k), acc0);
+        acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(k_row + k + 16),
+                               _mm512_loadu_ps(w_row + k + 16), acc1);
+      }
+      for (; k + 16 <= policy_d_model; k += 16) {
+        acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(k_row + k),
+                               _mm512_loadu_ps(w_row + k), acc0);
+      }
+      if (rem) {
+        acc0 = _mm512_fmadd_ps(_mm512_maskz_loadu_ps(rem_mask, k_row + k),
+                               _mm512_maskz_loadu_ps(rem_mask, w_row + k),
+                               acc0);
+      }
+      promotion_offsets[i][j] =
+          _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+    }
+  }
+  for (int i = 0; i < 3; ++i) {
+    for (int j = 0; j < 8; ++j) {
+      promotion_offsets[i][j] += promotion_offsets[3][j];
+    }
+  }
+  for (int k = 0; k < 8; ++k) {
+    for (int j = 0; j < 8; ++j) {
+      const float base = logits_board[(48 + k) * 64 + 56 + j];
+      for (int i = 0; i < 3; ++i) {
+        logits_board[64 * 64 + 24 * k + 3 * j + i] =
+            base + promotion_offsets[i][j];
+      }
+    }
+  }
+}
+
+void MhaAttentionHead32Avx512(size_t d_model, float scaling,
+                              const float* q_board, const float* k_board,
+                              const float* v_board, const float* smolgen_bias,
+                              size_t head_idx, float* attn_board) {
+  const size_t h_off = head_idx * 32;
+  alignas(64) float k_t[32][64];
+  alignas(64) float v_pack[64][32];
+
+  // Transpose K_h[64][32] -> k_t[32][64] and pre-scale by scaling.
+  for (size_t c = 0; c < 32; c += 8) {
+    for (size_t sq = 0; sq < 64; sq += 8) {
+      Transpose8x8(k_board + sq * d_model + h_off + c, d_model, &k_t[c][sq],
+                   64);
+    }
+  }
+  const __m512 scale_vec = _mm512_set1_ps(scaling);
+  float* kt_flat = &k_t[0][0];
+  for (size_t i = 0; i < 32 * 64; i += 64) {
+    _mm512_store_ps(kt_flat + i + 0,
+                    _mm512_mul_ps(_mm512_load_ps(kt_flat + i + 0), scale_vec));
+    _mm512_store_ps(kt_flat + i + 16,
+                    _mm512_mul_ps(_mm512_load_ps(kt_flat + i + 16), scale_vec));
+    _mm512_store_ps(kt_flat + i + 32,
+                    _mm512_mul_ps(_mm512_load_ps(kt_flat + i + 32), scale_vec));
+    _mm512_store_ps(kt_flat + i + 48,
+                    _mm512_mul_ps(_mm512_load_ps(kt_flat + i + 48), scale_vec));
+  }
+
+  // Pack strided V_h[64][32] contiguously so Attn*V stays in L1d.
+  for (size_t sq = 0; sq < 64; ++sq) {
+    const float* v_src = v_board + sq * d_model + h_off;
+    _mm512_store_ps(&v_pack[sq][0], _mm512_loadu_ps(v_src + 0));
+    _mm512_store_ps(&v_pack[sq][16], _mm512_loadu_ps(v_src + 16));
+  }
+
+  alignas(64) float q_tile[4][32];
+  alignas(64) float p_tile[4][64];
+
+  for (size_t r = 0; r < 64; r += 4) {
+    for (size_t i = 0; i < 4; ++i) {
+      const float* q_src = q_board + (r + i) * d_model + h_off;
+      _mm512_store_ps(&q_tile[i][0], _mm512_loadu_ps(q_src + 0));
+      _mm512_store_ps(&q_tile[i][16], _mm512_loadu_ps(q_src + 16));
+    }
+
+    __m512 c00, c01, c02, c03;
+    __m512 c10, c11, c12, c13;
+    __m512 c20, c21, c22, c23;
+    __m512 c30, c31, c32, c33;
+    if (smolgen_bias != nullptr) {
+      const float* sb = smolgen_bias + r * 64;
+      c00 = _mm512_loadu_ps(sb + 0 * 64 + 0);
+      c01 = _mm512_loadu_ps(sb + 0 * 64 + 16);
+      c02 = _mm512_loadu_ps(sb + 0 * 64 + 32);
+      c03 = _mm512_loadu_ps(sb + 0 * 64 + 48);
+      c10 = _mm512_loadu_ps(sb + 1 * 64 + 0);
+      c11 = _mm512_loadu_ps(sb + 1 * 64 + 16);
+      c12 = _mm512_loadu_ps(sb + 1 * 64 + 32);
+      c13 = _mm512_loadu_ps(sb + 1 * 64 + 48);
+      c20 = _mm512_loadu_ps(sb + 2 * 64 + 0);
+      c21 = _mm512_loadu_ps(sb + 2 * 64 + 16);
+      c22 = _mm512_loadu_ps(sb + 2 * 64 + 32);
+      c23 = _mm512_loadu_ps(sb + 2 * 64 + 48);
+      c30 = _mm512_loadu_ps(sb + 3 * 64 + 0);
+      c31 = _mm512_loadu_ps(sb + 3 * 64 + 16);
+      c32 = _mm512_loadu_ps(sb + 3 * 64 + 32);
+      c33 = _mm512_loadu_ps(sb + 3 * 64 + 48);
+    } else {
+      c00 = c01 = c02 = c03 = _mm512_setzero_ps();
+      c10 = c11 = c12 = c13 = _mm512_setzero_ps();
+      c20 = c21 = c22 = c23 = _mm512_setzero_ps();
+      c30 = c31 = c32 = c33 = _mm512_setzero_ps();
+    }
+
+    for (size_t k = 0; k < 32; ++k) {
+      const __m512 b0 = _mm512_load_ps(&k_t[k][0]);
+      const __m512 b1 = _mm512_load_ps(&k_t[k][16]);
+      const __m512 b2 = _mm512_load_ps(&k_t[k][32]);
+      const __m512 b3 = _mm512_load_ps(&k_t[k][48]);
+
+      const __m512 a0 = _mm512_set1_ps(q_tile[0][k]);
+      c00 = _mm512_fmadd_ps(a0, b0, c00);
+      c01 = _mm512_fmadd_ps(a0, b1, c01);
+      c02 = _mm512_fmadd_ps(a0, b2, c02);
+      c03 = _mm512_fmadd_ps(a0, b3, c03);
+
+      const __m512 a1 = _mm512_set1_ps(q_tile[1][k]);
+      c10 = _mm512_fmadd_ps(a1, b0, c10);
+      c11 = _mm512_fmadd_ps(a1, b1, c11);
+      c12 = _mm512_fmadd_ps(a1, b2, c12);
+      c13 = _mm512_fmadd_ps(a1, b3, c13);
+
+      const __m512 a2 = _mm512_set1_ps(q_tile[2][k]);
+      c20 = _mm512_fmadd_ps(a2, b0, c20);
+      c21 = _mm512_fmadd_ps(a2, b1, c21);
+      c22 = _mm512_fmadd_ps(a2, b2, c22);
+      c23 = _mm512_fmadd_ps(a2, b3, c23);
+
+      const __m512 a3 = _mm512_set1_ps(q_tile[3][k]);
+      c30 = _mm512_fmadd_ps(a3, b0, c30);
+      c31 = _mm512_fmadd_ps(a3, b1, c31);
+      c32 = _mm512_fmadd_ps(a3, b2, c32);
+      c33 = _mm512_fmadd_ps(a3, b3, c33);
+    }
+
+    auto softmax_row = [](__m512 v0, __m512 v1, __m512 v2, __m512 v3,
+                          float* dst) {
+      const __m512 max_v =
+          _mm512_max_ps(_mm512_max_ps(v0, v1), _mm512_max_ps(v2, v3));
+      const __m512 max_s = _mm512_set1_ps(_mm512_reduce_max_ps(max_v));
+      v0 = ExpPsAvx512(_mm512_sub_ps(v0, max_s));
+      v1 = ExpPsAvx512(_mm512_sub_ps(v1, max_s));
+      v2 = ExpPsAvx512(_mm512_sub_ps(v2, max_s));
+      v3 = ExpPsAvx512(_mm512_sub_ps(v3, max_s));
+      const float sum = _mm512_reduce_add_ps(
+          _mm512_add_ps(_mm512_add_ps(v0, v1), _mm512_add_ps(v2, v3)));
+      const __m512 inv_sum = _mm512_set1_ps(1.0f / sum);
+      _mm512_store_ps(dst + 0, _mm512_mul_ps(v0, inv_sum));
+      _mm512_store_ps(dst + 16, _mm512_mul_ps(v1, inv_sum));
+      _mm512_store_ps(dst + 32, _mm512_mul_ps(v2, inv_sum));
+      _mm512_store_ps(dst + 48, _mm512_mul_ps(v3, inv_sum));
+    };
+    softmax_row(c00, c01, c02, c03, &p_tile[0][0]);
+    softmax_row(c10, c11, c12, c13, &p_tile[1][0]);
+    softmax_row(c20, c21, c22, c23, &p_tile[2][0]);
+    softmax_row(c30, c31, c32, c33, &p_tile[3][0]);
+
+    __m512 o00_e = _mm512_setzero_ps(), o01_e = _mm512_setzero_ps();
+    __m512 o10_e = _mm512_setzero_ps(), o11_e = _mm512_setzero_ps();
+    __m512 o20_e = _mm512_setzero_ps(), o21_e = _mm512_setzero_ps();
+    __m512 o30_e = _mm512_setzero_ps(), o31_e = _mm512_setzero_ps();
+    __m512 o00_o = _mm512_setzero_ps(), o01_o = _mm512_setzero_ps();
+    __m512 o10_o = _mm512_setzero_ps(), o11_o = _mm512_setzero_ps();
+    __m512 o20_o = _mm512_setzero_ps(), o21_o = _mm512_setzero_ps();
+    __m512 o30_o = _mm512_setzero_ps(), o31_o = _mm512_setzero_ps();
+
+    for (size_t k = 0; k < 64; k += 2) {
+      const __m512 v0_e = _mm512_load_ps(&v_pack[k + 0][0]);
+      const __m512 v1_e = _mm512_load_ps(&v_pack[k + 0][16]);
+      const __m512 p0_e = _mm512_set1_ps(p_tile[0][k + 0]);
+      const __m512 p1_e = _mm512_set1_ps(p_tile[1][k + 0]);
+      const __m512 p2_e = _mm512_set1_ps(p_tile[2][k + 0]);
+      const __m512 p3_e = _mm512_set1_ps(p_tile[3][k + 0]);
+      o00_e = _mm512_fmadd_ps(p0_e, v0_e, o00_e);
+      o01_e = _mm512_fmadd_ps(p0_e, v1_e, o01_e);
+      o10_e = _mm512_fmadd_ps(p1_e, v0_e, o10_e);
+      o11_e = _mm512_fmadd_ps(p1_e, v1_e, o11_e);
+      o20_e = _mm512_fmadd_ps(p2_e, v0_e, o20_e);
+      o21_e = _mm512_fmadd_ps(p2_e, v1_e, o21_e);
+      o30_e = _mm512_fmadd_ps(p3_e, v0_e, o30_e);
+      o31_e = _mm512_fmadd_ps(p3_e, v1_e, o31_e);
+
+      const __m512 v0_o = _mm512_load_ps(&v_pack[k + 1][0]);
+      const __m512 v1_o = _mm512_load_ps(&v_pack[k + 1][16]);
+      const __m512 p0_o = _mm512_set1_ps(p_tile[0][k + 1]);
+      const __m512 p1_o = _mm512_set1_ps(p_tile[1][k + 1]);
+      const __m512 p2_o = _mm512_set1_ps(p_tile[2][k + 1]);
+      const __m512 p3_o = _mm512_set1_ps(p_tile[3][k + 1]);
+      o00_o = _mm512_fmadd_ps(p0_o, v0_o, o00_o);
+      o01_o = _mm512_fmadd_ps(p0_o, v1_o, o01_o);
+      o10_o = _mm512_fmadd_ps(p1_o, v0_o, o10_o);
+      o11_o = _mm512_fmadd_ps(p1_o, v1_o, o11_o);
+      o20_o = _mm512_fmadd_ps(p2_o, v0_o, o20_o);
+      o21_o = _mm512_fmadd_ps(p2_o, v1_o, o21_o);
+      o30_o = _mm512_fmadd_ps(p3_o, v0_o, o30_o);
+      o31_o = _mm512_fmadd_ps(p3_o, v1_o, o31_o);
+    }
+
+    float* dst0 = attn_board + (r + 0) * d_model + h_off;
+    float* dst1 = attn_board + (r + 1) * d_model + h_off;
+    float* dst2 = attn_board + (r + 2) * d_model + h_off;
+    float* dst3 = attn_board + (r + 3) * d_model + h_off;
+    _mm512_storeu_ps(dst0 + 0, _mm512_add_ps(o00_e, o00_o));
+    _mm512_storeu_ps(dst0 + 16, _mm512_add_ps(o01_e, o01_o));
+    _mm512_storeu_ps(dst1 + 0, _mm512_add_ps(o10_e, o10_o));
+    _mm512_storeu_ps(dst1 + 16, _mm512_add_ps(o11_e, o11_o));
+    _mm512_storeu_ps(dst2 + 0, _mm512_add_ps(o20_e, o20_o));
+    _mm512_storeu_ps(dst2 + 16, _mm512_add_ps(o21_e, o21_o));
+    _mm512_storeu_ps(dst3 + 0, _mm512_add_ps(o30_e, o30_o));
+    _mm512_storeu_ps(dst3 + 16, _mm512_add_ps(o31_e, o31_o));
   }
 }
 

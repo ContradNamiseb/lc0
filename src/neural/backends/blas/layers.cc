@@ -96,7 +96,8 @@ ConvLayer<use_eigen>::ConvLayer(const MultiHeadWeights::ConvBlock& weights,
                                 ActivationFunction activation,
                                 const std::vector<float>* raw_int8_weights,
                                 float plane109_scale, bool dynamic_int8_nhwc,
-                                bool convert_output_to_nchw)
+                                bool convert_output_to_nchw, bool input_is_nhwc,
+                                bool use_avx512_fp32)
     : BaseLayer<use_eigen>(weights.biases.size() * kSquares),
       weights_(weights),
       input_channels_(input_channels),
@@ -104,9 +105,22 @@ ConvLayer<use_eigen>::ConvLayer(const MultiHeadWeights::ConvBlock& weights,
       filter_size_(filter_size),
       activation_(activation),
       plane109_scale_(plane109_scale),
-      convert_output_to_nchw_(convert_output_to_nchw) {
+      convert_output_to_nchw_(convert_output_to_nchw),
+      input_is_nhwc_(input_is_nhwc) {
   assert(filter_size == 1 || filter_size == 3);
 #ifdef LC0_HAS_AVX512_VNNI
+  if (filter_size == 1 && input_is_nhwc_ && use_avx512_fp32 &&
+      CpuSupportsAvx512Vnni() &&
+      weights_.weights.size() == output_channels_ * input_channels_) {
+    nhwc_1x1_w_t_.resize(input_channels_ * output_channels_);
+    for (size_t o = 0; o < output_channels_; ++o) {
+      for (size_t c = 0; c < input_channels_; ++c) {
+        nhwc_1x1_w_t_[c * output_channels_ + o] =
+            weights_.weights[o * input_channels_ + c];
+      }
+    }
+    return;
+  }
   if (dynamic_int8_nhwc && raw_int8_weights != nullptr && filter_size == 3 &&
       CpuSupportsAvx512Vnni() &&
       raw_int8_weights->size() == output_channels_ * input_channels_ * 9) {
@@ -146,10 +160,12 @@ ConvLayer<use_eigen>::ConvLayer(const MultiHeadWeights::ConvBlock& weights,
     }
     int8_conv_.emplace(int8_w_storage_, int8_s_storage_, 1.0f / 255.0f,
                        uint8_t{0}, Int8Kernel::kVnniAvx512,
-                       /*is_conv3x3=*/true);
+                       /*is_conv3x3=*/true,
+                       /*allow_nr48=*/(output_channels_ % 48 == 0));
   }
 #else
   (void)raw_int8_weights;
+  (void)use_avx512_fp32;
 #endif
 }
 
@@ -157,6 +173,12 @@ template <bool use_eigen>
 void ConvLayer<use_eigen>::Eval(size_t batch_size, float* output,
                                 const float* input, const float* /*input2*/,
                                 Workspace<use_eigen>& workspace) const {
+  if (!nhwc_1x1_w_t_.empty()) {
+    RunGemmFp32Avx512(batch_size * kSquares, output_channels_, input_channels_,
+                      input, nhwc_1x1_w_t_.data(), weights_.biases.data(),
+                      activation_, output, workspace.int8.pool);
+    return;
+  }
   if (dyn_int8_conv_) {
     if (convert_output_to_nchw_) {
       workspace.int8.nhwc_output.Resize(batch_size * kSquares *
@@ -174,18 +196,9 @@ void ConvLayer<use_eigen>::Eval(size_t batch_size, float* output,
     return;
   }
   if (int8_conv_) {
-    workspace.int8.nhwc_input.Resize(batch_size * kSquares * input_channels_);
-    float* nhwc_in = workspace.int8.nhwc_input.data();
-    NchwToNhwcFast(batch_size, input_channels_, input, nhwc_in,
-                   workspace.int8.pool);
-    if (plane109_scale_ != 1.0f && input_channels_ > 109) {
-      const size_t total_sq = batch_size * kSquares;
-      for (size_t sq = 0; sq < total_sq; ++sq) {
-        nhwc_in[sq * input_channels_ + 109] *= plane109_scale_;
-      }
-    }
-    int8_conv_->Convolve3Nhwc(batch_size, nhwc_in, output, workspace.int8,
-                              weights_.biases.data(), activation_);
+    int8_conv_->Convolve3NchwToNhwc(batch_size, input, plane109_scale_, output,
+                                    workspace.int8, weights_.biases.data(),
+                                    activation_);
     return;
   }
   if (filter_size_ == 3) {
@@ -225,6 +238,22 @@ ResidualBlock<use_eigen>::ResidualBlock(
                         conv2.act_zp, int8_kernel, /*is_conv3x3=*/true,
                         allow_nr48);
   }
+  if (allow_nr48 && weights.has_se && !weights.se.w1.empty() &&
+      !weights.se.w2.empty()) {
+    const size_t fc = weights.se.b1.size();
+    se_w1_t_.resize(channels_ * fc);
+    for (size_t o = 0; o < fc; ++o) {
+      for (size_t i = 0; i < channels_; ++i) {
+        se_w1_t_[i * fc + o] = weights.se.w1[o * channels_ + i];
+      }
+    }
+    se_w2_t_.resize(fc * 2 * channels_);
+    for (size_t o = 0; o < 2 * channels_; ++o) {
+      for (size_t i = 0; i < fc; ++i) {
+        se_w2_t_[i * 2 * channels_ + o] = weights.se.w2[o * fc + i];
+      }
+    }
+  }
 }
 
 template <bool use_eigen>
@@ -246,6 +275,10 @@ void ResidualBlock<use_eigen>::Eval(size_t batch_size, float* output,
       se_params.b1 = weights_.se.b1.data();
       se_params.w2 = weights_.se.w2.data();
       se_params.b2 = weights_.se.b2.data();
+      if (!se_w1_t_.empty() && !se_w2_t_.empty()) {
+        se_params.w1_t = se_w1_t_.data();
+        se_params.w2_t = se_w2_t_.data();
+      }
     }
     Int8Weights::RunResidualBlockNhwc(batch_size, channels_, output,
                                       *conv1_int8_, conv1.biases.data(),
@@ -296,17 +329,53 @@ template <bool use_eigen>
 DenseLayer<use_eigen>::DenseLayer(const std::vector<float>& weights,
                                   const std::vector<float>& biases,
                                   size_t input_size,
-                                  ActivationFunction activation)
+                                  ActivationFunction activation,
+                                  bool use_avx512_fp32,
+                                  size_t nhwc_reorder_channels)
     : BaseLayer<use_eigen>(biases.size()),
       weights_(weights),
       biases_(biases),
       input_size_(input_size),
-      activation_(activation) {}
+      activation_(activation) {
+#ifdef LC0_HAS_AVX512_VNNI
+  const size_t outputs = biases_.size();
+  if (use_avx512_fp32 && CpuSupportsAvx512Vnni() && outputs > 0 &&
+      input_size_ > 0 && weights_.size() == outputs * input_size_) {
+    weights_t_.resize(input_size_ * outputs);
+    if (nhwc_reorder_channels > 0 &&
+        input_size_ == nhwc_reorder_channels * kSquares) {
+      for (size_t o = 0; o < outputs; ++o) {
+        for (size_t c = 0; c < nhwc_reorder_channels; ++c) {
+          for (size_t sq = 0; sq < kSquares; ++sq) {
+            weights_t_[(sq * nhwc_reorder_channels + c) * outputs + o] =
+                weights_[o * input_size_ + c * kSquares + sq];
+          }
+        }
+      }
+    } else {
+      for (size_t o = 0; o < outputs; ++o) {
+        for (size_t k = 0; k < input_size_; ++k) {
+          weights_t_[k * outputs + o] = weights_[o * input_size_ + k];
+        }
+      }
+    }
+  }
+#else
+  (void)use_avx512_fp32;
+  (void)nhwc_reorder_channels;
+#endif
+}
 
 template <bool use_eigen>
 void DenseLayer<use_eigen>::Eval(size_t batch_size, float* output,
                                  const float* input, const float* /*input2*/,
-                                 Workspace<use_eigen>& /*workspace*/) const {
+                                 Workspace<use_eigen>& workspace) const {
+  if (!weights_t_.empty()) {
+    RunGemmFp32Avx512(batch_size, biases_.size(), input_size_, input,
+                      weights_t_.data(), biases_.data(), activation_, output,
+                      workspace.int8.pool);
+    return;
+  }
   FullyConnectedLayer<use_eigen>::Forward1D(
       batch_size, input_size_, biases_.size(), input, weights_.data(),
       biases_.data(), activation_, output);
@@ -316,17 +385,38 @@ template <bool use_eigen>
 EmbeddingLayer<use_eigen>::EmbeddingLayer(const std::vector<float>& weights,
                                           const std::vector<float>& biases,
                                           size_t input_channels,
-                                          ActivationFunction activation)
+                                          ActivationFunction activation,
+                                          bool use_avx512_fp32)
     : BaseLayer<use_eigen>(biases.size() * kSquares),
       weights_(weights),
       biases_(biases),
       input_channels_(input_channels),
-      activation_(activation) {}
+      activation_(activation) {
+#ifdef LC0_HAS_AVX512_VNNI
+  if (!use_eigen && use_avx512_fp32 && CpuSupportsAvx512Vnni()) {
+    const size_t outputs = biases_.size();
+    weights_t_.resize(input_channels_ * outputs);
+    for (size_t o = 0; o < outputs; ++o) {
+      for (size_t k = 0; k < input_channels_; ++k) {
+        weights_t_[k * outputs + o] = weights_[o * input_channels_ + k];
+      }
+    }
+  }
+#else
+  (void)use_avx512_fp32;
+#endif
+}
 
 template <bool use_eigen>
 void EmbeddingLayer<use_eigen>::Eval(
     size_t batch_size, float* output, const float* input,
-    const float* /*input2*/, Workspace<use_eigen>& /*workspace*/) const {
+    const float* /*input2*/, Workspace<use_eigen>& workspace) const {
+  if (!weights_t_.empty()) {
+    RunGemmFp32Avx512(batch_size * kSquares, biases_.size(), input_channels_,
+                      input, weights_t_.data(), biases_.data(), activation_,
+                      output, workspace.int8.pool);
+    return;
+  }
   FullyConnectedLayer<use_eigen>::Forward1D(
       batch_size * kSquares, input_channels_, biases_.size(), input,
       weights_.data(), biases_.data(), activation_, output);
@@ -411,13 +501,12 @@ EncoderBlock<use_eigen>::EncoderBlock(
 }
 
 template <bool use_eigen>
-bool EncoderBlock<use_eigen>::Eval(size_t batch_size, std::vector<float>& flow,
-                                   std::vector<float>& buffer2,
-                                   std::vector<float>& buffer3,
-                                   std::vector<float>& buffer4,
-                                   Int8Scratch& int8_scratch,
-                                   bool qkv_already_quantized,
-                                   const Int8Weights* next_qkv_int8) const {
+bool EncoderBlock<use_eigen>::Eval(
+    size_t batch_size, std::vector<float>& flow, std::vector<float>& buffer2,
+    std::vector<float>& buffer3, std::vector<float>& buffer4,
+    Int8Scratch& int8_scratch, bool qkv_already_quantized,
+    const Int8Weights* next_qkv_int8, bool smol_compress_already_quantized,
+    bool next_has_smol_compress, bool* next_smol_compress_quantized) const {
   const auto& mha = weights_.mha;
   const auto& ffn = weights_.ffn;
   const size_t d_model = mha.q_b.size();
@@ -433,7 +522,9 @@ bool EncoderBlock<use_eigen>::Eval(size_t batch_size, std::vector<float>& flow,
   auto run_ln = [&](size_t ln_rows, size_t channels, float* data, float alpha,
                     const float* skip, const float* gammas, const float* betas,
                     float eps, uint8_t* quant_out = nullptr,
-                    float inv_scale = 0.0f, float zp = 0.0f) {
+                    float inv_scale = 0.0f, float zp = 0.0f,
+                    uint8_t* dyn_q = nullptr, float* dyn_s = nullptr,
+                    float* dyn_m = nullptr) {
 #ifdef LC0_HAS_AVX512_VNNI
     if (CpuSupportsAvx512Vnni()) {
       if (pool && pool->num_threads() > 1 && ln_rows >= 64) {
@@ -441,12 +532,14 @@ bool EncoderBlock<use_eigen>::Eval(size_t batch_size, std::vector<float>& flow,
           LayerNorm2DWithSkipAndQuantizeAvx512(
               r1 - r0, channels, data + r0 * channels, alpha,
               skip ? skip + r0 * channels : nullptr, gammas, betas, eps,
-              quant_out ? quant_out + r0 * channels : nullptr, inv_scale, zp);
+              quant_out ? quant_out + r0 * channels : nullptr, inv_scale, zp,
+              dyn_q ? dyn_q + r0 * channels : nullptr,
+              dyn_s ? dyn_s + r0 : nullptr, dyn_m ? dyn_m + r0 : nullptr);
         });
       } else {
-        LayerNorm2DWithSkipAndQuantizeAvx512(ln_rows, channels, data, alpha,
-                                             skip, gammas, betas, eps,
-                                             quant_out, inv_scale, zp);
+        LayerNorm2DWithSkipAndQuantizeAvx512(
+            ln_rows, channels, data, alpha, skip, gammas, betas, eps, quant_out,
+            inv_scale, zp, dyn_q, dyn_s, dyn_m);
       }
       return;
     }
@@ -454,6 +547,9 @@ bool EncoderBlock<use_eigen>::Eval(size_t batch_size, std::vector<float>& flow,
     (void)quant_out;
     (void)inv_scale;
     (void)zp;
+    (void)dyn_q;
+    (void)dyn_s;
+    (void)dyn_m;
     if (pool && pool->num_threads() > 1 && ln_rows >= 64) {
       pool->ParallelFor(ln_rows, 16, [&](size_t r0, size_t r1, size_t) {
         LayerNorm2DWithSkipConnection(
@@ -474,15 +570,33 @@ bool EncoderBlock<use_eigen>::Eval(size_t batch_size, std::vector<float>& flow,
   GrowBuffer(buffer4,
              batch_size * kSquares * std::max(kSquares * heads, dff_size));
 
+  // Smolgen + MHA fast path on AVX-512 when head depth == 32:
+  // Defer `smolgen_global` GEMM into the per-head MHA parallel region so each
+  // core computes its slice of `qk` in L2 and immediately fuses
+  // `Q*K^T + smolgen -> Softmax64 -> Attn*V` inside L1d!
+#ifdef LC0_HAS_AVX512_VNNI
+  const bool use_fused_mha_32 =
+      !use_eigen && (d_model / heads == 32) && (d_model % heads == 0) &&
+      CpuSupportsAvx512Vnni();
+#else
+  const bool use_fused_mha_32 = false;
+#endif
+
   // Smolgen.
   if (mha.has_smolgen) {
     float* qk = buffer4.data();
 
     // Compress.
     if (smolgen_compress_int8_) {
-      smolgen_compress_int8_->Forward(batch_size * kSquares, flow.data(),
-                                      nullptr, ACTIVATION_NONE, buffer2.data(),
-                                      int8_scratch);
+      if (smol_compress_already_quantized) {
+        smolgen_compress_int8_->ForwardPrepared(
+            batch_size * kSquares, nullptr, ACTIVATION_NONE, buffer2.data(),
+            int8_scratch);
+      } else {
+        smolgen_compress_int8_->Forward(batch_size * kSquares, flow.data(),
+                                        nullptr, ACTIVATION_NONE, buffer2.data(),
+                                        int8_scratch);
+      }
     } else {
       FullyConnectedLayer<use_eigen>::Forward1D(
           batch_size * kSquares, embedding_size_, hidden_channels, flow.data(),
@@ -501,30 +615,70 @@ bool EncoderBlock<use_eigen>::Eval(size_t batch_size, std::vector<float>& flow,
           mha.smolgen.dense1_w.data(), mha.smolgen.dense1_b.data(),
           smolgen_activation_, buffer3.data());
     }
-    // Layer Norm.
-    run_ln(batch_size, hidden_size, buffer3.data(), 1.0f, nullptr,
-           mha.smolgen.ln1_gammas.data(), mha.smolgen.ln1_betas.data(), 1e-3f);
-
-    // Dense 2.
+    // Layer Norm 1 + Dense 2.
     if (smolgen_dense2_int8_) {
-      smolgen_dense2_int8_->Forward(
-          batch_size, buffer3.data(), mha.smolgen.dense2_b.data(),
-          smolgen_activation_, buffer2.data(), int8_scratch);
+#ifdef LC0_HAS_AVX512_VNNI
+      int8_scratch.quantized_input2.Resize(batch_size * hidden_size);
+      if (int8_scratch.dynamic_scales.size() < batch_size) {
+        int8_scratch.dynamic_scales.resize(batch_size);
+      }
+      if (int8_scratch.dynamic_mins.size() < batch_size) {
+        int8_scratch.dynamic_mins.resize(batch_size);
+      }
+      LayerNormAndDynamicQuantizeAvx512(
+          batch_size, hidden_size, hidden_size, buffer3.data(),
+          mha.smolgen.ln1_gammas.data(), mha.smolgen.ln1_betas.data(), 1e-3f,
+          int8_scratch.quantized_input2.data(),
+          int8_scratch.dynamic_scales.data(),
+          int8_scratch.dynamic_mins.data());
+      smolgen_dense2_int8_->ForwardPrepared(
+          batch_size, mha.smolgen.dense2_b.data(), smolgen_activation_,
+          buffer2.data(), int8_scratch);
+#endif
     } else {
+      run_ln(batch_size, hidden_size, buffer3.data(), 1.0f, nullptr,
+             mha.smolgen.ln1_gammas.data(), mha.smolgen.ln1_betas.data(), 1e-3f);
       FullyConnectedLayer<use_eigen>::Forward1D(
           batch_size, hidden_size, generated_size, buffer3.data(),
           mha.smolgen.dense2_w.data(), mha.smolgen.dense2_b.data(),
           smolgen_activation_, buffer2.data());
     }
-    // Layer Norm.
-    run_ln(batch_size, generated_size, buffer2.data(), 1.0f, nullptr,
-           mha.smolgen.ln2_gammas.data(), mha.smolgen.ln2_betas.data(), 1e-3f);
 
-    // Global smolgen weights.
+    // Layer Norm 2 + Global smolgen weights.
     if (smolgen_global_int8_) {
-      smolgen_global_int8_->Forward(batch_size * heads, buffer2.data(), nullptr,
-                                    ACTIVATION_NONE, qk, int8_scratch);
+#ifdef LC0_HAS_AVX512_VNNI
+      const size_t total_heads = batch_size * heads;
+      const size_t gen_per_head = generated_size / heads;
+      int8_scratch.quantized_input2.Resize(batch_size * generated_size);
+      if (int8_scratch.dynamic_scales.size() < total_heads) {
+        int8_scratch.dynamic_scales.resize(total_heads);
+      }
+      if (int8_scratch.dynamic_mins.size() < total_heads) {
+        int8_scratch.dynamic_mins.resize(total_heads);
+      }
+      auto run_ln2_dyn = [&](size_t b0, size_t b1, size_t) {
+        LayerNormAndDynamicQuantizeAvx512(
+            b1 - b0, generated_size, gen_per_head,
+            buffer2.data() + b0 * generated_size, mha.smolgen.ln2_gammas.data(),
+            mha.smolgen.ln2_betas.data(), 1e-3f,
+            int8_scratch.quantized_input2.data() + b0 * generated_size,
+            int8_scratch.dynamic_scales.data() + b0 * heads,
+            int8_scratch.dynamic_mins.data() + b0 * heads);
+      };
+      if (pool && pool->num_threads() > 1 && batch_size >= 2 &&
+          batch_size * generated_size >= 8192) {
+        pool->ParallelFor(batch_size, 1, run_ln2_dyn);
+      } else {
+        run_ln2_dyn(0, batch_size, 0);
+      }
+      if (!use_fused_mha_32) {
+        smolgen_global_int8_->ForwardPrepared(total_heads, nullptr,
+                                              ACTIVATION_NONE, qk, int8_scratch);
+      }
+#endif
     } else {
+      run_ln(batch_size, generated_size, buffer2.data(), 1.0f, nullptr,
+             mha.smolgen.ln2_gammas.data(), mha.smolgen.ln2_betas.data(), 1e-3f);
       FullyConnectedLayer<use_eigen>::Forward1D(
           batch_size * heads, generated_size / heads, kSquares * kSquares,
           buffer2.data(), smolgen_global_weights_.data(), (const float*)nullptr,
@@ -571,139 +725,177 @@ bool EncoderBlock<use_eigen>::Eval(size_t batch_size, std::vector<float>& flow,
   const int row_stride = static_cast<int>(d_model);  // heads * depth
   const float scaling = 1.0f / sqrtf(static_cast<float>(depth));
 
-  // MHA is done per batch since there's a fourth dimension introduced.
-  auto run_qk_batches = [&](size_t b0, size_t b1, size_t) {
-#ifdef USE_MKL
-    if (pool && pool->num_threads() > 1 && batch_size > 1) {
-      mkl_set_num_threads_local(1);
-    }
-#endif
-    for (size_t batch = b0; batch < b1; batch++) {
-      const size_t batch_start = batch * kSquares * d_model;
-      float* qk = &buffer4[batch * kSquares * kSquares * heads];
-      const float* q = &buffer2[batch_start];
-      const float* k = &buffer3[batch_start];
-
-      for (size_t h = 0; h < heads; h++) {
-        const float* a = &q[h * depth];
-        const float* b = &k[h * depth];
-        float* c = &qk[h * kSquares * kSquares];
-        const float beta = mha.has_smolgen ? 1.0f : 0.0f;
-        if (use_eigen) {
-          auto c_mat = EigenMatrixMap<float>(c, kSquares, kSquares);
-          c_mat.noalias() =
-              beta * c_mat +
-              scaling *
-                  ConstEigenStridedMatrixMap<float>(
-                      b, depth, kSquares, Eigen::OuterStride<>(row_stride))
-                      .transpose() *
-                  ConstEigenStridedMatrixMap<float>(
-                      a, depth, kSquares, Eigen::OuterStride<>(row_stride));
-        } else {
-#ifdef USE_BLAS
-          cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, kSquares,
-                      kSquares, depth, scaling, a, row_stride, b, row_stride,
-                      beta, c, kSquares);
-#else
-          throw Exception("Blas backend internal error");
-#endif
-        }
-      }
-    }
-#ifdef USE_MKL
-    if (pool && pool->num_threads() > 1 && batch_size > 1) {
-      mkl_set_num_threads_local(0);
-    }
-#endif
-  };
-  if (pool && pool->num_threads() > 1 && batch_size > 1) {
-    pool->ParallelFor(batch_size, 1, run_qk_batches);
-  } else {
-    run_qk_batches(0, batch_size, 0);
-  }
-
-  // Apply Softmax.
-  float* qk = buffer4.data();
-  const size_t total_heads = batch_size * heads;
-  auto run_softmax = [&](size_t h0, size_t h1, size_t) {
 #ifdef LC0_HAS_AVX512_VNNI
-    if (CpuSupportsAvx512Vnni()) {
-      Softmax64Avx512((h1 - h0) * kSquares, qk + h0 * kSquares * kSquares);
-      return;
+  if (use_fused_mha_32) {
+    GrowBuffer(int8_scratch.mha_v, rows * d_model);
+    if (v_int8_) {
+      v_int8_->Forward(rows, qkv_quantized, mha.v_b.data(), ACTIVATION_NONE,
+                       int8_scratch.mha_v.data(), int8_scratch);
+    } else {
+      FullyConnectedLayer<use_eigen>::Forward1D(
+          rows, embedding_size_, d_model, flow.data(), mha.v_w.data(),
+          mha.v_b.data(), ACTIVATION_NONE, int8_scratch.mha_v.data());
     }
-#endif
-    for (size_t bh = h0; bh < h1; ++bh) {
-      float* head_qk = qk + bh * kSquares * kSquares;
-      for (size_t sq = 0; sq < kSquares; ++sq) {
-#if defined(USE_ISPC)
-        if (!use_eigen) {
-          ispc::SoftmaxActivation(kSquares, head_qk + sq * kSquares,
-                                  head_qk + sq * kSquares);
-          continue;
-        }
-#endif
-        SoftmaxActivation(kSquares, head_qk + sq * kSquares,
-                          head_qk + sq * kSquares);
+
+    const size_t total_heads = batch_size * heads;
+    auto run_fused_heads = [&](size_t bh0, size_t bh1, size_t) {
+      if (mha.has_smolgen && smolgen_global_int8_) {
+        smolgen_global_int8_->ForwardPreparedRange(
+            bh0, bh1, nullptr, ACTIVATION_NONE, buffer4.data(), int8_scratch);
       }
+      for (size_t bh = bh0; bh < bh1; ++bh) {
+        const size_t batch = bh / heads;
+        const size_t h = bh % heads;
+        const size_t batch_start = batch * kSquares * d_model;
+        MhaAttentionHead32Avx512(
+            d_model, scaling, &buffer2[batch_start], &buffer3[batch_start],
+            &int8_scratch.mha_v[batch_start],
+            mha.has_smolgen ? &buffer4[bh * kSquares * kSquares] : nullptr, h,
+            &buffer2[batch_start]);
+      }
+    };
+    if (pool && pool->num_threads() > 1 && total_heads >= 4) {
+      pool->ParallelFor(total_heads, 1, run_fused_heads);
+    } else {
+      run_fused_heads(0, total_heads, 0);
     }
-  };
-  if (pool && pool->num_threads() > 1 && total_heads >= 4) {
-    pool->ParallelFor(total_heads, 1, run_softmax);
-  } else {
-    run_softmax(0, total_heads, 0);
-  }
-
-  // V (reuses `qkv_quantized` from Q and K).
-  if (v_int8_) {
-    v_int8_->Forward(rows, qkv_quantized, mha.v_b.data(), ACTIVATION_NONE,
-                     buffer3.data(), int8_scratch);
-  } else {
-    FullyConnectedLayer<use_eigen>::Forward1D(
-        rows, embedding_size_, d_model, flow.data(), mha.v_w.data(),
-        mha.v_b.data(), ACTIVATION_NONE, buffer3.data());
-  }
-
-  auto run_sv_batches = [&](size_t b0, size_t b1, size_t) {
-#ifdef USE_MKL
-    if (pool && pool->num_threads() > 1 && batch_size > 1) {
-      mkl_set_num_threads_local(1);
-    }
+  } else
 #endif
-    for (size_t batch = b0; batch < b1; batch++) {
-      const size_t batch_start = batch * kSquares * d_model;
-      float* attention = &buffer2[batch_start];
-      const float* v = &buffer3[batch_start];
-      const float* batch_qk = &buffer4[batch * kSquares * kSquares * heads];
-      for (size_t h = 0; h < heads; h++) {
-        const float* a = &batch_qk[h * kSquares * kSquares];
-        const float* b = &v[h * depth];
-        float* c = &attention[h * depth];
-        if (use_eigen) {
-          auto c_mat = EigenStridedMatrixMap<float>(
-              c, depth, kSquares, Eigen::OuterStride<>(row_stride));
-          c_mat.noalias() =
-              ConstEigenStridedMatrixMap<float>(
-                  b, depth, kSquares, Eigen::OuterStride<>(row_stride)) *
-              ConstEigenMatrixMap<float>(a, kSquares, kSquares);
-        } else {
+  {
+    // MHA is done per batch since there's a fourth dimension introduced.
+    auto run_qk_batches = [&](size_t b0, size_t b1, size_t) {
+#ifdef USE_MKL
+      if (pool && pool->num_threads() > 1 && batch_size > 1) {
+        mkl_set_num_threads_local(1);
+      }
+#endif
+      for (size_t batch = b0; batch < b1; batch++) {
+        const size_t batch_start = batch * kSquares * d_model;
+        float* qk = &buffer4[batch * kSquares * kSquares * heads];
+        const float* q = &buffer2[batch_start];
+        const float* k = &buffer3[batch_start];
+
+        for (size_t h = 0; h < heads; h++) {
+          const float* a = &q[h * depth];
+          const float* b = &k[h * depth];
+          float* c = &qk[h * kSquares * kSquares];
+          const float beta = mha.has_smolgen ? 1.0f : 0.0f;
+          if (use_eigen) {
+            auto c_mat = EigenMatrixMap<float>(c, kSquares, kSquares);
+            c_mat.noalias() =
+                beta * c_mat +
+                scaling *
+                    ConstEigenStridedMatrixMap<float>(
+                        b, depth, kSquares, Eigen::OuterStride<>(row_stride))
+                        .transpose() *
+                    ConstEigenStridedMatrixMap<float>(
+                        a, depth, kSquares, Eigen::OuterStride<>(row_stride));
+          } else {
 #ifdef USE_BLAS
-          cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, kSquares,
-                      depth, kSquares, 1.0f, a, kSquares, b, row_stride, 0.0f,
-                      c, row_stride);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, kSquares,
+                        kSquares, depth, scaling, a, row_stride, b, row_stride,
+                        beta, c, kSquares);
+#else
+            throw Exception("Blas backend internal error");
 #endif
+          }
         }
       }
-    }
 #ifdef USE_MKL
-    if (pool && pool->num_threads() > 1 && batch_size > 1) {
-      mkl_set_num_threads_local(0);
-    }
+      if (pool && pool->num_threads() > 1 && batch_size > 1) {
+        mkl_set_num_threads_local(0);
+      }
 #endif
-  };
-  if (pool && pool->num_threads() > 1 && batch_size > 1) {
-    pool->ParallelFor(batch_size, 1, run_sv_batches);
-  } else {
-    run_sv_batches(0, batch_size, 0);
+    };
+    if (pool && pool->num_threads() > 1 && batch_size > 1) {
+      pool->ParallelFor(batch_size, 1, run_qk_batches);
+    } else {
+      run_qk_batches(0, batch_size, 0);
+    }
+
+    // Apply Softmax.
+    float* qk = buffer4.data();
+    const size_t total_heads = batch_size * heads;
+    auto run_softmax = [&](size_t h0, size_t h1, size_t) {
+#ifdef LC0_HAS_AVX512_VNNI
+      if (CpuSupportsAvx512Vnni()) {
+        Softmax64Avx512((h1 - h0) * kSquares, qk + h0 * kSquares * kSquares);
+        return;
+      }
+#endif
+      for (size_t bh = h0; bh < h1; ++bh) {
+        float* head_qk = qk + bh * kSquares * kSquares;
+        for (size_t sq = 0; sq < kSquares; ++sq) {
+#if defined(USE_ISPC)
+          if (!use_eigen) {
+            ispc::SoftmaxActivation(kSquares, head_qk + sq * kSquares,
+                                    head_qk + sq * kSquares);
+            continue;
+          }
+#endif
+          SoftmaxActivation(kSquares, head_qk + sq * kSquares,
+                            head_qk + sq * kSquares);
+        }
+      }
+    };
+    if (pool && pool->num_threads() > 1 && total_heads >= 4) {
+      pool->ParallelFor(total_heads, 1, run_softmax);
+    } else {
+      run_softmax(0, total_heads, 0);
+    }
+
+    // V (reuses `qkv_quantized` from Q and K).
+    if (v_int8_) {
+      v_int8_->Forward(rows, qkv_quantized, mha.v_b.data(), ACTIVATION_NONE,
+                       buffer3.data(), int8_scratch);
+    } else {
+      FullyConnectedLayer<use_eigen>::Forward1D(
+          rows, embedding_size_, d_model, flow.data(), mha.v_w.data(),
+          mha.v_b.data(), ACTIVATION_NONE, buffer3.data());
+    }
+
+    auto run_sv_batches = [&](size_t b0, size_t b1, size_t) {
+#ifdef USE_MKL
+      if (pool && pool->num_threads() > 1 && batch_size > 1) {
+        mkl_set_num_threads_local(1);
+      }
+#endif
+      for (size_t batch = b0; batch < b1; batch++) {
+        const size_t batch_start = batch * kSquares * d_model;
+        float* attention = &buffer2[batch_start];
+        const float* v = &buffer3[batch_start];
+        const float* batch_qk = &buffer4[batch * kSquares * kSquares * heads];
+        for (size_t h = 0; h < heads; h++) {
+          const float* a = &batch_qk[h * kSquares * kSquares];
+          const float* b = &v[h * depth];
+          float* c = &attention[h * depth];
+          if (use_eigen) {
+            auto c_mat = EigenStridedMatrixMap<float>(
+                c, depth, kSquares, Eigen::OuterStride<>(row_stride));
+            c_mat.noalias() =
+                ConstEigenStridedMatrixMap<float>(
+                    b, depth, kSquares, Eigen::OuterStride<>(row_stride)) *
+                ConstEigenMatrixMap<float>(a, kSquares, kSquares);
+          } else {
+#ifdef USE_BLAS
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, kSquares,
+                        depth, kSquares, 1.0f, a, kSquares, b, row_stride, 0.0f,
+                        c, row_stride);
+#endif
+          }
+        }
+      }
+#ifdef USE_MKL
+      if (pool && pool->num_threads() > 1 && batch_size > 1) {
+        mkl_set_num_threads_local(0);
+      }
+#endif
+    };
+    if (pool && pool->num_threads() > 1 && batch_size > 1) {
+      pool->ParallelFor(batch_size, 1, run_sv_batches);
+    } else {
+      run_sv_batches(0, batch_size, 0);
+    }
   }
 
   // Fully connected final MHA layer.
@@ -793,16 +985,35 @@ bool EncoderBlock<use_eigen>::Eval(size_t batch_size, std::vector<float>& flow,
   }
 
   // Layer Norm + skip connection, optionally fused with next encoder's QKV
-  // input quantization.
+  // and smolgen_compress input quantization.
   bool next_qkv_quantized = false;
+  if (next_smol_compress_quantized) *next_smol_compress_quantized = false;
 #ifdef LC0_HAS_AVX512_VNNI
   if (next_qkv_int8 && CpuSupportsAvx512Vnni()) {
     int8_scratch.quantized_input.Resize(rows * embedding_size_);
+    uint8_t* dyn_q = nullptr;
+    float* dyn_s = nullptr;
+    float* dyn_m = nullptr;
+    if (next_has_smol_compress && next_smol_compress_quantized &&
+        embedding_size_ == 256) {
+      int8_scratch.quantized_input2.Resize(rows * embedding_size_);
+      if (int8_scratch.dynamic_scales.size() < rows) {
+        int8_scratch.dynamic_scales.resize(rows);
+      }
+      if (int8_scratch.dynamic_mins.size() < rows) {
+        int8_scratch.dynamic_mins.resize(rows);
+      }
+      dyn_q = int8_scratch.quantized_input2.data();
+      dyn_s = int8_scratch.dynamic_scales.data();
+      dyn_m = int8_scratch.dynamic_mins.data();
+      *next_smol_compress_quantized = true;
+    }
     run_ln(rows, embedding_size_, buffer3.data(), alpha_, flow.data(),
            weights_.ln2_gammas.data(), weights_.ln2_betas.data(),
            default_epsilon_, int8_scratch.quantized_input.data(),
            next_qkv_int8->inverse_input_scale(),
-           static_cast<float>(next_qkv_int8->input_zero_point()));
+           static_cast<float>(next_qkv_int8->input_zero_point()), dyn_q, dyn_s,
+           dyn_m);
     next_qkv_quantized = true;
   }
 #endif
@@ -874,6 +1085,32 @@ AttentionBody<use_eigen>::AttentionBody(const MultiHeadWeights& weights,
                                   dff_size);
     }
   }
+  if (!use_eigen && CpuSupportsAvx512Vnni()) {
+    const size_t emb_in = has_residual_tower_
+                              ? input_channels_
+                              : input_channels_ + position_encoding_channels_;
+    if (weights_.ip_emb_w.size() == embedding_size_ * emb_in) {
+      ip_emb_w_t_.resize(emb_in * embedding_size_);
+      for (size_t o = 0; o < embedding_size_; ++o) {
+        for (size_t k = 0; k < emb_in; ++k) {
+          ip_emb_w_t_[k * embedding_size_ + o] =
+              weights_.ip_emb_w[o * emb_in + k];
+        }
+      }
+    }
+    if (!weights_.ip_mult_gate.empty() && !weights_.ip_add_gate.empty()) {
+      ip_mult_gate_nhwc_.resize(kSquares * embedding_size_);
+      ip_add_gate_nhwc_.resize(kSquares * embedding_size_);
+      for (size_t sq = 0; sq < kSquares; ++sq) {
+        for (size_t c = 0; c < embedding_size_; ++c) {
+          ip_mult_gate_nhwc_[sq * embedding_size_ + c] =
+              weights_.ip_mult_gate[c * kSquares + sq];
+          ip_add_gate_nhwc_[sq * embedding_size_ + c] =
+              weights_.ip_add_gate[c * kSquares + sq];
+        }
+      }
+    }
+  }
 #endif
   for (const auto& layer : weights.encoder) {
     encoders_.emplace_back(layer, weights.smolgen_w, embedding_size_,
@@ -901,8 +1138,23 @@ void AttentionBody<use_eigen>::Eval(size_t batch_size, float* output,
   GrowBuffer(buffer3, batch_size * kSquares * embedding_input_size);
   float* embedding_input = buffer3.data();
 
+  Int8ThreadPool* pool = workspace.int8.pool;
   if (has_residual_tower_) {
     NchwToNhwc(batch_size, input_channels_, input, embedding_input);
+  } else if (!is_pe_dense_embedding_ && !use_eigen && CpuSupportsAvx512Vnni()) {
+#ifdef LC0_HAS_AVX512_VNNI
+    auto run_prep = [&](size_t b0, size_t b1, size_t) {
+      PrepAttentionInputPeMapAvx512(
+          b1 - b0, input_channels_, position_encoding_channels_,
+          input + b0 * kSquares * input_channels_, &kPosEncoding[0][0],
+          embedding_input + b0 * kSquares * embedding_input_size);
+    };
+    if (pool && pool->num_threads() > 1 && batch_size > 1) {
+      pool->ParallelFor(batch_size, 1, run_prep);
+    } else {
+      run_prep(0, batch_size, 0);
+    }
+#endif
   } else {
     if (is_pe_dense_embedding_) {
       // NCHW to NHWC conversion of 12-channel slice of input.
@@ -945,10 +1197,17 @@ void AttentionBody<use_eigen>::Eval(size_t batch_size, float* output,
 
   // Input embedding.
   GrowBuffer(flow, batch_size * kSquares * embedding_size_);
-  FullyConnectedLayer<use_eigen>::Forward1D(
-      batch_size * kSquares, embedding_input_size, embedding_size_,
-      embedding_input, weights_.ip_emb_w.data(), weights_.ip_emb_b.data(),
-      default_activation_, flow.data());
+  if (!ip_emb_w_t_.empty()) {
+    RunGemmFp32Avx512(batch_size * kSquares, embedding_size_,
+                      embedding_input_size, embedding_input, ip_emb_w_t_.data(),
+                      weights_.ip_emb_b.data(), default_activation_,
+                      flow.data(), pool);
+  } else {
+    FullyConnectedLayer<use_eigen>::Forward1D(
+        batch_size * kSquares, embedding_input_size, embedding_size_,
+        embedding_input, weights_.ip_emb_w.data(), weights_.ip_emb_b.data(),
+        default_activation_, flow.data());
+  }
 
   // Layer norm for new encoding.
   if (is_pe_dense_embedding_) {
@@ -959,7 +1218,21 @@ void AttentionBody<use_eigen>::Eval(size_t batch_size, float* output,
   }
 
   // Input gating
-  if (weights_.ip_mult_gate.size() > 0 && weights_.ip_add_gate.size() > 0) {
+  if (!ip_mult_gate_nhwc_.empty() && !ip_add_gate_nhwc_.empty()) {
+#ifdef LC0_HAS_AVX512_VNNI
+    auto run_gate = [&](size_t b0, size_t b1, size_t) {
+      ApplyInputGatingAvx512(
+          b1 - b0, embedding_size_, flow.data() + b0 * kSquares * embedding_size_,
+          ip_mult_gate_nhwc_.data(), ip_add_gate_nhwc_.data());
+    };
+    if (pool && pool->num_threads() > 1 && batch_size > 1) {
+      pool->ParallelFor(batch_size, 1, run_gate);
+    } else {
+      run_gate(0, batch_size, 0);
+    }
+#endif
+  } else if (weights_.ip_mult_gate.size() > 0 &&
+             weights_.ip_add_gate.size() > 0) {
     for (size_t batch = 0; batch < batch_size; batch++) {
       for (size_t i = 0; i < kSquares; i++) {
         for (size_t j = 0; j < embedding_size_; j++) {
@@ -1020,7 +1293,6 @@ void AttentionBody<use_eigen>::Eval(size_t batch_size, float* output,
         zp = static_cast<float>(first_qkv->input_zero_point());
         qkv_quantized = true;
       }
-      Int8ThreadPool* pool = workspace.int8.pool;
       if (pool && pool->num_threads() > 1 && ln_rows >= 64) {
         pool->ParallelFor(ln_rows, 16, [&](size_t r0, size_t r1, size_t) {
           LayerNorm2DWithSkipAndQuantizeAvx512(
@@ -1047,22 +1319,34 @@ void AttentionBody<use_eigen>::Eval(size_t batch_size, float* output,
     std::swap(flow, buffer2);
 
     // Attention body encoders.
+    bool smol_quantized = false;
     for (size_t i = 0; i < encoders_.size(); ++i) {
       const Int8Weights* next_qkv =
           (i + 1 < encoders_.size()) ? encoders_[i + 1].q_int8() : nullptr;
-      qkv_quantized =
-          encoders_[i].Eval(batch_size, flow, buffer2, buffer3, buffer4,
-                            workspace.int8, qkv_quantized, next_qkv);
+      const bool next_smol = (i + 1 < encoders_.size()) &&
+                             encoders_[i + 1].has_smolgen_compress_int8();
+      bool next_smol_quantized = false;
+      qkv_quantized = encoders_[i].Eval(
+          batch_size, flow, buffer2, buffer3, buffer4, workspace.int8,
+          qkv_quantized, next_qkv, smol_quantized, next_smol,
+          &next_smol_quantized);
+      smol_quantized = next_smol_quantized;
     }
   } else {
     // Attention body encoders.
     bool qkv_quantized = false;
+    bool smol_quantized = false;
     for (size_t i = 0; i < encoders_.size(); ++i) {
       const Int8Weights* next_qkv =
           (i + 1 < encoders_.size()) ? encoders_[i + 1].q_int8() : nullptr;
-      qkv_quantized =
-          encoders_[i].Eval(batch_size, flow, buffer2, buffer3, buffer4,
-                            workspace.int8, qkv_quantized, next_qkv);
+      const bool next_smol = (i + 1 < encoders_.size()) &&
+                             encoders_[i + 1].has_smolgen_compress_int8();
+      bool next_smol_quantized = false;
+      qkv_quantized = encoders_[i].Eval(
+          batch_size, flow, buffer2, buffer3, buffer4, workspace.int8,
+          qkv_quantized, next_qkv, smol_quantized, next_smol,
+          &next_smol_quantized);
+      smol_quantized = next_smol_quantized;
     }
   }
 
@@ -1147,27 +1431,38 @@ void AttentionPolicyHead<use_eigen>::Eval(
   GrowBuffer(buffer2, batch_size * kSquares * policy_d_model);
   GrowBuffer(buffer3, batch_size * kSquares * policy_d_model);
 
-  // Q
-  if (ip2_pol_int8_) {
-    ip2_pol_int8_->Forward(batch_size * kSquares, flow.data(),
-                           weights_.ip2_pol_b.data(), ACTIVATION_NONE,
-                           buffer2.data(), workspace.int8);
+  if (ip2_pol_int8_ && ip3_pol_int8_) {
+    ip2_pol_int8_->PrepareDynamicRows(batch_size * kSquares, flow.data(),
+                                      workspace.int8);
+    ip2_pol_int8_->ForwardPrepared(batch_size * kSquares,
+                                   weights_.ip2_pol_b.data(), ACTIVATION_NONE,
+                                   buffer2.data(), workspace.int8);
+    ip3_pol_int8_->ForwardPrepared(batch_size * kSquares,
+                                   weights_.ip3_pol_b.data(), ACTIVATION_NONE,
+                                   buffer3.data(), workspace.int8);
   } else {
-    FullyConnectedLayer<use_eigen>::Forward1D(
-        batch_size * kSquares, policy_embedding_size, policy_d_model,
-        flow.data(), weights_.ip2_pol_w.data(), weights_.ip2_pol_b.data(),
-        ACTIVATION_NONE, buffer2.data());
-  }
-  // K
-  if (ip3_pol_int8_) {
-    ip3_pol_int8_->Forward(batch_size * kSquares, flow.data(),
-                           weights_.ip3_pol_b.data(), ACTIVATION_NONE,
-                           buffer3.data(), workspace.int8);
-  } else {
-    FullyConnectedLayer<use_eigen>::Forward1D(
-        batch_size * kSquares, policy_embedding_size, policy_d_model,
-        flow.data(), weights_.ip3_pol_w.data(), weights_.ip3_pol_b.data(),
-        ACTIVATION_NONE, buffer3.data());
+    // Q
+    if (ip2_pol_int8_) {
+      ip2_pol_int8_->Forward(batch_size * kSquares, flow.data(),
+                             weights_.ip2_pol_b.data(), ACTIVATION_NONE,
+                             buffer2.data(), workspace.int8);
+    } else {
+      FullyConnectedLayer<use_eigen>::Forward1D(
+          batch_size * kSquares, policy_embedding_size, policy_d_model,
+          flow.data(), weights_.ip2_pol_w.data(), weights_.ip2_pol_b.data(),
+          ACTIVATION_NONE, buffer2.data());
+    }
+    // K
+    if (ip3_pol_int8_) {
+      ip3_pol_int8_->Forward(batch_size * kSquares, flow.data(),
+                             weights_.ip3_pol_b.data(), ACTIVATION_NONE,
+                             buffer3.data(), workspace.int8);
+    } else {
+      FullyConnectedLayer<use_eigen>::Forward1D(
+          batch_size * kSquares, policy_embedding_size, policy_d_model,
+          flow.data(), weights_.ip3_pol_w.data(), weights_.ip3_pol_b.data(),
+          ACTIVATION_NONE, buffer3.data());
+    }
   }
   const int d_model = static_cast<int>(policy_d_model);
   const float scaling = 1.0f / sqrtf(static_cast<float>(d_model));
@@ -1198,6 +1493,37 @@ void AttentionPolicyHead<use_eigen>::Eval(
         throw Exception("Blas backend internal error");
 #endif
       }
+#ifdef LC0_HAS_AVX512_VNNI
+      if (!use_eigen && CpuSupportsAvx512Vnni()) {
+        AttentionPolicyPromoAvx512(policy_d_model, b, weights_.ip4_pol_w.data(),
+                                   c);
+        continue;
+      }
+#endif
+      float promotion_offsets[4][8];
+      for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 8; j++) {
+          float sum = 0;
+          for (size_t k = 0; k < policy_d_model; k++) {
+            sum += b[(56 + j) * policy_d_model + k] *
+                   weights_.ip4_pol_w[i * policy_d_model + k];
+          }
+          promotion_offsets[i][j] = sum;
+        }
+      }
+      for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 8; j++) {
+          promotion_offsets[i][j] += promotion_offsets[3][j];
+        }
+      }
+      for (int k = 0; k < 8; k++) {      // y in cuda
+        for (int j = 0; j < 8; j++) {    // w in cuda
+          for (int i = 0; i < 3; i++) {  // c in cuda
+            c[64 * 64 + 24 * k + 3 * j + i] =
+                c[(48 + k) * 64 + 56 + j] + promotion_offsets[i][j];
+          }
+        }
+      }
     }
 #ifdef USE_MKL
     if (pool && pool->num_threads() > 1 && batch_size > 1) {
@@ -1210,48 +1536,65 @@ void AttentionPolicyHead<use_eigen>::Eval(
   } else {
     run_pol_qk(0, batch_size, 0);
   }
-  // Promotion offset calculation.
-  for (size_t batch = 0; batch < batch_size; batch++) {
-    float* logits = output + batch * kAttentionPolicyOutputs;
-    float promotion_offsets[4][8];
-    // This is so small that SGEMM seems slower.
-    for (int i = 0; i < 4; i++) {
-      for (int j = 0; j < 8; j++) {
-        float sum = 0;
-        for (size_t k = 0; k < policy_d_model; k++) {
-          sum += buffer3[batch * kSquares * policy_d_model +
-                         (56 + j) * policy_d_model + k] *
-                 weights_.ip4_pol_w[i * policy_d_model + k];
-        }
-        promotion_offsets[i][j] = sum;
-      }
-    }
-    for (int i = 0; i < 3; i++) {
-      for (int j = 0; j < 8; j++) {
-        promotion_offsets[i][j] += promotion_offsets[3][j];
-      }
-    }
-    for (int k = 0; k < 8; k++) {      // y in cuda
-      for (int j = 0; j < 8; j++) {    // w in cuda
-        for (int i = 0; i < 3; i++) {  // c in cuda
-          logits[64 * 64 + 24 * k + 3 * j + i] =
-              logits[(48 + k) * 64 + 56 + j] + promotion_offsets[i][j];
-        }
-      }
-    }
-  }
 }
 
 template <bool use_eigen>
 ValueHead<use_eigen>::ValueHead(const MultiHeadWeights::ValueHead& weights,
                                 size_t input_channels, bool attention_body,
-                                bool wdl, ActivationFunction default_activation)
+                                bool wdl, ActivationFunction default_activation,
+                                bool input_is_nhwc, bool use_avx512_fp32)
     : BaseLayer<use_eigen>(wdl ? 3 : 1),
       weights_(weights),
       input_channels_(input_channels),
       attention_body_(attention_body),
       wdl_(wdl),
-      default_activation_(default_activation) {}
+      default_activation_(default_activation),
+      nhwc_avx512_(
+#ifdef LC0_HAS_AVX512_VNNI
+          !use_eigen && (attention_body || input_is_nhwc) && use_avx512_fp32 &&
+          CpuSupportsAvx512Vnni()
+#else
+          false
+#endif
+      ) {
+#ifdef LC0_HAS_AVX512_VNNI
+  if (nhwc_avx512_) {
+    const size_t input_planes = attention_body_ ? weights_.ip_val_b.size()
+                                                : weights_.value.biases.size();
+    const size_t value_channels = weights_.ip1_val_b.size();
+    const auto& ip_w =
+        attention_body_ ? weights_.ip_val_w : weights_.value.weights;
+    conv_w_t_.resize(input_channels_ * input_planes);
+    for (size_t o = 0; o < input_planes; ++o) {
+      for (size_t c = 0; c < input_channels_; ++c) {
+        conv_w_t_[c * input_planes + o] = ip_w[o * input_channels_ + c];
+      }
+    }
+    fc1_w_t_.resize(input_planes * kSquares * value_channels);
+    if (attention_body_) {
+      for (size_t o = 0; o < value_channels; ++o) {
+        for (size_t k = 0; k < input_planes * kSquares; ++k) {
+          fc1_w_t_[k * value_channels + o] =
+              weights_.ip1_val_w[o * (input_planes * kSquares) + k];
+        }
+      }
+    } else {
+      for (size_t o = 0; o < value_channels; ++o) {
+        for (size_t p = 0; p < input_planes; ++p) {
+          for (size_t sq = 0; sq < kSquares; ++sq) {
+            fc1_w_t_[(sq * input_planes + p) * value_channels + o] =
+                weights_.ip1_val_w[o * (input_planes * kSquares) +
+                                   p * kSquares + sq];
+          }
+        }
+      }
+    }
+  }
+#else
+  (void)input_is_nhwc;
+  (void)use_avx512_fp32;
+#endif
+}
 
 template <bool use_eigen>
 void ValueHead<use_eigen>::Eval(size_t batch_size, float* output,
@@ -1265,7 +1608,13 @@ void ValueHead<use_eigen>::Eval(size_t batch_size, float* output,
   GrowBuffer(head, batch_size * input_planes * kSquares);
   GrowBuffer(hidden, batch_size * value_channels);
 
-  if (attention_body_) {
+  if (nhwc_avx512_) {
+    const float* ip_b = attention_body_ ? weights_.ip_val_b.data()
+                                        : weights_.value.biases.data();
+    RunGemmFp32Avx512(batch_size * kSquares, input_planes, input_channels_,
+                      input, conv_w_t_.data(), ip_b, default_activation_,
+                      head.data(), workspace.int8.pool);
+  } else if (attention_body_) {
     FullyConnectedLayer<use_eigen>::Forward1D(
         batch_size * kSquares, input_channels_, input_planes, input,
         weights_.ip_val_w.data(), weights_.ip_val_b.data(), default_activation_,
@@ -1278,11 +1627,17 @@ void ValueHead<use_eigen>::Eval(size_t batch_size, float* output,
                  weights_.value.biases.data(), default_activation_);
   }
 
-  FullyConnectedLayer<use_eigen>::Forward1D(
-      batch_size, input_planes * kSquares, value_channels, head.data(),
-      weights_.ip1_val_w.data(), weights_.ip1_val_b.data(),
-      default_activation_,  // Activation On
-      hidden.data());
+  if (nhwc_avx512_) {
+    RunGemmFp32Avx512(batch_size, value_channels, input_planes * kSquares,
+                      head.data(), fc1_w_t_.data(), weights_.ip1_val_b.data(),
+                      default_activation_, hidden.data(), workspace.int8.pool);
+  } else {
+    FullyConnectedLayer<use_eigen>::Forward1D(
+        batch_size, input_planes * kSquares, value_channels, head.data(),
+        weights_.ip1_val_w.data(), weights_.ip1_val_b.data(),
+        default_activation_,  // Activation On
+        hidden.data());
+  }
 
   // Now get the score
   if (wdl_) {

@@ -56,6 +56,8 @@ struct Int8Scratch {
   AlignedBuffer<float> nhwc_output;
   // Per-thread scratch for direct 9-tap NHWC VNNI convolutions.
   std::vector<Conv3x3ThreadScratch> conv3_scratch;
+  // Scratch for fused MHA V projection ([batch_size][64][d_model]).
+  std::vector<float> mha_v;
   // Non-owning pointer to the network's INT8 thread pool (nullptr for 1
   // thread).
   Int8ThreadPool* pool = nullptr;
@@ -67,6 +69,13 @@ void NchwToNhwcFast(size_t batch_size, size_t channels, const float* input,
                     float* output, Int8ThreadPool* pool = nullptr);
 void NhwcToNchwFast(size_t batch_size, size_t channels, const float* input,
                     float* output, Int8ThreadPool* pool = nullptr);
+
+// Parallel AVX-512 FP32 GEMM: output[rows][outputs] = act(input[rows][inputs] *
+// weights_transposed[inputs][outputs] + biases[outputs]).
+void RunGemmFp32Avx512(size_t rows, size_t outputs, size_t inputs,
+                       const float* input, const float* weights_transposed,
+                       const float* biases, ActivationFunction activation,
+                       float* output, Int8ThreadPool* pool);
 
 // One W8A8 layer: int8 weights with one scale per output channel, and the
 // scale and zero point that quantize the layer's input to uint8. Computes
@@ -112,6 +121,13 @@ class Int8Weights {
                         uint8_t* quantized_output, Int8Scratch& scratch) const;
 
   // Quantizes `input` [rows][inputs] and runs Forward().
+  void PrepareDynamicRows(size_t rows, const float* input,
+                          Int8Scratch& scratch) const;
+
+  void ForwardPrepared(size_t rows, const float* biases,
+                       ActivationFunction activation, float* output,
+                       Int8Scratch& scratch) const;
+
   void Forward(size_t rows, const float* input, const float* biases,
                ActivationFunction activation, float* output,
                Int8Scratch& scratch) const;
@@ -128,6 +144,14 @@ class Int8Weights {
                      float* output_nhwc, Int8Scratch& scratch,
                      const float* biases = nullptr,
                      ActivationFunction activation = ACTIVATION_NONE) const;
+
+  // SmoothQuant-109 3x3 convolution reading NCHW directly on each worker
+  // thread (board-local L1/L2 transpose + plane-109 scale + pad1 quantize)
+  // and writing NHWC.
+  void Convolve3NchwToNhwc(size_t batch_size, const float* input_nchw,
+                           float plane109_scale, float* output_nhwc,
+                           Int8Scratch& scratch, const float* biases = nullptr,
+                           ActivationFunction activation = ACTIVATION_NONE) const;
 
   // Runs a complete fused NHWC residual block (conv1 -> bias1 + act ->
   // requant -> conv2 -> optional SE + skip + act) in-place on `tensor_nhwc`.
@@ -166,6 +190,17 @@ class DynamicInt8Weights {
 
   size_t inputs() const { return inputs_; }
   size_t outputs() const { return outputs_; }
+
+  void PrepareDynamicRows(size_t rows, const float* input,
+                          Int8Scratch& scratch) const;
+
+  void ForwardPrepared(size_t rows, const float* biases,
+                       ActivationFunction activation, float* output,
+                       Int8Scratch& scratch) const;
+
+  void ForwardPreparedRange(size_t row_begin, size_t row_end,
+                            const float* biases, ActivationFunction activation,
+                            float* output, const Int8Scratch& scratch) const;
 
   void Forward(size_t rows, const float* input, const float* biases,
                ActivationFunction activation, float* output,

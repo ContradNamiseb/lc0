@@ -105,7 +105,8 @@ class ConvLayer : public BaseLayer<use_eigen> {
             size_t filter_size, ActivationFunction activation,
             const std::vector<float>* raw_int8_weights = nullptr,
             float plane109_scale = 1.0f, bool dynamic_int8_nhwc = false,
-            bool convert_output_to_nchw = false);
+            bool convert_output_to_nchw = false, bool input_is_nhwc = false,
+            bool use_avx512_fp32 = false);
 
   void Eval(size_t batch_size, float* output, const float* input,
             const float* input2,
@@ -119,6 +120,8 @@ class ConvLayer : public BaseLayer<use_eigen> {
   const ActivationFunction activation_;
   const float plane109_scale_;
   const bool convert_output_to_nchw_;
+  const bool input_is_nhwc_;
+  std::vector<float> nhwc_1x1_w_t_;
   std::vector<int8_t> int8_w_storage_;
   std::vector<float> int8_s_storage_;
   std::optional<Int8Weights> int8_conv_;
@@ -147,6 +150,8 @@ class ResidualBlock : public BaseLayer<use_eigen> {
   const bool nhwc_layout_;
   std::optional<Int8Weights> conv1_int8_;
   std::optional<Int8Weights> conv2_int8_;
+  std::vector<float> se_w1_t_;
+  std::vector<float> se_w2_t_;
 };
 
 // A fully connected layer over each sample's whole input.
@@ -155,7 +160,8 @@ class DenseLayer : public BaseLayer<use_eigen> {
  public:
   DenseLayer(const std::vector<float>& weights,
              const std::vector<float>& biases, size_t input_size,
-             ActivationFunction activation);
+             ActivationFunction activation, bool use_avx512_fp32 = false,
+             size_t nhwc_reorder_channels = 0);
 
   void Eval(size_t batch_size, float* output, const float* input,
             const float* input2,
@@ -166,6 +172,7 @@ class DenseLayer : public BaseLayer<use_eigen> {
   const std::vector<float>& biases_;
   const size_t input_size_;
   const ActivationFunction activation_;
+  std::vector<float> weights_t_;
 };
 
 // A fully connected layer applied to every square of an NHWC tensor.
@@ -174,7 +181,7 @@ class EmbeddingLayer : public BaseLayer<use_eigen> {
  public:
   EmbeddingLayer(const std::vector<float>& weights,
                  const std::vector<float>& biases, size_t input_channels,
-                 ActivationFunction activation);
+                 ActivationFunction activation, bool use_avx512_fp32 = false);
 
   void Eval(size_t batch_size, float* output, const float* input,
             const float* input2,
@@ -185,6 +192,7 @@ class EmbeddingLayer : public BaseLayer<use_eigen> {
   const std::vector<float>& biases_;
   const size_t input_channels_;
   const ActivationFunction activation_;
+  std::vector<float> weights_t_;
 };
 
 // Picks the 1858 policy outputs out of the head's raw output, using one of
@@ -230,9 +238,15 @@ class EncoderBlock {
             std::vector<float>& buffer2, std::vector<float>& buffer3,
             std::vector<float>& buffer4, Int8Scratch& int8_scratch,
             bool qkv_already_quantized = false,
-            const Int8Weights* next_qkv_int8 = nullptr) const;
+            const Int8Weights* next_qkv_int8 = nullptr,
+            bool smol_compress_already_quantized = false,
+            bool next_has_smol_compress = false,
+            bool* next_smol_compress_quantized = nullptr) const;
 
   const Int8Weights* q_int8() const { return q_int8_ ? &(*q_int8_) : nullptr; }
+  bool has_smolgen_compress_int8() const {
+    return smolgen_compress_int8_.has_value();
+  }
 
  private:
   const MultiHeadWeights::EncoderLayer& weights_;
@@ -286,6 +300,9 @@ class AttentionBody : public BaseLayer<use_eigen> {
   std::optional<DynamicInt8Weights> ip_emb_ffn_d1_int8_;
   std::optional<DynamicInt8Weights> ip_emb_ffn_d2_int8_;
   std::optional<DynamicInt8Weights> smolgen_global_int8_;
+  std::vector<float> ip_emb_w_t_;
+  std::vector<float> ip_mult_gate_nhwc_;
+  std::vector<float> ip_add_gate_nhwc_;
   std::vector<EncoderBlock<use_eigen>> encoders_;
 };
 
@@ -328,7 +345,8 @@ class ValueHead : public BaseLayer<use_eigen> {
  public:
   ValueHead(const MultiHeadWeights::ValueHead& weights, size_t input_channels,
             bool attention_body, bool wdl,
-            ActivationFunction default_activation);
+            ActivationFunction default_activation, bool input_is_nhwc = false,
+            bool use_avx512_fp32 = false);
 
   void Eval(size_t batch_size, float* output, const float* input,
             const float* input2,
@@ -340,6 +358,9 @@ class ValueHead : public BaseLayer<use_eigen> {
   const bool attention_body_;
   const bool wdl_;
   const ActivationFunction default_activation_;
+  const bool nhwc_avx512_;
+  std::vector<float> conv_w_t_;
+  std::vector<float> fc1_w_t_;
 };
 
 }  // namespace blas_backend

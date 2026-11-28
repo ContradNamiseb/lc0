@@ -229,6 +229,7 @@ struct Conv3x3ThreadScratch {
   AlignedBuffer<float> avg_pool;      // channels
   AlignedBuffer<float> se_fc1;        // se_fc_outputs
   AlignedBuffer<float> se_fc2;        // 2 * channels
+  AlignedBuffer<float> nhwc_board;    // 64 * input_channels
 };
 
 }  // namespace blas_backend

@@ -476,8 +476,7 @@ Int8Weights::Int8Weights(const std::vector<int8_t>& weights,
   if (kernel_ == Int8Kernel::kVnniAvx512) {
     if (is_conv3x3) {
       const size_t in_c = inputs_ / kFilterTaps;
-      conv_nr_ =
-          (allow_nr48 && outputs_ == in_c && (outputs_ % 48) == 0) ? 48 : 32;
+      conv_nr_ = (allow_nr48 && (outputs_ % 48) == 0) ? 48 : 32;
       PackConv3x3Weights(weights_, outputs_, in_c, conv_nr_, packed_weights_);
     } else {
       PackGemmWeights(weights_, outputs_, inputs_, 32, packed_weights_);
@@ -804,7 +803,7 @@ void Int8Weights::Convolve3Nhwc(size_t batch_size, const float* input_nhwc,
                                packed_weights_.data(), output_scales_.data(),
                                zero_point_corrections_.data(),
                                inverse_input_scale_, input_zero_point_,
-                               out_board, view, biases, activation);
+                               out_board, view, biases, activation, conv_nr_);
         continue;
       }
 #endif
@@ -826,6 +825,101 @@ void Int8Weights::Convolve3Nhwc(size_t batch_size, const float* input_nhwc,
   } else {
     run_boards(0, batch_size, 0);
   }
+}
+
+void Int8Weights::Convolve3NchwToNhwc(size_t batch_size,
+                                      const float* input_nchw,
+                                      float plane109_scale, float* output_nhwc,
+                                      Int8Scratch& scratch,
+                                      const float* biases,
+                                      ActivationFunction activation) const {
+  const size_t input_channels = inputs_ / kFilterTaps;
+  const size_t padded_channels = ((input_channels + 3) / 4) * 4;
+  constexpr size_t kPadSquares = 10 * 10;
+  const size_t max_threads =
+      scratch.pool ? static_cast<size_t>(scratch.pool->num_threads()) : 1;
+  if (scratch.conv3_scratch.size() < max_threads) {
+    scratch.conv3_scratch.resize(max_threads);
+  }
+
+  auto run_boards = [&](size_t b0, size_t b1, size_t tid) {
+    Conv3x3ThreadScratch& thread_scratch = scratch.conv3_scratch[tid];
+    thread_scratch.pad1.Resize(kPadSquares * padded_channels);
+    thread_scratch.nhwc_board.Resize(kSquares * input_channels);
+    Conv3x3ScratchView view;
+    view.pad1 = thread_scratch.pad1.data();
+    view.nhwc_board = thread_scratch.nhwc_board.data();
+    for (size_t batch = b0; batch < b1; ++batch) {
+      const float* in_board = input_nchw + batch * kSquares * input_channels;
+      float* out_board = output_nhwc + batch * kSquares * outputs_;
+#ifdef LC0_HAS_AVX512_VNNI
+      if (kernel_ == Int8Kernel::kVnniAvx512) {
+        Conv3x3NhwcBoardAvx512(input_channels, outputs_, in_board,
+                               packed_weights_.data(), output_scales_.data(),
+                               zero_point_corrections_.data(),
+                               inverse_input_scale_, input_zero_point_,
+                               out_board, view, biases, activation, conv_nr_,
+                               /*input_is_nchw=*/true, plane109_scale);
+        continue;
+      }
+#endif
+      throw Exception("Convolve3NchwToNhwc called without an AVX512 kernel.");
+    }
+  };
+
+  if (scratch.pool && scratch.pool->num_threads() > 1 && batch_size > 1) {
+    scratch.pool->ParallelFor(batch_size, 1, run_boards);
+  } else {
+    run_boards(0, batch_size, 0);
+  }
+}
+
+void RunGemmFp32Avx512(size_t rows, size_t outputs, size_t inputs,
+                       const float* input, const float* weights_transposed,
+                       const float* biases, ActivationFunction activation,
+                       float* output, Int8ThreadPool* pool) {
+#ifdef LC0_HAS_AVX512_VNNI
+  const size_t work = rows * outputs * inputs;
+  if (!pool || pool->num_threads() <= 1 || work < 65536) {
+    GemmFp32Avx512(0, rows, 0, outputs, outputs, inputs, input,
+                   weights_transposed, biases, activation, output);
+    return;
+  }
+  const size_t threads = static_cast<size_t>(pool->num_threads());
+  if (rows >= threads * 8) {
+    pool->ParallelFor(rows, 8, [&](size_t r0, size_t r1, size_t /*tid*/) {
+      GemmFp32Avx512(r0, r1, 0, outputs, outputs, inputs, input,
+                     weights_transposed, biases, activation, output);
+    });
+  } else if (outputs >= 64) {
+    const size_t n_blocks = (outputs + 31) / 32;
+    pool->ParallelFor(n_blocks, 1, [&](size_t nb0, size_t nb1, size_t /*tid*/) {
+      const size_t c0 = nb0 * 32;
+      const size_t c1 = std::min(outputs, nb1 * 32);
+      GemmFp32Avx512(0, rows, c0, c1, outputs, inputs, input,
+                     weights_transposed, biases, activation, output);
+    });
+  } else if (rows >= 2) {
+    pool->ParallelFor(rows, 1, [&](size_t r0, size_t r1, size_t /*tid*/) {
+      GemmFp32Avx512(r0, r1, 0, outputs, outputs, inputs, input,
+                     weights_transposed, biases, activation, output);
+    });
+  } else {
+    GemmFp32Avx512(0, rows, 0, outputs, outputs, inputs, input,
+                   weights_transposed, biases, activation, output);
+  }
+#else
+  (void)rows;
+  (void)outputs;
+  (void)inputs;
+  (void)input;
+  (void)weights_transposed;
+  (void)biases;
+  (void)activation;
+  (void)output;
+  (void)pool;
+  throw Exception("RunGemmFp32Avx512 requires AVX-512.");
+#endif
 }
 
 void Int8Weights::Convolve3(size_t batch_size, const float* input,
@@ -920,10 +1014,8 @@ DynamicInt8Weights::DynamicInt8Weights(const float* weights_fp32,
   PackGemmWeights(w_q.data(), outputs_, inputs_, 32, packed_weights_);
 }
 
-void DynamicInt8Weights::Forward(size_t rows, const float* input,
-                                 const float* biases,
-                                 ActivationFunction activation, float* output,
-                                 Int8Scratch& scratch) const {
+void DynamicInt8Weights::PrepareDynamicRows(size_t rows, const float* input,
+                                              Int8Scratch& scratch) const {
 #ifdef LC0_HAS_AVX512_VNNI
   // Use quantized_input2 so any pre-quantized QKV buffer in quantized_input
   // stays intact across Smolgen.
@@ -948,6 +1040,23 @@ void DynamicInt8Weights::Forward(size_t rows, const float* input,
   } else {
     QuantizeDynamicRowsAvx512(rows, inputs_, input, q_in, r_scales, r_mins);
   }
+#else
+  (void)rows;
+  (void)input;
+  (void)scratch;
+  throw Exception("DynamicInt8Weights requires AVX-512 VNNI.");
+#endif
+}
+
+void DynamicInt8Weights::ForwardPrepared(size_t rows, const float* biases,
+                                         ActivationFunction activation,
+                                         float* output,
+                                         Int8Scratch& scratch) const {
+#ifdef LC0_HAS_AVX512_VNNI
+  const uint8_t* q_in = scratch.quantized_input2.data();
+  const float* r_scales = scratch.dynamic_scales.data();
+  const float* r_mins = scratch.dynamic_mins.data();
+  Int8ThreadPool* pool = scratch.pool;
 
   const size_t n_blocks = (outputs_ + 31) / 32;
   if (pool && pool->num_threads() > 1) {
@@ -990,13 +1099,45 @@ void DynamicInt8Weights::Forward(size_t rows, const float* input,
   }
 #else
   (void)rows;
-  (void)input;
   (void)biases;
   (void)activation;
   (void)output;
   (void)scratch;
   throw Exception("DynamicInt8Weights requires AVX-512 VNNI.");
 #endif
+}
+
+void DynamicInt8Weights::ForwardPreparedRange(
+    size_t row_begin, size_t row_end, const float* biases,
+    ActivationFunction activation, float* output,
+    const Int8Scratch& scratch) const {
+#ifdef LC0_HAS_AVX512_VNNI
+  if (row_begin >= row_end) return;
+  const uint8_t* q_in = scratch.quantized_input2.data();
+  const float* r_scales = scratch.dynamic_scales.data();
+  const float* r_mins = scratch.dynamic_mins.data();
+  const size_t n_blocks = (outputs_ + 31) / 32;
+  GemmDynamicEpilogueAvx512(
+      row_begin, row_end, 0, n_blocks, outputs_, inputs_, q_in, r_scales,
+      r_mins, packed_weights_.data(), weight_scales_.data(),
+      weight_sum_scaled_.data(), biases, activation, output);
+#else
+  (void)row_begin;
+  (void)row_end;
+  (void)biases;
+  (void)activation;
+  (void)output;
+  (void)scratch;
+  throw Exception("DynamicInt8Weights requires AVX-512 VNNI.");
+#endif
+}
+
+void DynamicInt8Weights::Forward(size_t rows, const float* input,
+                                 const float* biases,
+                                 ActivationFunction activation, float* output,
+                                 Int8Scratch& scratch) const {
+  PrepareDynamicRows(rows, input, scratch);
+  ForwardPrepared(rows, biases, activation, output, scratch);
 }
 
 // DynamicConv3x3Int8

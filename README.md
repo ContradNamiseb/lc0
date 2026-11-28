@@ -25,19 +25,29 @@ layers for both `blas` and `eigen` backends without requiring MKL:
   `eigen` options.
 - Linear layers pre-pack weights into 64-byte aligned panels and fuse
   dequantization, bias, activation, and optional downstream requantization
-  (e.g., `FFN1 + ReLU² + Quantize`) in registers.
-- Transformer encoders fuse `LayerNorm + Skip + Quantize` in a single
-  register-resident pass, run register-resident `Softmax64`, and use dynamic
-  W8A8 (`DynamicInt8Weights`) for `Smolgen`, `ip_emb_ffn`, and
-  `AttentionPolicyHead` (with parallel `Q × K^T`).
-- Residual towers run SmoothQuant-109 INT8 direct-NHWC `in_conv` (scaling
-  `rule50` plane 109 on non-hectoplies nets), direct 9-tap 10x10 padded
-  L1-resident convolutions (`8×32` and `8×48` leaf microkernels), fused
-  `conv1` → `conv2` requantization and global average pooling, fast reciprocal
-  Mish/Swish/Sigmoid, and dynamic W8A8 direct-NHWC 3×3 conv policy heads
-  (`DynamicConv3x3Int8`).
-- Multi-threading (`threads > 1`) parallelizes whole layers across boards and
-  row tiles via a lightweight spin-then-park thread pool.
+  (e.g., `FFN1 + ReLU² + Quantize`) in registers, while pre-transposed
+  multi-threaded AVX-512 FP32 `GemmFp32Avx512` keeps `ValueHead`, `MovesLeft`,
+  and classical/attention policy tails fast without MKL OpenMP spin-wait
+  contention (`mkl_set_num_threads(1)` + local guard).
+- Transformer encoders fuse `LayerNorm + Skip + Quantize` (including dual
+  static QKV + dynamic `smol_compress` quantization on `ln2`) in one
+  register pass, fuse `Smolgen` `LayerNorm + DynamicQuantize`
+  (`smol_ln1`/`smol_ln2`), shard dynamic `smolgen_global` per head
+  (`ForwardPreparedRange`), fuse L1d-resident `depth=32` `Q·K^T + smolgen ->
+  Softmax64 -> Attn·V` (`MhaAttentionHead32Avx512`) and parallel input
+  prep/gating (`PrepAttentionInputPeMapAvx512`, `ApplyInputGatingAvx512`), and
+  use vectorized `SELU` + `192d` quant + shared `Q`/`K` input + AVX-512
+  promotion offsets in `AttentionPolicyHead`.
+- Residual towers run fused `NCHW→NHWC` + SmoothQuant-109 INT8 `input_conv`
+  (`conv_nr=48` on `192` channels), direct 9-tap 10x10 padded L1-resident
+  convolutions (`8×32` and `8×48` leaf microkernels), fused `conv1` → `conv2`
+  requantization and global average pooling, IEEE-754 bit-shift `Exp` +
+  interleaved `Mish3x` + pre-transposed SE `ComputeSeFcAvx512`, dynamic W8A8
+  direct-NHWC 3×3 conv policy heads (`DynamicConv3x3Int8`), and end-to-end NHWC
+  head execution avoiding `NhwcToNchw` roundtrips.
+- Multi-threading (`threads > 1`) parallelizes whole layers across boards,
+  heads, and row tiles via a lightweight spin-then-park thread pool
+  (`Int8ThreadPool`).
 
 When VNNI is unavailable, MKL builds fall back to `cblas_gemm_s8u8s32` (while
 `eigen-int8` requires VNNI). Select `--backend=blas-fp32` (or `eigen-fp32`) to
@@ -150,6 +160,26 @@ nets from [`quantized-nets`](https://github.com/ContradNamiseb/lc0/tree/quantize
 | T1 (`256×10`) | 314 nps (50.95 ms) | 490 nps (32.65 ms) | +56.1% |
 | T79 (`15×192`, Mish) | 539 nps (29.70 ms) | 610 nps (26.22 ms) | +13.2% |
 | T74 (`10×128`, ReLU) | 1,394 nps (11.48 ms) | 1,838 nps (8.70 ms, peak 2,849) | +31.8% |
+
+**Further AVX-512 VNNI optimizations (`experiment/t79-ablations` over `8cbdce7d`):** eliminated MKL OpenMP spin-wait contention against `Int8ThreadPool`, vectorized `SELU` + `192d` dynamic quantization and shared `Q`/`K` input in `AttentionPolicyHead`, added bit-shift `Exp` + `Mish3x` + pre-transposed SE (`ComputeSeFcAvx512`), fused `NCHW→NHWC` + `plane109` into `conv_nr=48` `input_conv`, and added multi-threaded `GemmFp32Avx512` for NHWC heads without `NhwcToNchw` roundtrips (`backendbench t=4, B=16`, 3 alternating rounds):
+
+| Net | `8cbdce7d` (`t=4, B=16` mean / med) | T79-opt (`t=4, B=16` mean / med / max) | Gain (mean / med) |
+| --- | ---: | ---: | ---: |
+| T79 (`15×192`, Mish) | 549 / 532 nps | 848 / 960 / 1,126 nps | +54.5% / +80.6% |
+| T74 (`10×128`, ReLU) | 1,653 / 1,545 nps | 2,326 / 2,547 / 3,739 nps | +40.7% / +64.9% |
+| T1 (`256×10`) | 435 / 425 nps | 617 / 679 / 753 nps | +41.8% / +59.6% |
+
+**T1 Transformer & Smolgen ablations (`A + B + C1` on top of T79-opt):** parallelized PE prep, input gating, `ip_emb`, `ValueHead`, `MovesLeft`, and policy promotion (**A**); fused L1d `depth=32` `Q·K^T + smolgen -> Softmax64 -> Attn·V` (`MhaAttentionHead32Avx512`) with head-sharded `smolgen_global` (`ForwardPreparedRange`) (**B**); and fused `smol_ln1`/`smol_ln2` + dual `ln2` static/dynamic quantization (**C1**), while discarding a `6×64` VNNI GEMM microkernel (**C2**) that spilled registers on Tiger Lake's single VNNI port (`t=1 B=16` dropped `253–260` → `239` med nps). Balanced AB-BA benchmarks vs T79-opt:
+
+| Workload | Baseline (`t79_opt`) | Optimized (`A + B + C1`) | Delta |
+| --- | ---: | ---: | --- |
+| Live T1 MCTS (`t=4, threads=2, B=7, 400 nodes, 5 pos`) R1 / R2 | `7,687 ms` (`270 nps`) / `7,671 ms` (`267 nps`) | **`6,927 ms` (`296 nps`) / `7,063 ms` (`297 nps`)** | **`+9.6%` / `+11.2%`** |
+| T1 `backendbench t=8, B=16` | `674` mean (`774` med, `825` max) | **`733` mean (`849` med, `914` max)** | **`+8.8%` mean / `+9.7%` med / `+10.8%` max** |
+| T1 `backendbench t=4, B=16` | `670` mean (`815` max) | **`686` mean (`920` max)** | **`+12.8%` peak** |
+| T1 `backendbench t=1, B=16` (no PL1 throttle) | `243` mean (`251.5` med, `257` max) | **`251` mean (`257` med, `266` max)** | **`+3.3%` mean** |
+| T79 & T74 `backendbench t=4, B=16` | `1,206–1,212` / `3,790–3,817` peak | `1,213–1,221` / `3,808–3,848` peak | Preserved |
+
+Verification: `15/15` `BlasInt8VnniTest` passing, zero `std::` COMDATs in AVX-512/AVX `.obj`, `0.000000` `dQ` (`60/60` Top-1) on `T1 FP32` (`blas-fp32`) with fused MHA, **`193/200` (`96.5%`) Top-1** vs `T1 FP32` (`t1-256x10-distilled-swa-2432500.pb.gz`) on 200 positions (vs `191/200` = `95.5%` baseline), and `60/60` (`0.000000` `dQ`) on T79 and T74.
 
 Four 100-game FastChess matches (50 opening pairs, swapped colors,
 `UHO_2024_8mvs_+085_+094.epd`, `concurrency=1`, `0` forfeits) comparing
