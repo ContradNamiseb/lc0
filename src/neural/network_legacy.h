@@ -40,7 +40,8 @@ struct BaseWeights {
     Vec bn_means;
     Vec bn_stddivs;
 
-    // Optional W8A8 static INT8 quantization payloads (when weights use INT8 encoding).
+    // Optional W8A8 static INT8 quantization payloads (when weights use INT8
+    // encoding).
     bool has_int8 = false;
     std::vector<int8_t> weights_i8;
     Vec w_scales;
@@ -90,7 +91,8 @@ struct BaseWeights {
     Smolgen smolgen;
     bool has_smolgen;
 
-    // Optional W8A8 static INT8 quantization payloads (when weights use INT8 encoding).
+    // Optional W8A8 static INT8 quantization payloads (when weights use INT8
+    // encoding).
     bool has_int8 = false;
     std::vector<int8_t> q_w_i8;
     std::vector<int8_t> k_w_i8;
@@ -113,7 +115,8 @@ struct BaseWeights {
     Vec dense2_w;
     Vec dense2_b;
 
-    // Optional W8A8 static INT8 quantization payloads (when weights use INT8 encoding).
+    // Optional W8A8 static INT8 quantization payloads (when weights use INT8
+    // encoding).
     bool has_int8 = false;
     std::vector<int8_t> dense1_w_i8;
     std::vector<int8_t> dense2_w_i8;

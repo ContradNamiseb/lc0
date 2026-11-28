@@ -408,9 +408,10 @@ EmbeddingLayer<use_eigen>::EmbeddingLayer(const std::vector<float>& weights,
 }
 
 template <bool use_eigen>
-void EmbeddingLayer<use_eigen>::Eval(
-    size_t batch_size, float* output, const float* input,
-    const float* /*input2*/, Workspace<use_eigen>& workspace) const {
+void EmbeddingLayer<use_eigen>::Eval(size_t batch_size, float* output,
+                                     const float* input,
+                                     const float* /*input2*/,
+                                     Workspace<use_eigen>& workspace) const {
   if (!weights_t_.empty()) {
     RunGemmFp32Avx512(batch_size * kSquares, biases_.size(), input_channels_,
                       input, weights_t_.data(), biases_.data(), activation_,
@@ -575,9 +576,9 @@ bool EncoderBlock<use_eigen>::Eval(
   // core computes its slice of `qk` in L2 and immediately fuses
   // `Q*K^T + smolgen -> Softmax64 -> Attn*V` inside L1d!
 #ifdef LC0_HAS_AVX512_VNNI
-  const bool use_fused_mha_32 =
-      !use_eigen && (d_model / heads == 32) && (d_model % heads == 0) &&
-      CpuSupportsAvx512Vnni();
+  const bool use_fused_mha_32 = !use_eigen && (d_model / heads == 32) &&
+                                (d_model % heads == 0) &&
+                                CpuSupportsAvx512Vnni();
 #else
   const bool use_fused_mha_32 = false;
 #endif
@@ -589,13 +590,13 @@ bool EncoderBlock<use_eigen>::Eval(
     // Compress.
     if (smolgen_compress_int8_) {
       if (smol_compress_already_quantized) {
-        smolgen_compress_int8_->ForwardPrepared(
-            batch_size * kSquares, nullptr, ACTIVATION_NONE, buffer2.data(),
-            int8_scratch);
+        smolgen_compress_int8_->ForwardPrepared(batch_size * kSquares, nullptr,
+                                                ACTIVATION_NONE, buffer2.data(),
+                                                int8_scratch);
       } else {
         smolgen_compress_int8_->Forward(batch_size * kSquares, flow.data(),
-                                        nullptr, ACTIVATION_NONE, buffer2.data(),
-                                        int8_scratch);
+                                        nullptr, ACTIVATION_NONE,
+                                        buffer2.data(), int8_scratch);
       }
     } else {
       FullyConnectedLayer<use_eigen>::Forward1D(
@@ -629,15 +630,15 @@ bool EncoderBlock<use_eigen>::Eval(
           batch_size, hidden_size, hidden_size, buffer3.data(),
           mha.smolgen.ln1_gammas.data(), mha.smolgen.ln1_betas.data(), 1e-3f,
           int8_scratch.quantized_input2.data(),
-          int8_scratch.dynamic_scales.data(),
-          int8_scratch.dynamic_mins.data());
+          int8_scratch.dynamic_scales.data(), int8_scratch.dynamic_mins.data());
       smolgen_dense2_int8_->ForwardPrepared(
           batch_size, mha.smolgen.dense2_b.data(), smolgen_activation_,
           buffer2.data(), int8_scratch);
 #endif
     } else {
       run_ln(batch_size, hidden_size, buffer3.data(), 1.0f, nullptr,
-             mha.smolgen.ln1_gammas.data(), mha.smolgen.ln1_betas.data(), 1e-3f);
+             mha.smolgen.ln1_gammas.data(), mha.smolgen.ln1_betas.data(),
+             1e-3f);
       FullyConnectedLayer<use_eigen>::Forward1D(
           batch_size, hidden_size, generated_size, buffer3.data(),
           mha.smolgen.dense2_w.data(), mha.smolgen.dense2_b.data(),
@@ -672,13 +673,14 @@ bool EncoderBlock<use_eigen>::Eval(
         run_ln2_dyn(0, batch_size, 0);
       }
       if (!use_fused_mha_32) {
-        smolgen_global_int8_->ForwardPrepared(total_heads, nullptr,
-                                              ACTIVATION_NONE, qk, int8_scratch);
+        smolgen_global_int8_->ForwardPrepared(
+            total_heads, nullptr, ACTIVATION_NONE, qk, int8_scratch);
       }
 #endif
     } else {
       run_ln(batch_size, generated_size, buffer2.data(), 1.0f, nullptr,
-             mha.smolgen.ln2_gammas.data(), mha.smolgen.ln2_betas.data(), 1e-3f);
+             mha.smolgen.ln2_gammas.data(), mha.smolgen.ln2_betas.data(),
+             1e-3f);
       FullyConnectedLayer<use_eigen>::Forward1D(
           batch_size * heads, generated_size / heads, kSquares * kSquares,
           buffer2.data(), smolgen_global_weights_.data(), (const float*)nullptr,
@@ -1221,9 +1223,10 @@ void AttentionBody<use_eigen>::Eval(size_t batch_size, float* output,
   if (!ip_mult_gate_nhwc_.empty() && !ip_add_gate_nhwc_.empty()) {
 #ifdef LC0_HAS_AVX512_VNNI
     auto run_gate = [&](size_t b0, size_t b1, size_t) {
-      ApplyInputGatingAvx512(
-          b1 - b0, embedding_size_, flow.data() + b0 * kSquares * embedding_size_,
-          ip_mult_gate_nhwc_.data(), ip_add_gate_nhwc_.data());
+      ApplyInputGatingAvx512(b1 - b0, embedding_size_,
+                             flow.data() + b0 * kSquares * embedding_size_,
+                             ip_mult_gate_nhwc_.data(),
+                             ip_add_gate_nhwc_.data());
     };
     if (pool && pool->num_threads() > 1 && batch_size > 1) {
       pool->ParallelFor(batch_size, 1, run_gate);
@@ -1326,10 +1329,10 @@ void AttentionBody<use_eigen>::Eval(size_t batch_size, float* output,
       const bool next_smol = (i + 1 < encoders_.size()) &&
                              encoders_[i + 1].has_smolgen_compress_int8();
       bool next_smol_quantized = false;
-      qkv_quantized = encoders_[i].Eval(
-          batch_size, flow, buffer2, buffer3, buffer4, workspace.int8,
-          qkv_quantized, next_qkv, smol_quantized, next_smol,
-          &next_smol_quantized);
+      qkv_quantized =
+          encoders_[i].Eval(batch_size, flow, buffer2, buffer3, buffer4,
+                            workspace.int8, qkv_quantized, next_qkv,
+                            smol_quantized, next_smol, &next_smol_quantized);
       smol_quantized = next_smol_quantized;
     }
   } else {
@@ -1342,10 +1345,10 @@ void AttentionBody<use_eigen>::Eval(size_t batch_size, float* output,
       const bool next_smol = (i + 1 < encoders_.size()) &&
                              encoders_[i + 1].has_smolgen_compress_int8();
       bool next_smol_quantized = false;
-      qkv_quantized = encoders_[i].Eval(
-          batch_size, flow, buffer2, buffer3, buffer4, workspace.int8,
-          qkv_quantized, next_qkv, smol_quantized, next_smol,
-          &next_smol_quantized);
+      qkv_quantized =
+          encoders_[i].Eval(batch_size, flow, buffer2, buffer3, buffer4,
+                            workspace.int8, qkv_quantized, next_qkv,
+                            smol_quantized, next_smol, &next_smol_quantized);
       smol_quantized = next_smol_quantized;
     }
   }

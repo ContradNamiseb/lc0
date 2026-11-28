@@ -208,9 +208,9 @@ TEST(BlasInt8VnniTest, GemmEdgeShapesAndActivations) {
     size_t m, n, k;
   };
   const std::vector<Shape> shapes = {
-      {1, 1, 1},       {3, 17, 5},     {7, 31, 13},    {8, 32, 64},
-      {13, 65, 129},   {16, 128, 256}, {7, 1024, 256}, {64, 256, 256},
-      {71, 384, 256},
+      {1, 1, 1},      {3, 17, 5},     {7, 31, 13},
+      {8, 32, 64},    {13, 65, 129},  {16, 128, 256},
+      {7, 1024, 256}, {64, 256, 256}, {71, 384, 256},
   };
   const std::vector<ActivationFunction> acts = {
       ACTIVATION_NONE, ACTIVATION_RELU,  ACTIVATION_RELU_2,
@@ -850,13 +850,12 @@ TEST(BlasInt8VnniTest, PreTransposedSeAndMishExpAccuracy) {
   Int8Scratch scratch;
   scratch.pool = &pool;
 
-  Int8Weights::RunResidualBlockNhwc(batch, channels, io_plain.data(), conv1_nr32,
-                                    b1.data(), conv2_nr32, b2.data(),
-                                    ACTIVATION_MISH, se_plain, scratch);
-  Int8Weights::RunResidualBlockNhwc(batch, channels, io_transposed.data(),
-                                    conv1_nr48, b1.data(), conv2_nr48,
-                                    b2.data(), ACTIVATION_MISH, se_transposed,
-                                    scratch);
+  Int8Weights::RunResidualBlockNhwc(
+      batch, channels, io_plain.data(), conv1_nr32, b1.data(), conv2_nr32,
+      b2.data(), ACTIVATION_MISH, se_plain, scratch);
+  Int8Weights::RunResidualBlockNhwc(
+      batch, channels, io_transposed.data(), conv1_nr48, b1.data(), conv2_nr48,
+      b2.data(), ACTIVATION_MISH, se_transposed, scratch);
 
   for (size_t i = 0; i < io_plain.size(); ++i) {
     ASSERT_NEAR(io_transposed[i], io_plain[i],
@@ -878,17 +877,16 @@ TEST(BlasInt8VnniTest, GemmFp32Avx512AndConvolve3NchwToNhwc) {
     ActivationFunction act;
   };
   const ShapeCase cases[] = {
-      {1, 1, 128, ACTIVATION_RELU},
-      {7, 15, 33, ACTIVATION_NONE},
-      {16, 128, 2048, ACTIVATION_MISH},
-      {64, 48, 192, ACTIVATION_SELU},
+      {1, 1, 128, ACTIVATION_RELU},     {7, 15, 33, ACTIVATION_NONE},
+      {16, 128, 2048, ACTIVATION_MISH}, {64, 48, 192, ACTIVATION_SELU},
       {448, 32, 192, ACTIVATION_MISH},
   };
   for (const auto& sc : cases) {
     std::vector<float> a(sc.rows * sc.inputs);
     std::vector<float> w_t(sc.inputs * sc.outputs);
     std::vector<float> bias(sc.outputs);
-    for (auto& v : a) v = (sc.act == ACTIVATION_MISH ? wide_dist : f_dist)(rng) * 0.1f;
+    for (auto& v : a)
+      v = (sc.act == ACTIVATION_MISH ? wide_dist : f_dist)(rng) * 0.1f;
     for (auto& v : w_t) v = f_dist(rng) * 0.05f;
     for (auto& v : bias) v = f_dist(rng) * 0.5f;
 
@@ -977,7 +975,8 @@ TEST(BlasInt8VnniTest, AttentionPrepGatingAndPromoParity) {
     for (size_t sq = 0; sq < kSquares; ++sq) {
       const float* row = got_nhwc.data() + (b * kSquares + sq) * emb_in;
       for (size_t c = 0; c < in_c; ++c) {
-        ASSERT_FLOAT_EQ(row[c], planes[b * kSquares * in_c + c * kSquares + sq]);
+        ASSERT_FLOAT_EQ(row[c],
+                        planes[b * kSquares * in_c + c * kSquares + sq]);
       }
       for (size_t c = 0; c < pe_c; ++c) {
         ASSERT_FLOAT_EQ(row[in_c + c], pe[sq * pe_c + c]);
@@ -997,8 +996,8 @@ TEST(BlasInt8VnniTest, AttentionPrepGatingAndPromoParity) {
     for (size_t sq = 0; sq < kSquares; ++sq) {
       for (size_t c = 0; c < emb; ++c) {
         const size_t idx = (b * kSquares + sq) * emb + c;
-        flow_ref[idx] =
-            flow_ref[idx] * mult_nchw[c * kSquares + sq] + add_nchw[c * kSquares + sq];
+        flow_ref[idx] = flow_ref[idx] * mult_nchw[c * kSquares + sq] +
+                        add_nchw[c * kSquares + sq];
       }
     }
   }
@@ -1012,7 +1011,8 @@ TEST(BlasInt8VnniTest, AttentionPrepGatingAndPromoParity) {
   ApplyInputGatingAvx512(batch, emb, flow.data(), mult_nhwc.data(),
                          add_nhwc.data());
   for (size_t i = 0; i < flow.size(); ++i) {
-    ASSERT_NEAR(flow[i], flow_ref[i], 1e-5f * std::max(1.0f, std::abs(flow_ref[i])));
+    ASSERT_NEAR(flow[i], flow_ref[i],
+                1e-5f * std::max(1.0f, std::abs(flow_ref[i])));
   }
 
   const size_t pol_d = 256;
@@ -1045,7 +1045,8 @@ TEST(BlasInt8VnniTest, AttentionPrepGatingAndPromoParity) {
       }
     }
   }
-  AttentionPolicyPromoAvx512(pol_d, k_board.data(), ip4_w.data(), logits.data());
+  AttentionPolicyPromoAvx512(pol_d, k_board.data(), ip4_w.data(),
+                             logits.data());
   for (size_t i = 0; i < logits.size(); ++i) {
     ASSERT_NEAR(logits[i], logits_ref[i],
                 1e-4f * std::max(1.0f, std::abs(logits_ref[i])));
@@ -1080,8 +1081,10 @@ TEST(BlasInt8VnniTest, MhaAttentionHead32Avx512Parity) {
             dot += static_cast<double>(q[r * d_model + h * depth + d]) *
                    static_cast<double>(k[c * d_model + h * depth + d]);
           }
-          logits[c] = dot * static_cast<double>(scaling) +
-                      (with_smolgen ? static_cast<double>(smol[h * 4096 + r * 64 + c]) : 0.0);
+          logits[c] =
+              dot * static_cast<double>(scaling) +
+              (with_smolgen ? static_cast<double>(smol[h * 4096 + r * 64 + c])
+                            : 0.0);
           if (logits[c] > mx) mx = logits[c];
         }
         double sum = 0.0;
@@ -1092,7 +1095,8 @@ TEST(BlasInt8VnniTest, MhaAttentionHead32Avx512Parity) {
         for (size_t d = 0; d < depth; ++d) {
           double acc = 0.0;
           for (size_t c = 0; c < kSquares; ++c) {
-            acc += (logits[c] / sum) * static_cast<double>(v[c * d_model + h * depth + d]);
+            acc += (logits[c] / sum) *
+                   static_cast<double>(v[c * d_model + h * depth + d]);
           }
           out[r * d_model + h * depth + d] = static_cast<float>(acc);
         }
@@ -1139,9 +1143,9 @@ TEST(BlasInt8VnniTest, SmolgenFusionAndSmallMGemmParity) {
                                       got_q.data(), got_s.data(), got_m.data());
 
     std::vector<float> ref_ln = x;
-    LayerNorm2DWithSkipAndQuantizeAvx512(
-        rows, channels, ref_ln.data(), 1.0f, nullptr, gamma.data(), beta.data(),
-        1e-3f, nullptr, 0.0f, 0.0f);
+    LayerNorm2DWithSkipAndQuantizeAvx512(rows, channels, ref_ln.data(), 1.0f,
+                                         nullptr, gamma.data(), beta.data(),
+                                         1e-3f, nullptr, 0.0f, 0.0f);
     std::vector<uint8_t> ref_q(rows * channels);
     std::vector<float> ref_s(rows * num_groups), ref_m(rows * num_groups);
     QuantizeDynamicRowsAvx512(rows * num_groups, group, ref_ln.data(),
@@ -1157,7 +1161,8 @@ TEST(BlasInt8VnniTest, SmolgenFusionAndSmallMGemmParity) {
     }
   }
 
-  // 2. LayerNorm2DWithSkipAndQuantizeAvx512 fused static + dynamic quant parity.
+  // 2. LayerNorm2DWithSkipAndQuantizeAvx512 fused static + dynamic quant
+  // parity.
   {
     const size_t rows = 16;
     const size_t channels = 256;

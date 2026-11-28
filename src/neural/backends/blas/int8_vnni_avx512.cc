@@ -122,12 +122,12 @@ inline void Mish3xPsAvx512(__m512& v0, __m512& v1, __m512& v2) {
   const __m512 c1 = _mm512_max_ps(_mm512_min_ps(v1, cap), min_x);
   const __m512 c2 = _mm512_max_ps(_mm512_min_ps(v2, cap), min_x);
 
-  const __m512 k0 =
-      _mm512_roundscale_ps(_mm512_mul_ps(c0, log2_e), _MM_FROUND_TO_NEAREST_INT);
-  const __m512 k1 =
-      _mm512_roundscale_ps(_mm512_mul_ps(c1, log2_e), _MM_FROUND_TO_NEAREST_INT);
-  const __m512 k2 =
-      _mm512_roundscale_ps(_mm512_mul_ps(c2, log2_e), _MM_FROUND_TO_NEAREST_INT);
+  const __m512 k0 = _mm512_roundscale_ps(_mm512_mul_ps(c0, log2_e),
+                                         _MM_FROUND_TO_NEAREST_INT);
+  const __m512 k1 = _mm512_roundscale_ps(_mm512_mul_ps(c1, log2_e),
+                                         _MM_FROUND_TO_NEAREST_INT);
+  const __m512 k2 = _mm512_roundscale_ps(_mm512_mul_ps(c2, log2_e),
+                                         _MM_FROUND_TO_NEAREST_INT);
 
   __m512 r0 = _mm512_fnmadd_ps(k0, ln2_hi, c0);
   __m512 r1 = _mm512_fnmadd_ps(k1, ln2_hi, c1);
@@ -734,14 +734,30 @@ void Microkernel8x48Conv3x3(const uint8_t* pad_rank_y, size_t padded_channels,
     }
   }
 
-  acc[0][0] = c00; acc[0][1] = c01; acc[0][2] = c02;
-  acc[1][0] = c10; acc[1][1] = c11; acc[1][2] = c12;
-  acc[2][0] = c20; acc[2][1] = c21; acc[2][2] = c22;
-  acc[3][0] = c30; acc[3][1] = c31; acc[3][2] = c32;
-  acc[4][0] = c40; acc[4][1] = c41; acc[4][2] = c42;
-  acc[5][0] = c50; acc[5][1] = c51; acc[5][2] = c52;
-  acc[6][0] = c60; acc[6][1] = c61; acc[6][2] = c62;
-  acc[7][0] = c70; acc[7][1] = c71; acc[7][2] = c72;
+  acc[0][0] = c00;
+  acc[0][1] = c01;
+  acc[0][2] = c02;
+  acc[1][0] = c10;
+  acc[1][1] = c11;
+  acc[1][2] = c12;
+  acc[2][0] = c20;
+  acc[2][1] = c21;
+  acc[2][2] = c22;
+  acc[3][0] = c30;
+  acc[3][1] = c31;
+  acc[3][2] = c32;
+  acc[4][0] = c40;
+  acc[4][1] = c41;
+  acc[4][2] = c42;
+  acc[5][0] = c50;
+  acc[5][1] = c51;
+  acc[5][2] = c52;
+  acc[6][0] = c60;
+  acc[6][1] = c61;
+  acc[6][2] = c62;
+  acc[7][0] = c70;
+  acc[7][1] = c71;
+  acc[7][2] = c72;
 }
 
 inline void FillPadBorder(uint8_t* pad, size_t padded_channels,
@@ -1059,9 +1075,9 @@ inline void ComputeSeFcAvx512(size_t channels, const ResidualSeParams& se,
     fc1[o] = Activate(value, runtime_activation);
   }
   for (size_t o = 0; o < 2 * channels; ++o) {
-    fc2[o] = DotProductAvx512(se.w2 + o * se.se_fc_outputs, fc1,
-                              se.se_fc_outputs) +
-             se.b2[o];
+    fc2[o] =
+        DotProductAvx512(se.w2 + o * se.se_fc_outputs, fc1, se.se_fc_outputs) +
+        se.b2[o];
   }
   for (size_t c = 0; c < channels; c += 16) {
     const size_t remaining = channels - c;
@@ -1835,10 +1851,12 @@ void LayerNorm2DWithSkipAndQuantizeAvx512(
   }
 }
 
-void LayerNormAndDynamicQuantizeAvx512(
-    size_t rows, size_t channels, size_t quant_group_size, const float* input,
-    const float* gammas, const float* betas, float epsilon, uint8_t* q_out,
-    float* group_scales, float* group_mins) {
+void LayerNormAndDynamicQuantizeAvx512(size_t rows, size_t channels,
+                                       size_t quant_group_size,
+                                       const float* input, const float* gammas,
+                                       const float* betas, float epsilon,
+                                       uint8_t* q_out, float* group_scales,
+                                       float* group_mins) {
   const float inv_c = 1.0f / static_cast<float>(channels);
 
   if (channels == 256 && quant_group_size == 256) {
@@ -2352,6 +2370,8 @@ void GemmDynamicEpilogueAvx512(
   }
 }
 
+namespace {
+
 // Specialized zero-spill 8x48 residual block path for `channels % 48 == 0`
 // (e.g. T79 C=192).
 template <ActivationFunction Act>
@@ -2571,6 +2591,8 @@ void ResidualBlockBoardsAvx512Nr48Impl(
   }
 }
 
+}  // namespace
+
 void ResidualBlockBoardsAvx512(
     size_t num_boards, size_t channels, float* boards_io,
     const int8_t* conv1_packed_weights, const float* conv1_output_scales,
@@ -2730,8 +2752,8 @@ void Conv3x3NhwcBoardAvx512(
       const __m512 scale0 = _mm512_loadu_ps(output_scales + n_offset);
       const __m512 scale1 = _mm512_loadu_ps(output_scales + n_offset + 16);
       const __m512 scale2 = _mm512_loadu_ps(output_scales + n_offset + 32);
-      const __m512 bias0 = biases ? _mm512_loadu_ps(biases + n_offset)
-                                  : _mm512_setzero_ps();
+      const __m512 bias0 =
+          biases ? _mm512_loadu_ps(biases + n_offset) : _mm512_setzero_ps();
       const __m512 bias1 = biases ? _mm512_loadu_ps(biases + n_offset + 16)
                                   : _mm512_setzero_ps();
       const __m512 bias2 = biases ? _mm512_loadu_ps(biases + n_offset + 32)
@@ -2846,18 +2868,15 @@ void Conv3x3NhwcBoardAvx512(
 namespace {
 
 template <ActivationFunction Act, size_t kRows>
-inline void GemmFp32RowsAvx512(size_t row, size_t col, size_t col_rem,
-                               size_t outputs, size_t inputs,
-                               const float* input,
-                               const float* weights_transposed,
-                               const float* biases,
-                               ActivationFunction runtime_activation,
-                               float* output) {
+inline void GemmFp32RowsAvx512(
+    size_t row, size_t col, size_t col_rem, size_t outputs, size_t inputs,
+    const float* input, const float* weights_transposed, const float* biases,
+    ActivationFunction runtime_activation, float* output) {
   const bool full_n = (col_rem == 32);
   const __mmask16 mask0 =
       full_n ? 0xFFFF
-             : static_cast<__mmask16>(
-                   col_rem >= 16 ? 0xFFFF : ((1u << col_rem) - 1u));
+             : static_cast<__mmask16>(col_rem >= 16 ? 0xFFFF
+                                                    : ((1u << col_rem) - 1u));
   const __mmask16 mask1 =
       full_n ? 0xFFFF
              : static_cast<__mmask16>(
@@ -2923,9 +2942,10 @@ inline void GemmFp32RowsAvx512(size_t row, size_t col, size_t col_rem,
                        : _mm512_maskz_loadu_ps(mask0, biases + col))
              : _mm512_setzero_ps();
   const __m512 bias1 =
-      biases && mask1 ? (full_n ? _mm512_loadu_ps(biases + col + 16)
-                                : _mm512_maskz_loadu_ps(mask1, biases + col + 16))
-                      : _mm512_setzero_ps();
+      biases && mask1
+          ? (full_n ? _mm512_loadu_ps(biases + col + 16)
+                    : _mm512_maskz_loadu_ps(mask1, biases + col + 16))
+          : _mm512_setzero_ps();
 
   for (size_t r = 0; r < kRows; ++r) {
     float* dst = output + (row + r) * outputs + col;
@@ -2949,28 +2969,28 @@ inline void GemmFp32RowsAvx512(size_t row, size_t col, size_t col_rem,
 
 template <ActivationFunction Act>
 void GemmFp32Avx512Impl(size_t row_begin, size_t row_end, size_t col_begin,
-                         size_t col_end, size_t outputs, size_t inputs,
-                         const float* input, const float* weights_transposed,
-                         const float* biases,
-                         ActivationFunction runtime_activation, float* output) {
+                        size_t col_end, size_t outputs, size_t inputs,
+                        const float* input, const float* weights_transposed,
+                        const float* biases,
+                        ActivationFunction runtime_activation, float* output) {
   for (size_t col = col_begin; col < col_end; col += 32) {
     const size_t col_rem = MinSize(32, col_end - col);
     size_t row = row_begin;
     for (; row + 8 <= row_end; row += 8) {
       GemmFp32RowsAvx512<Act, 8>(row, col, col_rem, outputs, inputs, input,
-                                 weights_transposed, biases,
-                                 runtime_activation, output);
+                                 weights_transposed, biases, runtime_activation,
+                                 output);
     }
     if (row + 4 <= row_end) {
       GemmFp32RowsAvx512<Act, 4>(row, col, col_rem, outputs, inputs, input,
-                                 weights_transposed, biases,
-                                 runtime_activation, output);
+                                 weights_transposed, biases, runtime_activation,
+                                 output);
       row += 4;
     }
     for (; row < row_end; ++row) {
       GemmFp32RowsAvx512<Act, 1>(row, col, col_rem, outputs, inputs, input,
-                                 weights_transposed, biases,
-                                 runtime_activation, output);
+                                 weights_transposed, biases, runtime_activation,
+                                 output);
     }
   }
 }
@@ -2985,40 +3005,34 @@ void GemmFp32Avx512(size_t row_begin, size_t row_end, size_t col_begin,
   if (row_begin >= row_end || col_begin >= col_end) return;
   switch (activation) {
     case ACTIVATION_NONE:
-      GemmFp32Avx512Impl<ACTIVATION_NONE>(row_begin, row_end, col_begin,
-                                          col_end, outputs, inputs, input,
-                                          weights_transposed, biases,
-                                          activation, output);
+      GemmFp32Avx512Impl<ACTIVATION_NONE>(
+          row_begin, row_end, col_begin, col_end, outputs, inputs, input,
+          weights_transposed, biases, activation, output);
       break;
     case ACTIVATION_RELU:
-      GemmFp32Avx512Impl<ACTIVATION_RELU>(row_begin, row_end, col_begin,
-                                          col_end, outputs, inputs, input,
-                                          weights_transposed, biases,
-                                          activation, output);
+      GemmFp32Avx512Impl<ACTIVATION_RELU>(
+          row_begin, row_end, col_begin, col_end, outputs, inputs, input,
+          weights_transposed, biases, activation, output);
       break;
     case ACTIVATION_MISH:
-      GemmFp32Avx512Impl<ACTIVATION_MISH>(row_begin, row_end, col_begin,
-                                          col_end, outputs, inputs, input,
-                                          weights_transposed, biases,
-                                          activation, output);
+      GemmFp32Avx512Impl<ACTIVATION_MISH>(
+          row_begin, row_end, col_begin, col_end, outputs, inputs, input,
+          weights_transposed, biases, activation, output);
       break;
     case ACTIVATION_SELU:
-      GemmFp32Avx512Impl<ACTIVATION_SELU>(row_begin, row_end, col_begin,
-                                          col_end, outputs, inputs, input,
-                                          weights_transposed, biases,
-                                          activation, output);
+      GemmFp32Avx512Impl<ACTIVATION_SELU>(
+          row_begin, row_end, col_begin, col_end, outputs, inputs, input,
+          weights_transposed, biases, activation, output);
       break;
     case ACTIVATION_SWISH:
-      GemmFp32Avx512Impl<ACTIVATION_SWISH>(row_begin, row_end, col_begin,
-                                           col_end, outputs, inputs, input,
-                                           weights_transposed, biases,
-                                           activation, output);
+      GemmFp32Avx512Impl<ACTIVATION_SWISH>(
+          row_begin, row_end, col_begin, col_end, outputs, inputs, input,
+          weights_transposed, biases, activation, output);
       break;
     default:
-      GemmFp32Avx512Impl<ACTIVATION_DEFAULT>(row_begin, row_end, col_begin,
-                                             col_end, outputs, inputs, input,
-                                             weights_transposed, biases,
-                                             activation, output);
+      GemmFp32Avx512Impl<ACTIVATION_DEFAULT>(
+          row_begin, row_end, col_begin, col_end, outputs, inputs, input,
+          weights_transposed, biases, activation, output);
       break;
   }
 }
@@ -3137,12 +3151,11 @@ void AttentionPolicyPromoAvx512(size_t policy_d_model, const float* k_board,
                                _mm512_loadu_ps(w_row + k), acc0);
       }
       if (rem) {
-        acc0 = _mm512_fmadd_ps(_mm512_maskz_loadu_ps(rem_mask, k_row + k),
-                               _mm512_maskz_loadu_ps(rem_mask, w_row + k),
-                               acc0);
+        acc0 =
+            _mm512_fmadd_ps(_mm512_maskz_loadu_ps(rem_mask, k_row + k),
+                            _mm512_maskz_loadu_ps(rem_mask, w_row + k), acc0);
       }
-      promotion_offsets[i][j] =
-          _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+      promotion_offsets[i][j] = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
     }
   }
   for (int i = 0; i < 3; ++i) {

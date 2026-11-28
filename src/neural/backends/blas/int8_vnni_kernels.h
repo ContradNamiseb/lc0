@@ -40,9 +40,9 @@ namespace blas_backend {
 struct ResidualSeParams {
   bool has_se = false;
   size_t se_fc_outputs = 0;
-  const float* w1 = nullptr;    // [se_fc_outputs][channels] row-major
+  const float* w1 = nullptr;  // [se_fc_outputs][channels] row-major
   const float* b1 = nullptr;
-  const float* w2 = nullptr;    // [2 * channels][se_fc_outputs] row-major
+  const float* w2 = nullptr;  // [2 * channels][se_fc_outputs] row-major
   const float* b2 = nullptr;
   const float* w1_t = nullptr;  // optional [channels][se_fc_outputs]
   const float* w2_t = nullptr;  // optional [se_fc_outputs][2 * channels]
@@ -51,13 +51,13 @@ struct ResidualSeParams {
 // Pre-sized raw scratch pointers passed into the ISA residual-block kernels so
 // those translation units never allocate or instantiate AlignedBuffer methods.
 struct Conv3x3ScratchView {
-  uint8_t* pad1 = nullptr;          // 10 * 10 * padded_channels
-  uint8_t* pad2 = nullptr;          // 10 * 10 * padded_channels
-  float* conv2_output = nullptr;    // 64 * channels
-  float* avg_pool = nullptr;        // channels
-  float* se_fc1 = nullptr;          // se_fc_outputs
-  float* se_fc2 = nullptr;          // 2 * channels
-  float* nhwc_board = nullptr;      // optional 64 * input_channels staging
+  uint8_t* pad1 = nullptr;        // 10 * 10 * padded_channels
+  uint8_t* pad2 = nullptr;        // 10 * 10 * padded_channels
+  float* conv2_output = nullptr;  // 64 * channels
+  float* avg_pool = nullptr;      // channels
+  float* se_fc1 = nullptr;        // se_fc_outputs
+  float* se_fc2 = nullptr;        // 2 * channels
+  float* nhwc_board = nullptr;    // optional 64 * input_channels staging
 };
 
 #ifdef LC0_HAS_AVX512_VNNI
@@ -92,10 +92,12 @@ void LayerNorm2DWithSkipAndQuantizeAvx512(
 
 // Single-pass AVX-512 LayerNorm (alpha=1, no skip, read-only input) fused
 // directly with per-group dynamic uint8 quantization (used by Smolgen LN1/LN2).
-void LayerNormAndDynamicQuantizeAvx512(
-    size_t rows, size_t channels, size_t quant_group_size, const float* input,
-    const float* gammas, const float* betas, float epsilon, uint8_t* q_out,
-    float* group_scales, float* group_mins);
+void LayerNormAndDynamicQuantizeAvx512(size_t rows, size_t channels,
+                                       size_t quant_group_size,
+                                       const float* input, const float* gammas,
+                                       const float* betas, float epsilon,
+                                       uint8_t* q_out, float* group_scales,
+                                       float* group_mins);
 
 // In-place AVX-512 Softmax over `rows` rows of exactly 64 floats each.
 void Softmax64Avx512(size_t rows, float* data);

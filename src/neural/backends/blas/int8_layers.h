@@ -148,10 +148,10 @@ class Int8Weights {
   // SmoothQuant-109 3x3 convolution reading NCHW directly on each worker
   // thread (board-local L1/L2 transpose + plane-109 scale + pad1 quantize)
   // and writing NHWC.
-  void Convolve3NchwToNhwc(size_t batch_size, const float* input_nchw,
-                           float plane109_scale, float* output_nhwc,
-                           Int8Scratch& scratch, const float* biases = nullptr,
-                           ActivationFunction activation = ACTIVATION_NONE) const;
+  void Convolve3NchwToNhwc(
+      size_t batch_size, const float* input_nchw, float plane109_scale,
+      float* output_nhwc, Int8Scratch& scratch, const float* biases = nullptr,
+      ActivationFunction activation = ACTIVATION_NONE) const;
 
   // Runs a complete fused NHWC residual block (conv1 -> bias1 + act ->
   // requant -> conv2 -> optional SE + skip + act) in-place on `tensor_nhwc`.

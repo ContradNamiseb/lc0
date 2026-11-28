@@ -187,8 +187,8 @@ BaseWeights::MHA::MHA(const pblczero::Weights::MHA& mha)
       mha.k_w().encoding() == pblczero::Weights::Layer::INT8 &&
       mha.v_w().encoding() == pblczero::Weights::Layer::INT8 &&
       mha.dense_w().encoding() == pblczero::Weights::Layer::INT8 &&
-      mha.has_q_w_scales() && mha.has_k_w_scales() &&
-      mha.has_v_w_scales() && mha.has_dense_w_scales();
+      mha.has_q_w_scales() && mha.has_k_w_scales() && mha.has_v_w_scales() &&
+      mha.has_dense_w_scales();
   if (int8_mode) {
     if (mha.qkv_act_scale() <= 0.0f || mha.dense_act_scale() <= 0.0f ||
         mha.qkv_act_zp() > 255 || mha.dense_act_zp() > 255) {
@@ -207,7 +207,8 @@ BaseWeights::MHA::MHA(const pblczero::Weights::MHA& mha)
     qkv_act_zp = static_cast<uint8_t>(mha.qkv_act_zp());
     dense_act_scale = mha.dense_act_scale();
     dense_act_zp = static_cast<uint8_t>(mha.dense_act_zp());
-    // Also populate dequantized FP32 vectors so non-INT8 backends stay functional.
+    // Also populate dequantized FP32 vectors so non-INT8 backends stay
+    // functional.
     q_w = DequantizeInt8RowMajor(q_w_i8, q_w_scales, "mha.q_w");
     k_w = DequantizeInt8RowMajor(k_w_i8, k_w_scales, "mha.k_w");
     v_w = DequantizeInt8RowMajor(v_w_i8, v_w_scales, "mha.v_w");
@@ -415,8 +416,8 @@ bool MhaHasInt8(const pblczero::Weights::MHA& mha) {
          mha.k_w().encoding() == pblczero::Weights::Layer::INT8 &&
          mha.v_w().encoding() == pblczero::Weights::Layer::INT8 &&
          mha.dense_w().encoding() == pblczero::Weights::Layer::INT8 &&
-         mha.has_q_w_scales() && mha.has_k_w_scales() &&
-         mha.has_v_w_scales() && mha.has_dense_w_scales();
+         mha.has_q_w_scales() && mha.has_k_w_scales() && mha.has_v_w_scales() &&
+         mha.has_dense_w_scales();
 }
 
 bool FfnHasInt8(const pblczero::Weights::FFN& ffn) {

@@ -830,8 +830,7 @@ void Int8Weights::Convolve3Nhwc(size_t batch_size, const float* input_nhwc,
 void Int8Weights::Convolve3NchwToNhwc(size_t batch_size,
                                       const float* input_nchw,
                                       float plane109_scale, float* output_nhwc,
-                                      Int8Scratch& scratch,
-                                      const float* biases,
+                                      Int8Scratch& scratch, const float* biases,
                                       ActivationFunction activation) const {
   const size_t input_channels = inputs_ / kFilterTaps;
   const size_t padded_channels = ((input_channels + 3) / 4) * 4;
@@ -1015,7 +1014,7 @@ DynamicInt8Weights::DynamicInt8Weights(const float* weights_fp32,
 }
 
 void DynamicInt8Weights::PrepareDynamicRows(size_t rows, const float* input,
-                                              Int8Scratch& scratch) const {
+                                            Int8Scratch& scratch) const {
 #ifdef LC0_HAS_AVX512_VNNI
   // Use quantized_input2 so any pre-quantized QKV buffer in quantized_input
   // stays intact across Smolgen.
@@ -1117,10 +1116,10 @@ void DynamicInt8Weights::ForwardPreparedRange(
   const float* r_scales = scratch.dynamic_scales.data();
   const float* r_mins = scratch.dynamic_mins.data();
   const size_t n_blocks = (outputs_ + 31) / 32;
-  GemmDynamicEpilogueAvx512(
-      row_begin, row_end, 0, n_blocks, outputs_, inputs_, q_in, r_scales,
-      r_mins, packed_weights_.data(), weight_scales_.data(),
-      weight_sum_scaled_.data(), biases, activation, output);
+  GemmDynamicEpilogueAvx512(row_begin, row_end, 0, n_blocks, outputs_, inputs_,
+                            q_in, r_scales, r_mins, packed_weights_.data(),
+                            weight_scales_.data(), weight_sum_scaled_.data(),
+                            biases, activation, output);
 #else
   (void)row_begin;
   (void)row_end;
