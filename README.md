@@ -165,7 +165,7 @@ adjudication `500` cp on the first match and `900` cp on the other three):
 | `T74_blas_int8` vs `T79_master_fp32` | `30+0.5` | 81 / 0 / 19 | 90.5% | +391.57 ± 70.75 | `[0, 0, 0, 19, 31]` | 2,075 vs 138 (15.0×)* |
 | `T74_blas_int8` vs `T79_master_fp32` | 1,000 nodes | 5 / 51 / 44 | 27.0% | −172.78 ± 44.16 | `[9, 30, 9, 2, 0]` | 2,196 vs 175 (12.5×)* |
 
-At 1,000 nodes/move, `T74_blas_int8` ran at `MinibatchSize=16` vs `32` for
+*\*Match-setting vs matched-search NPS & batch-size note:* at 1,000 nodes/move, `T74_blas_int8` ran at `MinibatchSize=16` vs `32` for
 `T74_master_fp32`, so that per-node comparison is confounded and `+20.9 ± 34.5`
 Elo is within noise either way. Likewise, the `4.88×` (`4.44×` at 1k nodes) NPS
 ratio reflects those match-tuned settings (`threads=8, MinibatchSize=16` vs
